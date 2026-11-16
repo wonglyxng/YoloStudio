@@ -1,0 +1,9 @@
+[project]
+name = "yolo-studio"
+version = "0.1.0"
+description = "Desktop GUI and CLI studio for Video Frame Extraction, X-AnyLabeling dataset conversion, and YOLO26 training."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
