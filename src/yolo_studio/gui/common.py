@@ -22,6 +22,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+# 长任务日志框（`QPlainTextEdit.setMaximumBlockCount`）保留的最大行数；超出后自动丢弃最早的行，
+# 避免长时间训练日志无限增长拖慢界面
+LOG_MAX_LINES = 5000
+
 
 def open_local_path(path: Path) -> None:
     """在系统文件管理器中打开本地目录或文件；若目标不存在则回退打开其父目录。"""

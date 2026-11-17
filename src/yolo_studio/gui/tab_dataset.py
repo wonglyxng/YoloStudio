@@ -40,6 +40,7 @@ from yolo_studio.core.dataset_converter import (
     DatasetBuildResult,
     DatasetScanSummary,
 )
+from yolo_studio.core.mllm_reviewer import BUCKET_NEED_REVIEW
 from yolo_studio.gui.common import PathPickerRow, open_local_path
 from yolo_studio.gui.workers import DatasetBuildWorker, DatasetScanWorker
 
@@ -151,10 +152,22 @@ class DatasetTab(QWidget):
         ds_form.addRow("划分比例:", ratio_row)
 
         opt_row = QHBoxLayout()
-        self.include_empty_chk = QCheckBox("保留未标注图片作为负样本")
+        self.include_empty_chk = QCheckBox("保留无标注文件的图片作为负样本")
+        self.include_empty_chk.setToolTip(
+            "仅影响完全没有 .json/.txt 的图片；已保存但无目标的标注文件视为人工确认的负样本，始终纳入"
+        )
         self.recursive_chk = QCheckBox("递归扫描子目录")
+        self.exclude_need_review_chk = QCheckBox(f"排除未复核的 {BUCKET_NEED_REVIEW} 子目录")
+        self.exclude_need_review_chk.setChecked(True)
+        self.exclude_need_review_chk.setToolTip(
+            "MLLM 清洗结果中的 need_review 含 LLM 补框与审核出错样本，人工复核完成前不应进入训练；"
+            "确认已在工作台复核后可取消勾选。仅在递归扫描时生效。"
+        )
         opt_row.addWidget(self.include_empty_chk)
         opt_row.addWidget(self.recursive_chk)
+        opt_row.addWidget(self.exclude_need_review_chk)
+        self.recursive_chk.toggled.connect(self.exclude_need_review_chk.setEnabled)
+        self.exclude_need_review_chk.setEnabled(self.recursive_chk.isChecked())
         ds_form.addRow("附加选项:", opt_row)
 
         left.addWidget(ds_group)
@@ -246,6 +259,9 @@ class DatasetTab(QWidget):
             seed=self.seed_spin.value(),
             copy_images=True,
             recursive=self.recursive_chk.isChecked(),
+            exclude_subdirs=(
+                (BUCKET_NEED_REVIEW,) if self.exclude_need_review_chk.isChecked() else ()
+            ),
         )
 
     def _on_open_in_workbench(self) -> None:
@@ -282,8 +298,10 @@ class DatasetTab(QWidget):
         fmt_name = "X-AnyLabeling JSON" if summary.detected_format == "json" else "YOLO TXT"
         self.summary_label.setText(
             f"识别格式: {fmt_name} | 图片总数: {summary.total_images} | "
-            f"已标注: {summary.annotated_images} | 未标注: {summary.unannotated_images} | "
+            f"已标注: {summary.annotated_images} | 未标注: {summary.unannotated_images}"
+            f"（其中显式负样本 {summary.negative_images}） | "
             f"总框数: {summary.total_boxes} | 类别数: {len(summary.classes)}"
+            + (f" | 已排除: {summary.excluded_images}" if summary.excluded_images else "")
         )
         self._populate_class_table(summary.classes, summary.class_counts)
         if summary.warnings:

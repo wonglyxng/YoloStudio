@@ -39,7 +39,9 @@ def main() -> int:
         if extra_path.is_dir() and str(extra_path) not in sys.path:
             sys.path.insert(0, str(extra_path))
 
-    # 降低部分平台下科学计算库多线程引发的冲突并抑制无关 ICC 日志噪音
+    # 与原版 X-AnyLabeling 入口保持一致，降低内嵌标注工作台中科学计算库多线程冲突并抑制无关 ICC 日志；
+    # 该设置会让 torch 默认只用 1 个 CPU 线程，训练/推理入口通过
+    # `core.trainer.ensure_torch_cpu_threads()` 恢复 torch 线程数，不受此影响
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     os.environ.setdefault("OMP_NUM_THREADS", "1")

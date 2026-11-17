@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -224,6 +225,35 @@ def _compute_step_frames(info: VideoInfo, config: ExtractionConfig, start_frame:
     return 1.0
 
 
+# 距下一个采样点超过该帧数时才使用 `CAP_PROP_POS_FRAMES` 跳转；更近时用 `grab()` 顺序跳帧。
+# 原因：H.264/H.265 等长 GOP 编码每次 seek 都要从前一关键帧重新解码，小步长下频繁 seek
+# 反而比顺序读取慢，且部分后端 seek 不精确；`grab()` 只解码不做 retrieve/色彩转换，开销更低。
+SEEK_THRESHOLD_FRAMES = 300
+
+
+def _plan_video_name_keys(videos: list[Path]) -> dict[Path, str]:
+    """为每个视频规划输出命名键（用作帧文件名前缀与子目录名），保证不同视频之间不重名。
+
+    文件 `stem`（不区分大小写）唯一时直接使用；多个视频同名（如 `cam1/rec.mp4` 与 `cam2/rec.mp4`）
+    时改用 `上级目录名_stem`，仍冲突再追加序号，防止帧文件互相覆盖。
+    """
+    stem_counts: dict[str, int] = {}
+    for v in videos:
+        stem_counts[v.stem.lower()] = stem_counts.get(v.stem.lower(), 0) + 1
+    used: set[str] = set()
+    keys: dict[Path, str] = {}
+    for v in videos:
+        base = v.stem if stem_counts[v.stem.lower()] == 1 else f"{v.parent.name}_{v.stem}"
+        key = base
+        idx = 1
+        while key.lower() in used:
+            key = f"{base}_{idx}"
+            idx += 1
+        used.add(key.lower())
+        keys[v] = key
+    return keys
+
+
 def extract_frames(
     video_paths: list[Path],
     config: ExtractionConfig,
@@ -234,12 +264,16 @@ def extract_frames(
 
     副作用与资源管理：
         自动创建 `config.output_dir` 及子目录并写出图片文件，存在同名文件时直接覆盖；
+        多个视频同名时由 `_plan_video_name_keys` 消歧，帧文件不会跨视频互相覆盖。
         每个视频的 `cv2.VideoCapture` 在内部 `finally` 块释放，防止句柄泄漏。
 
+    读取策略：
+        距下一个采样点不超过 `SEEK_THRESHOLD_FRAMES` 帧时用 `grab()` 顺序跳过，否则直接 seek。
+
     回调、取消与失败行为：
-        保存新帧时立即触发 `progress_callback`，未采样帧每 30 帧触发一次进度更新；
-        外部通过 `cancel_event` 请求取消后将在下个循环检查点停止并返回已保存结果
-        （`result.cancelled = True`，已落盘文件不回滚）；
+        保存新帧时立即触发 `progress_callback`，跳过的帧每 30 帧触发一次进度更新；
+        外部通过 `cancel_event` 请求取消后将在下个检查点停止并返回已保存结果
+        （`result.cancelled = True`，已落盘文件不回滚，被中断的视频不计入 `videos_processed`）；
         未找到任何有效视频或单视频打开失败/时间段非法时将错误信息记入 `result.errors`，
         单视频失败不会中断其余视频处理。
     """
@@ -258,9 +292,13 @@ def extract_frames(
 
     ext = ".png" if config.image_format.lower() == "png" else ".jpg"
     total_videos = len(videos)
+    name_keys = _plan_video_name_keys(videos)
+
+    def _cancelled() -> bool:
+        return bool(cancel_event and cancel_event.is_set())
 
     for vid_idx, video_path in enumerate(videos, start=1):
-        if cancel_event and cancel_event.is_set():
+        if _cancelled():
             result.cancelled = True
             break
 
@@ -290,94 +328,99 @@ def extract_frames(
                 continue
 
             step = _compute_step_frames(info, config, start_frame, end_frame)
+            name_key = name_keys[video_path]
             target_dir = (
-                config.output_dir / video_path.stem
-                if config.create_video_subfolder
-                else config.output_dir
+                config.output_dir / name_key if config.create_video_subfolder else config.output_dir
             )
-            name_prefix = f"{config.prefix}{video_path.stem}" if config.prefix else video_path.stem
+            name_prefix = f"{config.prefix}{name_key}" if config.prefix else name_key
+
+            def _emit_progress(frame_idx: int, last_saved: Path | None) -> None:
+                if progress_callback is None:
+                    return
+                progress_callback(
+                    ExtractionProgress(
+                        video_index=vid_idx,
+                        total_videos=total_videos,
+                        video_name=video_path.name,
+                        current_frame=frame_idx + 1,
+                        total_frames=total_frames if total_frames > 0 else frame_idx + 1,
+                        saved_total=result.frames_saved,
+                        skipped_similar=result.frames_skipped_similar,
+                        last_saved_path=last_saved,
+                    )
+                )
 
             if start_frame > 0:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
+            # frame_idx 始终表示下一次 grab/read 将得到的帧序号
             frame_idx = start_frame
             next_sample_at = float(start_frame)
             saved_for_video = 0
             prev_small: np.ndarray | None = None
+            interrupted = False
 
-            while True:
-                if cancel_event and cancel_event.is_set():
-                    result.cancelled = True
-                    break
-                if frame_idx >= end_frame:
+            while frame_idx < end_frame:
+                if _cancelled():
+                    interrupted = True
                     break
 
-                # 采样步长较大时直接跳转关键帧位置以提升抽帧速度，否则顺序读取
-                if step >= 15 and int(round(next_sample_at)) > frame_idx + 1:
-                    jump_to = int(round(next_sample_at))
-                    if jump_to >= end_frame:
+                target = max(frame_idx, int(math.ceil(next_sample_at - 1e-6)))
+                if target >= end_frame:
+                    break
+
+                if target - frame_idx > SEEK_THRESHOLD_FRAMES:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                    frame_idx = target
+                else:
+                    stream_ended = False
+                    while frame_idx < target:
+                        if _cancelled():
+                            interrupted = True
+                            break
+                        if not cap.grab():
+                            stream_ended = True
+                            break
+                        frame_idx += 1
+                        if frame_idx % 30 == 0:
+                            _emit_progress(frame_idx, None)
+                    if interrupted or stream_ended:
                         break
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, jump_to)
-                    frame_idx = jump_to
 
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     break
 
-                should_sample = frame_idx + 1e-6 >= next_sample_at
-                if should_sample:
-                    while next_sample_at <= frame_idx + 1e-6:
-                        next_sample_at += step
+                while next_sample_at <= frame_idx + 1e-6:
+                    next_sample_at += step
 
-                    is_duplicate = False
-                    if config.dedup_threshold > 0:
-                        diff, current_small = _compute_frame_diff(prev_small, frame)
-                        if prev_small is not None and diff < config.dedup_threshold:
-                            is_duplicate = True
-                            result.frames_skipped_similar += 1
-                        else:
-                            prev_small = current_small
+                is_duplicate = False
+                if config.dedup_threshold > 0:
+                    diff, current_small = _compute_frame_diff(prev_small, frame)
+                    if prev_small is not None and diff < config.dedup_threshold:
+                        is_duplicate = True
+                        result.frames_skipped_similar += 1
+                    else:
+                        prev_small = current_small
 
-                    if not is_duplicate:
-                        processed = _resize_if_needed(frame, config.max_dimension)
-                        saved_for_video += 1
-                        out_name = f"{name_prefix}_{saved_for_video:06d}{ext}"
-                        out_path = target_dir / out_name
-                        _write_image_unicode_safe(
-                            out_path, processed, config.image_format, config.jpeg_quality
-                        )
-                        result.frames_saved += 1
-                        result.saved_files.append(out_path)
-
-                        if progress_callback:
-                            progress_callback(
-                                ExtractionProgress(
-                                    video_index=vid_idx,
-                                    total_videos=total_videos,
-                                    video_name=video_path.name,
-                                    current_frame=frame_idx + 1,
-                                    total_frames=total_frames if total_frames > 0 else frame_idx + 1,
-                                    saved_total=result.frames_saved,
-                                    skipped_similar=result.frames_skipped_similar,
-                                    last_saved_path=out_path,
-                                )
-                            )
-                elif progress_callback and frame_idx % 30 == 0:
-                    progress_callback(
-                        ExtractionProgress(
-                            video_index=vid_idx,
-                            total_videos=total_videos,
-                            video_name=video_path.name,
-                            current_frame=frame_idx + 1,
-                            total_frames=total_frames if total_frames > 0 else frame_idx + 1,
-                            saved_total=result.frames_saved,
-                            skipped_similar=result.frames_skipped_similar,
-                            last_saved_path=None,
-                        )
+                if not is_duplicate:
+                    processed = _resize_if_needed(frame, config.max_dimension)
+                    saved_for_video += 1
+                    out_path = target_dir / f"{name_prefix}_{saved_for_video:06d}{ext}"
+                    _write_image_unicode_safe(
+                        out_path, processed, config.image_format, config.jpeg_quality
                     )
+                    result.frames_saved += 1
+                    result.saved_files.append(out_path)
+                    _emit_progress(frame_idx, out_path)
+                else:
+                    _emit_progress(frame_idx, None)
 
                 frame_idx += 1
 
+            if interrupted:
+                result.cancelled = True
+                break
             result.videos_processed += 1
         finally:
             cap.release()

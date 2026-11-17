@@ -2,18 +2,22 @@
 
 职责：
     在离线 `offscreen` Qt 环境下验证主窗口六标签页装配、X-AnyLabeling 内嵌宿主初始化、
-    快捷键作用域隔离、`open_directory` 精确目录/单图/类别加载以及跨标签页联动跳转。
+    快捷键作用域隔离、`open_directory` 精确目录/单图/类别加载、跨标签页联动跳转，
+    以及关闭主窗口时等待后台线程安全停止后再退出。
 
 运行环境与协作边界：
     通过 `pytest` 运行，依赖 `PyQt6`、`PyQt6-WebEngine`、`Pillow` 与本地安装的
-    `third_party/X-AnyLabeling`（`anylabeling` 包）；不访问外部网络，也不弹出可见桌面窗口。
+    `third_party/X-AnyLabeling`（`anylabeling` 包）；不访问外部网络，也不弹出可见桌面窗口
+    （关闭确认对话框在测试中被替换为直接返回“是”）。
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 from PIL import Image
@@ -23,9 +27,9 @@ XAL_ROOT = PROJECT_ROOT / "third_party" / "X-AnyLabeling"
 if XAL_ROOT.is_dir() and str(XAL_ROOT) not in sys.path:
     sys.path.insert(0, str(XAL_ROOT))
 
-from PyQt6.QtCore import QCoreApplication, Qt  # noqa: E402
+from PyQt6.QtCore import QCoreApplication, Qt, QThread  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from yolo_studio.gui.main_window import MainWindow  # noqa: E402
 from yolo_studio.gui.tab_labeling import (  # noqa: E402
@@ -117,3 +121,45 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+class _CancellableThread(QThread):
+    """模拟支持协作取消的后台任务线程，收到 `cancel()` 后在下一个检查点退出。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel = Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        while not self._cancel.wait(0.05):
+            pass
+
+
+def test_close_waits_for_running_workers(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证关闭主窗口时会请求后台线程停止，并在线程结束后才真正关闭，不在运行中析构 `QThread`。"""
+    win = MainWindow(workspace_root=tmp_path)
+    worker = _CancellableThread()
+    win.train_tab.worker = worker
+    worker.start()
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *_a, **_k: QMessageBox.StandardButton.Yes)
+    )
+    win.show()
+    try:
+        win.close()
+        # 首次关闭被忽略并进入等待；线程收到取消信号后退出，定时器随后触发真正关闭
+        assert win._close_wait_timer.isActive() or not worker.isRunning()
+        deadline = time.monotonic() + 5.0
+        while win.isVisible() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+        assert not worker.isRunning()
+        assert not win.isVisible()
+    finally:
+        worker.cancel()
+        worker.wait(2000)

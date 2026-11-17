@@ -28,6 +28,15 @@
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+> 注意：`ultralytics` 依赖 `opencv-python`，X-AnyLabeling 依赖 `opencv-contrib-python-headless`，两者都会写入同一个 `cv2` 包而互相覆盖。安装或更新依赖后请执行以下命令，只保留后者（它已包含本项目需要的全部 OpenCV 功能）：
+>
+> ```powershell
+> .venv\Scripts\python.exe -m pip uninstall -y opencv-python opencv-contrib-python-headless
+> .venv\Scripts\python.exe -m pip install --no-deps opencv-contrib-python-headless
+> ```
+>
+> 之后 `pip check` 会提示 `ultralytics` 缺少 `opencv-python`，可以忽略。
+
 详细使用说明请参考：
 - [001_录制视频抽帧工具使用说明.md](docs/001_录制视频抽帧工具使用说明.md)
 - [002_YOLO26训练使用说明.md](docs/002_YOLO26训练使用说明.md)

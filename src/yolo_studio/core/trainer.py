@@ -16,8 +16,7 @@
 
 from __future__ import annotations
 
-import io
-from contextlib import redirect_stderr, redirect_stdout
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
@@ -25,6 +24,9 @@ from typing import Callable
 
 import cv2
 import torch
+
+from yolo_studio.core.frame_extractor import VIDEO_EXTENSIONS
+from yolo_studio.core.log_capture import capture_thread_output
 
 YOLO26_DETECT_MODELS = [
     ("yolo26n.pt", "YOLO26n (Nano - 速度最快，显存占用最低)"),
@@ -53,7 +55,12 @@ class TrainConfig:
     关键字段说明：
         `batch`：批大小，设为 `-1` 时由 Ultralytics 自动探测最大可用批次。
         `lr0`：初始学习率；`patience`：早停容忍轮数；`workers`：DataLoader 工作进程数。
-        `project_dir` / `run_name`：训练产物保存根目录与子实验名（默认开启 `exist_ok=True`）。
+        `project_dir` / `run_name`：训练产物保存根目录与子实验名。
+        `exist_ok`：默认 `False`，同名实验目录已存在时由 Ultralytics 自动递增为 `run_name2` 等，
+            避免覆盖上一次的权重与曲线；设为 `True` 时直接写入并覆盖同名目录。
+        `resume`：断点续训。此时 `model_name` 若指向已存在的非官方预训练 `.pt`（如某次的 `last.pt`）
+            则以其为断点，否则使用 `project_dir/run_name/weights/last.pt`；断点不存在时训练前抛出
+            `FileNotFoundError`。续训的超参数与保存目录由断点记录决定。
     """
 
     data_yaml: Path
@@ -70,6 +77,7 @@ class TrainConfig:
     project_dir: Path = Path("runs/detect")
     run_name: str = "yolo26_train"
     resume: bool = False
+    exist_ok: bool = False
     extra_args: dict[str, object] = field(default_factory=dict)
 
 
@@ -98,35 +106,36 @@ class TrainResult:
     stopped_early: bool = False
 
 
-class _StreamForwarder(io.TextIOBase):
-    """按行缓冲并转发标准输出/错误流至日志回调的适配流。
+def ensure_torch_cpu_threads() -> None:
+    """恢复 PyTorch CPU 算子的线程数。
 
-    状态与线程约束：
-        内部 `_buffer` 保存尚未遇到换行符的半行内容（将 `\\r` 统一转为 `\\n`），
-        调用方应在退出重定向块后调用 `flush()` 以刷出尾部残留行；
-        本类非线程安全，仅应在单次 `redirect_stdout` / `redirect_stderr` 作用域内使用。
+    设计原因：
+        桌面入口为兼容内嵌 X-AnyLabeling 设置了 `OMP_NUM_THREADS=1` 等环境变量，
+        导致 torch 默认只用 1 个线程，CPU 训练/推理显著变慢。本函数在当前线程数为 1 时
+        把 torch 进程级线程数恢复为约等于物理核心数（逻辑核数的一半，至少 1）。
+        仅影响 torch，不影响 numpy/MKL 与 onnxruntime；可重复调用。
     """
+    try:
+        if torch.get_num_threads() <= 1:
+            torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
+    except Exception:
+        # 线程数设置失败不影响功能，仅保留默认值
+        pass
 
-    def __init__(self, log_callback: Callable[[str], None] | None) -> None:
-        super().__init__()
-        self._callback = log_callback
-        self._buffer = ""
 
-    def write(self, s: str) -> int:
-        if not s:
-            return 0
-        self._buffer += s.replace("\r", "\n")
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            stripped = line.strip()
-            if stripped and self._callback:
-                self._callback(stripped)
-        return len(s)
-
-    def flush(self) -> None:
-        if self._buffer.strip() and self._callback:
-            self._callback(self._buffer.strip())
-        self._buffer = ""
+def _resolve_resume_checkpoint(config: TrainConfig) -> Path:
+    """确定断点续训使用的 `last.pt`，不存在时抛出 `FileNotFoundError`。"""
+    official_names = {name for name, _ in YOLO26_DETECT_MODELS}
+    candidate = Path(config.model_name)
+    if candidate.name not in official_names and candidate.is_file():
+        return candidate
+    default_ckpt = config.project_dir / config.run_name / "weights" / "last.pt"
+    if default_ckpt.is_file():
+        return default_ckpt
+    raise FileNotFoundError(
+        f"断点续训需要上一次训练的 last.pt，未找到: {default_ckpt}。"
+        "请确认实验名称与上次一致，或在自定义权重路径中直接选择要续训的 last.pt。"
+    )
 
 
 def detect_compute_device() -> DeviceInfo:
@@ -167,28 +176,37 @@ def train_yolo26(
     """使用 Ultralytics 启动 YOLO26 目标检测模型训练。
 
     调用条件与副作用：
-        要求 `config.data_yaml` 存在（否则抛出 `FileNotFoundError`）；
-        会在 `config.project_dir / config.run_name` 下写出训练日志、指标曲线及 `weights/best.pt`、`last.pt`。
+        要求 `config.data_yaml` 存在（否则抛出 `FileNotFoundError`）；断点续训时还要求能解析到
+        `last.pt`（见 `TrainConfig.resume`）。会在 `config.project_dir` 下的实验目录
+        （`exist_ok=False` 时同名目录存在会自动递增）写出训练日志、指标曲线及 `weights/best.pt`、`last.pt`，
+        实际目录以返回值 `TrainResult.save_dir` 为准。
 
     回调与安全停训约束：
         通过 `on_train_epoch_end` 与 `on_fit_epoch_end` 回调派发 `EpochMetrics` 并检查 `cancel_event`；
-        若收到取消信号，将设置 `trainer.stop = True`，等待当前轮次完成并保存断点权重后再退出。
-        训练期间会重定向当前进程的 `stdout` 与 `stderr` 到 `log_callback`。
+        若收到取消信号，将设置 `trainer.stop = True`，等待当前轮次完成并保存断点权重后再退出，
+        此时 `TrainResult.stopped_early=True`（训练已自然结束后才设置的取消信号不计入）。
+        训练期间仅把**当前线程**的标准输出、标准错误与 `ultralytics` 日志按行转发到 `log_callback`
+        （见 `core.log_capture`），不影响其他并发任务的输出。
     """
     from ultralytics import YOLO
 
     if not config.data_yaml.is_file():
         raise FileNotFoundError(f"data.yaml 不存在: {config.data_yaml}")
 
+    model_source = str(_resolve_resume_checkpoint(config)) if config.resume else config.model_name
+
     if log_callback:
-        log_callback(f"加载模型: {config.model_name}")
+        log_callback(f"{'断点续训，加载断点' if config.resume else '加载模型'}: {model_source}")
         log_callback(f"数据集配置: {config.data_yaml}")
 
-    model = YOLO(config.model_name)
+    ensure_torch_cpu_threads()
+    model = YOLO(model_source)
+    stop_requested = {"value": False}
 
     def _check_cancel(trainer: object) -> None:
-        if cancel_event and cancel_event.is_set():
+        if cancel_event and cancel_event.is_set() and not stop_requested["value"]:
             setattr(trainer, "stop", True)
+            stop_requested["value"] = True
             if log_callback:
                 log_callback("收到停止请求，将在当前轮次结束后安全停止训练...")
 
@@ -239,15 +257,13 @@ def train_yolo26(
         "cache": bool(config.cache),
         "project": str(config.project_dir.resolve()),
         "name": config.run_name,
-        "exist_ok": True,
+        "exist_ok": bool(config.exist_ok),
         "resume": bool(config.resume),
     }
     train_kwargs.update(config.extra_args)
 
-    forwarder = _StreamForwarder(log_callback)
-    with redirect_stdout(forwarder), redirect_stderr(forwarder):
+    with capture_thread_output(log_callback):
         results = model.train(**train_kwargs)
-    forwarder.flush()
 
     save_dir = Path(getattr(model.trainer, "save_dir", config.project_dir / config.run_name))
     weights_dir = save_dir / "weights"
@@ -265,7 +281,7 @@ def train_yolo26(
         best_weights=best_pt if best_pt.is_file() else None,
         last_weights=last_pt if last_pt.is_file() else None,
         metrics=final_metrics,
-        stopped_early=bool(cancel_event and cancel_event.is_set()),
+        stopped_early=stop_requested["value"],
     )
 
 
@@ -278,7 +294,8 @@ def validate_model(
 ) -> dict[str, float]:
     """在指定验证数据集上评估已训练的 YOLO26 权重并返回指标字典。
 
-    `weights_path` 或 `data_yaml` 不存在时抛出 `FileNotFoundError`。
+    `weights_path` 或 `data_yaml` 不存在时抛出 `FileNotFoundError`；
+    当前线程的输出与 `ultralytics` 日志转发到 `log_callback`。
     """
     from ultralytics import YOLO
 
@@ -287,11 +304,10 @@ def validate_model(
     if not data_yaml.is_file():
         raise FileNotFoundError(f"data.yaml 不存在: {data_yaml}")
 
+    ensure_torch_cpu_threads()
     model = YOLO(str(weights_path))
-    forwarder = _StreamForwarder(log_callback)
-    with redirect_stdout(forwarder), redirect_stderr(forwarder):
+    with capture_thread_output(log_callback):
         metrics = model.val(data=str(data_yaml), imgsz=imgsz, device=device)
-    forwarder.flush()
 
     summary: dict[str, float] = {}
     results_dict = getattr(metrics, "results_dict", None)
@@ -299,6 +315,20 @@ def validate_model(
         for k, v in results_dict.items():
             summary[str(k)] = _safe_float(v)
     return summary
+
+
+def _unique_pred_path(output_dir: Path, src: Path, used: set[str]) -> Path:
+    """生成不重名的 `*_pred.jpg` 输出路径；同名不同扩展名（如 a.jpg 与 a.png）追加扩展名区分。"""
+    base = f"{src.stem}_pred"
+    if base.lower() in used:
+        base = f"{src.stem}_{src.suffix.lstrip('.').lower()}_pred"
+    candidate = base
+    idx = 1
+    while candidate.lower() in used:
+        candidate = f"{base}_{idx}"
+        idx += 1
+    used.add(candidate.lower())
+    return output_dir / f"{candidate}.jpg"
 
 
 def predict_source(
@@ -314,8 +344,9 @@ def predict_source(
     """对单张图片、图片目录或视频运行推理并将带框结果写入 `output_dir`。
 
     视频输入交由 Ultralytics 写出至 `output_dir / "predict"`；
-    图片输入通过 `cv2.imencode` + `Path.write_bytes` 写出为 `*_pred.jpg` 以支持中文路径。
-    权重或输入路径缺失时抛出 `FileNotFoundError`。
+    图片输入通过 `cv2.imencode` + `Path.write_bytes` 写出为 `*_pred.jpg` 以支持中文路径，
+    同名图片自动消歧不互相覆盖。两种输入均以 `stream=True` 逐帧迭代，
+    内存占用与视频长度或图片数量无关。权重或输入路径缺失时抛出 `FileNotFoundError`。
     """
     from ultralytics import YOLO
 
@@ -325,16 +356,15 @@ def predict_source(
         raise FileNotFoundError(f"推理输入不存在: {source_path}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_torch_cpu_threads()
     model = YOLO(str(weights_path))
 
-    forwarder = _StreamForwarder(log_callback)
     saved_outputs: list[Path] = []
-    with redirect_stdout(forwarder), redirect_stderr(forwarder):
-        is_video = source_path.is_file() and source_path.suffix.lower() in {
-            ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".ts", ".m4v", ".webm"
-        }
+    with capture_thread_output(log_callback):
+        is_video = source_path.is_file() and source_path.suffix.lower() in VIDEO_EXTENSIONS
         if is_video:
-            results = model.predict(
+            save_dir: Path | None = None
+            for r in model.predict(
                 source=str(source_path),
                 conf=conf,
                 iou=iou,
@@ -344,28 +374,33 @@ def predict_source(
                 project=str(output_dir.resolve()),
                 name="predict",
                 exist_ok=True,
-            )
-            if results:
-                save_dir = Path(results[0].save_dir)
+                stream=True,
+            ):
+                if save_dir is None and getattr(r, "save_dir", None):
+                    save_dir = Path(r.save_dir)
+            if save_dir is not None:
                 saved_outputs = sorted(save_dir.glob("*"))
         else:
-            results = model.predict(
-                source=str(source_path),
-                conf=conf,
-                iou=iou,
-                imgsz=imgsz,
-                device=device,
-                save=False,
-            )
-            for idx, r in enumerate(results, start=1):
+            used_names: set[str] = set()
+            for idx, r in enumerate(
+                model.predict(
+                    source=str(source_path),
+                    conf=conf,
+                    iou=iou,
+                    imgsz=imgsz,
+                    device=device,
+                    save=False,
+                    stream=True,
+                ),
+                start=1,
+            ):
                 plotted = r.plot()
-                src_name = Path(r.path).stem if getattr(r, "path", None) else f"pred_{idx}"
-                out_file = output_dir / f"{src_name}_pred.jpg"
+                src = Path(r.path) if getattr(r, "path", None) else Path(f"pred_{idx}.jpg")
+                out_file = _unique_pred_path(output_dir, src, used_names)
                 ok, encoded = cv2.imencode(".jpg", plotted, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 if ok:
                     out_file.write_bytes(encoded.tobytes())
                     saved_outputs.append(out_file)
-    forwarder.flush()
     return saved_outputs
 
 
@@ -380,6 +415,7 @@ def export_model(
     """将已训练的 YOLO26 `.pt` 权重导出为指定部署格式（`onnx`、`torchscript`、`engine` 等）。
 
     当 `export_format == "onnx"` 时强制使用 `"cpu"` 设备导出，避免部分环境下 ONNX 图追踪设备冲突；
+    CPU 导出不支持 FP16，此时会通过 `log_callback` 提示 `half` 被忽略。
     产物生成在源权重同目录并返回其路径，权重缺失时抛出 `FileNotFoundError`。
     """
     from ultralytics import YOLO
@@ -387,14 +423,17 @@ def export_model(
     if not weights_path.is_file():
         raise FileNotFoundError(f"权重文件不存在: {weights_path}")
 
+    export_device = device if export_format != "onnx" else "cpu"
+    if half and export_device == "cpu" and log_callback:
+        log_callback("提示：ONNX 在 CPU 上导出，不支持 FP16，半精度选项将被忽略。")
+
+    ensure_torch_cpu_threads()
     model = YOLO(str(weights_path))
-    forwarder = _StreamForwarder(log_callback)
-    with redirect_stdout(forwarder), redirect_stderr(forwarder):
+    with capture_thread_output(log_callback):
         exported = model.export(
             format=export_format,
             imgsz=imgsz,
-            half=half,
-            device=device if export_format != "onnx" else "cpu",
+            half=half and export_device != "cpu",
+            device=export_device,
         )
-    forwarder.flush()
     return Path(str(exported))

@@ -28,6 +28,7 @@ import yaml
 from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+SPLIT_NAMES = ("train", "val", "test")
 
 
 class AnnotationFormat(str, Enum):
@@ -56,16 +57,28 @@ class BoundingBox:
 
 @dataclass
 class LabeledSample:
-    """单张图片及其解析出的边界框列表；未匹配到标注文件时 `source_label_path` 为 `None`。"""
+    """单张图片及其解析出的边界框列表；未匹配到标注文件时 `source_label_path` 为 `None`。
+
+    `is_negative` 为 `True` 表示存在标注文件、其中确实没有任何目标且解析过程未跳过任何形状或行
+    （空 `.txt` 或 `shapes=[]` 的 `.json`），即人工确认过的背景负样本；
+    因格式错误、不支持的形状被跳过而导致无框的样本不视为负样本。
+    """
 
     image_path: Path
     source_label_path: Path | None
     boxes: list[BoundingBox] = field(default_factory=list)
+    is_negative: bool = False
 
 
 @dataclass
 class DatasetScanSummary:
-    """构建训练集前的只读扫描统计报告。"""
+    """构建训练集前的只读扫描统计报告。
+
+    计数口径：
+        `annotated_images` 为至少含 1 个有效框的图片数；`unannotated_images` 为无有效框的图片数，
+        其中 `negative_images` 张属于显式负样本（见 `LabeledSample.is_negative`）；
+        `excluded_images` 为递归扫描时因位于 `exclude_subdirs` 中而被排除、不计入 `total_images` 的图片数。
+    """
 
     detected_format: str
     total_images: int
@@ -76,6 +89,8 @@ class DatasetScanSummary:
     class_counts: dict[str, int]
     samples: list[LabeledSample]
     warnings: list[str] = field(default_factory=list)
+    negative_images: int = 0
+    excluded_images: int = 0
 
 
 @dataclass
@@ -85,9 +100,12 @@ class DatasetBuildConfig:
     关键字段说明：
         `annotations_dir`：标注目录；为 `None` 时默认与 `images_dir` 相同。
         `train_ratio` / `val_ratio` / `test_ratio`：划分权重，划分时会按三者之和归一化。
-        `include_unannotated`：是否将无标注图片作为纯负样本纳入拆分输出。
+        `include_unannotated`：是否将**没有任何标注文件**的图片作为纯负样本纳入拆分输出；
+            存在标注文件但无目标的显式负样本（见 `LabeledSample.is_negative`）始终纳入，不受此开关影响。
         `copy_images`：为 `True` 时复制源图片，为 `False` 时移动源图片到目标数据集目录。
         `recursive`：是否递归扫描 `images_dir` 子目录（适配 MLLM 清洗分流后的多子目录）。
+        `exclude_subdirs`：仅在 `recursive=True` 时生效，相对 `images_dir` 路径中任一层目录名
+            命中该集合的图片会被排除（例如排除尚未人工复核的 `need_review`）。
     """
 
     images_dir: Path
@@ -102,6 +120,7 @@ class DatasetBuildConfig:
     seed: int = 42
     copy_images: bool = True
     recursive: bool = False
+    exclude_subdirs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -120,11 +139,37 @@ class DatasetBuildResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _find_images(images_dir: Path, recursive: bool) -> list[Path]:
-    iterator = images_dir.rglob("*") if recursive else images_dir.iterdir()
-    return sorted(
-        p for p in iterator if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    )
+def find_images(
+    images_dir: Path, recursive: bool, exclude_subdirs: tuple[str, ...] | set[str] = ()
+) -> list[Path]:
+    """按路径排序返回目录中的图片文件列表（只读）。
+
+    `recursive=True` 时递归扫描子目录，并排除相对 `images_dir` 路径中任一层目录名命中
+    `exclude_subdirs` 的图片；非递归模式只扫描顶层，`exclude_subdirs` 不生效。
+    同时供 `core.mllm_reviewer` 复用。
+    """
+    if not recursive:
+        return sorted(
+            p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        )
+    excluded = set(exclude_subdirs)
+    found: list[Path] = []
+    for p in images_dir.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if excluded and any(part in excluded for part in p.parent.relative_to(images_dir).parts):
+            continue
+        found.append(p)
+    return sorted(found)
+
+
+def _count_excluded_images(images_dir: Path, exclude_subdirs: tuple[str, ...]) -> int:
+    """统计递归扫描时因 `exclude_subdirs` 被排除的图片数量，用于告警提示。"""
+    if not exclude_subdirs:
+        return 0
+    total = len(find_images(images_dir, recursive=True))
+    kept = len(find_images(images_dir, recursive=True, exclude_subdirs=exclude_subdirs))
+    return total - kept
 
 
 def _load_classes_file(classes_file: Path | None, search_dirs: list[Path]) -> list[str]:
@@ -158,8 +203,18 @@ def _clamp01(value: float) -> float:
 def _parse_xanylabeling_json(
     json_path: Path, image_path: Path, warnings: list[str]
 ) -> list[BoundingBox]:
-    """解析单个 X-AnyLabeling `.json` 文件，将矩形/多边形/旋转框转换为归一化外接框。"""
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    """解析单个 X-AnyLabeling `.json` 文件，将矩形/多边形/旋转框转换为归一化外接框。
+
+    文件损坏或不是合法 JSON 时记录告警并返回空列表，不中断整次扫描。
+    """
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        warnings.append(f"标注文件损坏或无法读取，已跳过 {json_path.name}: {exc}")
+        return []
+    if not isinstance(data, dict):
+        warnings.append(f"标注文件结构无效，已跳过: {json_path.name}")
+        return []
     img_w = data.get("imageWidth")
     img_h = data.get("imageHeight")
     if not img_w or not img_h:
@@ -172,16 +227,21 @@ def _parse_xanylabeling_json(
         return []
 
     boxes: list[BoundingBox] = []
-    for shape in data.get("shapes", []):
+    for shape in data.get("shapes") or []:
         label = str(shape.get("label", "")).strip()
         if not label:
+            warnings.append(f"空标签形状已忽略 ({json_path.name})")
             continue
         shape_type = str(shape.get("shape_type", "rectangle")).lower()
         points = shape.get("points") or []
 
         if shape_type in {"rectangle", "polygon", "rotation"} and len(points) >= 2:
-            xs = [float(pt[0]) for pt in points]
-            ys = [float(pt[1]) for pt in points]
+            try:
+                xs = [float(pt[0]) for pt in points]
+                ys = [float(pt[1]) for pt in points]
+            except (TypeError, ValueError, IndexError):
+                warnings.append(f"坐标格式错误已忽略 ({json_path.name}, label={label})")
+                continue
             x_min, x_max = min(xs), max(xs)
             y_min, y_max = min(ys), max(ys)
 
@@ -214,9 +274,16 @@ def _parse_yolo_txt(
     known_classes: list[str],
     warnings: list[str],
 ) -> list[BoundingBox]:
-    """解析单个 YOLO `.txt` 标签文件；类别索引越界时会就地扩展 `known_classes`。"""
+    """解析单个 YOLO `.txt` 标签文件；类别索引越界时会就地扩展 `known_classes`。
+
+    文件无法按 UTF-8 读取时记录告警并返回空列表。
+    """
     boxes: list[BoundingBox] = []
-    lines = txt_path.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = txt_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        warnings.append(f"标签文件无法读取，已跳过 {txt_path.name}: {exc}")
+        return []
     for line_no, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
         if not line:
@@ -254,26 +321,39 @@ def _parse_yolo_txt(
     return boxes
 
 
-def _resolve_label_file(
+def resolve_label_file(
     image_path: Path,
     images_dir: Path,
     annotations_dir: Path,
     suffix: str,
+    allow_flat_fallback: bool = True,
 ) -> Path | None:
+    """按优先级查找图片对应的标注文件，未找到返回 `None`。
+
+    查找顺序：`annotations_dir/<相对子目录>/<stem><suffix>` → `annotations_dir/<stem><suffix>`
+    （仅 `allow_flat_fallback=True` 时）→ 与图片同目录的 `<stem><suffix>`。
+    递归扫描中若存在同名（同 `stem`）图片，调用方应传 `allow_flat_fallback=False`，
+    避免子目录图片误配到属于另一张同名图片的平铺标注。同时供 `core.mllm_reviewer` 复用。
+    """
     try:
         rel_parent = image_path.parent.relative_to(images_dir)
     except ValueError:
         rel_parent = Path(".")
 
-    candidates = [
-        annotations_dir / rel_parent / f"{image_path.stem}{suffix}",
-        annotations_dir / f"{image_path.stem}{suffix}",
-        image_path.with_suffix(suffix),
-    ]
+    candidates = [annotations_dir / rel_parent / f"{image_path.stem}{suffix}"]
+    if allow_flat_fallback or rel_parent == Path("."):
+        candidates.append(annotations_dir / f"{image_path.stem}{suffix}")
+    candidates.append(image_path.with_suffix(suffix))
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None
+
+
+def stem_collisions(images: list[Path]) -> set[str]:
+    """返回在图片列表中出现不止一次的文件 `stem` 集合，用于关闭平铺标注回退匹配。"""
+    counts = Counter(p.stem for p in images)
+    return {stem for stem, n in counts.items() if n > 1}
 
 
 def scan_dataset(config: DatasetBuildConfig) -> DatasetScanSummary:
@@ -283,6 +363,11 @@ def scan_dataset(config: DatasetBuildConfig) -> DatasetScanSummary:
         `images_dir` 或指定的 `annotations_dir` 不存在时抛出 `FileNotFoundError`；
         未发现图片时抛出 `ValueError`。当标注格式为 `AUTO` 时，先抽样前 50 张图片统计
         `.json` 与 `.txt` 命中数（若全未命中再顺序扫描至首个命中），命中数相同时优先 `.json`。
+        单个标注文件损坏只记录告警，不中断扫描。
+
+    递归扫描约束：
+        `config.recursive=True` 时按 `config.exclude_subdirs` 排除子目录并在告警中注明排除数量；
+        同名（同 `stem`）图片不使用平铺标注回退匹配，防止跨子目录误配标注。
     """
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
@@ -291,14 +376,30 @@ def scan_dataset(config: DatasetBuildConfig) -> DatasetScanSummary:
     if not ann_dir.is_dir():
         raise FileNotFoundError(f"标注目录不存在: {ann_dir}")
 
-    images = _find_images(config.images_dir, recursive=config.recursive)
+    exclude = tuple(config.exclude_subdirs) if config.recursive else ()
+    images = find_images(config.images_dir, recursive=config.recursive, exclude_subdirs=exclude)
     warnings: list[str] = []
+    excluded_count = _count_excluded_images(config.images_dir, exclude)
+    if excluded_count:
+        warnings.append(
+            f"已按设置排除子目录 {list(exclude)} 中的 {excluded_count} 张图片（未纳入统计与数据集）。"
+        )
     if not images:
         raise ValueError(f"在目录中未找到图片文件: {config.images_dir}")
 
     known_classes = _load_classes_file(
         config.classes_file, [ann_dir, config.images_dir, ann_dir.parent]
     )
+    colliding_stems = stem_collisions(images)
+
+    def _resolve(img: Path, suffix: str) -> Path | None:
+        return resolve_label_file(
+            img,
+            config.images_dir,
+            ann_dir,
+            suffix,
+            allow_flat_fallback=img.stem not in colliding_stems,
+        )
 
     # 若格式为 AUTO，根据已有标注文件命中数量自动推断格式
     fmt = config.annotation_format
@@ -306,16 +407,16 @@ def scan_dataset(config: DatasetBuildConfig) -> DatasetScanSummary:
         json_hits = 0
         txt_hits = 0
         for img in images[:50]:
-            if _resolve_label_file(img, config.images_dir, ann_dir, ".json"):
+            if _resolve(img, ".json"):
                 json_hits += 1
-            if _resolve_label_file(img, config.images_dir, ann_dir, ".txt"):
+            if _resolve(img, ".txt"):
                 txt_hits += 1
         if json_hits == 0 and txt_hits == 0:
             # 抽样前 50 张未命中时继续全量探测，避免标注靠后导致误判
             for img in images:
-                if _resolve_label_file(img, config.images_dir, ann_dir, ".json"):
+                if _resolve(img, ".json"):
                     json_hits += 1
-                if _resolve_label_file(img, config.images_dir, ann_dir, ".txt"):
+                if _resolve(img, ".txt"):
                     txt_hits += 1
                 if json_hits or txt_hits:
                     break
@@ -335,17 +436,19 @@ def scan_dataset(config: DatasetBuildConfig) -> DatasetScanSummary:
 
     annotated_count = 0
     unannotated_count = 0
+    negative_count = 0
 
     for img_path in images:
+        warn_before = len(warnings)
         if fmt == AnnotationFormat.XANYLABELING_JSON:
-            label_path = _resolve_label_file(img_path, config.images_dir, ann_dir, ".json")
+            label_path = _resolve(img_path, ".json")
             boxes = (
                 _parse_xanylabeling_json(label_path, img_path, warnings)
                 if label_path
                 else []
             )
         else:
-            label_path = _resolve_label_file(img_path, config.images_dir, ann_dir, ".txt")
+            label_path = _resolve(img_path, ".txt")
             boxes = (
                 _parse_yolo_txt(label_path, discovered_classes, warnings)
                 if label_path
@@ -359,13 +462,22 @@ def scan_dataset(config: DatasetBuildConfig) -> DatasetScanSummary:
                 discovered_classes.append(box.class_name)
                 discovered_set.add(box.class_name)
 
+        # 仅当标注文件存在、无框且解析过程没有跳过任何内容时，才视为人工确认的显式负样本
+        is_negative = label_path is not None and not boxes and len(warnings) == warn_before
         if boxes:
             annotated_count += 1
         else:
             unannotated_count += 1
+            if is_negative:
+                negative_count += 1
 
         samples.append(
-            LabeledSample(image_path=img_path, source_label_path=label_path, boxes=boxes)
+            LabeledSample(
+                image_path=img_path,
+                source_label_path=label_path,
+                boxes=boxes,
+                is_negative=is_negative,
+            )
         )
 
     return DatasetScanSummary(
@@ -378,6 +490,8 @@ def scan_dataset(config: DatasetBuildConfig) -> DatasetScanSummary:
         class_counts=dict(class_counter),
         samples=samples,
         warnings=warnings,
+        negative_images=negative_count,
+        excluded_images=excluded_count,
     )
 
 
@@ -433,6 +547,45 @@ def _unique_stem(path: Path, used_names: set[str]) -> str:
     return candidate
 
 
+def _is_within(path: Path, parent: Path) -> bool:
+    """判断已解析的 `path` 是否位于 `parent` 之内（含相等）。"""
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_output_location(
+    config: DatasetBuildConfig,
+    out_dir: Path,
+    split_dirs: list[Path],
+    samples: list[LabeledSample],
+) -> None:
+    """在清理旧划分目录前校验输出位置，防止误删源图片或把输出重新扫描为输入。"""
+    if config.recursive and _is_within(out_dir, config.images_dir.resolve()):
+        raise ValueError(
+            f"递归扫描时数据集输出目录不能位于图片目录内部，否则重复构建会把旧数据集当作输入: {out_dir}"
+        )
+    for sample in samples:
+        src = sample.image_path.resolve()
+        if any(_is_within(src, d) for d in split_dirs):
+            raise ValueError(
+                f"源图片位于将被重建的数据集划分目录中，请更换输出目录: {sample.image_path}"
+            )
+
+
+def _clear_previous_splits(out_dir: Path, split_dirs: list[Path]) -> None:
+    """删除上一次构建残留的划分子目录与 Ultralytics 标签缓存，仅作用于 `out_dir` 下的固定子路径。"""
+    for d in split_dirs:
+        if d.is_dir():
+            shutil.rmtree(d)
+    labels_root = out_dir / "labels"
+    if labels_root.is_dir():
+        for cache_file in labels_root.glob("*.cache"):
+            cache_file.unlink(missing_ok=True)
+
+
 def build_yolo_dataset(config: DatasetBuildConfig) -> DatasetBuildResult:
     """转换标注、按比例划分为 train/val/test，并写出 Ultralytics `data.yaml`。
 
@@ -444,14 +597,22 @@ def build_yolo_dataset(config: DatasetBuildConfig) -> DatasetBuildResult:
         在 `config.output_dir` 下创建 `images/{train,val,test}`、`labels/{train,val,test}`、
         `classes.txt` 与 `data.yaml`（若 `val_set` 为空，`data.yaml` 的 `val` 回退指向 `images/train`；
         若 `test_set` 为空则不创建 `test` 目录与配置项）。
+        写入前会**删除**上述六个划分子目录及 `labels/*.cache`，保证重复构建时不残留旧划分文件
+        （否则同一图片可能同时出现在 train 与 val 中造成评估泄漏）；`output_dir` 中的其他文件不受影响。
         当 `config.copy_images=False` 时会移动源图片文件并在目标已存在时先覆盖删除。
+
+    安全约束：
+        若任一源图片位于将被清理的划分子目录内，或递归扫描时 `output_dir` 位于 `images_dir` 内部，
+        抛出 `ValueError` 且不删除任何文件。
     """
     summary = scan_dataset(config)
     if not summary.classes:
         raise ValueError("未检测到任何目标类别，请先确认标注文件中包含有效标注。")
 
     selected = [
-        s for s in summary.samples if config.include_unannotated or len(s.boxes) > 0
+        s
+        for s in summary.samples
+        if s.boxes or s.is_negative or config.include_unannotated
     ]
     if not selected:
         raise ValueError("没有任何包含有效标注框的图片，无法构建训练数据集。")
@@ -462,6 +623,10 @@ def build_yolo_dataset(config: DatasetBuildConfig) -> DatasetBuildResult:
     )
 
     out_dir = config.output_dir.resolve()
+    split_dirs = [out_dir / kind / split for kind in ("images", "labels") for split in SPLIT_NAMES]
+    _validate_output_location(config, out_dir, split_dirs, summary.samples)
+    _clear_previous_splits(out_dir, split_dirs)
+
     for split_name, split_items in (("train", train_set), ("val", val_set), ("test", test_set)):
         if not split_items and split_name == "test":
             continue

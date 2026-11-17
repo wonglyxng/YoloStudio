@@ -27,13 +27,13 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
-    QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from yolo_studio.core.trainer import detect_compute_device
-from yolo_studio.gui.common import PathPickerRow, load_pixmap_scaled, open_local_path
+from yolo_studio.gui.common import LOG_MAX_LINES, PathPickerRow, load_pixmap_scaled, open_local_path
 from yolo_studio.gui.workers import ExportWorker, PredictWorker, ValidateWorker
 
 
@@ -153,7 +153,8 @@ class EvalTab(QWidget):
         e_form.addRow("导出格式:", exp_row)
         left.addWidget(exp_group)
 
-        self.log_box = QTextEdit()
+        self.log_box = QPlainTextEdit()
+        self.log_box.setMaximumBlockCount(LOG_MAX_LINES)
         self.log_box.setReadOnly(True)
         self.log_box.setPlaceholderText("验证指标、推理结果路径与导出日志将在此显示...")
         left.addWidget(self.log_box, 1)
@@ -223,7 +224,7 @@ class EvalTab(QWidget):
 
         self._set_busy(True)
         self.log_box.clear()
-        self.log_box.append("开始执行模型验证...")
+        self.log_box.appendPlainText("开始执行模型验证...")
 
         self.val_worker = ValidateWorker(
             Path(w),
@@ -231,16 +232,16 @@ class EvalTab(QWidget):
             imgsz=self.imgsz_spin.value(),
             device=self.device_edit.text().strip() or "0",
         )
-        self.val_worker.log_line.connect(self.log_box.append)
+        self.val_worker.log_line.connect(self.log_box.appendPlainText)
         self.val_worker.finished_metrics.connect(self._on_val_done)
         self.val_worker.failed.connect(self._on_failed)
         self.val_worker.start()
 
     def _on_val_done(self, metrics: dict[str, float]) -> None:
         self._set_busy(False)
-        self.log_box.append("\n=== 验证完成 ===")
+        self.log_box.appendPlainText("\n=== 验证完成 ===")
         for k, v in metrics.items():
-            self.log_box.append(f"{k}: {v:.4f}")
+            self.log_box.appendPlainText(f"{k}: {v:.4f}")
 
     def _on_predict(self) -> None:
         """校验权重与测试输入路径后在后台启动 `PredictWorker`。"""
@@ -256,7 +257,7 @@ class EvalTab(QWidget):
         out_dir = Path(self.pred_out_picker.text() or (self.workspace_root / "runs" / "predict_preview"))
         self._set_busy(True)
         self.log_box.clear()
-        self.log_box.append("开始推理测试...")
+        self.log_box.appendPlainText("开始推理测试...")
 
         self.pred_worker = PredictWorker(
             weights_path=Path(w),
@@ -267,16 +268,16 @@ class EvalTab(QWidget):
             imgsz=self.imgsz_spin.value(),
             device=self.device_edit.text().strip() or "0",
         )
-        self.pred_worker.log_line.connect(self.log_box.append)
+        self.pred_worker.log_line.connect(self.log_box.appendPlainText)
         self.pred_worker.finished_outputs.connect(self._on_predict_done)
         self.pred_worker.failed.connect(self._on_failed)
         self.pred_worker.start()
 
     def _on_predict_done(self, outputs: list[Path]) -> None:
         self._set_busy(False)
-        self.log_box.append(f"\n推理完成，共生成 {len(outputs)} 个结果文件。")
+        self.log_box.appendPlainText(f"\n推理完成，共生成 {len(outputs)} 个结果文件。")
         for p in outputs[:20]:
-            self.log_box.append(f"- {p}")
+            self.log_box.appendPlainText(f"- {p}")
         for p in outputs:
             if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
                 pix = load_pixmap_scaled(
@@ -298,7 +299,7 @@ class EvalTab(QWidget):
         fmt = str(self.format_combo.currentData())
         self._set_busy(True)
         self.log_box.clear()
-        self.log_box.append(f"开始导出为 {fmt} 格式...")
+        self.log_box.appendPlainText(f"开始导出为 {fmt} 格式...")
 
         self.export_worker = ExportWorker(
             weights_path=Path(w),
@@ -307,17 +308,17 @@ class EvalTab(QWidget):
             half=self.half_chk.isChecked(),
             device=self.device_edit.text().strip() or "0",
         )
-        self.export_worker.log_line.connect(self.log_box.append)
+        self.export_worker.log_line.connect(self.log_box.appendPlainText)
         self.export_worker.finished_path.connect(self._on_export_done)
         self.export_worker.failed.connect(self._on_failed)
         self.export_worker.start()
 
     def _on_export_done(self, exported_path: str) -> None:
         self._set_busy(False)
-        self.log_box.append(f"\n=== 导出成功 ===\n文件路径: {exported_path}")
+        self.log_box.appendPlainText(f"\n=== 导出成功 ===\n文件路径: {exported_path}")
         QMessageBox.information(self, "导出成功", f"模型已导出到:\n{exported_path}")
 
     def _on_failed(self, err: str) -> None:
         self._set_busy(False)
-        self.log_box.append(f"\n[错误] {err}")
+        self.log_box.appendPlainText(f"\n[错误] {err}")
         QMessageBox.critical(self, "执行错误", err)

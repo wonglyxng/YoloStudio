@@ -7,16 +7,17 @@
 运行环境与协作边界：
     需 PyQt6 主事件循环与已创建的 `QApplication`；由 `main.py` 创建并显示，
     内部持有六个标签页实例及 `QSettings("YOLO26Studio", "VideoToYOLO26")` 持久化对象。
-    退出窗口时先经 `LabelingStudioTab.prepare_for_close()` 确认未保存标注修改，未放行则阻止关闭。
+    退出窗口时先经 `LabelingStudioTab.prepare_for_close()` 确认未保存标注修改，未放行则阻止关闭；
+    仍有后台任务运行时请求其安全停止，并在全部线程结束后才真正关闭。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, QThread, QTimer
 from PyQt6.QtGui import QCloseEvent
-from PyQt6.QtWidgets import QMainWindow, QTabWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget
 
 from yolo_studio.gui.tab_dataset import DatasetTab
 from yolo_studio.gui.tab_eval import EvalTab
@@ -129,11 +130,19 @@ class MainWindow(QMainWindow):
 
         self._restore_settings()
 
+        # 关闭时等待后台线程结束的轮询定时器（仅在用户确认停止任务后启动）
+        self._close_wait_timer = QTimer(self)
+        self._close_wait_timer.setInterval(500)
+        self._close_wait_timer.timeout.connect(self._poll_workers_then_close)
+
     def _on_frames_ready(self, frames_dir: str) -> None:
-        """同步抽帧输出目录至数据集页与纠错页，并在主动跳转或处于首页时切至内嵌标注工作台。"""
+        """同步抽帧输出目录至数据集页与纠错页；用户仍停留在抽帧页时自动切至内嵌标注工作台。
+
+        抽帧完成与点击「发送到标注工作台」都会触发此槽；两种情况下用户通常都处于抽帧页。
+        """
         self.dataset_tab.set_frames_dir(frames_dir)
         self.review_tab.set_images_dir(frames_dir)
-        if self.sender() == self.extract_tab.send_next_btn or self.tabs.currentIndex() == 0:
+        if self.tabs.currentIndex() == 0:
             self._on_open_in_workbench(frames_dir, "", "")
 
     def _on_open_in_workbench(
@@ -191,11 +200,68 @@ class MainWindow(QMainWindow):
             self.dataset_tab.set_frames_dir(last_dir)
             self.review_tab.set_images_dir(last_dir)
 
+    def _running_workers(self) -> list[QThread]:
+        """收集各标签页中仍在运行的后台 `QThread`（属性不存在或尚未创建时忽略）。"""
+        candidates = [
+            getattr(self.extract_tab, "worker", None),
+            getattr(self.dataset_tab, "scan_worker", None),
+            getattr(self.dataset_tab, "build_worker", None),
+            getattr(self.review_tab, "worker", None),
+            getattr(self.train_tab, "worker", None),
+            getattr(self.eval_tab, "val_worker", None),
+            getattr(self.eval_tab, "pred_worker", None),
+            getattr(self.eval_tab, "export_worker", None),
+        ]
+        return [w for w in candidates if isinstance(w, QThread) and w.isRunning()]
+
+    def _poll_workers_then_close(self) -> None:
+        """等待后台任务全部结束后再次触发关闭；由 `_close_wait_timer` 周期调用。"""
+        running = self._running_workers()
+        if running:
+            self.statusBar().showMessage(f"正在等待 {len(running)} 个后台任务安全停止后退出...")
+            return
+        self._close_wait_timer.stop()
+        self.close()
+
     def closeEvent(self, event: QCloseEvent) -> None:
-        """关闭主窗口前先核查内嵌标注工作台未保存改动，再持久化目录状态。"""
+        """关闭主窗口：先核查内嵌标注工作台未保存改动，再处理仍在运行的后台任务，最后持久化目录状态。
+
+        后台任务处理：
+            存在运行中的 `QThread` 时询问用户；确认后对支持取消的任务调用 `cancel()`，
+            禁用界面并忽略本次关闭事件，由定时器轮询到全部线程结束后再次调用 `close()`。
+            这样可避免 Qt 在线程运行中析构 `QThread` 导致进程异常退出，训练会在当前轮结束并保存权重后停止。
+            验证、推理与导出不支持取消，只能等待其完成。重复关闭请求在等待期间被直接忽略。
+        """
+        if self._close_wait_timer.isActive():
+            event.ignore()
+            return
         if not self.labeling_tab.prepare_for_close():
             event.ignore()
             return
+
+        running = self._running_workers()
+        if running:
+            reply = QMessageBox.question(
+                self,
+                "后台任务仍在运行",
+                f"当前有 {len(running)} 个后台任务正在运行（如训练、抽帧或 MLLM 审核）。\n"
+                "是否请求停止并在其安全结束后退出？\n"
+                "训练会在当前轮次结束并保存权重后停止；验证、推理、导出需等待完成。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            event.ignore()
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            for worker in running:
+                cancel = getattr(worker, "cancel", None)
+                if callable(cancel):
+                    cancel()
+            self.tabs.setEnabled(False)
+            self.statusBar().showMessage("正在等待后台任务安全停止后退出...")
+            self._close_wait_timer.start()
+            return
+
         cur_frames = self.dataset_tab.images_picker.text()
         if cur_frames:
             self.settings.setValue("last_frames_dir", cur_frames)

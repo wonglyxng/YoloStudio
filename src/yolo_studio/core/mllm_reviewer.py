@@ -12,7 +12,7 @@
 
 协作对象与职责边界：
     为 `cli._cmd_review`、`gui.workers.MllmReviewWorker` 与 `gui.tab_review.MllmReviewTab`
-    提供核心管线，复用 `dataset_converter.IMAGE_EXTENSIONS`。
+    提供核心管线，复用 `dataset_converter` 的图片扫描与标注文件匹配函数。
     仅负责审核清洗、X-AnyLabeling `.json` 产出与汇总报告写出，不执行数据集划分或模型训练。
 """
 
@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
@@ -35,7 +36,17 @@ import numpy as np
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from yolo_studio.core.dataset_converter import IMAGE_EXTENSIONS
+from yolo_studio.core.dataset_converter import (
+    find_images,
+    resolve_label_file,
+    stem_collisions,
+)
+
+# 分流桶目录名；`need_review` 同时被 GUI 数据集页用作默认排除的未复核子目录
+BUCKET_AUTO_PASSED = "auto_passed"
+BUCKET_LLM_FIXED = "llm_fixed"
+BUCKET_NEED_REVIEW = "need_review"
+TRIAGE_BUCKETS = (BUCKET_AUTO_PASSED, BUCKET_LLM_FIXED, BUCKET_NEED_REVIEW)
 
 
 class ReviewSourceMode(str, Enum):
@@ -117,7 +128,9 @@ class CandidateBox:
     x2: float
     y2: float
     confidence: float | None = None
-    status: str = "original"  # 状态取值：original | kept | relabeled | deleted | llm_added
+    # 状态取值：original | kept | relabeled | relabel_invalid | deleted | llm_added；
+    # relabel_invalid 表示模型要求改类但给出的新类别不在允许清单中，保留原类别并强制进入人工复核
+    status: str = "original"
     reason: str = ""
     original_label: str = ""
 
@@ -324,6 +337,10 @@ class OpenAICompatMllmClient:
     凭据与兼容性：
         初始化时依次回退 `api_key`、`OPENAI_API_KEY` 与 `"ollama"`（用于本地免鉴权服务），
         `base_url` 为空时默认使用 DashScope 兼容端点，`model_name` 为空抛出 `ValueError`。
+
+    JSON 模式降级状态：
+        `_json_mode_supported` 初始为 `True`；首次请求因 `openai.BadRequestError` 被拒后置为 `False`，
+        此后该实例的所有请求直接使用纯文本约束。多线程并发下最多多出几次失败尝试，结论一致，无需加锁。
     """
 
     def __init__(
@@ -333,11 +350,13 @@ class OpenAICompatMllmClient:
         model_name: str,
         timeout: float = 90.0,
     ) -> None:
-        from openai import OpenAI
+        from openai import BadRequestError, OpenAI
 
         resolved_key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip() or "ollama"
         resolved_url = base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         self.client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=timeout)
+        self._bad_request_error = BadRequestError
+        self._json_mode_supported = True
         self.model_name = model_name.strip()
         if not self.model_name:
             raise ValueError("请指定 OpenAI 兼容接口的模型名称（如 qwen-vl-max-latest）。")
@@ -380,16 +399,21 @@ class OpenAICompatMllmClient:
             {"role": "user", "content": user_content},
         ]
 
-        try:
-            # 保留 type: ignore 指令供静态类型检查器识别兼容接口动态构造的列表消息
-            resp = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-        except Exception:
-            # 部分本地 Ollama / vLLM 后端不支持 response_format={"type": "json_object"}，降级为纯文本约束重试
+        resp = None
+        if self._json_mode_supported:
+            try:
+                # 保留 type: ignore 指令供静态类型检查器识别兼容接口动态构造的列表消息
+                resp = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,  # type: ignore[arg-type]
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+            except self._bad_request_error:
+                # 仅当后端以 400 拒绝请求（通常是不支持 response_format）时降级为纯文本约束重试，
+                # 并记住该结论避免后续每张图都重复失败一次；鉴权、超时、限流等错误直接向上抛出
+                self._json_mode_supported = False
+        if resp is None:
             resp = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,  # type: ignore[arg-type]
@@ -485,11 +509,25 @@ def _render_overview_and_crops(
     return overview_jpeg, crops
 
 
+def _overview_scale(img_w: int, img_h: int, max_dim: int) -> float:
+    """返回总览图相对原图的缩放系数（与 `_encode_jpeg_bytes` 的缩放规则一致，最大为 `1.0`）。"""
+    longest = max(img_w, img_h)
+    if max_dim > 0 and longest > max_dim:
+        return max_dim / float(longest)
+    return 1.0
+
+
 def _build_prompts(
     boxes: list[CandidateBox],
     allowed_classes: list[str],
     config: MllmReviewConfig,
+    coord_scale: float = 1.0,
 ) -> tuple[str, str]:
+    """构造系统提示词与用户提示词。
+
+    `coord_scale` 为送审总览图相对原图的缩放系数；提示词中的 `xyxy` 会乘以该系数，
+    使坐标与模型实际看到的图片像素一致（候选框内部仍以原图像素坐标保存）。
+    """
     classes_str = ", ".join(allowed_classes) if allowed_classes else "(any relevant object)"
     system_prompt = (
         "You are a strict, accurate computer vision data quality reviewer. "
@@ -509,8 +547,10 @@ def _build_prompts(
     box_lines = []
     for b in boxes:
         conf_part = f", conf={b.confidence:.2f}" if b.confidence is not None else ""
+        s = coord_scale
         box_lines.append(
-            f"- box_id={b.box_id}, label='{b.label}'{conf_part}, xyxy=[{int(b.x1)}, {int(b.y1)}, {int(b.x2)}, {int(b.y2)}]"
+            f"- box_id={b.box_id}, label='{b.label}'{conf_part}, "
+            f"xyxy=[{int(b.x1 * s)}, {int(b.y1 * s)}, {int(b.x2 * s)}, {int(b.y2 * s)}]"
         )
     boxes_summary = "\n".join(box_lines) if box_lines else "(No candidate boxes were predicted on this image.)"
 
@@ -528,6 +568,7 @@ def _build_prompts(
 
     user_prompt = (
         f"Review the candidate bounding boxes shown on the first image (numbered [0], [1], ...).\n"
+        f"Candidate xyxy coordinates are in pixels of the first image as sent to you.\n"
         f"Candidate boxes:\n{boxes_summary}\n\n"
         f"{missing_instr}\n\n"
         "Return strict JSON with keys: box_reviews (list of {box_id, action, new_label, reason}), "
@@ -594,6 +635,7 @@ def apply_review_decisions(
 
     返回 `(after_boxes, kept, relabeled, deleted, added)`；
     未出现在 `box_reviews` 中的候选框按保留（`kept`）处理，
+    要求改为非允许类别的框计入 `kept` 但状态为 `relabel_invalid`（调用方据此分流到 `need_review`），
     新增补充框若与同类别现有框 IoU > 0.65 则视为重复并跳过。
     """
     decision_map = {d.box_id: d for d in response.box_reviews}
@@ -638,7 +680,10 @@ def apply_review_decisions(
                     )
                 )
             else:
+                # 新类别为空、与原类别相同或不在允许清单中：保留原类别；
+                # 若模型确实给出了不同但非法的类别，标记为 relabel_invalid 以强制人工复核
                 kept += 1
+                invalid = bool(decision.new_label) and resolved is None
                 after_boxes.append(
                     CandidateBox(
                         box_id=box.box_id,
@@ -648,8 +693,12 @@ def apply_review_decisions(
                         x2=box.x2,
                         y2=box.y2,
                         confidence=box.confidence,
-                        status="kept",
-                        reason=decision.reason,
+                        status="relabel_invalid" if invalid else "kept",
+                        reason=(
+                            f"模型建议改为非法类别 '{decision.new_label}'; {decision.reason}"
+                            if invalid
+                            else decision.reason
+                        ),
                         original_label=box.label,
                     )
                 )
@@ -754,21 +803,21 @@ def _load_existing_json_boxes(json_path: Path) -> list[CandidateBox]:
     return boxes
 
 
-def _find_images(images_dir: Path, recursive: bool) -> list[Path]:
-    it = images_dir.rglob("*") if recursive else images_dir.iterdir()
-    return sorted(p for p in it if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
-
-
 def _discover_yolo_candidates(
     images: list[Path],
     config: MllmReviewConfig,
     log_callback: Callable[[str], None] | None,
+    cancel_event: Event | None = None,
 ) -> tuple[dict[Path, list[CandidateBox]], list[str]]:
+    """使用基准模型逐张低阈值推理获取候选框；收到取消信号时提前返回已推理部分。"""
     from ultralytics import YOLO
+
+    from yolo_studio.core.trainer import ensure_torch_cpu_threads
 
     if not config.weights_path or not config.weights_path.is_file():
         raise FileNotFoundError(f"基准模型权重文件不存在: {config.weights_path}")
 
+    ensure_torch_cpu_threads()
     if log_callback:
         log_callback(
             f"正在使用基准模型 {config.weights_path.name} 对 {len(images)} 张图片执行低阈值推理 (conf={config.yolo_conf})..."
@@ -778,6 +827,8 @@ def _discover_yolo_candidates(
 
     candidates_map: dict[Path, list[CandidateBox]] = {}
     for img_path in images:
+        if cancel_event and cancel_event.is_set():
+            break
         results = model.predict(
             source=str(img_path),
             conf=config.yolo_conf,
@@ -819,35 +870,89 @@ def _discover_yolo_candidates(
 def _discover_json_candidates(
     images: list[Path],
     config: MllmReviewConfig,
-) -> tuple[dict[Path, list[CandidateBox]], list[str]]:
+) -> tuple[dict[Path, list[CandidateBox]], list[str], dict[Path, str]]:
+    """读取已有 X-AnyLabeling `.json` 作为候选框。
+
+    返回 `(候选框映射, 类别发现顺序, 读取失败映射)`；单个标注文件损坏不会中断整批，
+    而是记录到读取失败映射中，由调用方将该图分流至 `need_review`。
+    同名（同 `stem`）图片不使用平铺标注回退匹配，避免跨子目录误配。
+    """
     ann_dir = config.annotations_dir if config.annotations_dir else config.images_dir
     if not ann_dir.is_dir():
         raise FileNotFoundError(f"标注目录不存在: {ann_dir}")
 
+    colliding = stem_collisions(images)
     candidates_map: dict[Path, list[CandidateBox]] = {}
     discovered_classes: list[str] = []
     seen_cls: set[str] = set()
+    load_errors: dict[Path, str] = {}
 
     for img_path in images:
-        try:
-            rel_parent = img_path.parent.relative_to(config.images_dir)
-        except ValueError:
-            rel_parent = Path(".")
-
-        candidates = [
-            ann_dir / rel_parent / f"{img_path.stem}.json",
-            ann_dir / f"{img_path.stem}.json",
-            img_path.with_suffix(".json"),
-        ]
-        json_file = next((c for c in candidates if c.is_file()), None)
-        boxes = _load_existing_json_boxes(json_file) if json_file else []
+        json_file = resolve_label_file(
+            img_path,
+            config.images_dir,
+            ann_dir,
+            ".json",
+            allow_flat_fallback=img_path.stem not in colliding,
+        )
+        boxes: list[CandidateBox] = []
+        if json_file:
+            try:
+                boxes = _load_existing_json_boxes(json_file)
+            except (OSError, UnicodeDecodeError, ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+                load_errors[img_path] = f"读取已有标注失败 {json_file.name}: {exc}"
         for b in boxes:
             if b.label not in seen_cls:
                 seen_cls.add(b.label)
                 discovered_classes.append(b.label)
         candidates_map[img_path] = boxes
 
-    return candidates_map, discovered_classes
+    return candidates_map, discovered_classes, load_errors
+
+
+def _plan_output_names(images: list[Path], images_dir: Path) -> dict[Path, str]:
+    """为每张输入图片规划输出文件名，保证同一输出目录内图片与 `.json` 均不重名。
+
+    文件 `stem`（不区分大小写，兼容 Windows）唯一时沿用原文件名；
+    否则用 `相对子目录__stem__扩展名` 拼接消歧（例如 `cam1__frame_001__jpg.jpg`），
+    仍冲突时追加序号。规划在提交并发任务前一次性完成，因此各线程写出的文件互不覆盖。
+    """
+    stem_counts = Counter(p.stem.lower() for p in images)
+    used_stems: set[str] = set()
+    names: dict[Path, str] = {}
+    for p in images:
+        if stem_counts[p.stem.lower()] == 1:
+            stem = p.stem
+        else:
+            try:
+                rel_parent_parts = list(p.parent.relative_to(images_dir).parts)
+            except ValueError:
+                rel_parent_parts = []
+            stem = "__".join(rel_parent_parts + [p.stem, p.suffix.lstrip(".").lower()])
+        candidate = stem
+        idx = 1
+        while candidate.lower() in used_stems:
+            candidate = f"{stem}_{idx}"
+            idx += 1
+        used_stems.add(candidate.lower())
+        names[p] = f"{candidate}{p.suffix}"
+    return names
+
+
+def _remove_stale_bucket_outputs(output_dir: Path, out_name: str, keep_bucket: str) -> None:
+    """删除同名输出在其他分流桶中的旧图片与 `.json`，防止重复审核后同一图片同时留在多个桶中。
+
+    仅作用于 `output_dir/{auto_passed,llm_fixed,need_review}` 下与 `out_name` 同名的文件；
+    若本次输入恰好来自其中某个桶（例如复审 `need_review`），该输入会在新结果写出后被移除，
+    效果等同于把图片移动到新的分流桶。
+    """
+    for bucket in TRIAGE_BUCKETS:
+        if bucket == keep_bucket:
+            continue
+        stale_img = output_dir / bucket / out_name
+        for stale in (stale_img, stale_img.with_suffix(".json")):
+            if stale.is_file():
+                stale.unlink()
 
 
 def run_mllm_review(
@@ -862,34 +967,99 @@ def run_mllm_review(
     前置条件与失败方式：
         `images_dir` 不存在抛出 `FileNotFoundError`，无图片抛出 `ValueError`；
         在 `YOLO_PREDICT` 模式下需存在有效 `weights_path`，在 `EXISTING_JSON` 模式下需存在标注目录。
-        单张图片审核异常不会中止整批流程，而是将该图连同原始候选框写入 `need_review` 并记录 `error`。
+        单张图片审核异常（含已有标注读取失败）不会中止整批流程，而是将该图连同原始候选框写入
+        `need_review` 并记录 `error`；即使错误结果本身写出失败，也只记录到该图的 `error` 中，
+        保证 `review_report.json` 最终一定写出。
+
+    分流规则：
+        存在漏标提示、LLM 补框或 `relabel_invalid` 框 → `need_review`；有改类或删框 → `llm_fixed`；
+        其余 → `auto_passed`。纠错后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`
+        （避免被数据集构建当作显式负样本），只复制图片。
 
     并发、取消与输出产物：
         使用 `ThreadPoolExecutor(max_workers=max(1, config.max_workers))` 并发处理各图；
-        若通过 `cancel_event` 请求停止，将停止提交新任务并尝试取消尚未开始的任务。
-        会在 `config.output_dir` 下写出分流图片与 `.json`（视 `triage_subfolders` 决定是否建子目录）、
-        `classes.txt`（当类别非空时）及 `review_report.json`。
+        若通过 `cancel_event` 请求停止，将停止提交新任务并尝试取消尚未开始的任务
+        （基准推理阶段收到取消时不会提交任何审核任务）。
+        会在 `config.output_dir` 下写出分流图片与 `.json`（视 `triage_subfolders` 决定是否建子目录，
+        输出文件名由 `_plan_output_names` 消歧）、`classes.txt`（当类别非空时）及 `review_report.json`；
+        分桶模式下会删除同名图片在其他桶中的旧结果（见 `_remove_stale_bucket_outputs`）。
     """
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
 
-    images = _find_images(config.images_dir, recursive=config.recursive)
+    images = find_images(config.images_dir, recursive=config.recursive)
     if not images:
         raise ValueError(f"未在目录中找到任何图片: {config.images_dir}")
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    load_errors: dict[Path, str] = {}
     if config.source_mode == ReviewSourceMode.YOLO_PREDICT:
-        candidates_map, discovered_classes = _discover_yolo_candidates(images, config, log_callback)
+        candidates_map, discovered_classes = _discover_yolo_candidates(
+            images, config, log_callback, cancel_event
+        )
     else:
-        candidates_map, discovered_classes = _discover_json_candidates(images, config)
+        candidates_map, discovered_classes, load_errors = _discover_json_candidates(images, config)
 
     allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
     client: MllmClient = client_override or build_mllm_client(config)
+    output_names = _plan_output_names(images, config.images_dir)
 
     if log_callback:
         log_callback(
             f"开始 MLLM 纠错审核（共 {len(images)} 张图，类别: {allowed_classes}，并发={config.max_workers}）..."
+        )
+
+    def _bucket_dir(bucket: str) -> Path:
+        return (config.output_dir / bucket) if config.triage_subfolders else config.output_dir
+
+    def _copy_image(img_path: Path, bucket: str) -> Path:
+        target_dir = _bucket_dir(bucket)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        out_img_path = target_dir / output_names[img_path]
+        if out_img_path.resolve() != img_path.resolve():
+            shutil.copy2(img_path, out_img_path)
+        return out_img_path
+
+    def _write_error_record(
+        img_path: Path, before_boxes: list[CandidateBox], exc: BaseException
+    ) -> ImageReviewRecord:
+        """把出错图片连同原始候选框写入 `need_review`；写出过程再失败时仅记录错误，不向外抛出。"""
+        message = str(exc)
+        out_img_path: Path | None = None
+        out_json_path: Path | None = None
+        try:
+            out_img_path = _copy_image(img_path, BUCKET_NEED_REVIEW)
+            try:
+                with Image.open(img_path) as pil_img:
+                    iw, ih = pil_img.size
+            except Exception:
+                iw, ih = 0, 0
+            out_json_path = out_img_path.with_suffix(".json")
+            _write_xanylabeling_json(
+                out_json_path,
+                out_img_path.name,
+                img_w=iw,
+                img_h=ih,
+                boxes=before_boxes,
+                has_missing=True,
+                missing_note=f"MLLM 审核异常: {message}",
+            )
+            if config.triage_subfolders:
+                _remove_stale_bucket_outputs(config.output_dir, out_img_path.name, BUCKET_NEED_REVIEW)
+        except Exception as write_exc:
+            message = f"{message}；错误结果写出失败: {write_exc}"
+            out_json_path = out_json_path if out_json_path and out_json_path.is_file() else None
+        return ImageReviewRecord(
+            image_path=img_path,
+            output_image_path=out_img_path,
+            output_json_path=out_json_path,
+            triage_bucket=BUCKET_NEED_REVIEW,
+            before_boxes=before_boxes,
+            after_boxes=before_boxes,
+            has_missing=True,
+            missing_note=f"审核出错: {message}",
+            error=message,
         )
 
     def _process_one(img_path: Path) -> ImageReviewRecord | None:
@@ -897,15 +1067,26 @@ def run_mllm_review(
             return None
         before_boxes = candidates_map.get(img_path, [])
         try:
+            if img_path in load_errors:
+                raise RuntimeError(load_errors[img_path])
+
             with Image.open(img_path) as pil_img:
                 img_w, img_h = pil_img.size
 
-            # 当已有框全部达到高置信度阈值且未开启漏标巡检时，直接跳过 MLLM 调用
+            # 已有框全部达到高置信度阈值且未开启漏标巡检，或无候选框且未开启漏标巡检时，
+            # MLLM 无事可审，直接跳过调用以节省费用
             all_high_conf = bool(before_boxes) and all(
                 (b.confidence is not None and b.confidence >= config.high_conf_skip)
                 for b in before_boxes
             )
-            if all_high_conf and not config.check_missing:
+            skip_reason = ""
+            if not config.check_missing:
+                if all_high_conf:
+                    skip_reason = "高置信度跳过 MLLM"
+                elif not before_boxes:
+                    skip_reason = "无候选框且未开启漏标检查，跳过 MLLM"
+
+            if skip_reason:
                 after_boxes = [
                     CandidateBox(
                         box_id=b.box_id,
@@ -916,7 +1097,7 @@ def run_mllm_review(
                         y2=b.y2,
                         confidence=b.confidence,
                         status="kept",
-                        reason="高置信度跳过 MLLM",
+                        reason=skip_reason,
                         original_label=b.label,
                     )
                     for b in before_boxes
@@ -935,7 +1116,12 @@ def run_mllm_review(
                     high_conf_skip=config.high_conf_skip,
                     max_dim=config.max_image_dim,
                 )
-                system_prompt, user_prompt = _build_prompts(before_boxes, allowed_classes, config)
+                system_prompt, user_prompt = _build_prompts(
+                    before_boxes,
+                    allowed_classes,
+                    config,
+                    coord_scale=_overview_scale(img_w, img_h, config.max_image_dim),
+                )
                 response = client.review_image(overview_jpeg, crops, system_prompt, user_prompt)
                 after_boxes, kept, relabeled, deleted, added = apply_review_decisions(
                     before_boxes,
@@ -949,28 +1135,33 @@ def run_mllm_review(
                 missing_note = response.missing_note
                 skipped_mllm = False
 
-            if has_missing or added > 0:
-                bucket = "need_review"
+            has_invalid_relabel = any(b.status == "relabel_invalid" for b in after_boxes)
+            if has_missing or added > 0 or has_invalid_relabel:
+                bucket = BUCKET_NEED_REVIEW
             elif relabeled > 0 or deleted > 0:
-                bucket = "llm_fixed"
+                bucket = BUCKET_LLM_FIXED
             else:
-                bucket = "auto_passed"
+                bucket = BUCKET_AUTO_PASSED
 
-            target_dir = (config.output_dir / bucket) if config.triage_subfolders else config.output_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-            out_img_path = target_dir / img_path.name
-            if out_img_path.resolve() != img_path.resolve():
-                shutil.copy2(img_path, out_img_path)
-            out_json_path = out_img_path.with_suffix(".json")
-            _write_xanylabeling_json(
-                out_json_path,
-                out_img_path.name,
-                img_w=img_w,
-                img_h=img_h,
-                boxes=after_boxes,
-                has_missing=has_missing,
-                missing_note=missing_note,
-            )
+            out_img_path = _copy_image(img_path, bucket)
+            out_json_path: Path | None = out_img_path.with_suffix(".json")
+            if after_boxes or config.check_missing:
+                _write_xanylabeling_json(
+                    out_json_path,
+                    out_img_path.name,
+                    img_w=img_w,
+                    img_h=img_h,
+                    boxes=after_boxes,
+                    has_missing=has_missing,
+                    missing_note=missing_note,
+                )
+            else:
+                # 空结果未经漏标确认：不写 `.json`，并清理该位置可能残留的旧标注
+                if out_json_path.is_file() and out_json_path.resolve() != img_path.with_suffix(".json").resolve():
+                    out_json_path.unlink()
+                out_json_path = None
+            if config.triage_subfolders:
+                _remove_stale_bucket_outputs(config.output_dir, out_img_path.name, bucket)
 
             return ImageReviewRecord(
                 image_path=img_path,
@@ -989,39 +1180,7 @@ def run_mllm_review(
             )
         except Exception as exc:
             # 单图审核异常时保留图片与原始框并分流至 need_review，防止样本丢失
-            target_dir = (
-                (config.output_dir / "need_review") if config.triage_subfolders else config.output_dir
-            )
-            target_dir.mkdir(parents=True, exist_ok=True)
-            out_img_path = target_dir / img_path.name
-            if out_img_path.resolve() != img_path.resolve():
-                shutil.copy2(img_path, out_img_path)
-            out_json_path = out_img_path.with_suffix(".json")
-            try:
-                with Image.open(img_path) as pil_img:
-                    iw, ih = pil_img.size
-            except Exception:
-                iw, ih = 0, 0
-            _write_xanylabeling_json(
-                out_json_path,
-                out_img_path.name,
-                img_w=iw,
-                img_h=ih,
-                boxes=before_boxes,
-                has_missing=True,
-                missing_note=f"MLLM 审核异常: {exc}",
-            )
-            return ImageReviewRecord(
-                image_path=img_path,
-                output_image_path=out_img_path,
-                output_json_path=out_json_path,
-                triage_bucket="need_review",
-                before_boxes=before_boxes,
-                after_boxes=before_boxes,
-                has_missing=True,
-                missing_note=f"审核出错: {exc}",
-                error=str(exc),
-            )
+            return _write_error_record(img_path, before_boxes, exc)
 
     records: list[ImageReviewRecord] = []
     total = len(images)
@@ -1044,7 +1203,20 @@ def run_mllm_review(
                     pending.cancel()
             if fut.cancelled():
                 continue
-            rec = fut.result()
+            try:
+                rec = fut.result()
+            except Exception as exc:
+                # 理论上 `_process_one` 已兜底所有异常，此处再保护一层，保证报告一定写出
+                src = futures[fut]
+                rec = ImageReviewRecord(
+                    image_path=src,
+                    output_image_path=None,
+                    output_json_path=None,
+                    triage_bucket=BUCKET_NEED_REVIEW,
+                    has_missing=True,
+                    missing_note=f"审核出错: {exc}",
+                    error=str(exc),
+                )
             if rec is None:
                 cancelled = True
                 continue
@@ -1058,11 +1230,11 @@ def run_mllm_review(
                     f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}, 补漏:{rec.added_count})"
                 )
 
-    records.sort(key=lambda r: r.image_path.name)
+    records.sort(key=lambda r: str(r.image_path))
 
-    auto_passed = sum(1 for r in records if r.triage_bucket == "auto_passed")
-    llm_fixed = sum(1 for r in records if r.triage_bucket == "llm_fixed")
-    need_review = sum(1 for r in records if r.triage_bucket == "need_review")
+    auto_passed = sum(1 for r in records if r.triage_bucket == BUCKET_AUTO_PASSED)
+    llm_fixed = sum(1 for r in records if r.triage_bucket == BUCKET_LLM_FIXED)
+    need_review = sum(1 for r in records if r.triage_bucket == BUCKET_NEED_REVIEW)
     error_count = sum(1 for r in records if r.error)
 
     classes_txt_path = config.output_dir / "classes.txt"
@@ -1075,10 +1247,12 @@ def run_mllm_review(
         "llm_fixed": llm_fixed,
         "need_review": need_review,
         "errors": error_count,
+        "cancelled": cancelled,
         "classes": allowed_classes,
         "items": [
             {
                 "image": r.image_path.name,
+                "source": str(r.image_path),
                 "bucket": r.triage_bucket,
                 "kept": r.kept_count,
                 "relabeled": r.relabeled_count,
@@ -1087,6 +1261,7 @@ def run_mllm_review(
                 "has_missing": r.has_missing,
                 "missing_note": r.missing_note,
                 "error": r.error,
+                "output_image": str(r.output_image_path) if r.output_image_path else "",
                 "output_json": str(r.output_json_path) if r.output_json_path else "",
             }
             for r in records
@@ -1121,6 +1296,7 @@ def _draw_labeled_boxes(
         "original": (200, 180, 0),
         "kept": (0, 200, 0),
         "relabeled": (0, 140, 255),
+        "relabel_invalid": (60, 60, 255),
         "llm_added": (255, 220, 0),
     }
 

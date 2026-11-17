@@ -2,10 +2,13 @@
 
 职责：
     使用确定性桩客户端 `_FakeMllmClient` 离线验证 JSON 围栏解析、保留/改类/删误检/补漏与
-    高重叠去重合并、三分类目录分流、对比图渲染及与 `dataset_converter` 的闭环衔接。
+    高重叠去重合并、三分类目录分流、对比图渲染及与 `dataset_converter` 的闭环衔接；
+    并覆盖重复审核跨桶去重、异常与损坏标注兜底写报告、非法改类强制复核、
+    递归同名输出消歧、空结果跳过调用以及 OpenAI 兼容客户端仅在 400 时降级等回归场景。
 
 运行环境与协作边界：
-    通过 `pytest` 在临时目录（`tmp_path`）中离线运行，不发起真实网络 API 调用；
+    通过 `pytest` 在临时目录（`tmp_path`）中离线运行，不发起真实网络 API 调用
+    （OpenAI 兼容客户端测试替换了底层 `chat.completions` 对象）；
     协作覆盖 `yolo_studio.core.mllm_reviewer` 与 `yolo_studio.core.dataset_converter`。
 """
 
@@ -206,3 +209,175 @@ def test_run_mllm_review_existing_json_triage_and_dataset_roundtrip(tmp_path: Pa
     )
     assert ds_res.train_count + ds_res.val_count == 3
     assert ds_res.total_boxes == 4  # 总框数为 1 + 1 + 2 = 4 个
+
+
+class _RaisingClient:
+    """每次调用都抛出异常的测试桩客户端。"""
+
+    def review_image(self, *_args, **_kwargs) -> MllmReviewResponse:
+        raise RuntimeError("模拟接口故障")
+
+
+def _person_json(img_path: Path, score: float = 0.5) -> None:
+    payload = {
+        "shapes": [
+            {
+                "label": "person",
+                "score": score,
+                "points": [[40.0, 20.0], [160.0, 180.0]],
+                "shape_type": "rectangle",
+            }
+        ],
+        "imageWidth": 400,
+        "imageHeight": 200,
+    }
+    img_path.with_suffix(".json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _json_cfg(in_dir: Path, out_dir: Path, **kwargs) -> MllmReviewConfig:
+    return MllmReviewConfig(
+        images_dir=in_dir,
+        output_dir=out_dir,
+        source_mode=ReviewSourceMode.EXISTING_JSON,
+        allowed_classes=["person", "helmet"],
+        max_workers=1,
+        **kwargs,
+    )
+
+
+def test_rerun_moves_image_between_buckets_without_duplicates(tmp_path: Path) -> None:
+    """验证重复审核到同一输出目录时，同名图片只保留在最新分流桶中。"""
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    img = in_dir / "a.jpg"
+    _write_img(img)
+    _person_json(img)
+
+    first = MllmReviewResponse(box_reviews=[BoxDecision(box_id=0, action="keep")], has_missing=True)
+    run_mllm_review(_json_cfg(in_dir, out_dir), client_override=_FakeMllmClient([first]))
+    assert (out_dir / "need_review" / "a.jpg").is_file()
+
+    second = MllmReviewResponse(box_reviews=[BoxDecision(box_id=0, action="keep")], has_missing=False)
+    run_mllm_review(_json_cfg(in_dir, out_dir), client_override=_FakeMllmClient([second]))
+    assert (out_dir / "auto_passed" / "a.jpg").is_file()
+    assert not (out_dir / "need_review" / "a.jpg").exists()
+    assert not (out_dir / "need_review" / "a.json").exists()
+
+
+def test_errors_and_corrupt_json_still_write_report(tmp_path: Path) -> None:
+    """验证接口异常与已有标注损坏都会分流到 need_review 且报告照常写出。"""
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    good = in_dir / "good.jpg"
+    _write_img(good)
+    _person_json(good)
+    broken = in_dir / "broken.jpg"
+    _write_img(broken)
+    broken.with_suffix(".json").write_text("{oops", encoding="utf-8")
+
+    res = run_mllm_review(_json_cfg(in_dir, out_dir), client_override=_RaisingClient())
+    assert res.total_images == 2
+    assert res.error_count == 2
+    assert res.need_review_count == 2
+    assert res.report_path and res.report_path.is_file()
+    report = json.loads(res.report_path.read_text(encoding="utf-8"))
+    broken_item = next(i for i in report["items"] if i["image"] == "broken.jpg")
+    assert "读取已有标注失败" in broken_item["error"]
+
+
+def test_invalid_relabel_goes_to_need_review() -> None:
+    """验证模型要求改为非允许类别时框被保留为 relabel_invalid，供调用方分流人工复核。"""
+    before = [CandidateBox(box_id=0, label="person", x1=10, y1=10, x2=100, y2=100, confidence=0.5)]
+    response = MllmReviewResponse(
+        box_reviews=[BoxDecision(box_id=0, action="relabel", new_label="dog", reason="looks like dog")]
+    )
+    after, kept, relabeled, _deleted, _added = apply_review_decisions(
+        before, response, ["person", "helmet"], img_w=400, img_h=200
+    )
+    assert (kept, relabeled) == (1, 0)
+    assert after[0].status == "relabel_invalid"
+    assert after[0].label == "person"
+
+
+def test_recursive_same_name_outputs_do_not_overwrite(tmp_path: Path) -> None:
+    """验证递归模式下不同子目录的同名图片输出到同一分流桶时不会互相覆盖。"""
+    in_dir = tmp_path / "in"
+    for sub in ("cam1", "cam2"):
+        img = in_dir / sub / "frame.jpg"
+        _write_img(img)
+        _person_json(img)
+    responses = [
+        MllmReviewResponse(box_reviews=[BoxDecision(box_id=0, action="keep")]) for _ in range(2)
+    ]
+    out_dir = tmp_path / "out"
+    res = run_mllm_review(
+        _json_cfg(in_dir, out_dir, recursive=True), client_override=_FakeMllmClient(responses)
+    )
+    outputs = {r.output_image_path.name for r in res.records if r.output_image_path}
+    assert outputs == {"cam1__frame__jpg.jpg", "cam2__frame__jpg.jpg"}
+    assert len(list((out_dir / "auto_passed").glob("*.json"))) == 2
+
+
+def test_empty_result_without_missing_check_skips_mllm_and_json(tmp_path: Path) -> None:
+    """验证无候选框且未开启漏标检查时跳过 MLLM 调用，且不写出未经确认的空 `.json`。"""
+    in_dir = tmp_path / "in"
+    _write_img(in_dir / "empty.jpg")
+    client = _FakeMllmClient([])
+    res = run_mllm_review(
+        _json_cfg(in_dir, tmp_path / "out", check_missing=False), client_override=client
+    )
+    assert client.calls == []
+    rec = res.records[0]
+    assert rec.skipped_mllm and rec.output_json_path is None
+    assert rec.output_image_path and rec.output_image_path.is_file()
+
+
+def test_openai_client_falls_back_only_on_bad_request() -> None:
+    """验证 OpenAI 兼容客户端仅在 400 错误时降级为纯文本模式并记住结论，其他错误直接抛出。"""
+    import httpx
+    import openai
+
+    from yolo_studio.core.mllm_reviewer import OpenAICompatMllmClient
+
+    request = httpx.Request("POST", "http://localhost/v1/chat/completions")
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    class _Msg:
+        content = ok_json
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Completions:
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+            self.calls: list[bool] = []
+
+        def create(self, **kwargs):
+            self.calls.append("response_format" in kwargs)
+            if "response_format" in kwargs:
+                raise self.error
+            return _Resp()
+
+    client = OpenAICompatMllmClient(api_key="k", base_url="http://localhost/v1", model_name="m")
+    bad = openai.BadRequestError("unsupported", response=httpx.Response(400, request=request), body=None)
+    completions = _Completions(bad)
+    client.client = type("C", (), {"chat": type("Chat", (), {"completions": completions})()})()
+    client.review_image(b"x", [], "s", "u")
+    client.review_image(b"x", [], "s", "u")
+    assert completions.calls == [True, False, False]
+
+    auth_client = OpenAICompatMllmClient(api_key="k", base_url="http://localhost/v1", model_name="m")
+    auth_err = openai.AuthenticationError("denied", response=httpx.Response(401, request=request), body=None)
+    auth_completions = _Completions(auth_err)
+    auth_client.client = type("C", (), {"chat": type("Chat", (), {"completions": auth_completions})()})()
+    try:
+        auth_client.review_image(b"x", [], "s", "u")
+    except openai.AuthenticationError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("鉴权错误不应被降级重试吞掉")
+    assert auth_completions.calls == [True]

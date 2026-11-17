@@ -42,6 +42,7 @@ from yolo_studio.core.frame_extractor import (  # noqa: E402
     extract_frames,
 )
 from yolo_studio.core.mllm_reviewer import (  # noqa: E402
+    BUCKET_NEED_REVIEW,
     MllmProvider,
     MllmReviewConfig,
     ReviewSourceMode,
@@ -82,8 +83,12 @@ def _cmd_dataset(args: argparse.Namespace) -> int:
         test_ratio=args.test_ratio,
         include_unannotated=args.include_empty,
         seed=args.seed,
+        recursive=args.recursive,
+        exclude_subdirs=() if args.include_need_review else (BUCKET_NEED_REVIEW,),
     )
     res = build_yolo_dataset(cfg)
+    for warning in res.warnings[:50]:
+        print(f"[WARN] {warning}", file=sys.stderr)
     print(
         f"数据集生成成功: {res.data_yaml_path}\n"
         f"Train={res.train_count}, Val={res.val_count}, Test={res.test_count}, Classes={res.classes}"
@@ -102,6 +107,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
         device=args.device,
         project_dir=Path(args.project),
         run_name=args.name,
+        resume=args.resume,
+        exist_ok=args.exist_ok,
     )
     res = train_yolo26(cfg, log_callback=print)
     print(f"训练完成，输出目录: {res.save_dir}, best.pt: {res.best_weights}")
@@ -168,19 +175,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_ds.add_argument("--train-ratio", type=float, default=0.8)
     p_ds.add_argument("--val-ratio", type=float, default=0.2)
     p_ds.add_argument("--test-ratio", type=float, default=0.0)
-    p_ds.add_argument("--include-empty", action="store_true")
+    p_ds.add_argument("--include-empty", action="store_true", help="同时纳入没有任何标注文件的图片作为负样本")
     p_ds.add_argument("--seed", type=int, default=42)
+    p_ds.add_argument("-r", "--recursive", action="store_true", help="递归扫描图片子目录（如 MLLM 清洗分流目录）")
+    p_ds.add_argument(
+        "--include-need-review",
+        action="store_true",
+        help="递归扫描时同时纳入 need_review 子目录（默认排除未人工复核的样本）",
+    )
     p_ds.set_defaults(func=_cmd_dataset)
 
     p_tr = sub.add_parser("train", help="启动 YOLO26 模型训练")
     p_tr.add_argument("-d", "--data", required=True, help="data.yaml 路径")
-    p_tr.add_argument("-m", "--model", default="yolo26s.pt", help="YOLO26 权重文件")
+    p_tr.add_argument("-m", "--model", default="yolo26s.pt", help="YOLO26 权重文件；续训时可直接指定 last.pt")
     p_tr.add_argument("--epochs", type=int, default=100)
     p_tr.add_argument("--imgsz", type=int, default=640)
     p_tr.add_argument("--batch", type=int, default=16)
     p_tr.add_argument("--device", default="0")
     p_tr.add_argument("--project", default="runs/detect")
     p_tr.add_argument("--name", default="yolo26_train")
+    p_tr.add_argument("--resume", action="store_true", help="从 last.pt 断点续训")
+    p_tr.add_argument("--exist-ok", action="store_true", help="允许覆盖同名实验目录（默认自动递增编号）")
     p_tr.set_defaults(func=_cmd_train)
 
     p_rv = sub.add_parser("review", help="基准模型低阈值推理 + MLLM 纠错清洗")

@@ -2,7 +2,7 @@
 ultralytics>=8.4.0
 PyQt6>=6.6.0
 PyQt6-WebEngine>=6.6.0
-opencv-python>=4.10.0
+# 只显式声明 contrib-headless；ultralytics 仍会间接拉取 opencv-python，二者冲突的处理见 README.md
 opencv-contrib-python-headless>=4.7.0.72
 Pillow>=10.0.0
 PyYAML>=6.0.1

@@ -2,7 +2,8 @@
 
 职责：
     验证 `probe_video` 与 `extract_frames` 在按秒间隔抽帧、目标帧数均匀抽帧、
-    最长边缩放、中文路径输出以及静态帧相似去重上的行为。
+    最长边缩放、中文路径输出、静态帧相似去重、同名视频输出消歧、
+    大步长 seek 读取以及取消行为上的表现。
 
 运行环境与协作边界：
     通过 `pytest` 在临时目录（`tmp_path`）中运行，依赖 `opencv-python` 与 `numpy`
@@ -105,3 +106,35 @@ def test_dedup_skips_static_frames(tmp_path: Path) -> None:
     res = extract_frames([video], cfg)
     assert res.frames_saved == 1
     assert res.frames_skipped_similar == 3
+
+
+def test_same_name_videos_do_not_overwrite_frames(tmp_path: Path) -> None:
+    """验证不同目录下同名视频抽帧时文件名自动消歧，帧图片不会互相覆盖。"""
+    (tmp_path / "cam1").mkdir()
+    (tmp_path / "cam2").mkdir()
+    v1 = _create_synthetic_video(tmp_path / "cam1" / "rec.mp4", 20, 10.0)
+    v2 = _create_synthetic_video(tmp_path / "cam2" / "rec.mp4", 20, 10.0)
+    cfg = ExtractionConfig(
+        output_dir=tmp_path / "out",
+        mode=ExtractionMode.EVERY_N_FRAMES,
+        every_n_frames=10,
+    )
+    res = extract_frames([v1, v2], cfg)
+    assert res.frames_saved == 4
+    assert len({p.name for p in res.saved_files}) == 4
+    assert {p.name.rsplit("_", 1)[0] for p in res.saved_files} == {"cam1_rec", "cam2_rec"}
+
+
+def test_large_step_seek_and_cancel(tmp_path: Path) -> None:
+    """验证超过 seek 阈值的大步长抽帧结果正确，并验证取消后不计入已处理视频。"""
+    from threading import Event
+
+    video = _create_synthetic_video(tmp_path / "long.mp4", num_frames=700, fps=25.0)
+    cfg = ExtractionConfig(output_dir=tmp_path / "seek", mode=ExtractionMode.EVERY_N_FRAMES, every_n_frames=320)
+    res = extract_frames([video], cfg)
+    assert res.frames_saved == 3  # 第 0、320、640 帧
+
+    cancel = Event()
+    cancel.set()
+    res2 = extract_frames([video], ExtractionConfig(output_dir=tmp_path / "cancel"), cancel_event=cancel)
+    assert res2.cancelled and res2.videos_processed == 0

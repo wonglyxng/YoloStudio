@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -49,7 +49,7 @@ from yolo_studio.core.mllm_reviewer import (
     render_review_comparison,
 )
 from yolo_studio.core.trainer import detect_compute_device
-from yolo_studio.gui.common import PathPickerRow, open_local_path
+from yolo_studio.gui.common import LOG_MAX_LINES, PathPickerRow, open_local_path
 from yolo_studio.gui.workers import MllmReviewWorker
 
 
@@ -304,7 +304,8 @@ class MllmReviewTab(QWidget):
         )
         splitter.addWidget(self.preview_label)
 
-        self.log_box = QTextEdit()
+        self.log_box = QPlainTextEdit()
+        self.log_box.setMaximumBlockCount(LOG_MAX_LINES)
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(140)
         self.log_box.setPlaceholderText("MLLM 逐张审核日志将在此输出...")
@@ -424,7 +425,7 @@ class MllmReviewTab(QWidget):
 
         self.worker = MllmReviewWorker(cfg)
         self.worker.progress.connect(self._on_progress)
-        self.worker.log_line.connect(self.log_box.append)
+        self.worker.log_line.connect(self.log_box.appendPlainText)
         self.worker.finished_result.connect(self._on_finished)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
@@ -434,7 +435,7 @@ class MllmReviewTab(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
-            self.log_box.append("正在停止 MLLM 纠错任务...")
+            self.log_box.appendPlainText("正在停止 MLLM 纠错任务...")
 
     def _on_progress(self, cur: int, total: int, rec: ImageReviewRecord) -> None:
         """追加单张审核记录到表格并刷新整体进度条。"""
@@ -490,7 +491,7 @@ class MllmReviewTab(QWidget):
             f"已删改错标 {res.llm_fixed_count} | 待人工复核 {res.need_review_count} | 出错 {res.error_count}"
         )
         if res.report_path:
-            self.log_box.append(f"\n审核报告已保存: {res.report_path}")
+            self.log_box.appendPlainText(f"\n审核报告已保存: {res.report_path}")
 
     def _on_failed(self, err: str) -> None:
         self.start_btn.setEnabled(True)

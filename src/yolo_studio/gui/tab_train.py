@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
-    QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -42,7 +42,7 @@ from yolo_studio.core.trainer import (
     TrainResult,
     detect_compute_device,
 )
-from yolo_studio.gui.common import PathPickerRow, make_metric_card, open_local_path
+from yolo_studio.gui.common import LOG_MAX_LINES, PathPickerRow, make_metric_card, open_local_path
 from yolo_studio.gui.workers import TrainWorker
 
 
@@ -173,6 +173,10 @@ class TrainTab(QWidget):
         self.amp_chk.setChecked(self.device_info.cuda_available)
         self.cache_chk = QCheckBox("内存缓存图片 (cache)")
         self.resume_chk = QCheckBox("断点续训 (resume)")
+        self.resume_chk.setToolTip(
+            "从上次中断的训练继续：优先使用「自定义权重路径」中选择的 last.pt，"
+            "否则使用「保存根目录/实验名称/weights/last.pt」；新训练不会覆盖已有实验目录，会自动递增编号"
+        )
         opt_row.addWidget(self.amp_chk)
         opt_row.addWidget(self.cache_chk)
         opt_row.addWidget(self.resume_chk)
@@ -235,7 +239,8 @@ class TrainTab(QWidget):
 
         log_group = QGroupBox("4. 训练日志")
         log_layout = QVBoxLayout(log_group)
-        self.log_box = QTextEdit()
+        self.log_box = QPlainTextEdit()
+        self.log_box.setMaximumBlockCount(LOG_MAX_LINES)
         self.log_box.setReadOnly(True)
         self.log_box.setPlaceholderText("Ultralytics YOLO26 实时日志将在此输出...")
         log_layout.addWidget(self.log_box)
@@ -307,7 +312,7 @@ class TrainTab(QWidget):
         self.send_eval_btn.setEnabled(False)
         self.progress_bar.setValue(0)
         self.log_box.clear()
-        self.log_box.append("正在启动 YOLO26 训练任务...")
+        self.log_box.appendPlainText("正在启动 YOLO26 训练任务...")
 
         self.worker = TrainWorker(cfg)
         self.worker.epoch_updated.connect(self._on_epoch_updated)
@@ -321,7 +326,7 @@ class TrainTab(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
-            self.log_box.append("正在请求停止训练，请等待当前 Epoch 完成保存...")
+            self.log_box.appendPlainText("正在请求停止训练，请等待当前 Epoch 完成保存...")
 
     def _on_epoch_updated(self, m: EpochMetrics) -> None:
         pct = int(min(100, (m.epoch / max(1, m.total_epochs)) * 100))
@@ -335,7 +340,7 @@ class TrainTab(QWidget):
         self.val_map50_95.setText(f"{m.map50_95:.4f}")
 
     def _on_log_line(self, line: str) -> None:
-        self.log_box.append(line)
+        self.log_box.appendPlainText(line)
 
     def _on_finished(self, res: TrainResult) -> None:
         """恢复界面状态并记录产物目录；若生成了 `best.pt` 则自动通知下游标签页。"""
@@ -346,18 +351,18 @@ class TrainTab(QWidget):
             self.progress_bar.setValue(100)
 
         status_text = "训练已提前停止" if res.stopped_early else "训练完成"
-        self.log_box.append(f"\n=== {status_text} ===")
-        self.log_box.append(f"结果目录: {res.save_dir}")
+        self.log_box.appendPlainText(f"\n=== {status_text} ===")
+        self.log_box.appendPlainText(f"结果目录: {res.save_dir}")
         if res.best_weights:
             self._last_best_pt = str(res.best_weights)
             self.send_eval_btn.setEnabled(True)
-            self.log_box.append(f"最佳权重: {res.best_weights}")
+            self.log_box.appendPlainText(f"最佳权重: {res.best_weights}")
             self.send_best_weights.emit(self._last_best_pt, self.yaml_picker.text())
         if res.last_weights:
-            self.log_box.append(f"最新权重: {res.last_weights}")
+            self.log_box.appendPlainText(f"最新权重: {res.last_weights}")
 
     def _on_failed(self, err: str) -> None:
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.log_box.append(f"\n[错误] {err}")
+        self.log_box.appendPlainText(f"\n[错误] {err}")
         QMessageBox.critical(self, "训练错误", err)
