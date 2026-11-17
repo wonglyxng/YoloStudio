@@ -214,6 +214,28 @@ def test_parse_pyvenv_home_and_slim_app_copy(tmp_path: Path) -> None:
     assert not (bundle_out / "app" / "third_party" / "X-AnyLabeling" / "tests").exists()
 
 
+def test_clone_base_python_runtime_preserves_pip_in_clean_mode_and_ensurepip(tmp_path: Path) -> None:
+    """验证 `clean` 模式保留归档预置的 `site-packages/pip`，且两种模式均保留 `Lib/ensurepip`。"""
+    bp = _load_build_portable_module()
+
+    src_py = tmp_path / "standalone_py"
+    (src_py / "Lib" / "site-packages" / "pip").mkdir(parents=True)
+    (src_py / "Lib" / "site-packages" / "pip" / "__init__.py").write_text("# pip\n", encoding="utf-8")
+    (src_py / "Lib" / "ensurepip").mkdir(parents=True)
+    (src_py / "Lib" / "ensurepip" / "__init__.py").write_text("# ensurepip\n", encoding="utf-8")
+    (src_py / "python.exe").write_bytes(b"MZ")
+
+    clean_rt = tmp_path / "clean_runtime"
+    bp.clone_base_python_runtime(src_py, clean_rt, keep_site_packages=True)
+    assert (clean_rt / "Lib" / "site-packages" / "pip" / "__init__.py").is_file()
+    assert (clean_rt / "Lib" / "ensurepip" / "__init__.py").is_file()
+
+    venv_rt = tmp_path / "venv_runtime"
+    bp.clone_base_python_runtime(src_py, venv_rt, keep_site_packages=False)
+    assert not (venv_rt / "Lib" / "site-packages" / "pip").exists()
+    assert (venv_rt / "Lib" / "ensurepip" / "__init__.py").is_file()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="仅在 Windows 上编译原生 GUI 启动器 YoloStudio.exe")
 def test_compile_windows_launcher_and_cli_cmd_with_parens_path(tmp_path: Path) -> None:
     """验证 `csc.exe` 编译生成有效 PE `.exe`，且 `YoloStudio-CLI.cmd` 在含空格与圆括号路径下可正常运行。"""

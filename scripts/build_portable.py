@@ -62,16 +62,14 @@ BASE_PYTHON_EXCLUDED_TOP: frozenset[str] = frozenset(
     }
 )
 
-# 从宿主基础 Python 的 Lib 标准库目录复制时跳过的子目录（避免混入宿主全局包与测试套件）
+# 从宿主基础 Python 的 Lib 标准库目录复制时默认跳过的子目录（避免混入测试套件与闲置 Tk 组件）
 BASE_LIB_EXCLUDED_DIRS: frozenset[str] = frozenset(
     {
-        "site-packages",
         "test",
         "tests",
         "idlelib",
         "tkinter",
         "turtledemo",
-        "ensurepip",
         "__pycache__",
     }
 )
@@ -202,9 +200,25 @@ def _copy_tree_filtered(
             shutil.copy2(item, target)
 
 
-def clone_base_python_runtime(base_python_dir: Path, runtime_dir: Path) -> None:
-    """将宿主基础 Python 核心文件与标准库（不含宿主 `site-packages` 与 `pyvenv.cfg`）复制到 `runtime_dir`。"""
+def clone_base_python_runtime(
+    base_python_dir: Path,
+    runtime_dir: Path,
+    keep_site_packages: bool = False,
+) -> None:
+    """将基础 Python 核心文件与标准库复制到 `runtime_dir`。
+
+    参数说明：
+        `keep_site_packages`：`from-venv` 模式下设为 `False` 以排除宿主全局杂包；
+        `clean` 模式下从纯净 `python-build-standalone` 归档初始化时设为 `True`，保留其预置的 `pip`。
+        任何模式下均跳过 `pyvenv.cfg` 与受限 `._pth` 文件，并保留 `Lib/ensurepip` 供包管理器自举兜底。
+    """
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    lib_excluded = (
+        BASE_LIB_EXCLUDED_DIRS
+        if keep_site_packages
+        else (BASE_LIB_EXCLUDED_DIRS | {"site-packages"})
+    )
+
     for entry in base_python_dir.iterdir():
         name_lower = entry.name.lower()
         if name_lower in BASE_PYTHON_EXCLUDED_TOP:
@@ -217,7 +231,7 @@ def clone_base_python_runtime(base_python_dir: Path, runtime_dir: Path) -> None:
             if name_lower == "lib":
                 dst.mkdir(parents=True, exist_ok=True)
                 for lib_item in entry.iterdir():
-                    if lib_item.name.lower() in BASE_LIB_EXCLUDED_DIRS:
+                    if lib_item.name.lower() in lib_excluded:
                         continue
                     lib_dst = dst / lib_item.name
                     if lib_item.is_dir():
@@ -244,7 +258,10 @@ def _safe_extract_archive(archive_path: Path, extract_to: Path) -> Path:
                 target = (extract_to / member.name).resolve()
                 if root_resolved != target and root_resolved not in target.parents:
                     raise ValueError(f"检测到越界归档条目: {member.name}")
-            tar.extractall(extract_to)
+            try:
+                tar.extractall(extract_to, filter="data")
+            except TypeError:
+                tar.extractall(extract_to)
     elif name_lower.endswith(".zip"):
         with zipfile.ZipFile(archive_path, "r") as zf:
             for member_name in zf.namelist():
@@ -328,7 +345,7 @@ def prepare_clean_runtime(config: BuildConfig, runtime_dir: Path) -> None:
                     if p.is_dir() and (p / "python.exe").is_file() and config.python_version in p.name
                 ]
                 if candidates:
-                    clone_base_python_runtime(candidates[-1], runtime_dir)
+                    clone_base_python_runtime(candidates[-1], runtime_dir, keep_site_packages=True)
                 else:
                     archive = _download_python_build_standalone(config.python_version, config.cache_dir)
             else:
@@ -339,7 +356,7 @@ def prepare_clean_runtime(config: BuildConfig, runtime_dir: Path) -> None:
             if extract_stage.exists():
                 shutil.rmtree(extract_stage)
             extracted_root = _safe_extract_archive(archive.resolve(), extract_stage)
-            clone_base_python_runtime(extracted_root, runtime_dir)
+            clone_base_python_runtime(extracted_root, runtime_dir, keep_site_packages=True)
             shutil.rmtree(extract_stage, ignore_errors=True)
 
     py_exe = runtime_dir / "python.exe"
@@ -599,19 +616,28 @@ def prepare_weights_and_workspace(config: BuildConfig, bundle_root: Path) -> lis
     if config.download_weights:
         py_exe = bundle_root / "runtime" / "python.exe"
         env = _isolated_subprocess_env(bundle_root / "runtime", bundle_root)
+        dl_code = """
+import shutil
+import sys
+from pathlib import Path
+from ultralytics.utils.downloads import attempt_download_asset
+
+dst = Path(sys.argv[1]).resolve()
+downloaded = Path(attempt_download_asset(dst)).resolve()
+if downloaded.is_file() and downloaded != dst:
+    shutil.copy2(downloaded, dst)
+if not dst.is_file() or dst.stat().st_size == 0:
+    raise RuntimeError(f"未能下载预训练模型权重: {dst.name}")
+print(f"downloaded_ok={dst.name} ({dst.stat().st_size} bytes)")
+"""
         for model_name in config.download_weights:
             target = weights_dir / Path(model_name).name
             if target.is_file() and target.stat().st_size > 0:
+                staged_weights.append(target.name)
                 continue
             print(f"[权重] 下载预置模型权重至 weights/: {model_name}")
-            dl_code = (
-                "import shutil, sys; from pathlib import Path; from ultralytics import YOLO; "
-                "m = YOLO(sys.argv[1]); ckpt = Path(getattr(m, 'ckpt_path', sys.argv[1])); "
-                "dst = Path(sys.argv[2]); "
-                "ckpt.resolve() != dst.resolve() and ckpt.is_file() and shutil.move(str(ckpt), str(dst))"
-            )
             subprocess.run(
-                [str(py_exe), "-c", dl_code, model_name, str(target)],
+                [str(py_exe), "-c", dl_code, str(target)],
                 cwd=str(weights_dir),
                 env=env,
                 check=True,
