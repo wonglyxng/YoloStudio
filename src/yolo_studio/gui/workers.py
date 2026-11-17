@@ -37,13 +37,40 @@ from yolo_studio.core.mllm_reviewer import (
     run_mllm_review,
 )
 from yolo_studio.core.trainer import (
+    DeviceInfo,
     TrainConfig,
     TrainResult,
+    detect_compute_device,
     export_model,
     predict_source,
     train_yolo26,
     validate_model,
 )
+
+
+class DeviceProbeWorker(QThread):
+    """在后台线程执行 `detect_compute_device`（含首次 `import torch` 与 CUDA 探测），避免阻塞首屏显示。
+
+    信号契约：
+        `finished_info(DeviceInfo)`：探测完成后发射真实硬件摘要；发生异常时发射 CPU 回退摘要。
+    """
+
+    finished_info = Signal(object)
+
+    def run(self) -> None:
+        """线程入口：查询底层计算设备并通过信号回传 `DeviceInfo`。"""
+        try:
+            info = detect_compute_device()
+        except Exception as exc:
+            info = DeviceInfo(
+                cuda_available=False,
+                device_count=0,
+                device_name=f"CPU (硬件探测异常已回退: {exc})",
+                vram_gb=0.0,
+                recommended_device="cpu",
+                probing=False,
+            )
+        self.finished_info.emit(info)
 
 
 class VideoProbeWorker(QThread):

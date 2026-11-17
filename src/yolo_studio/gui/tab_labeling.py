@@ -218,9 +218,17 @@ class LabelingStudioTab(QWidget):
     send_to_review = Signal(str)  # 参数：(图片目录)
     annotations_changed = Signal(str)  # 参数：(发生 .json 写入/修改的目录)
 
-    def __init__(self, workspace_root: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        parent: QWidget | None = None,
+        lazy_mount: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.workspace_root = workspace_root
+        self._lazy_mount = lazy_mount
+        self._mounting = False
+        self._mount_failed = False
         self._xal_window = None
         self._current_dir: Path | None = None
         self._last_classes_file: Path | None = None
@@ -271,7 +279,10 @@ class LabelingStudioTab(QWidget):
         self._host_container.setContentsMargins(0, 0, 0, 0)
         root.addLayout(self._host_container, 1)
 
-        self._mount_embedded_xanylabeling()
+        if self._lazy_mount:
+            self._show_lazy_placeholder()
+        else:
+            self._mount_embedded_xanylabeling()
 
         self.open_dir_btn.clicked.connect(self._on_pick_and_open_dir)
         self.load_classes_btn.clicked.connect(self._on_pick_and_load_classes)
@@ -279,15 +290,64 @@ class LabelingStudioTab(QWidget):
         self.to_dataset_btn.clicked.connect(self._on_send_to_dataset)
         self.to_review_btn.clicked.connect(self._on_send_to_review)
 
-    def _mount_embedded_xanylabeling(self) -> None:
-        """初始化并挂载原版 X-AnyLabeling 主窗口；若加载失败则在页内呈现错误说明与重试按钮。"""
+    def _clear_host_container(self) -> None:
+        """清空工作台宿主容器内的占位面板或旧组件。"""
         while self._host_container.count():
             item = self._host_container.takeAt(0)
             if item.widget() is not None:
                 item.widget().deleteLater()
 
+    def _show_lazy_placeholder(self) -> None:
+        """在延迟挂载模式下展示轻量占位视图，避免首屏启动时同步加载整个 X-AnyLabeling。"""
+        self._clear_host_container()
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(10)
+        hint_lbl = QLabel("正在准备内嵌 X-AnyLabeling 标注工作台...")
+        hint_lbl.setStyleSheet("color: #57606a; font-size: 14px; font-weight: 500;")
+        load_btn = QPushButton("立即加载标注工作台")
+        load_btn.clicked.connect(lambda: self.ensure_mounted())
+        layout.addWidget(hint_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(load_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._host_container.addWidget(box, 1)
+
+    def ensure_mounted(self) -> bool:
+        """幂等确保内嵌 X-AnyLabeling 主窗口已完成初始化与挂载；成功返回 `True`。
+
+        重入保护：
+            挂载期间设置 `_mounting=True` 并切换等待光标，防止事件刷新引发 `showEvent` 递归调用。
+        """
+        if self._xal_window is not None:
+            return True
+        if self._mounting:
+            return False
+
+        self._mounting = True
+        self.status_label.setText("正在加载内嵌 X-AnyLabeling 标注工作台，请稍候...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            QApplication.processEvents()
+            self._mount_embedded_xanylabeling()
+            if self._xal_window is not None:
+                self._mount_failed = False
+                self.status_label.setText(
+                    "工作台就绪：可打开抽帧目录进行人工画框或 AI 辅助标注（快捷键 R 画框，Ctrl+S 保存）"
+                )
+                return True
+            self._mount_failed = True
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._mounting = False
+
+    def _mount_embedded_xanylabeling(self) -> None:
+        """初始化并挂载原版 X-AnyLabeling 主窗口；若加载失败则在页内呈现错误说明与重试按钮。"""
+        self._clear_host_container()
+
         app = QApplication.instance()
         if not isinstance(app, QApplication):
+            self._mount_failed = True
             self._show_mount_error("未检测到有效 QApplication 实例，无法挂载内嵌标注工作台。")
             return
 
@@ -297,8 +357,10 @@ class LabelingStudioTab(QWidget):
             self._xal_window = embedded_cls(app, config)
             self._xal_window.title_changed.connect(self._on_xal_title_changed)
             self._host_container.addWidget(self._xal_window, 1)
+            self._mount_failed = False
         except Exception as exc:
             self._xal_window = None
+            self._mount_failed = True
             self._show_mount_error(f"初始化内嵌 X-AnyLabeling 失败：{exc}")
 
     def _show_mount_error(self, message: str) -> None:
@@ -318,10 +380,17 @@ class LabelingStudioTab(QWidget):
         return _resolve_xal_view(self._xal_window)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
-        """切换进入工作台标签页时重新收敛快捷键作用域（保留 type: ignore 指令）。"""
+        """切换进入工作台标签页时按需触发首次挂载，并重新收敛快捷键作用域（保留 type: ignore 指令）。"""
         super().showEvent(event)
         if self._xal_window is not None:
             self._xal_window.scope_shortcuts()
+        elif not self._mount_failed and not self._mounting:
+            QTimer.singleShot(0, self._auto_mount_on_show)
+
+    def _auto_mount_on_show(self) -> None:
+        """在标签页切换绘制完成后异步完成工作台首次挂载。"""
+        if self.isVisible() and self._xal_window is None and not self._mount_failed:
+            self.ensure_mounted()
 
     def _on_xal_title_changed(self, title: str) -> None:
         if title:
@@ -362,6 +431,8 @@ class LabelingStudioTab(QWidget):
         返回值：
             成功导入的非空类别数量；工作台未就绪或文件不存在时返回 `0`。
         """
+        if self._xal_window is None:
+            self.ensure_mounted()
         lw = self._label_widget()
         if lw is None or not classes_file.is_file():
             return 0
@@ -387,9 +458,11 @@ class LabelingStudioTab(QWidget):
         """在内嵌 X-AnyLabeling 中打开指定图片目录，并可选预载类别与定位到单张图片。
 
         调用条件与失败/取消行为：
-            切换前会调用 `may_continue()`；若当前图片有未保存修改且用户取消保存弹窗，
-            直接返回 `False` 并不覆盖当前画布状态。
+            尚未挂载时自动调用 `ensure_mounted()`；切换前会调用 `may_continue()`，
+            若当前图片有未保存修改且用户取消保存弹窗，直接返回 `False` 并不覆盖当前画布状态。
         """
+        if self._xal_window is None:
+            self.ensure_mounted()
         lw = self._label_widget()
         if lw is None:
             QMessageBox.warning(self, "工作台未就绪", "内嵌 X-AnyLabeling 尚未完成初始化。")

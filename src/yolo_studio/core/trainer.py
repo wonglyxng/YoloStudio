@@ -38,13 +38,14 @@ YOLO26_DETECT_MODELS = [
 
 @dataclass
 class DeviceInfo:
-    """可用计算硬件与显存摘要；`vram_gb` 单位为 GiB。"""
+    """可用计算硬件与显存摘要；`vram_gb` 单位为 GiB，`probing=True` 表示后台异步探测尚在进行中。"""
 
     cuda_available: bool
     device_count: int
     device_name: str
     vram_gb: float
     recommended_device: str
+    probing: bool = False
 
 
 @dataclass

@@ -19,7 +19,7 @@ from PyQt6.QtCore import QSettings, QThread, QTimer
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget
 
-from yolo_studio.core.trainer import detect_compute_device
+from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.common import GpuTaskGuard
 from yolo_studio.gui.tab_dataset import DatasetTab
 from yolo_studio.gui.tab_eval import EvalTab
@@ -27,6 +27,7 @@ from yolo_studio.gui.tab_extract import ExtractTab
 from yolo_studio.gui.tab_labeling import LabelingStudioTab
 from yolo_studio.gui.tab_review import MllmReviewTab
 from yolo_studio.gui.tab_train import TrainTab
+from yolo_studio.gui.workers import DeviceProbeWorker
 
 APP_STYLESHEET = """
 QMainWindow, QWidget {
@@ -87,9 +88,11 @@ class MainWindow(QMainWindow):
         关闭时先委派内嵌 `LabelingStudioTab` 核查未保存标注再持久化主窗口状态。
     """
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(self, workspace_root: Path, lazy_init: bool = False) -> None:
         super().__init__()
         self.workspace_root = workspace_root
+        self._lazy_init = lazy_init
+        self._device_probe_worker: DeviceProbeWorker | None = None
         self.settings = QSettings("YOLO26Studio", "VideoToYOLO26")
         self.setWindowTitle(
             "YOLO26 视频抽帧与训练工具 (Video → 内嵌 X-AnyLabeling → MLLM纠错 → YOLO26)"
@@ -101,12 +104,22 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        self.device_info = detect_compute_device()
+        if lazy_init:
+            self.device_info = DeviceInfo(
+                cuda_available=False,
+                device_count=0,
+                device_name="正在后台检测计算设备...",
+                vram_gb=0.0,
+                recommended_device="cpu",
+                probing=True,
+            )
+        else:
+            self.device_info = detect_compute_device()
         self.gpu_guard = GpuTaskGuard()
 
         self.tabs = QTabWidget()
         self.extract_tab = ExtractTab(workspace_root)
-        self.labeling_tab = LabelingStudioTab(workspace_root)
+        self.labeling_tab = LabelingStudioTab(workspace_root, lazy_mount=lazy_init)
         self.dataset_tab = DatasetTab(workspace_root)
         self.review_tab = MllmReviewTab(
             workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
@@ -141,10 +154,40 @@ class MainWindow(QMainWindow):
 
         self._restore_settings()
 
-        # 关闭时等待后台线程结束的轮询定时器（仅在用户确认停止任务后启动）
+        # 关闭时等待后台线程结束的轮询定时器（仅在用户确认停止任务或等待后台初始化线程收尾时启动）
         self._close_wait_timer = QTimer(self)
-        self._close_wait_timer.setInterval(500)
+        self._close_wait_timer.setInterval(200)
         self._close_wait_timer.timeout.connect(self._poll_workers_then_close)
+
+    def start_background_warmup(self) -> None:
+        """在主窗口显示上屏后幂等启动后台异步硬件探测（加载 `torch` 并刷新 CUDA/CPU 状态）。"""
+        if not self.device_info.probing:
+            return
+        if self._device_probe_worker is not None and self._device_probe_worker.isRunning():
+            return
+        self._device_probe_worker = DeviceProbeWorker()
+        self._device_probe_worker.finished_info.connect(self._on_device_probed)
+        self._device_probe_worker.start()
+
+    def _on_device_probed(self, info: DeviceInfo) -> None:
+        """接收后台硬件探测结果，原地更新共享 `device_info` 并刷新第 4/5/6 标签页控件。"""
+        self.device_info.cuda_available = info.cuda_available
+        self.device_info.device_count = info.device_count
+        self.device_info.device_name = info.device_name
+        self.device_info.vram_gb = info.vram_gb
+        self.device_info.recommended_device = info.recommended_device
+        self.device_info.probing = False
+
+        self.review_tab.apply_device_info(self.device_info)
+        self.train_tab.apply_device_info(self.device_info)
+        self.eval_tab.apply_device_info(self.device_info)
+
+        summary = (
+            f"计算设备就绪: {info.device_name} ({info.vram_gb:.1f} GB)"
+            if info.cuda_available
+            else "计算设备就绪: CPU 模式"
+        )
+        self.statusBar().showMessage(summary, 5000)
 
     def _on_frames_ready(self, frames_dir: str) -> None:
         """同步抽帧输出目录至数据集页与纠错页；用户仍停留在抽帧页时自动切至内嵌标注工作台。
@@ -227,10 +270,14 @@ class MainWindow(QMainWindow):
         return [w for w in candidates if isinstance(w, QThread) and w.isRunning()]
 
     def _poll_workers_then_close(self) -> None:
-        """等待后台任务全部结束后再次触发关闭；由 `_close_wait_timer` 周期调用。"""
+        """等待后台任务及硬件探测线程全部结束后再次触发关闭；由 `_close_wait_timer` 周期调用。"""
         running = self._running_workers()
+        probing = self._device_probe_worker is not None and self._device_probe_worker.isRunning()
         if running:
             self.statusBar().showMessage(f"正在等待 {len(running)} 个后台任务安全停止后退出...")
+            return
+        if probing:
+            self.statusBar().showMessage("正在等待后台硬件检测收尾后退出...")
             return
         self._close_wait_timer.stop()
         self.close()
@@ -239,10 +286,9 @@ class MainWindow(QMainWindow):
         """关闭主窗口：先核查内嵌标注工作台未保存改动，再处理仍在运行的后台任务，最后持久化目录状态。
 
         后台任务处理：
-            存在运行中的 `QThread` 时询问用户；确认后对支持取消的任务调用 `cancel()`，
+            存在运行中的业务 `QThread` 时询问用户；确认后对支持取消的任务调用 `cancel()`，
             禁用界面并忽略本次关闭事件，由定时器轮询到全部线程结束后再次调用 `close()`。
-            这样可避免 Qt 在线程运行中析构 `QThread` 导致进程异常退出，训练会在当前轮结束并保存权重后停止。
-            验证、推理与导出不支持取消，只能等待其完成。重复关闭请求在等待期间被直接忽略。
+            若仅有只读的后台硬件探测线程仍在收尾，则免打扰直接通过定时器等待其退出，避免析构运行中的 `QThread`。
         """
         if self._close_wait_timer.isActive():
             event.ignore()
@@ -271,6 +317,13 @@ class MainWindow(QMainWindow):
                     cancel()
             self.tabs.setEnabled(False)
             self.statusBar().showMessage("正在等待后台任务安全停止后退出...")
+            self._close_wait_timer.start()
+            return
+
+        if self._device_probe_worker is not None and self._device_probe_worker.isRunning():
+            event.ignore()
+            self.tabs.setEnabled(False)
+            self.statusBar().showMessage("正在等待后台硬件检测收尾后退出...")
             self._close_wait_timer.start()
             return
 

@@ -66,6 +66,7 @@ class EvalTab(QWidget):
         self.val_worker: ValidateWorker | None = None
         self.pred_worker: PredictWorker | None = None
         self.export_worker: ExportWorker | None = None
+        self._auto_device_text: str = self.device_info.recommended_device
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -212,6 +213,13 @@ class EvalTab(QWidget):
             self.half_chk.setEnabled(True)
             self.half_chk.setToolTip("以 FP16 半精度导出权重（通常需在 GPU 设备上执行）")
 
+    def apply_device_info(self, info: DeviceInfo) -> None:
+        """异步硬件探测完成后刷新默认设备输入框（不覆盖用户已手动修改的值）。"""
+        self.device_info = info
+        if self.device_edit.text().strip() == self._auto_device_text:
+            self.device_edit.setText(info.recommended_device)
+        self._auto_device_text = info.recommended_device
+
     def set_weights_and_yaml(self, weights_path: str, yaml_path: str) -> None:
         """跨页写入：同步更新待评估权重与 `data.yaml` 路径。"""
         if weights_path:
@@ -242,6 +250,8 @@ class EvalTab(QWidget):
 
     def _on_validate(self) -> None:
         """校验权重与 `data.yaml` 后在后台启动 `ValidateWorker`。"""
+        if self.device_info.probing:
+            self.apply_device_info(detect_compute_device())
         w = self.weights_picker.text()
         y = self.yaml_picker.text()
         if not w or not Path(w).is_file():
@@ -279,6 +289,8 @@ class EvalTab(QWidget):
 
     def _on_predict(self) -> None:
         """校验权重与测试输入路径后在后台启动 `PredictWorker`。"""
+        if self.device_info.probing:
+            self.apply_device_info(detect_compute_device())
         w = self.weights_picker.text()
         src = self.source_edit.text().strip()
         if not w or not Path(w).is_file():
@@ -330,6 +342,8 @@ class EvalTab(QWidget):
 
     def _on_export(self) -> None:
         """校验 `.pt` 权重路径后按所选格式在后台启动 `ExportWorker`。"""
+        if self.device_info.probing:
+            self.apply_device_info(detect_compute_device())
         w = self.weights_picker.text()
         if not w or not Path(w).is_file():
             QMessageBox.warning(self, "提示", "请选择有效的 .pt 权重文件。")

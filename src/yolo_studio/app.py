@@ -158,12 +158,87 @@ def report_startup_crash(
     return log_file
 
 
-def main(workspace_root: Path | None = None) -> int:
-    """初始化运行环境、Qt 资源及桌面主窗口事件循环。
+def _find_app_icon_path(code_root: Path, workspace_root: Path) -> Path | None:
+    """在应用代码目录或工作区中查找内置 `icon.ico` 路径，不存在时返回 `None`。"""
+    rel = Path("third_party") / "X-AnyLabeling" / "anylabeling" / "resources" / "images" / "icon.ico"
+    for base in (code_root, workspace_root):
+        candidate = base / rel
+        if candidate.is_file():
+            return candidate
+    return None
 
-    副作用：若应用代码根或工作区下存在 `third_party/X-AnyLabeling` 则将其插入 `sys.path`，
-    设置科学计算线程环境变量、CUDA DLL 搜索路径、`AA_ShareOpenGLContexts`、`QApplication`、
-    X-AnyLabeling 翻译/主题资源及 `MainWindow`，阻塞至用户关闭主窗口后返回 Qt 退出码。
+
+def _create_startup_splash(app: object, icon_path: Path | None) -> object | None:
+    """在非无头桌面环境下立即绘制并显示轻量启动欢迎图（`QSplashScreen`），消除冷启动视觉空白期。"""
+    if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+        return None
+
+    from PyQt6.QtCore import QRectF, Qt
+    from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap
+    from PyQt6.QtWidgets import QApplication, QSplashScreen
+
+    qapp = app if isinstance(app, QApplication) else QApplication.instance()
+    screen = qapp.primaryScreen() if qapp is not None else None
+    dpr = float(screen.devicePixelRatio()) if screen is not None else 1.0
+
+    width, height = 460, 210
+    pixmap = QPixmap(int(width * dpr), int(height * dpr))
+    pixmap.setDevicePixelRatio(dpr)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(2, 2, width - 4, height - 4), 12.0, 12.0)
+    painter.fillPath(path, QColor("#161b22"))
+    painter.setPen(QColor("#30363d"))
+    painter.drawPath(path)
+
+    text_x = 28
+    if icon_path is not None:
+        icon_pix = QIcon(str(icon_path)).pixmap(48, 48)
+        if not icon_pix.isNull():
+            painter.drawPixmap(28, 34, 48, 48, icon_pix)
+            text_x = 90
+
+    title_font = QFont("Microsoft YaHei UI", 16, QFont.Weight.Bold)
+    painter.setFont(title_font)
+    painter.setPen(QColor("#f0f6fc"))
+    painter.drawText(QRectF(text_x, 32, width - text_x - 24, 30), "YoloStudio")
+
+    sub_font = QFont("Microsoft YaHei UI", 9)
+    painter.setFont(sub_font)
+    painter.setPen(QColor("#8b949e"))
+    painter.drawText(
+        QRectF(text_x, 64, width - text_x - 24, 24),
+        "视频抽帧 → 内嵌 X-AnyLabeling → MLLM 纠错 → YOLO26 训练",
+    )
+
+    painter.setPen(QColor("#0969da"))
+    painter.drawLine(28, 148, width - 28, 148)
+    painter.end()
+
+    splash = QSplashScreen(
+        pixmap,
+        Qt.WindowType.SplashScreen | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint,
+    )
+    splash.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    status_align = int(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+    splash.showMessage("      正在加载工作区主界面...", status_align, QColor("#c9d1d9"))
+    splash.show()
+    if qapp is not None:
+        qapp.processEvents()
+    return splash
+
+
+def main(workspace_root: Path | None = None) -> int:
+    """初始化运行环境、瞬时启动欢迎图及桌面主窗口事件循环。
+
+    性能优化设计：
+        1. `QApplication` 就绪后立即弹出轻量 `QSplashScreen`（约 `0.15s` 上屏反馈）；
+        2. 主窗口采用 `lazy_init=True` 构建：内嵌 X-AnyLabeling 推迟至首次进入「2. 标注工作台」或跨页打开目录时挂载，
+           `torch` 计算设备检测推迟至主窗口显示后由后台 `DeviceProbeWorker` 异步完成，使首屏在亚秒级直接可交互。
     """
     root = (
         workspace_root.resolve()
@@ -184,23 +259,29 @@ def main(workspace_root: Path | None = None) -> int:
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.gui.icc=false")
 
-    from PyQt6.QtCore import QCoreApplication, Qt
+    from PyQt6.QtCore import QCoreApplication, QTimer, Qt
+    from PyQt6.QtGui import QIcon
     from PyQt6.QtWidgets import QApplication
 
-    from yolo_studio.gui.tab_labeling import (
-        ensure_cuda_dll_search_paths,
-        ensure_xanylabeling_runtime_initialized,
-    )
+    from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
 
     ensure_cuda_dll_search_paths()
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
     app = QApplication(sys.argv)
     app.setApplicationName("YOLO26 Training Studio")
-    ensure_xanylabeling_runtime_initialized(app)
+    icon_path = _find_app_icon_path(code_root, root)
+    if icon_path is not None:
+        app.setWindowIcon(QIcon(str(icon_path)))
+
+    splash = _create_startup_splash(app, icon_path)
 
     from yolo_studio.gui.main_window import MainWindow
 
-    window = MainWindow(workspace_root=root)
+    window = MainWindow(workspace_root=root, lazy_init=True)
     window.show()
+    if splash is not None:
+        splash.finish(window)
+
+    QTimer.singleShot(50, window.start_background_warmup)
     return app.exec()

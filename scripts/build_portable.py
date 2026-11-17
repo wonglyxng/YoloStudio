@@ -866,6 +866,37 @@ else:
     print(f"[自检] 通过: {probe_res.stdout.strip()}")
 
 
+def precompile_bytecode(bundle_root: Path) -> None:
+    """使用内置解释器并行预编译 `app/` 与 `runtime/Lib/` 下的 `.pyc` 字节码缓存，加速用户首次冷启动。
+
+    设计说明：
+        对自有及内嵌应用目录 `app/` 强制校验编译零语法错误；
+        对第三方依赖所在的 `runtime/Lib/` 采用容错模式（部分科学计算包内含非运行态代码生成模板），
+        确保其余全部有效模块提前生成 `.pyc`，免去终端用户首次双击时的 AST 解析与大量小文件写盘。
+    """
+    py_exe = bundle_root / "runtime" / "python.exe"
+    if not py_exe.is_file():
+        return
+    env = _isolated_subprocess_env(bundle_root / "runtime", bundle_root)
+    print("[优化] 正在并行预编译 Python 字节码缓存 (.pyc) 以加速首次启动...")
+    app_dir = bundle_root / "app"
+    if app_dir.is_dir():
+        subprocess.run(
+            [str(py_exe), "-m", "compileall", "-q", "-j", "0", str(app_dir)],
+            env=env,
+            check=True,
+        )
+    lib_dir = bundle_root / "runtime" / "Lib"
+    if lib_dir.is_dir():
+        subprocess.run(
+            [str(py_exe), "-m", "compileall", "-q", "-j", "0", str(lib_dir)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
 def create_bundle_archive(bundle_root: Path, archive_format: str) -> Path | None:
     """按指定格式（`7z` 或 `zip`）将便携整合包目录打包为单文件压缩归档，保留顶层目录名。"""
     fmt = archive_format.strip().lower()
@@ -962,6 +993,7 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
     print("[启动器] 编译无黑框原生桌面启动器 YoloStudio.exe...")
     compile_windows_launcher(launcher_cs, bundle_root / "YoloStudio.exe", icon_file=icon_path)
     write_cli_and_quickstart_files(bundle_root, version=version, variant=config.variant)
+    precompile_bytecode(bundle_root)
 
     if not config.skip_smoke_test:
         verify_portable_bundle(bundle_root, skip_heavy_imports=config.skip_heavy_imports)

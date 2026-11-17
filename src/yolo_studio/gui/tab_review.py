@@ -85,7 +85,15 @@ class MllmReviewTab(QWidget):
         self._preview_cache: OrderedDict[int, bytes] = OrderedDict()
         self._last_output_dir: Path = workspace_root / "data" / "reviewed_frames"
         self._last_classes_txt: str = ""
+        self._auto_device_text: str = self.device_info.recommended_device
         self._init_ui()
+
+    def apply_device_info(self, info: DeviceInfo) -> None:
+        """异步硬件探测完成后刷新基准推理设备默认值（保留用户已手动修改的值）。"""
+        self.device_info = info
+        if self.yolo_device_edit.text().strip() == self._auto_device_text:
+            self.yolo_device_edit.setText(info.recommended_device)
+        self._auto_device_text = info.recommended_device
 
     def set_images_dir(self, path_str: str) -> None:
         """跨页写入：同步待纠错图片目录输入框。"""
@@ -389,6 +397,8 @@ class MllmReviewTab(QWidget):
             return
 
         source_mode: ReviewSourceMode = self.source_mode_combo.currentData()
+        if source_mode == ReviewSourceMode.YOLO_PREDICT and self.device_info.probing:
+            self.apply_device_info(detect_compute_device())
         weights_text = self.weights_picker.text()
         if source_mode == ReviewSourceMode.YOLO_PREDICT and (
             not weights_text or not Path(weights_text).is_file()

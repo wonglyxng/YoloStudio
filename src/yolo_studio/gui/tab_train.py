@@ -76,6 +76,8 @@ class TrainTab(QWidget):
         self.worker: TrainWorker | None = None
         self._last_save_dir: Path = workspace_root / "runs" / "detect"
         self._last_best_pt: str = ""
+        self._auto_device_text: str = self.device_info.recommended_device
+        self._auto_batch_value: int = 16 if self.device_info.cuda_available else 4
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -88,17 +90,8 @@ class TrainTab(QWidget):
         # 计算设备状态横幅
         hw_group = QGroupBox("1. 计算设备状态")
         hw_layout = QHBoxLayout(hw_group)
-        if self.device_info.cuda_available:
-            hw_text = (
-                f"已就绪 GPU: {self.device_info.device_name} "
-                f"({self.device_info.vram_gb:.1f} GB 显存) | CUDA 可用"
-            )
-            hw_color = "#1f7a1f"
-        else:
-            hw_text = "未检测到可用 CUDA GPU，将使用 CPU 训练（速度较慢）"
-            hw_color = "#b25900"
-        self.hw_label = QLabel(hw_text)
-        self.hw_label.setStyleSheet(f"color: {hw_color}; font-weight: 600;")
+        self.hw_label = QLabel()
+        self._refresh_hw_banner()
         hw_layout.addWidget(self.hw_label)
         left.addWidget(hw_group)
 
@@ -273,6 +266,41 @@ class TrainTab(QWidget):
             else None
         )
 
+    def _refresh_hw_banner(self) -> None:
+        """按当前 `device_info` 状态更新顶部计算设备提示横幅文案与配色。"""
+        if self.device_info.probing:
+            hw_text = "正在后台检测计算设备 (CUDA GPU / CPU)..."
+            hw_color = "#0969da"
+        elif self.device_info.cuda_available:
+            hw_text = (
+                f"已就绪 GPU: {self.device_info.device_name} "
+                f"({self.device_info.vram_gb:.1f} GB 显存) | CUDA 可用"
+            )
+            hw_color = "#1f7a1f"
+        else:
+            hw_text = "未检测到可用 CUDA GPU，将使用 CPU 训练（速度较慢）"
+            hw_color = "#b25900"
+        self.hw_label.setText(hw_text)
+        self.hw_label.setStyleSheet(f"color: {hw_color}; font-weight: 600;")
+
+    def apply_device_info(self, info: DeviceInfo) -> None:
+        """异步硬件探测完成后刷新横幅与尚未被用户手动改动的默认训练参数。"""
+        was_probing = self.device_info.probing
+        self.device_info = info
+        self._refresh_hw_banner()
+
+        if self.device_edit.text().strip() == self._auto_device_text:
+            self.device_edit.setText(info.recommended_device)
+        self._auto_device_text = info.recommended_device
+
+        target_batch = 16 if info.cuda_available else 4
+        if self.batch_spin.value() == self._auto_batch_value:
+            self.batch_spin.setValue(target_batch)
+        self._auto_batch_value = target_batch
+
+        if was_probing and (self.worker is None or not self.worker.isRunning()):
+            self.amp_chk.setChecked(info.cuda_available)
+
     def set_data_yaml(self, yaml_path: str) -> None:
         """跨页写入：更新训练集配置文件 `data.yaml` 路径。"""
         if yaml_path:
@@ -287,6 +315,8 @@ class TrainTab(QWidget):
 
     def _on_start(self) -> None:
         """校验 `data.yaml` 与 `imgsz` 后锁定运行按钮、清空日志并启动 `TrainWorker`。"""
+        if self.device_info.probing:
+            self.apply_device_info(detect_compute_device())
         yaml_text = self.yaml_picker.text()
         if not yaml_text or not Path(yaml_text).is_file():
             QMessageBox.warning(self, "提示", "请选择有效的 data.yaml 文件。")

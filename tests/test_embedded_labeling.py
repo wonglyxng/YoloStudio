@@ -297,3 +297,49 @@ def test_async_video_probe_and_review_preview_cache(
             win.extract_tab.probe_worker.wait(2000)
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_lazy_init_fast_startup_and_async_device_probe_and_on_demand_mount(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证 `lazy_init=True` 首屏不挂载工作台、异步探测无损刷新设备状态，且跨页跳转时自动按需挂载。"""
+    frames_dir = tmp_path / "lazy_frames"
+    _write_sample_frame(frames_dir / "f001.jpg")
+
+    win = MainWindow(workspace_root=tmp_path, lazy_init=True)
+    try:
+        # 1) 首屏秒开阶段：内嵌工作台处于未挂载占位态，设备处于后台探测态
+        assert win.labeling_tab._xal_window is None
+        assert win.device_info.probing is True
+        assert "正在后台检测" in win.train_tab.hw_label.text()
+
+        # 模拟用户在探测返回前手动改写了第 6 页的设备输入框
+        win.eval_tab.device_edit.setText("custom:1")
+
+        # 2) 启动后台硬件探测并等待信号回传
+        win.start_background_warmup()
+        assert win._device_probe_worker is not None
+        deadline = time.monotonic() + 10.0
+        while win._device_probe_worker.isRunning() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+        qt_app.processEvents()
+
+        assert win.device_info.probing is False
+        assert win.train_tab.device_info is win.device_info
+        assert "正在后台检测" not in win.train_tab.hw_label.text()
+        assert win.train_tab.device_edit.text() == win.device_info.recommended_device
+        # 用户手动修改过的设备值不被后台探测覆盖
+        assert win.eval_tab.device_edit.text() == "custom:1"
+
+        # 3) 从第 1 页发送抽帧目录时，第 2 页自动按需挂载内嵌 X-AnyLabeling 并打开目录
+        assert win.tabs.currentIndex() == 0
+        win.extract_tab.send_frames_dir.emit(str(frames_dir))
+        assert win.labeling_tab._xal_window is not None
+        assert win.tabs.currentIndex() == 1
+        assert win.labeling_tab.current_directory() == frames_dir.resolve()
+    finally:
+        if win._device_probe_worker and win._device_probe_worker.isRunning():
+            win._device_probe_worker.wait(3000)
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
