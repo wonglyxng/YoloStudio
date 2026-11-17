@@ -32,8 +32,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from yolo_studio.core.trainer import detect_compute_device
-from yolo_studio.gui.common import LOG_MAX_LINES, PathPickerRow, load_pixmap_scaled, open_local_path
+from yolo_studio.core.dataset_converter import IMAGE_EXTENSIONS
+from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
+from yolo_studio.gui.common import (
+    GpuTaskGuard,
+    LOG_MAX_LINES,
+    PathPickerRow,
+    load_pixmap_scaled,
+    open_local_path,
+)
 from yolo_studio.gui.workers import ExportWorker, PredictWorker, ValidateWorker
 
 
@@ -41,14 +48,21 @@ class EvalTab(QWidget):
     """模型验证、推理测试与部署导出标签页（标签页 6）。
 
     内部状态：
-        持有硬件信息 `device_info` 以及三个互斥运行的后台工作线程引用
+        持有硬件信息 `device_info`、跨页计算设备互斥协调器 `gpu_guard`，以及三个互斥运行的后台工作线程引用
         `val_worker`、`pred_worker`、`export_worker`。
     """
 
-    def __init__(self, workspace_root: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        parent: QWidget | None = None,
+        device_info: DeviceInfo | None = None,
+        gpu_guard: GpuTaskGuard | None = None,
+    ) -> None:
         super().__init__(parent)
         self.workspace_root = workspace_root
-        self.device_info = detect_compute_device()
+        self.device_info = device_info or detect_compute_device()
+        self.gpu_guard = gpu_guard
         self.val_worker: ValidateWorker | None = None
         self.pred_worker: PredictWorker | None = None
         self.export_worker: ExportWorker | None = None
@@ -182,6 +196,21 @@ class EvalTab(QWidget):
         self.predict_btn.clicked.connect(self._on_predict)
         self.open_pred_btn.clicked.connect(lambda: open_local_path(self.pred_out_picker.path()))
         self.export_btn.clicked.connect(self._on_export)
+        self.format_combo.currentIndexChanged.connect(self._on_export_format_changed)
+        self._on_export_format_changed()
+
+    def _on_export_format_changed(self) -> None:
+        """同步半精度选项状态：ONNX 固定在 CPU 上导出，不支持 FP16，需在界面上置灰提示。"""
+        is_onnx = str(self.format_combo.currentData()) == "onnx"
+        if is_onnx:
+            self.half_chk.setChecked(False)
+            self.half_chk.setEnabled(False)
+            self.half_chk.setToolTip(
+                "ONNX 导出固定使用 CPU 以规避图追踪设备冲突，不支持 FP16 半精度；选择 TorchScript 或 TensorRT 时可启用"
+            )
+        else:
+            self.half_chk.setEnabled(True)
+            self.half_chk.setToolTip("以 FP16 半精度导出权重（通常需在 GPU 设备上执行）")
 
     def set_weights_and_yaml(self, weights_path: str, yaml_path: str) -> None:
         """跨页写入：同步更新待评估权重与 `data.yaml` 路径。"""
@@ -195,7 +224,7 @@ class EvalTab(QWidget):
             self,
             "选择测试图片或视频",
             str(self.workspace_root),
-            "媒体文件 (*.jpg *.jpeg *.png *.bmp *.webp *.mp4 *.avi *.mov *.mkv);;所有文件 (*.*)",
+            "媒体文件 (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff *.mp4 *.avi *.mov *.mkv *.flv *.wmv *.ts *.m4v *.webm);;所有文件 (*.*)",
         )
         if chosen:
             self.source_edit.setText(chosen)
@@ -222,6 +251,9 @@ class EvalTab(QWidget):
             QMessageBox.warning(self, "提示", "请选择有效的 data.yaml 文件。")
             return
 
+        if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "模型验证 (Val)"):
+            return
+
         self._set_busy(True)
         self.log_box.clear()
         self.log_box.appendPlainText("开始执行模型验证...")
@@ -232,6 +264,8 @@ class EvalTab(QWidget):
             imgsz=self.imgsz_spin.value(),
             device=self.device_edit.text().strip() or "0",
         )
+        if self.gpu_guard is not None:
+            self.gpu_guard.bind(self.val_worker, "模型验证 (Val)")
         self.val_worker.log_line.connect(self.log_box.appendPlainText)
         self.val_worker.finished_metrics.connect(self._on_val_done)
         self.val_worker.failed.connect(self._on_failed)
@@ -254,6 +288,9 @@ class EvalTab(QWidget):
             QMessageBox.warning(self, "提示", "请选择有效的测试输入文件或目录。")
             return
 
+        if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "模型推理预览"):
+            return
+
         out_dir = Path(self.pred_out_picker.text() or (self.workspace_root / "runs" / "predict_preview"))
         self._set_busy(True)
         self.log_box.clear()
@@ -268,6 +305,8 @@ class EvalTab(QWidget):
             imgsz=self.imgsz_spin.value(),
             device=self.device_edit.text().strip() or "0",
         )
+        if self.gpu_guard is not None:
+            self.gpu_guard.bind(self.pred_worker, "模型推理预览")
         self.pred_worker.log_line.connect(self.log_box.appendPlainText)
         self.pred_worker.finished_outputs.connect(self._on_predict_done)
         self.pred_worker.failed.connect(self._on_failed)
@@ -279,7 +318,7 @@ class EvalTab(QWidget):
         for p in outputs[:20]:
             self.log_box.appendPlainText(f"- {p}")
         for p in outputs:
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+            if p.suffix.lower() in IMAGE_EXTENSIONS:
                 pix = load_pixmap_scaled(
                     p,
                     max(360, self.preview_label.width() - 12),
@@ -297,6 +336,9 @@ class EvalTab(QWidget):
             return
 
         fmt = str(self.format_combo.currentData())
+        if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, f"模型导出 ({fmt})"):
+            return
+
         self._set_busy(True)
         self.log_box.clear()
         self.log_box.appendPlainText(f"开始导出为 {fmt} 格式...")
@@ -308,6 +350,8 @@ class EvalTab(QWidget):
             half=self.half_chk.isChecked(),
             device=self.device_edit.text().strip() or "0",
         )
+        if self.gpu_guard is not None:
+            self.gpu_guard.bind(self.export_worker, f"模型导出 ({fmt})")
         self.export_worker.log_line.connect(self.log_box.appendPlainText)
         self.export_worker.finished_path.connect(self._on_export_done)
         self.export_worker.failed.connect(self._on_failed)

@@ -42,7 +42,13 @@ from yolo_studio.core.trainer import (
     TrainResult,
     detect_compute_device,
 )
-from yolo_studio.gui.common import LOG_MAX_LINES, PathPickerRow, make_metric_card, open_local_path
+from yolo_studio.gui.common import (
+    GpuTaskGuard,
+    LOG_MAX_LINES,
+    PathPickerRow,
+    make_metric_card,
+    open_local_path,
+)
 from yolo_studio.gui.workers import TrainWorker
 
 
@@ -50,16 +56,23 @@ class TrainTab(QWidget):
     """YOLO26 模型训练功能标签页（标签页 5）。
 
     内部状态：
-        持有硬件探测结果 `device_info`、训练工作线程 `worker`、最近实验目录 `_last_save_dir`
-        以及最近产出的最佳权重路径 `_last_best_pt`。
+        持有硬件探测结果 `device_info`、跨页计算设备互斥协调器 `gpu_guard`、训练工作线程 `worker`、
+        最近实验目录 `_last_save_dir` 以及最近产出的最佳权重路径 `_last_best_pt`。
     """
 
     send_best_weights = Signal(str, str)  # 信号参数：(weights_path, data_yaml)
 
-    def __init__(self, workspace_root: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        parent: QWidget | None = None,
+        device_info: DeviceInfo | None = None,
+        gpu_guard: GpuTaskGuard | None = None,
+    ) -> None:
         super().__init__(parent)
         self.workspace_root = workspace_root
-        self.device_info: DeviceInfo = detect_compute_device()
+        self.device_info: DeviceInfo = device_info or detect_compute_device()
+        self.gpu_guard = gpu_guard
         self.worker: TrainWorker | None = None
         self._last_save_dir: Path = workspace_root / "runs" / "detect"
         self._last_best_pt: str = ""
@@ -307,6 +320,9 @@ class TrainTab(QWidget):
             resume=self.resume_chk.isChecked(),
         )
 
+        if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "YOLO26 模型训练"):
+            return
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.send_eval_btn.setEnabled(False)
@@ -315,6 +331,8 @@ class TrainTab(QWidget):
         self.log_box.appendPlainText("正在启动 YOLO26 训练任务...")
 
         self.worker = TrainWorker(cfg)
+        if self.gpu_guard is not None:
+            self.gpu_guard.bind(self.worker, "YOLO26 模型训练")
         self.worker.epoch_updated.connect(self._on_epoch_updated)
         self.worker.log_line.connect(self._on_log_line)
         self.worker.finished_result.connect(self._on_finished)

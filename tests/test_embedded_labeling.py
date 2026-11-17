@@ -1,8 +1,9 @@
 """PyQt6 单进程内嵌 X-AnyLabeling 工作台与跨页联动集成测试。
 
 职责：
-    在离线 `offscreen` Qt 环境下验证主窗口六标签页装配、X-AnyLabeling 内嵌宿主初始化、
-    快捷键作用域隔离、`open_directory` 精确目录/单图/类别加载、跨标签页联动跳转，
+    在离线 `offscreen` Qt 环境下验证主窗口六标签页装配、X-AnyLabeling 内嵌宿主初始化与桥接适配层、
+    快捷键作用域隔离、`open_directory` 精确目录/单图/类别加载、跨标签页联动跳转、
+    跨页 GPU 任务互斥与 ONNX 导出 FP16 置灰、异步视频探测、MLLM 对比图缓存，
     以及关闭主窗口时等待后台线程安全停止后再退出。
 
 运行环境与协作边界：
@@ -163,3 +164,136 @@ def test_close_waits_for_running_workers(
     finally:
         worker.cancel()
         worker.wait(2000)
+
+
+def test_xal_label_bridge_and_defensive_fallback(qt_app: QApplication, tmp_path: Path) -> None:
+    """验证 X-AnyLabeling 类别桥接函数同步写入配置、唯一标签列表与弹窗历史词库，且对不兼容对象安全返回 False。"""
+    from yolo_studio.gui.tab_labeling import _apply_labels_to_xal_view
+
+    assert _apply_labels_to_xal_view(object(), ["person"]) is False
+
+    classes_file = tmp_path / "classes.txt"
+    classes_file.write_text("worker\nvest\ngoggles\n", encoding="utf-8")
+
+    win = MainWindow(workspace_root=tmp_path)
+    try:
+        count = win.labeling_tab.load_classes_file(classes_file)
+        assert count == 3
+        lw = win.labeling_tab._label_widget()
+        assert lw is not None
+        assert lw._config["labels"] == ["worker", "vest", "goggles"]
+        assert lw.unique_label_list.count() == 3
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+def test_gpu_guard_shared_device_and_eval_onnx_half_toggle(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证主窗口跨页共享 `DeviceInfo` 与 `GpuTaskGuard` 互斥保护，以及 `EvalTab` 的 ONNX 半精度自动置灰。"""
+    warnings_shown: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        staticmethod(lambda _p, title, text: warnings_shown.append(f"{title}:{text}")),
+    )
+
+    win = MainWindow(workspace_root=tmp_path)
+    worker = _CancellableThread()
+    try:
+        # 三个标签页共享同一份硬件快照与互斥协调器
+        assert win.train_tab.device_info is win.device_info
+        assert win.review_tab.device_info is win.device_info
+        assert win.eval_tab.device_info is win.device_info
+        assert win.train_tab.gpu_guard is win.gpu_guard
+
+        # 默认导出格式为 ONNX：FP16 复选框应自动置灰且未勾选；切换至 TorchScript 后启用
+        assert win.eval_tab.format_combo.currentData() == "onnx"
+        assert not win.eval_tab.half_chk.isEnabled()
+        assert not win.eval_tab.half_chk.isChecked()
+        win.eval_tab.format_combo.setCurrentIndex(1)  # torchscript
+        assert win.eval_tab.half_chk.isEnabled()
+        win.eval_tab.half_chk.setChecked(True)
+        win.eval_tab.format_combo.setCurrentIndex(0)  # 切回 onnx 自动取消勾选并置灰
+        assert not win.eval_tab.half_chk.isEnabled()
+        assert not win.eval_tab.half_chk.isChecked()
+
+        # 绑定运行中的后台模型任务时，其他任务请求应被拦截；线程退出后自动放行
+        worker.start()
+        win.gpu_guard.bind(worker, "YOLO26 模型训练")
+        assert win.gpu_guard.try_acquire(win, "模型推理预览") is False
+        assert len(warnings_shown) == 1 and "YOLO26 模型训练" in warnings_shown[0]
+
+        worker.cancel()
+        worker.wait(2000)
+        assert win.gpu_guard.try_acquire(win, "模型推理预览") is True
+    finally:
+        worker.cancel()
+        worker.wait(2000)
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+def test_async_video_probe_and_review_preview_cache(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证抽帧页通过后台线程异步探测视频列表，且审核页切换结果行复用 LRU 预览缓存。"""
+    import cv2
+    import numpy as np
+
+    from yolo_studio.core import mllm_reviewer
+    from yolo_studio.core.mllm_reviewer import CandidateBox, ImageReviewRecord
+
+    video_path = tmp_path / "sample.mp4"
+    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 15.0, (160, 120))
+    assert writer.isOpened()
+    for _ in range(15):
+        writer.write(np.zeros((120, 160, 3), dtype=np.uint8))
+    writer.release()
+
+    img_path = tmp_path / "rev.jpg"
+    _write_sample_frame(img_path)
+
+    render_calls = {"count": 0}
+    orig_render = mllm_reviewer.render_review_comparison
+
+    def _counting_render(rec: ImageReviewRecord, max_width: int = 1200) -> bytes:
+        render_calls["count"] += 1
+        return orig_render(rec, max_width=max_width)
+
+    monkeypatch.setattr("yolo_studio.gui.tab_review.render_review_comparison", _counting_render)
+
+    win = MainWindow(workspace_root=tmp_path)
+    try:
+        # 1) 验证异步视频探测线程不阻塞主线程并将结果填入列表
+        win.extract_tab._add_video_paths([video_path])
+        assert win.extract_tab.probe_worker is not None
+        deadline = time.monotonic() + 5.0
+        while win.extract_tab.probe_worker.isRunning() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+        qt_app.processEvents()
+        assert win.extract_tab.video_list.count() == 1
+        assert "160x120" in win.extract_tab.video_list.item(0).text()
+
+        # 2) 验证审核结果行重复点击时直接命中内存 LRU 缓存，不重复渲染
+        rec = ImageReviewRecord(
+            image_path=img_path,
+            output_image_path=img_path,
+            output_json_path=None,
+            triage_bucket="auto_passed",
+            before_boxes=[CandidateBox(box_id=0, label="person", x1=10, y1=10, x2=80, y2=80)],
+            after_boxes=[CandidateBox(box_id=0, label="person", x1=10, y1=10, x2=80, y2=80, status="kept")],
+            kept_count=1,
+        )
+        win.review_tab._on_progress(1, 1, rec)
+        win.review_tab._on_row_selected(0)
+        win.review_tab._on_row_selected(0)
+        assert render_calls["count"] == 1
+    finally:
+        if win.extract_tab.probe_worker and win.extract_tab.probe_worker.isRunning():
+            win.extract_tab.probe_worker.cancel()
+            win.extract_tab.probe_worker.wait(2000)
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()

@@ -19,6 +19,8 @@ from PyQt6.QtCore import QSettings, QThread, QTimer
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget
 
+from yolo_studio.core.trainer import detect_compute_device
+from yolo_studio.gui.common import GpuTaskGuard
 from yolo_studio.gui.tab_dataset import DatasetTab
 from yolo_studio.gui.tab_eval import EvalTab
 from yolo_studio.gui.tab_extract import ExtractTab
@@ -99,13 +101,22 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        self.device_info = detect_compute_device()
+        self.gpu_guard = GpuTaskGuard()
+
         self.tabs = QTabWidget()
         self.extract_tab = ExtractTab(workspace_root)
         self.labeling_tab = LabelingStudioTab(workspace_root)
         self.dataset_tab = DatasetTab(workspace_root)
-        self.review_tab = MllmReviewTab(workspace_root)
-        self.train_tab = TrainTab(workspace_root)
-        self.eval_tab = EvalTab(workspace_root)
+        self.review_tab = MllmReviewTab(
+            workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
+        )
+        self.train_tab = TrainTab(
+            workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
+        )
+        self.eval_tab = EvalTab(
+            workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
+        )
 
         self.tabs.addTab(self.extract_tab, "1. 视频抽帧")
         self.tabs.addTab(self.labeling_tab, "2. 标注工作台 (X-AnyLabeling)")
@@ -203,6 +214,7 @@ class MainWindow(QMainWindow):
     def _running_workers(self) -> list[QThread]:
         """收集各标签页中仍在运行的后台 `QThread`（属性不存在或尚未创建时忽略）。"""
         candidates = [
+            getattr(self.extract_tab, "probe_worker", None),
             getattr(self.extract_tab, "worker", None),
             getattr(self.dataset_tab, "scan_worker", None),
             getattr(self.dataset_tab, "build_worker", None),

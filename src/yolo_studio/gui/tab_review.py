@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal as Signal
@@ -48,28 +49,40 @@ from yolo_studio.core.mllm_reviewer import (
     ReviewSourceMode,
     render_review_comparison,
 )
-from yolo_studio.core.trainer import detect_compute_device
-from yolo_studio.gui.common import LOG_MAX_LINES, PathPickerRow, open_local_path
+from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
+from yolo_studio.gui.common import GpuTaskGuard, LOG_MAX_LINES, PathPickerRow, open_local_path
 from yolo_studio.gui.workers import MllmReviewWorker
+
+# 左右对比预览 JPEG 字节流的 LRU 缓存容量上限（按结果表行号索引，每次重新开始审核时清空）
+_PREVIEW_CACHE_MAX = 64
 
 
 class MllmReviewTab(QWidget):
     """MLLM 自动标注纠错与补漏功能标签页（标签页 4）。
 
     内部状态：
-        持有硬件探测信息 `device_info`、后台工作线程 `worker`、已完成的逐图审核记录列表 `_records`、
+        持有硬件探测信息 `device_info`、跨页计算设备互斥协调器 `gpu_guard`、后台工作线程 `worker`、
+        已完成的逐图审核记录列表 `_records`、对比图字节缓存 `_preview_cache`、
         最近输出目录 `_last_output_dir` 与类别文件 `_last_classes_txt`。
     """
 
     send_cleaned_dataset = Signal(str, str, bool)  # 信号参数：(输出目录, classes.txt 路径, 是否按子目录递归扫描)
     open_in_workbench = Signal(str, str, str)  # 信号参数：(目标目录, classes.txt 路径, 可选指定图片路径)
 
-    def __init__(self, workspace_root: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        parent: QWidget | None = None,
+        device_info: DeviceInfo | None = None,
+        gpu_guard: GpuTaskGuard | None = None,
+    ) -> None:
         super().__init__(parent)
         self.workspace_root = workspace_root
-        self.device_info = detect_compute_device()
+        self.device_info = device_info or detect_compute_device()
+        self.gpu_guard = gpu_guard
         self.worker: MllmReviewWorker | None = None
         self._records: list[ImageReviewRecord] = []
+        self._preview_cache: OrderedDict[int, bytes] = OrderedDict()
         self._last_output_dir: Path = workspace_root / "data" / "reviewed_frames"
         self._last_classes_txt: str = ""
         self._init_ui()
@@ -414,7 +427,12 @@ class MllmReviewTab(QWidget):
             recursive=self.recursive_chk.isChecked(),
         )
 
+        if source_mode == ReviewSourceMode.YOLO_PREDICT and self.gpu_guard is not None:
+            if not self.gpu_guard.try_acquire(self, "MLLM 基准模型推理审核"):
+                return
+
         self._records.clear()
+        self._preview_cache.clear()
         self.result_table.setRowCount(0)
         self.log_box.clear()
         self.progress_bar.setValue(0)
@@ -424,6 +442,8 @@ class MllmReviewTab(QWidget):
         self.summary_label.setText("正在运行基准模型推理与 MLLM 纠错清洗...")
 
         self.worker = MllmReviewWorker(cfg)
+        if source_mode == ReviewSourceMode.YOLO_PREDICT and self.gpu_guard is not None:
+            self.gpu_guard.bind(self.worker, "MLLM 基准模型推理审核")
         self.worker.progress.connect(self._on_progress)
         self.worker.log_line.connect(self.log_box.appendPlainText)
         self.worker.finished_result.connect(self._on_finished)
@@ -458,12 +478,24 @@ class MllmReviewTab(QWidget):
         self.result_table.setItem(row, 5, QTableWidgetItem(str(rec.added_count)))
         self.result_table.setItem(row, 6, QTableWidgetItem(note))
 
+    def _get_comparison_jpeg(self, row: int, rec: ImageReviewRecord) -> bytes:
+        """获取单行审核对比预览 JPEG 字节流；命中 LRU 缓存时免除重复磁盘解码与绘图。"""
+        cached = self._preview_cache.get(row)
+        if cached is not None:
+            self._preview_cache.move_to_end(row)
+            return cached
+        jpeg_bytes = render_review_comparison(rec, max_width=1100)
+        self._preview_cache[row] = jpeg_bytes
+        while len(self._preview_cache) > _PREVIEW_CACHE_MAX:
+            self._preview_cache.popitem(last=False)
+        return jpeg_bytes
+
     def _on_row_selected(self, row: int, *_args) -> None:
         if row < 0 or row >= len(self._records):
             return
         rec = self._records[row]
         try:
-            jpeg_bytes = render_review_comparison(rec, max_width=1100)
+            jpeg_bytes = self._get_comparison_jpeg(row, rec)
             pix = QPixmap()
             pix.loadFromData(jpeg_bytes, "JPG")
             if not pix.isNull():

@@ -1,4 +1,4 @@
-# YoloStudio 核心与桌面界面依赖（Python >= 3.11，与 PyQt6 单进程内嵌 X-AnyLabeling 对齐）
+# YoloStudio 核心与桌面界面运行时依赖（Python >= 3.11，与 PyQt6 单进程内嵌 X-AnyLabeling 对齐）
 ultralytics>=8.4.0
 PyQt6>=6.6.0
 PyQt6-WebEngine>=6.6.0
@@ -7,10 +7,12 @@ opencv-contrib-python-headless>=4.7.0.72
 Pillow>=10.0.0
 PyYAML>=6.0.1
 numpy>=2.0.0
-pytest>=8.0.0
 google-genai>=2.30.1
 openai>=1.50.0
 pydantic>=2.0.0
 
 # 本地源码级集成的 X-AnyLabeling 及其 CUDA 12 GPU AI 辅助标注后端
 -e ./third_party/X-AnyLabeling[gpu]
+
+# 开发与单元测试依赖（对应 pyproject.toml 中的 [project.optional-dependencies].dev）
+pytest>=8.0.0

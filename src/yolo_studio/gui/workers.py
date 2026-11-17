@@ -1,7 +1,7 @@
 """PyQt6 `QThread` 后台工作线程封装模块。
 
 职责：
-    将视频抽帧、标注扫描与转换、YOLO26 训练/验证/推理/导出及 MLLM 纠错清洗等耗时任务
+    将视频元信息探测、视频抽帧、标注扫描与转换、YOLO26 训练/验证/推理/导出及 MLLM 纠错清洗等耗时任务
     下沉至后台 `QThread` 执行，并通过 Qt `pyqtSignal` 安全回传进度与结果，避免阻塞主界面事件循环。
 
 运行环境与协作边界：
@@ -26,18 +26,17 @@ from yolo_studio.core.dataset_converter import (
 )
 from yolo_studio.core.frame_extractor import (
     ExtractionConfig,
-    ExtractionProgress,
     ExtractionResult,
+    collect_videos,
     extract_frames,
+    probe_video,
 )
 from yolo_studio.core.mllm_reviewer import (
-    ImageReviewRecord,
     MllmReviewConfig,
     MllmReviewResult,
     run_mllm_review,
 )
 from yolo_studio.core.trainer import (
-    EpochMetrics,
     TrainConfig,
     TrainResult,
     export_model,
@@ -45,6 +44,58 @@ from yolo_studio.core.trainer import (
     train_yolo26,
     validate_model,
 )
+
+
+class VideoProbeWorker(QThread):
+    """在后台线程扫描目录并逐个读取视频头元信息，避免添加大量视频时卡住主界面。
+
+    信号契约：
+        `item_probed(Path, str)`：每探测完一个新视频发射一次，携带视频路径与列表展示文本。
+        `finished_probing(int)`：全部探测完成或响应取消后发射本次新增的视频数量。
+        `failed(str)`：发生意外未捕获异常时发射错误消息。
+    """
+
+    item_probed = Signal(object, str)
+    finished_probing = Signal(int)
+    failed = Signal(str)
+
+    def __init__(self, raw_paths: list[Path], existing_resolved: set[Path]) -> None:
+        super().__init__()
+        self.raw_paths = list(raw_paths)
+        self.existing_resolved = set(existing_resolved)
+        self.cancel_event = Event()
+
+    def cancel(self) -> None:
+        """设置协同取消标志，停止后续视频探测。"""
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        """线程入口：展开视频路径、跳过已存在项并逐个调用 `probe_video` 回传结果。"""
+        try:
+            added = 0
+            seen = set(self.existing_resolved)
+            for vp in collect_videos(self.raw_paths):
+                if self.cancel_event.is_set():
+                    break
+                resolved = vp.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    info = probe_video(vp)
+                    text = (
+                        f"{vp.name}  [{info.width}x{info.height}, {info.fps:.1f}fps, "
+                        f"{info.duration_sec:.1f}s, {info.frame_count}帧]"
+                    )
+                except Exception:
+                    text = f"{vp.name}  [读取元信息失败]"
+                if self.cancel_event.is_set():
+                    break
+                added += 1
+                self.item_probed.emit(vp, text)
+            self.finished_probing.emit(added)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class FrameExtractWorker(QThread):

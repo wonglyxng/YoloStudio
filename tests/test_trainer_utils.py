@@ -1,12 +1,13 @@
-"""线程路由输出捕获与训练辅助函数单元测试。
+"""线程路由输出捕获、训练辅助函数与 CLI 入口单元测试。
 
 职责：
     验证 `core.log_capture` 的 `\\r` 覆盖语义、线程隔离与 `ultralytics` 日志转发，
-    以及 `core.trainer` 中断点续训解析与推理输出文件名消歧等纯函数行为。
+    `core.trainer` 中断点续训解析、推理输出文件名消歧与硬件探测缓存，
+    以及 `yolo_studio.cli` 新增抽帧参数（起止时间、前缀、子目录、质量）的解析与端到端执行。
 
 运行环境与协作边界：
-    通过 `pytest` 运行，依赖 `torch`（`core.trainer` 模块导入时加载），不启动真实训练、
-    不访问网络，也不加载任何 YOLO 权重。
+    通过 `pytest` 运行；`core.trainer` 仅在调用 `detect_compute_device` 时按需加载 `torch`，
+    测试不启动真实训练、不访问外部网络，也不加载任何 YOLO 权重。
 """
 
 from __future__ import annotations
@@ -85,3 +86,58 @@ def test_unique_pred_path_disambiguates_same_stem(tmp_path: Path) -> None:
     second = _unique_pred_path(tmp_path, Path("a.png"), used)
     assert first.name == "a_pred.jpg"
     assert second.name == "a_png_pred.jpg"
+
+
+def test_detect_compute_device_caches_result() -> None:
+    """验证 `detect_compute_device` 默认复用进程级缓存快照，传入 `refresh=True` 时可重新探测。"""
+    from yolo_studio.core.trainer import detect_compute_device
+
+    first = detect_compute_device()
+    second = detect_compute_device()
+    assert first is second
+    refreshed = detect_compute_device(refresh=True)
+    assert refreshed.recommended_device in {"0", "cpu"}
+
+
+def test_cli_extract_supports_time_slice_prefix_and_subfolder(tmp_path: Path) -> None:
+    """验证 `yolo_studio.cli` 的 `extract` 子命令支持起止时间裁剪、前缀、JPG 质量与子目录分建。"""
+    import cv2
+    import numpy as np
+
+    from yolo_studio.cli import main as cli_main
+
+    video_path = tmp_path / "clip.mp4"
+    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (120, 90))
+    assert writer.isOpened()
+    for i in range(30):
+        frame = np.full((90, 120, 3), (i * 8) % 255, dtype=np.uint8)
+        writer.write(frame)
+    writer.release()
+
+    out_dir = tmp_path / "cli_out"
+    code = cli_main(
+        [
+            "extract",
+            str(video_path),
+            "-o",
+            str(out_dir),
+            "--mode",
+            "interval_seconds",
+            "--interval",
+            "0.5",
+            "--start",
+            "0.5",
+            "--end",
+            "2.0",
+            "--dedup",
+            "0",
+            "--quality",
+            "90",
+            "--prefix",
+            "camA_",
+            "--subfolder",
+        ]
+    )
+    assert code == 0
+    sub_files = sorted((out_dir / "clip").glob("camA_clip_*.jpg"))
+    assert len(sub_files) == 3  # 0.5s(帧5)、1.0s(帧10)、1.5s(帧15)

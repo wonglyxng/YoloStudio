@@ -39,18 +39,17 @@ from yolo_studio.core.frame_extractor import (
     ExtractionMode,
     ExtractionProgress,
     ExtractionResult,
-    collect_videos,
-    probe_video,
 )
 from yolo_studio.gui.common import PathPickerRow, load_pixmap_scaled, open_local_path
-from yolo_studio.gui.workers import FrameExtractWorker
+from yolo_studio.gui.workers import FrameExtractWorker, VideoProbeWorker
 
 
 class ExtractTab(QWidget):
     """视频抽帧功能标签页（标签页 1）。
 
     内部状态：
-        持有 `workspace_root`、当前待处理视频路径列表 `_video_paths` 以及后台 `worker` 引用。
+        持有 `workspace_root`、当前待处理视频路径列表 `_video_paths`、
+        后台视频探测线程 `probe_worker` 以及后台抽帧线程 `worker` 引用。
     """
 
     send_frames_dir = Signal(str)
@@ -59,6 +58,7 @@ class ExtractTab(QWidget):
         super().__init__(parent)
         self.workspace_root = workspace_root
         self.worker: FrameExtractWorker | None = None
+        self.probe_worker: VideoProbeWorker | None = None
         self._video_paths: list[Path] = []
         self._init_ui()
 
@@ -234,24 +234,54 @@ class ExtractTab(QWidget):
         self.frame_step_spin.setEnabled(mode == ExtractionMode.EVERY_N_FRAMES)
         self.target_count_spin.setEnabled(mode == ExtractionMode.TARGET_COUNT)
 
+    def _set_list_controls_enabled(self, enabled: bool, allow_clear: bool = True) -> None:
+        """同步视频列表增删按钮与开始抽帧按钮的可用性，防止探测或抽帧期间并发改动列表。"""
+        self.add_files_btn.setEnabled(enabled)
+        self.add_folder_btn.setEnabled(enabled)
+        self.remove_btn.setEnabled(enabled)
+        self.clear_btn.setEnabled(allow_clear)
+        self.start_btn.setEnabled(enabled)
+
     def _add_video_paths(self, raw_paths: list[Path]) -> None:
+        """启动后台 `VideoProbeWorker` 扫描并探测视频元信息，避免大量视频阻塞界面。"""
+        if self.probe_worker and self.probe_worker.isRunning():
+            return
         existing = {p.resolve() for p in self._video_paths}
-        for vp in collect_videos(raw_paths):
-            if vp.resolve() in existing:
-                continue
-            try:
-                info = probe_video(vp)
-                text = (
-                    f"{vp.name}  [{info.width}x{info.height}, {info.fps:.1f}fps, "
-                    f"{info.duration_sec:.1f}s, {info.frame_count}帧]"
-                )
-            except Exception:
-                text = f"{vp.name}  [读取元信息失败]"
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, str(vp))
-            self.video_list.addItem(item)
-            self._video_paths.append(vp)
-            existing.add(vp.resolve())
+        self._set_list_controls_enabled(False)
+        self.status_label.setText("正在后台扫描并读取视频元信息...")
+
+        self.probe_worker = VideoProbeWorker(raw_paths, existing)
+        self.probe_worker.item_probed.connect(self._on_video_probed)
+        self.probe_worker.finished_probing.connect(self._on_probe_finished)
+        self.probe_worker.failed.connect(self._on_probe_failed)
+        self.probe_worker.start()
+
+    def _on_video_probed(self, vp: Path, text: str) -> None:
+        """接收后台探测完成的单个视频并追加至列表；若探测已被取消则忽略残留队列信号。"""
+        if self.sender() is not self.probe_worker or (
+            self.probe_worker and self.probe_worker.cancel_event.is_set()
+        ):
+            return
+        if any(p.resolve() == vp.resolve() for p in self._video_paths):
+            return
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, str(vp))
+        self.video_list.addItem(item)
+        self._video_paths.append(vp)
+
+    def _on_probe_finished(self, added: int) -> None:
+        if self.sender() is not self.probe_worker:
+            return
+        self._set_list_controls_enabled(True)
+        self.status_label.setText(
+            f"已添加 {added} 个视频（当前列表共 {len(self._video_paths)} 个）。"
+        )
+
+    def _on_probe_failed(self, err: str) -> None:
+        if self.sender() is not self.probe_worker:
+            return
+        self._set_list_controls_enabled(True)
+        self.status_label.setText(f"读取视频列表失败: {err}")
 
     def _on_add_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -276,8 +306,11 @@ class ExtractTab(QWidget):
                 self._video_paths.pop(row)
 
     def _on_clear_videos(self) -> None:
+        if self.probe_worker and self.probe_worker.isRunning():
+            self.probe_worker.cancel()
         self.video_list.clear()
         self._video_paths.clear()
+        self._set_list_controls_enabled(True)
 
     def _on_start(self) -> None:
         """校验视频列表与输出目录后切换按钮状态并启动后台 `FrameExtractWorker`。"""
@@ -306,7 +339,7 @@ class ExtractTab(QWidget):
             create_video_subfolder=self.subfolder_chk.isChecked(),
         )
 
-        self.start_btn.setEnabled(False)
+        self._set_list_controls_enabled(False, allow_clear=False)
         self.stop_btn.setEnabled(True)
         self.progress_bar.setValue(0)
         self.status_label.setText("正在初始化抽帧...")
@@ -343,7 +376,7 @@ class ExtractTab(QWidget):
 
     def _on_finished(self, result: ExtractionResult) -> None:
         """恢复按钮可用状态、展示完成摘要，并在保存了至少 1 帧时向后续页同步输出目录。"""
-        self.start_btn.setEnabled(True)
+        self._set_list_controls_enabled(True)
         self.stop_btn.setEnabled(False)
         self.progress_bar.setValue(100 if not result.cancelled else self.progress_bar.value())
 
@@ -360,7 +393,7 @@ class ExtractTab(QWidget):
             self.send_frames_dir.emit(str(result.output_dir))
 
     def _on_failed(self, err: str) -> None:
-        self.start_btn.setEnabled(True)
+        self._set_list_controls_enabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText(f"抽帧失败: {err}")
         QMessageBox.critical(self, "抽帧错误", err)

@@ -60,7 +60,8 @@ class ExtractionConfig:
         `interval_seconds`：按秒抽帧间隔（秒，运行时最小夹紧为 `0.01`）。
         `every_n_frames` / `target_count`：帧步长或每视频目标抽取帧数（均至少为 `1`）。
         `start_sec` / `end_sec`：截取起止时间（秒）；`end_sec` 为 `None` 或 `<= 0` 表示抽到结尾。
-        `dedup_threshold`：相似帧灰度缩略图平均绝对像素差阈值（`[0, 255]`），`<= 0` 关闭去重。
+        `dedup_threshold`：相似帧灰度缩略图平均绝对像素差阈值（`[0, 255]`），`<= 0` 关闭去重
+            （编程接口默认 `0.0` 以保证确定性采样；GUI 与 CLI 入口默认设为 `2.0` 以过滤录制静止帧）。
         `max_dimension`：输出最长边像素上限，`<= 0` 保持原尺寸。
         `image_format` / `jpeg_quality`：输出格式（`jpg` 或 `png`）及 JPG 压缩质量（`1..100`）。
         `create_video_subfolder`：是否按视频文件名 `stem` 在 `output_dir` 下分建子目录。

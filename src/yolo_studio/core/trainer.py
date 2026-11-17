@@ -23,7 +23,6 @@ from threading import Event
 from typing import Callable
 
 import cv2
-import torch
 
 from yolo_studio.core.frame_extractor import VIDEO_EXTENSIONS
 from yolo_studio.core.log_capture import capture_thread_output
@@ -106,6 +105,10 @@ class TrainResult:
     stopped_early: bool = False
 
 
+# 进程内缓存的本机硬件探测快照；首次调用 `detect_compute_device` 时写入，`refresh=True` 时重查
+_CACHED_DEVICE_INFO: DeviceInfo | None = None
+
+
 def ensure_torch_cpu_threads() -> None:
     """恢复 PyTorch CPU 算子的线程数。
 
@@ -116,6 +119,8 @@ def ensure_torch_cpu_threads() -> None:
         仅影响 torch，不影响 numpy/MKL 与 onnxruntime；可重复调用。
     """
     try:
+        import torch
+
         if torch.get_num_threads() <= 1:
             torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
     except Exception:
@@ -138,25 +143,39 @@ def _resolve_resume_checkpoint(config: TrainConfig) -> Path:
     )
 
 
-def detect_compute_device() -> DeviceInfo:
-    """检测本机 CUDA GPU 可用性并读取 0 号卡显存信息，无可用 GPU 时回退为 CPU。"""
+def detect_compute_device(refresh: bool = False) -> DeviceInfo:
+    """检测本机 CUDA GPU 可用性并读取 0 号卡显存信息，无可用 GPU 时回退为 CPU。
+
+    缓存与延迟导入：
+        函数内部按需导入 `torch`，使无需 GPU 的轻量命令（如 `extract`、`dataset`）不必在模块加载期导入 PyTorch；
+        探测结果缓存在模块级 `_CACHED_DEVICE_INFO` 中，传 `refresh=True` 时才重新查询底层设备。
+    """
+    global _CACHED_DEVICE_INFO
+    if _CACHED_DEVICE_INFO is not None and not refresh:
+        return _CACHED_DEVICE_INFO
+
+    import torch
+
     if torch.cuda.is_available() and torch.cuda.device_count() > 0:
         props = torch.cuda.get_device_properties(0)
         vram_gb = props.total_memory / (1024**3)
-        return DeviceInfo(
+        info = DeviceInfo(
             cuda_available=True,
             device_count=torch.cuda.device_count(),
             device_name=props.name,
             vram_gb=vram_gb,
             recommended_device="0",
         )
-    return DeviceInfo(
-        cuda_available=False,
-        device_count=0,
-        device_name="CPU (未检测到可用 CUDA GPU)",
-        vram_gb=0.0,
-        recommended_device="cpu",
-    )
+    else:
+        info = DeviceInfo(
+            cuda_available=False,
+            device_count=0,
+            device_name="CPU (未检测到可用 CUDA GPU)",
+            vram_gb=0.0,
+            recommended_device="cpu",
+        )
+    _CACHED_DEVICE_INFO = info
+    return info
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:

@@ -171,6 +171,41 @@ def _create_embedded_window_class():
     return _EmbeddedXAnyLabelingWindow
 
 
+def _resolve_xal_view(xal_window: object | None) -> object | None:
+    """安全读取 X-AnyLabeling 主窗口内的核心标注画布视图（`labeling_widget.view`）。"""
+    if xal_window is None:
+        return None
+    wrapper = getattr(xal_window, "labeling_widget", None)
+    return getattr(wrapper, "view", None)
+
+
+def _apply_labels_to_xal_view(lw: object, labels: list[str]) -> bool:
+    """将类别列表注入 X-AnyLabeling 视图的配置、右侧唯一标签列表与弹窗历史补全词库。
+
+    版本耦合与防御说明：
+        对应 `third_party/X-AnyLabeling/anylabeling/views/labeling/label_widget.py` 的内部结构；
+        对 `_config`、`load_labels` 与 `label_dialog.add_label_history` 均先做属性/类型校验，
+        避免未来升级第三方源码导致未捕获的 `AttributeError` 或 `TypeError`。
+        至少成功调用 `load_labels` 时返回 `True`。
+    """
+    load_fn = getattr(lw, "load_labels", None)
+    if not callable(load_fn):
+        return False
+
+    cfg = getattr(lw, "_config", None)
+    if isinstance(cfg, dict):
+        cfg["labels"] = list(labels)
+
+    load_fn(labels, clear_existing=True)
+
+    dialog = getattr(lw, "label_dialog", None)
+    add_history = getattr(dialog, "add_label_history", None)
+    if callable(add_history):
+        for label in labels:
+            add_history(label, update_last_label=False)
+    return True
+
+
 class LabelingStudioTab(QWidget):
     """单进程内嵌 X-AnyLabeling 标注工作台标签页（标签页 2）。
 
@@ -280,9 +315,7 @@ class LabelingStudioTab(QWidget):
         self._host_container.addWidget(box, 1)
 
     def _label_widget(self):
-        if self._xal_window is None:
-            return None
-        return self._xal_window.labeling_widget.view
+        return _resolve_xal_view(self._xal_window)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         """切换进入工作台标签页时重新收敛快捷键作用域（保留 type: ignore 指令）。"""
@@ -340,10 +373,8 @@ class LabelingStudioTab(QWidget):
         if not labels:
             return 0
 
-        lw._config["labels"] = list(labels)
-        lw.load_labels(labels, clear_existing=True)
-        for label in labels:
-            lw.label_dialog.add_label_history(label, update_last_label=False)
+        if not _apply_labels_to_xal_view(lw, labels):
+            return 0
         self._last_classes_file = classes_file.resolve()
         return len(labels)
 
