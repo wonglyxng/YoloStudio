@@ -165,6 +165,44 @@ def test_embedded_workbench_keyboard_shortcuts_and_tab_isolation(
         win.close()
 
 
+def test_switching_next_image_with_long_path_does_not_resize_mainwindow(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证切换长路径/高分辨率图片时顶部省略状态栏不会抬高 minimumSizeHint 或动态改变主窗口尺寸。"""
+    deep_dir = tmp_path / ("长路径测试目录_" * 6)
+    _write_sample_frame(deep_dir / "img_001.jpg", size=(640, 480))
+    long_name = "img_002_" + ("very_long_frame_filename_" * 5) + ".jpg"
+    _write_sample_frame(deep_dir / long_name, size=(2560, 1440))
+
+    win = MainWindow(workspace_root=tmp_path)
+    win.show()
+    qt_app.processEvents()
+    try:
+        initial_size = win.size()
+        initial_min_w = win.minimumSizeHint().width()
+        assert win.labeling_tab.status_label.minimumSizeHint().width() == 80
+
+        win.tabs.setCurrentIndex(1)
+        assert win.labeling_tab.open_directory(deep_dir) is True
+        qt_app.processEvents()
+        size_after_first = win.size()
+        assert size_after_first == initial_size
+
+        lw = win.labeling_tab._label_widget()
+        assert lw is not None
+        lw.open_next_image()
+        qt_app.processEvents()
+
+        # 切换到超长路径的第二张大图后，主窗口尺寸与最小宽度保持不变，且全文保存在 full_text/toolTip 中
+        assert win.size() == initial_size
+        assert win.minimumSizeHint().width() == initial_min_w
+        assert long_name in win.labeling_tab.status_label.full_text()
+        assert long_name in win.labeling_tab.status_label.toolTip()
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
 def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
     qt_app: QApplication, tmp_path: Path
 ) -> None:

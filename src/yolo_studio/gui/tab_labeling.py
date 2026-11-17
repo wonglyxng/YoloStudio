@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import QFileSystemWatcher, QLocale, Qt, QTimer, QTranslator, pyqtSignal as Signal
+from PyQt6.QtCore import QFileSystemWatcher, QLocale, QSize, Qt, QTimer, QTranslator, pyqtSignal as Signal
 from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -235,6 +236,51 @@ def _apply_labels_to_xal_view(lw: object, labels: list[str]) -> bool:
     return True
 
 
+class _ElidedStatusLabel(QLabel):
+    """固定最小宽度并自动居中省略过长路径的单行状态标签。
+
+    设计原因：
+        X-AnyLabeling 切换图片时会调用 `setWindowTitle` 传入包含完整绝对路径、分辨率与序号的长标题；
+        普通 `QLabel` 的 `minimumSizeHint` 等于全文像素宽度，会把顶层主窗口动态撑宽。
+        本控件将水平策略设为 `Ignored` 并固定紧凑 `sizeHint`，超宽时自动省略中间路径且通过悬浮提示展示全文。
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__("", parent)
+        self._full_text = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(80)
+        if text:
+            self.setText(text)
+
+    def full_text(self) -> str:
+        """返回未经省略截断的完整状态文本。"""
+        return self._full_text
+
+    def setText(self, text: str) -> None:  # type: ignore[override]
+        """记录完整文本并刷新悬浮提示与省略显示（保留 type: ignore 指令）。"""
+        self._full_text = text or ""
+        self.setToolTip(self._full_text)
+        self._refresh_elided()
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(80, super().minimumSizeHint().height())
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(240, super().sizeHint().height())
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._refresh_elided()
+
+    def _refresh_elided(self) -> None:
+        avail = max(40, self.contentsRect().width())
+        elided = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle, avail
+        )
+        super().setText(elided)
+
+
 class LabelingStudioTab(QWidget):
     """单进程内嵌 X-AnyLabeling 标注工作台标签页（标签页 2）。
 
@@ -286,7 +332,9 @@ class LabelingStudioTab(QWidget):
         bar_layout.setContentsMargins(10, 5, 10, 5)
         bar_layout.setSpacing(8)
 
-        self.status_label = QLabel("工作台就绪：可打开抽帧目录进行人工画框或 AI 辅助标注（快捷键 R 画框，Ctrl+S 保存）")
+        self.status_label = _ElidedStatusLabel(
+            "工作台就绪：可打开抽帧目录进行人工画框或 AI 辅助标注（快捷键 R 画框，Ctrl+S 保存）"
+        )
         self.status_label.setStyleSheet("border: none; color: #24292f; font-weight: 500;")
         bar_layout.addWidget(self.status_label, 1)
 
