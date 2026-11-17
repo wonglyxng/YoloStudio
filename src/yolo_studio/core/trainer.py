@@ -143,6 +143,59 @@ def _resolve_resume_checkpoint(config: TrainConfig) -> Path:
     )
 
 
+WEIGHTS_DIR_ENV_VAR = "YOLO_STUDIO_WEIGHTS_DIR"
+
+
+def resolve_pretrained_weights(
+    model_name: str, workspace_root: Path | None = None
+) -> str:
+    """优先将裸预训练权重名（如 `yolo26s.pt`）解析为本地预置文件绝对路径，未找到时原样返回。
+
+    查找顺序：
+        1. `model_name` 本身已是本地存在的非空文件时直接返回；
+        2. 若 `model_name` 为不含目录层级的纯文件名，依次检索环境变量 `YOLO_STUDIO_WEIGHTS_DIR`、
+           `workspace_root / "weights"`、`Path.cwd() / "weights"`、应用代码根 `weights/`
+           以及独立便携包根 `<便携包根>/weights/` 下的同名文件；
+        3. 全部未命中时原样返回 `model_name`，交由 Ultralytics 按默认机制下载或解析。
+    """
+    direct = Path(model_name)
+    if direct.is_file() and direct.stat().st_size > 0:
+        return str(direct.resolve())
+
+    if direct.name != model_name or "/" in model_name or "\\" in model_name:
+        return model_name
+
+    code_root = Path(__file__).resolve().parents[3]
+    search_dirs: list[Path] = []
+    env_weights = os.environ.get(WEIGHTS_DIR_ENV_VAR, "").strip()
+    if env_weights:
+        search_dirs.append(Path(env_weights).expanduser())
+    if workspace_root is not None:
+        search_dirs.append(workspace_root / "weights")
+    search_dirs.extend(
+        [
+            Path.cwd() / "weights",
+            code_root / "weights",
+            code_root.parent / "weights",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for folder in search_dirs:
+        try:
+            resolved_dir = folder.resolve()
+        except OSError:
+            continue
+        if resolved_dir in seen:
+            continue
+        seen.add(resolved_dir)
+        candidate = resolved_dir / model_name
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return str(candidate)
+
+    return model_name
+
+
 def detect_compute_device(refresh: bool = False) -> DeviceInfo:
     """检测本机 CUDA GPU 可用性并读取 0 号卡显存信息，无可用 GPU 时回退为 CPU。
 
@@ -212,7 +265,11 @@ def train_yolo26(
     if not config.data_yaml.is_file():
         raise FileNotFoundError(f"data.yaml 不存在: {config.data_yaml}")
 
-    model_source = str(_resolve_resume_checkpoint(config)) if config.resume else config.model_name
+    model_source = (
+        str(_resolve_resume_checkpoint(config))
+        if config.resume
+        else resolve_pretrained_weights(config.model_name)
+    )
 
     if log_callback:
         log_callback(f"{'断点续训，加载断点' if config.resume else '加载模型'}: {model_source}")

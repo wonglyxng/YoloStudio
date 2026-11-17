@@ -37,6 +37,21 @@
 >
 > 之后 `pip check` 会提示 `ultralytics` 缺少 `opencv-python`，可以忽略。
 
-详细使用说明请参考：
+## 独立便携整合包发布（面向无 Python 电脑）
+
+针对未安装 Python 或 CUDA Toolkit 的目标 Windows x64 电脑，可执行以下命令构建免安装绿色便携整合包（含无黑框原生启动器 `YoloStudio.exe` 与 `YoloStudio-CLI.cmd`）：
+
+```powershell
+# 从本机现有 .venv 快速离线组装并压缩为 .7z 发布包
+.\scripts\build_portable.ps1 --archive 7z
+
+# 或从纯净独立 Python 3.12 全新安装构建（推荐正式对外发版，支持 --variant gpu / cpu）
+.\scripts\build_portable.ps1 --mode clean --variant gpu --download-weights yolo26n.pt yolo26s.pt --archive 7z
+```
+
+## 项目文档
+
+完整索引见 [项目文档索引.md](项目文档索引.md)：
 - [001_录制视频抽帧工具使用说明.md](docs/001_录制视频抽帧工具使用说明.md)
 - [002_YOLO26训练使用说明.md](docs/002_YOLO26训练使用说明.md)
+- [003_独立便携整合包构建与发布说明.md](docs/003_独立便携整合包构建与发布说明.md)
