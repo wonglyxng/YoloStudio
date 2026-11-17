@@ -1,11 +1,11 @@
-"""PySide6 `QThread` 后台工作线程封装模块。
+"""PyQt6 `QThread` 后台工作线程封装模块。
 
 职责：
     将视频抽帧、标注扫描与转换、YOLO26 训练/验证/推理/导出及 MLLM 纠错清洗等耗时任务
-    下沉至后台 `QThread` 执行，并通过 Qt Signal 安全回传进度与结果，避免阻塞主界面事件循环。
+    下沉至后台 `QThread` 执行，并通过 Qt `pyqtSignal` 安全回传进度与结果，避免阻塞主界面事件循环。
 
 运行环境与协作边界：
-    依赖 `PySide6` 与 `yolo_studio.core` 各引擎；由各标签页在主线程实例化并启动。
+    依赖 `PyQt6` 与 `yolo_studio.core` 各引擎；由各标签页在主线程实例化并启动。
     所有工作线程捕获未处理异常后通过 `failed` 信号传递字符串消息；
     支持取消的工作线程仅通过 `threading.Event` 请求安全停机，不强行终止线程。
 """
@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QThread, Signal
+from PyQt6.QtCore import QThread, pyqtSignal as Signal
 
 from yolo_studio.core.dataset_converter import (
     DatasetBuildConfig,

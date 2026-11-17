@@ -5,7 +5,7 @@
     并在抽帧完成或手动点击转发时向主窗口派发输出目录信号。
 
 运行环境与协作边界：
-    运行于 PySide6 主线程；耗时抽帧委托给 `gui.workers.FrameExtractWorker`（调用
+    运行于 PyQt6 主线程；耗时抽帧委托给 `gui.workers.FrameExtractWorker`（调用
     `core.frame_extractor`），通过 `send_frames_dir` 信号与 `gui.main_window.MainWindow` 协同。
 """
 
@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (
+from PyQt6.QtCore import Qt, pyqtSignal as Signal
+from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -181,7 +181,7 @@ class ExtractTab(QWidget):
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.open_dir_btn = QPushButton("打开输出目录")
-        self.send_next_btn = QPushButton("发送到「2. 标注与数据集」→")
+        self.send_next_btn = QPushButton("发送到「2. 标注工作台」→")
         action_row.addWidget(self.start_btn)
         action_row.addWidget(self.stop_btn)
         action_row.addWidget(self.open_dir_btn)

@@ -1,19 +1,19 @@
-"""PySide6 界面共享辅助控件与本地路径/图像工具函数。
+"""PyQt6 界面共享辅助控件与本地路径/图像工具函数。
 
 职责：
     提供路径选择器行控件、系统文件管理器跳转、等比缩略图加载与紧凑型指标卡片构建。
 
 运行环境与协作边界：
-    Python >= 3.11 + `PySide6`；供 `gui` 各标签页复用，不持有全局状态或启动后台线程。
+    Python >= 3.11 + `PyQt6`；供 `gui` 各标签页复用，不持有全局状态或启动后台线程。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QPixmap
-from PySide6.QtWidgets import (
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices, QPixmap
+from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,

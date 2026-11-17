@@ -1,11 +1,11 @@
-"""标签页 5：模型验证、推理预览与导出界面。
+"""标签页 6：模型验证、推理预览与导出界面。
 
 职责：
     对训练好的 YOLO26 `.pt` 权重执行验证集指标评估（Val）、图片/目录/视频推理可视化预览，
     以及导出 `ONNX`、`TorchScript` 或 `TensorRT (.engine)` 部署模型。
 
 运行环境与协作边界：
-    运行于 PySide6 主线程；三类耗时任务分别委托给 `ValidateWorker`、`PredictWorker`、
+    运行于 PyQt6 主线程；三类耗时任务分别委托给 `ValidateWorker`、`PredictWorker`、
     `ExportWorker`，并通过 `_set_busy()` 互斥锁住执行按钮，避免同一时刻并发占用模型或 GPU。
 """
 
@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -38,7 +38,7 @@ from yolo_studio.gui.workers import ExportWorker, PredictWorker, ValidateWorker
 
 
 class EvalTab(QWidget):
-    """模型验证、推理测试与部署导出标签页（标签页 5）。
+    """模型验证、推理测试与部署导出标签页（标签页 6）。
 
     内部状态：
         持有硬件信息 `device_info` 以及三个互斥运行的后台工作线程引用

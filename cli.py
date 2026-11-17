@@ -10,7 +10,7 @@
     `review` 子命令调用远程多模态接口时还需通过 `--api-key` 或环境变量
     `GEMINI_API_KEY` / `OPENAI_API_KEY` 提供有效凭据。
     本脚本仅负责参数解析、配置构建与摘要输出，具体执行委托给 `yolo_studio.core` 各引擎，
-    不启动 PySide6 GUI。
+    不启动 PyQt6 GUI。
 
 输入输出与失败方式：
     按子命令从本地视频、图片、标注或 `data.yaml` 读取输入，并在指定输出目录写出帧图、

@@ -1,12 +1,12 @@
-"""标签页 2：X-AnyLabeling 标注启动与 YOLO26 数据集准备界面。
+"""标签页 3：标注统计检验与 YOLO26 数据集准备界面。
 
 职责：
-    负责启动外部 X-AnyLabeling 工具标注抽帧图片，扫描并展示标注分布与告警，
+    与「2. 标注工作台」联动打开标注图片目录，扫描并展示标注分布与告警，
     并按 train/val/test 比例生成 YOLO26 标准数据集与 `data.yaml`。
 
 运行环境与协作边界：
-    运行于 PySide6 主线程；扫描与构建任务委托给 `DatasetScanWorker` / `DatasetBuildWorker`，
-    外部标注进程通过 `core.xanylabeling_launcher.launch_xanylabeling` 拉起；
+    运行于 PyQt6 主线程；扫描与构建任务委托给 `DatasetScanWorker` / `DatasetBuildWorker`，
+    通过 `open_in_workbench` 请求主窗口切换至内嵌标注工作台，
     生成结果通过 `send_data_yaml` 信号同步至 `MainWindow` 与训练标签页。
 """
 
@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (
+from PyQt6.QtCore import pyqtSignal as Signal
+from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -40,22 +40,19 @@ from yolo_studio.core.dataset_converter import (
     DatasetBuildResult,
     DatasetScanSummary,
 )
-from yolo_studio.core.xanylabeling_launcher import (
-    find_xanylabeling_executable,
-    launch_xanylabeling,
-)
 from yolo_studio.gui.common import PathPickerRow, open_local_path
 from yolo_studio.gui.workers import DatasetBuildWorker, DatasetScanWorker
 
 
 class DatasetTab(QWidget):
-    """X-AnyLabeling 标注衔接与数据集构建标签页（标签页 2）。
+    """标注校验与 YOLO26 数据集构建标签页（标签页 3）。
 
     内部状态：
         持有后台线程 `scan_worker`、`build_worker` 及最近一次成功生成的 `_last_yaml_path`。
     """
 
     send_data_yaml = Signal(str)
+    open_in_workbench = Signal(str, str)  # 信号参数：(图片目录, 可选 classes.txt 路径)
 
     def __init__(self, workspace_root: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -72,34 +69,25 @@ class DatasetTab(QWidget):
         left = QVBoxLayout()
         left.setSpacing(10)
 
-        # 分组 1：X-AnyLabeling 启动配置
-        xal_group = QGroupBox("1. 启动 X-AnyLabeling 进行目标框标注")
+        # 分组 1：标注源目录与内嵌工作台联动
+        xal_group = QGroupBox("1. 标注源目录与工作台联动")
         xal_form = QFormLayout(xal_group)
-
-        detected_exe = find_xanylabeling_executable()
-        self.xal_exe_picker = PathPickerRow(
-            placeholder="选择 X-AnyLabeling.exe（未检测到时手动指定）",
-            mode="file",
-            file_filter="可执行文件 (*.exe);;所有文件 (*.*)",
-            default_path=str(detected_exe) if detected_exe else "",
-        )
-        xal_form.addRow("X-AnyLabeling 路径:", self.xal_exe_picker)
 
         default_frames = str((self.workspace_root / "data" / "raw_frames").resolve())
         self.images_picker = PathPickerRow(
-            placeholder="选择待标注图片目录（与抽帧输出一致）",
+            placeholder="选择待标注或待转换的图片目录（与抽帧输出一致）",
             mode="dir",
             default_path=default_frames,
         )
         xal_form.addRow("图片目录:", self.images_picker)
 
         xal_btn_row = QHBoxLayout()
-        self.launch_xal_btn = QPushButton("启动 X-AnyLabeling 标注此目录")
-        self.launch_xal_btn.setObjectName("primaryBtn")
-        xal_tip = QLabel("提示：在 X-AnyLabeling 中可用快捷键 R 画矩形框，保存后默认在图片同目录生成 .json，也可导出 YOLO .txt。")
+        self.open_workbench_btn = QPushButton("在「2. 标注工作台」中打开标注 →")
+        self.open_workbench_btn.setObjectName("primaryBtn")
+        xal_tip = QLabel("提示：支持 X-AnyLabeling 同目录保存的原生 .json 以及导出的 YOLO .txt；工作台保存后可直接点下方扫描统计。")
         xal_tip.setWordWrap(True)
         xal_tip.setStyleSheet("color: #666666;")
-        xal_btn_row.addWidget(self.launch_xal_btn)
+        xal_btn_row.addWidget(self.open_workbench_btn)
         xal_form.addRow("", xal_btn_row)
         xal_form.addRow("", xal_tip)
         left.addWidget(xal_group)
@@ -176,7 +164,7 @@ class DatasetTab(QWidget):
         self.build_btn = QPushButton("生成 YOLO26 数据集 (data.yaml)")
         self.build_btn.setObjectName("primaryBtn")
         self.open_ds_btn = QPushButton("打开数据集目录")
-        self.send_train_btn = QPushButton("发送到「4. YOLO26 训练」→")
+        self.send_train_btn = QPushButton("发送到「5. YOLO26 训练」→")
         self.send_train_btn.setEnabled(False)
         btn_row.addWidget(self.scan_btn)
         btn_row.addWidget(self.build_btn)
@@ -211,7 +199,7 @@ class DatasetTab(QWidget):
         root.addLayout(right, 2)
 
         # 信号与槽连接
-        self.launch_xal_btn.clicked.connect(self._on_launch_xal)
+        self.open_workbench_btn.clicked.connect(self._on_open_in_workbench)
         self.scan_btn.clicked.connect(self._on_scan)
         self.build_btn.clicked.connect(self._on_build)
         self.open_ds_btn.clicked.connect(lambda: open_local_path(self.output_ds_picker.path()))
@@ -234,13 +222,6 @@ class DatasetTab(QWidget):
         if classes_file:
             self.classes_picker.setText(classes_file)
         self.recursive_chk.setChecked(recursive)
-
-    def get_xal_path(self) -> str:
-        return self.xal_exe_picker.text()
-
-    def set_xal_path(self, path_str: str) -> None:
-        if path_str:
-            self.xal_exe_picker.setText(path_str)
 
     def _build_config(self) -> DatasetBuildConfig:
         images_text = self.images_picker.text()
@@ -267,22 +248,14 @@ class DatasetTab(QWidget):
             recursive=self.recursive_chk.isChecked(),
         )
 
-    def _on_launch_xal(self) -> None:
+    def _on_open_in_workbench(self) -> None:
         images_text = self.images_picker.text()
-        if not images_text:
-            QMessageBox.warning(self, "提示", "请先选择图片目录。")
+        if not images_text or not Path(images_text).is_dir():
+            QMessageBox.warning(self, "提示", "请先选择有效的图片目录。")
             return
-        exe_text = self.xal_exe_picker.text()
         cls_text = self.classes_picker.text()
-        try:
-            launch_xanylabeling(
-                frames_dir=Path(images_text),
-                executable_path=Path(exe_text) if exe_text else None,
-                classes_file=Path(cls_text) if cls_text else None,
-            )
-            self.log_box.append(f"已启动 X-AnyLabeling，目标目录: {images_text}")
-        except Exception as exc:
-            QMessageBox.warning(self, "无法启动 X-AnyLabeling", str(exc))
+        self.open_in_workbench.emit(images_text, cls_text)
+        self.log_box.append(f"已在「2. 标注工作台」中打开目录: {images_text}")
 
     def _on_scan(self) -> None:
         """校验参数后禁用扫描/生成按钮并在后台线程执行只读扫描。"""

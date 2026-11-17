@@ -1,20 +1,20 @@
-"""标签页 4：YOLO26 模型训练界面。
+"""标签页 5：YOLO26 模型训练界面。
 
 职责：
     展示本机计算设备（CUDA GPU/CPU）状态，配置 `data.yaml`、预训练权重、超参数与保存目录，
     并在后台启动训练后实时刷新 Epoch 指标卡片与 Ultralytics 日志流。
 
 运行环境与协作边界：
-    运行于 PySide6 主线程；训练任务委托给 `gui.workers.TrainWorker`，
-    在训练产出有效 `best.pt` 时通过 `send_best_weights` 信号向主窗口同步给标签页 3 与标签页 5。
+    运行于 PyQt6 主线程；训练任务委托给 `gui.workers.TrainWorker`，
+    在训练产出有效 `best.pt` 时通过 `send_best_weights` 信号向主窗口同步给标签页 4 与标签页 6。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (
+from PyQt6.QtCore import pyqtSignal as Signal
+from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -47,7 +47,7 @@ from yolo_studio.gui.workers import TrainWorker
 
 
 class TrainTab(QWidget):
-    """YOLO26 模型训练功能标签页（标签页 4）。
+    """YOLO26 模型训练功能标签页（标签页 5）。
 
     内部状态：
         持有硬件探测结果 `device_info`、训练工作线程 `worker`、最近实验目录 `_last_save_dir`
@@ -195,7 +195,7 @@ class TrainTab(QWidget):
         self.stop_btn = QPushButton("安全停止训练")
         self.stop_btn.setEnabled(False)
         self.open_run_btn = QPushButton("打开训练结果目录")
-        self.send_eval_btn = QPushButton("将 best.pt 发送到「5. 验证与推理」→")
+        self.send_eval_btn = QPushButton("将 best.pt 发送到「6. 验证与推理」→")
         self.send_eval_btn.setEnabled(False)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)

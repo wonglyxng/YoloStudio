@@ -1,22 +1,22 @@
-"""标签页 3：基准模型自动标注与 MLLM 纠错补漏界面。
+"""标签页 4：基准模型自动标注与 MLLM 纠错补漏界面。
 
 职责：
     配置候选框来源（基准 `.pt` 低阈值推理或已有 X-AnyLabeling `.json`）、MLLM 接口与预设、
     审核分流策略；展示逐图分流结果表格、纠错前后对比图与实时日志，
-    并支持用 X-AnyLabeling 打开 `need_review` 目录复核或将清洗结果发送回数据集准备页。
+    并支持直接跳转「2. 标注工作台」打开 `need_review` 目录或定位单张图片复核，以及发送清洗结果至数据集准备页。
 
 运行环境与协作边界：
-    运行于 PySide6 主线程；后台审核由 `MllmReviewWorker` 执行，`render_review_comparison`
-    在点击行时即时渲染对比图，通过 `send_cleaned_dataset` 信号与 `MainWindow` 协同。
+    运行于 PyQt6 主线程；后台审核由 `MllmReviewWorker` 执行，`render_review_comparison`
+    在点击行时即时渲染对比图，通过 `open_in_workbench` 与 `send_cleaned_dataset` 信号与 `MainWindow` 协同。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import (
+from PyQt6.QtCore import Qt, pyqtSignal as Signal
+from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -49,35 +49,30 @@ from yolo_studio.core.mllm_reviewer import (
     render_review_comparison,
 )
 from yolo_studio.core.trainer import detect_compute_device
-from yolo_studio.core.xanylabeling_launcher import launch_xanylabeling
 from yolo_studio.gui.common import PathPickerRow, open_local_path
 from yolo_studio.gui.workers import MllmReviewWorker
 
 
 class MllmReviewTab(QWidget):
-    """MLLM 自动标注纠错与补漏功能标签页（标签页 3）。
+    """MLLM 自动标注纠错与补漏功能标签页（标签页 4）。
 
     内部状态：
         持有硬件探测信息 `device_info`、后台工作线程 `worker`、已完成的逐图审核记录列表 `_records`、
-        最近输出目录 `_last_output_dir`、类别文件 `_last_classes_txt` 及外部传入的 X-AnyLabeling 路径回调 `_xal_exe_provider`。
+        最近输出目录 `_last_output_dir` 与类别文件 `_last_classes_txt`。
     """
 
     send_cleaned_dataset = Signal(str, str, bool)  # 信号参数：(输出目录, classes.txt 路径, 是否按子目录递归扫描)
+    open_in_workbench = Signal(str, str, str)  # 信号参数：(目标目录, classes.txt 路径, 可选指定图片路径)
 
     def __init__(self, workspace_root: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.workspace_root = workspace_root
         self.device_info = detect_compute_device()
         self.worker: MllmReviewWorker | None = None
-        self._xal_exe_provider = lambda: ""
         self._records: list[ImageReviewRecord] = []
         self._last_output_dir: Path = workspace_root / "data" / "reviewed_frames"
         self._last_classes_txt: str = ""
         self._init_ui()
-
-    def set_xal_exe_provider(self, fn) -> None:
-        """注入获取 X-AnyLabeling 可执行路径的回调函数（由主窗口绑定数据集标签页提供）。"""
-        self._xal_exe_provider = fn
 
     def set_images_dir(self, path_str: str) -> None:
         """跨页写入：同步待纠错图片目录输入框。"""
@@ -263,9 +258,9 @@ class MllmReviewTab(QWidget):
         self.start_btn.setObjectName("primaryBtn")
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
-        self.open_need_review_btn = QPushButton("用 X-AnyLabeling 打开待复核目录")
+        self.open_need_review_btn = QPushButton("在工作台打开待复核目录")
         self.open_out_btn = QPushButton("打开输出目录")
-        self.send_ds_btn = QPushButton("发送到「2. 数据集准备」→")
+        self.send_ds_btn = QPushButton("发送到「3. 数据集准备」→")
         self.send_ds_btn.setEnabled(False)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
@@ -296,10 +291,12 @@ class MllmReviewTab(QWidget):
         self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.result_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.result_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.result_table.currentCellChanged.connect(self._on_row_selected)
+        self.result_table.cellDoubleClicked.connect(self._on_row_double_clicked)
         splitter.addWidget(self.result_table)
 
-        self.preview_label = QLabel("点击上方表格任意一行，可在此对比「纠错前 vs 纠错后」标注框")
+        self.preview_label = QLabel("单击表格行对比「纠错前 vs 纠错后」标注框；双击行可在「2. 标注工作台」定位该图精修")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(230)
         self.preview_label.setStyleSheet(
@@ -501,6 +498,24 @@ class MllmReviewTab(QWidget):
         self.summary_label.setText(f"执行失败: {err}")
         QMessageBox.critical(self, "MLLM 纠错失败", err)
 
+    def _on_row_double_clicked(self, row: int, _col: int) -> None:
+        """双击结果行时跳转到内嵌标注工作台并定位到对应输出图片。"""
+        if row < 0 or row >= len(self._records):
+            return
+        rec = self._records[row]
+        target_img = (
+            rec.output_image_path
+            if (rec.output_image_path and rec.output_image_path.is_file())
+            else rec.image_path
+        )
+        if not target_img.is_file():
+            QMessageBox.warning(self, "提示", f"图片文件不存在：\n{target_img}")
+            return
+        out_dir = self.output_picker.path()
+        cls_file = out_dir / "classes.txt"
+        cls_str = str(cls_file) if cls_file.is_file() else self._last_classes_txt
+        self.open_in_workbench.emit(str(target_img.parent), cls_str, str(target_img))
+
     def _on_open_need_review_in_xal(self) -> None:
         out_dir = self.output_picker.path()
         need_dir = out_dir / "need_review"
@@ -508,16 +523,9 @@ class MllmReviewTab(QWidget):
         if not target_dir.is_dir():
             QMessageBox.warning(self, "提示", f"目录不存在，请先运行清洗或检查路径:\n{target_dir}")
             return
-        exe_str = self._xal_exe_provider()
         cls_file = out_dir / "classes.txt"
-        try:
-            launch_xanylabeling(
-                frames_dir=target_dir,
-                executable_path=Path(exe_str) if exe_str else None,
-                classes_file=cls_file if cls_file.is_file() else None,
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "无法启动 X-AnyLabeling", str(exc))
+        cls_str = str(cls_file) if cls_file.is_file() else self._last_classes_txt
+        self.open_in_workbench.emit(str(target_dir), cls_str, "")
 
     def _on_send_to_dataset(self) -> None:
         out_dir = str(self._last_output_dir)

@@ -1,0 +1,119 @@
+"""PyQt6 单进程内嵌 X-AnyLabeling 工作台与跨页联动集成测试。
+
+职责：
+    在离线 `offscreen` Qt 环境下验证主窗口六标签页装配、X-AnyLabeling 内嵌宿主初始化、
+    快捷键作用域隔离、`open_directory` 精确目录/单图/类别加载以及跨标签页联动跳转。
+
+运行环境与协作边界：
+    通过 `pytest` 运行，依赖 `PyQt6`、`PyQt6-WebEngine`、`Pillow` 与本地安装的
+    `third_party/X-AnyLabeling`（`anylabeling` 包）；不访问外部网络，也不弹出可见桌面窗口。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+XAL_ROOT = PROJECT_ROOT / "third_party" / "X-AnyLabeling"
+if XAL_ROOT.is_dir() and str(XAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(XAL_ROOT))
+
+from PyQt6.QtCore import QCoreApplication, Qt  # noqa: E402
+from PyQt6.QtGui import QAction  # noqa: E402
+from PyQt6.QtWidgets import QApplication  # noqa: E402
+
+from yolo_studio.gui.main_window import MainWindow  # noqa: E402
+from yolo_studio.gui.tab_labeling import (  # noqa: E402
+    ensure_cuda_dll_search_paths,
+    ensure_xanylabeling_runtime_initialized,
+)
+
+
+@pytest.fixture(scope="module")
+def qt_app() -> QApplication:
+    """初始化模块级无头 `QApplication` 与 X-AnyLabeling 运行时资源。"""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    ensure_cuda_dll_search_paths()
+    existing = QApplication.instance()
+    if existing is None:
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+        app = QApplication([])
+    else:
+        app = existing
+    ensure_xanylabeling_runtime_initialized(app)
+    return app
+
+
+def _write_sample_frame(path: Path, size: tuple[int, int] = (160, 120)) -> None:
+    """在临时目录生成用于测试加载的 JPEG 图片。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, color=(60, 130, 180)).save(path)
+
+
+def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证主窗口装配 6 个标签页、成功挂载原版 X-AnyLabeling，且快捷键隔离至工作台子层级。"""
+    win = MainWindow(workspace_root=tmp_path)
+    try:
+        assert win.tabs.count() == 6
+        assert win.tabs.tabText(1) == "2. 标注工作台 (X-AnyLabeling)"
+        assert win.labeling_tab._xal_window is not None
+
+        actions = [a for a in win.labeling_tab._xal_window.findChildren(QAction) if a.shortcuts()]
+        assert len(actions) > 10
+        assert all(
+            action.shortcutContext() == Qt.ShortcutContext.WidgetWithChildrenShortcut
+            for action in actions
+        )
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证 `open_directory`、`classes.txt` 预载、单图定位及数据集/纠错页双向联动信号。"""
+    frames_dir = tmp_path / "frames"
+    img_a = frames_dir / "frame_001.jpg"
+    img_b = frames_dir / "frame_002.jpg"
+    _write_sample_frame(img_a)
+    _write_sample_frame(img_b)
+
+    classes_file = tmp_path / "classes.txt"
+    classes_file.write_text("person\nhelmet\n", encoding="utf-8")
+
+    win = MainWindow(workspace_root=tmp_path)
+    try:
+        # 从「3. 数据集准备」触发跳转至「2. 标注工作台」并定位第二张图
+        win.tabs.setCurrentIndex(2)
+        win.review_tab.open_in_workbench.emit(
+            str(frames_dir), str(classes_file), str(img_b)
+        )
+
+        assert win.tabs.currentIndex() == 1
+        assert win.labeling_tab.current_directory() == frames_dir.resolve()
+
+        lw = win.labeling_tab._label_widget()
+        assert lw is not None
+        assert lw.unique_label_list.count() == 2
+        assert Path(str(lw.filename)).resolve() == img_b.resolve()
+
+        # 从「2. 标注工作台」发回「3. 数据集准备」与「4. MLLM 标注纠错」
+        win.labeling_tab.send_to_dataset.emit(str(frames_dir), str(classes_file))
+        assert win.tabs.currentIndex() == 2
+        assert Path(win.dataset_tab.images_picker.text()).resolve() == frames_dir.resolve()
+        assert Path(win.dataset_tab.classes_picker.text()).resolve() == classes_file.resolve()
+
+        win.labeling_tab.send_to_review.emit(str(frames_dir))
+        assert win.tabs.currentIndex() == 3
+        assert Path(win.review_tab.images_picker.text()).resolve() == frames_dir.resolve()
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()

@@ -7,14 +7,14 @@ __pycache__/
 # 虚拟环境与打包构建产物
 .venv/
 venv/
-build/
-dist/
+/build/
+/dist/
 *.egg-info/
 
 # 本地运行生成的抽帧图片、数据集、训练输出与模型权重
-data/
-datasets/
-runs/
+/data/
+/datasets/
+/runs/
 *.pt
 *.onnx
 *.engine

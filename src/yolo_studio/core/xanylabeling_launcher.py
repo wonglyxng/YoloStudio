@@ -8,8 +8,9 @@
     Python >= 3.11，桌面 GUI 会话环境；预设路径面向 Windows，同时兼容 `PATH` 中的跨平台命令名。
 
 协作对象与职责边界：
-    由 `gui.tab_dataset.DatasetTab` 与 `gui.tab_review.MllmReviewTab` 调用。
-    仅负责查找路径与启动独立子进程，不监控、等待或关闭子进程，也不读写标注文件。
+    保留为可选的独立外部进程启动辅助工具（供命令行或独立调试场景调用）；
+    主桌面 GUI 现已通过 `gui.tab_labeling.LabelingStudioTab` 在单进程内直接嵌入 X-AnyLabeling。
+    本模块仅负责查找路径与启动独立子进程，不监控、等待或关闭子进程，也不读写标注文件。
 """
 
 from __future__ import annotations
