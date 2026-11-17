@@ -26,8 +26,12 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -119,8 +123,9 @@ def _create_embedded_window_class():
 
         状态与副作用：
             持有 `_allow_close` 关闭放行开关与 `title_changed` 信号；
-            通过 `Qt.WindowType.Widget` 嵌入外层布局，并将所有内部 `QAction` 快捷键作用域
-            限制为 `WidgetWithChildrenShortcut`，防止在其他标签页输入时误触单键标注快捷键。
+            通过 `Qt.WindowType.Widget` 嵌入外层布局，并随标签页可见状态动态切换内部 `QAction`
+            的快捷键上下文：当前页可见时启用原生 `WindowShortcut`（确保挂载在菜单/工具栏上的
+            `R`/`A`/`D` 等全部快捷键正常响应），切离隐藏时收起为 `WidgetShortcut` 防止跨页误触。
         """
 
         title_changed = Signal(str)
@@ -130,12 +135,36 @@ def _create_embedded_window_class():
             super().__init__(app, config=config)
             self.setWindowFlags(Qt.WindowType.Widget)
             self.setStyleSheet(get_app_stylesheet())
-            self.scope_shortcuts()
+            # 初始挂载时尚未显示，先收起快捷键，待所在标签页真正进入可见态再激活
+            self.set_shortcuts_active(False)
 
-        def scope_shortcuts(self) -> None:
-            """将内嵌工作台内的所有 `QAction` 快捷键限制为仅在工作台拥有焦点或子级焦点时生效。"""
+        def set_shortcuts_active(self, active: bool) -> None:
+            """按工作台标签页是否可见切换内部 `QAction` 的快捷键作用域。
+
+            原因说明：
+                X-AnyLabeling 将绝大多数快捷键 `QAction` 仅注册在 `QMenu` 与 `ToolBar` 上，
+                并未同时 `addAction` 到画布或外层容器；若强设为 `WidgetWithChildrenShortcut`，
+                当焦点位于兄弟节点 `Canvas` 时 Qt `QShortcutMap` 不会匹配，导致快捷键全部失效。
+                因此在工作台可见时恢复原生 `WindowShortcut`，隐藏时切为 `WidgetShortcut` 实现跨页隔离。
+            """
+            ctx = (
+                Qt.ShortcutContext.WindowShortcut
+                if active
+                else Qt.ShortcutContext.WidgetShortcut
+            )
             for action in self.findChildren(QAction):
-                action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                # 排除独立的非模态顶层子窗口（如点云/分类弹窗），但保留 QMenu（Popup 亦带 Window 标志位）
+                obj = action.parent()
+                while obj is not None and not isinstance(obj, QWidget):
+                    obj = obj.parent()
+                if (
+                    isinstance(obj, QWidget)
+                    and obj is not self
+                    and obj.isWindow()
+                    and not isinstance(obj, QMenu)
+                ):
+                    continue
+                action.setShortcutContext(ctx)
 
         def _restore_window_geometry(self) -> None:
             """内嵌模式下由外层标签页布局接管尺寸，忽略独立窗口位置/大小恢复。"""
@@ -268,11 +297,16 @@ class LabelingStudioTab(QWidget):
         self.to_dataset_btn.setObjectName("primaryBtn")
         self.to_review_btn = QPushButton("发送到「4. MLLM 纠错」→")
 
-        bar_layout.addWidget(self.open_dir_btn)
-        bar_layout.addWidget(self.load_classes_btn)
-        bar_layout.addWidget(self.refresh_btn)
-        bar_layout.addWidget(self.to_dataset_btn)
-        bar_layout.addWidget(self.to_review_btn)
+        for btn in (
+            self.open_dir_btn,
+            self.load_classes_btn,
+            self.refresh_btn,
+            self.to_dataset_btn,
+            self.to_review_btn,
+        ):
+            # 防止点击顶部联动按钮后滞留键盘焦点，避免按 Space 平移画布时误触按钮点击
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            bar_layout.addWidget(btn)
         root.addWidget(bar)
 
         self._host_container = QVBoxLayout()
@@ -331,6 +365,10 @@ class LabelingStudioTab(QWidget):
             self._mount_embedded_xanylabeling()
             if self._xal_window is not None:
                 self._mount_failed = False
+                is_active = self.isVisible()
+                self._xal_window.set_shortcuts_active(is_active)
+                if is_active:
+                    QTimer.singleShot(0, self._focus_canvas_if_ready)
                 self.status_label.setText(
                     "工作台就绪：可打开抽帧目录进行人工画框或 AI 辅助标注（快捷键 R 画框，Ctrl+S 保存）"
                 )
@@ -357,6 +395,7 @@ class LabelingStudioTab(QWidget):
             self._xal_window = embedded_cls(app, config)
             self._xal_window.title_changed.connect(self._on_xal_title_changed)
             self._host_container.addWidget(self._xal_window, 1)
+            self._xal_window.set_shortcuts_active(self.isVisible())
             self._mount_failed = False
         except Exception as exc:
             self._xal_window = None
@@ -379,13 +418,38 @@ class LabelingStudioTab(QWidget):
     def _label_widget(self):
         return _resolve_xal_view(self._xal_window)
 
+    def _focus_canvas_if_ready(self) -> None:
+        """在工作台可见且未聚焦于内部文本输入框时，将键盘焦点移交给画布以响应直接按键。"""
+        if not self.isVisible() or self._xal_window is None:
+            return
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit)) and self._xal_window.isAncestorOf(
+            focused
+        ):
+            return
+        lw = self._label_widget()
+        if lw is None:
+            return
+        canvas = getattr(lw, "canvas", None)
+        if isinstance(canvas, QWidget) and canvas.isEnabled():
+            canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+        elif isinstance(lw, QWidget):
+            lw.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def showEvent(self, event) -> None:  # type: ignore[override]
-        """切换进入工作台标签页时按需触发首次挂载，并重新收敛快捷键作用域（保留 type: ignore 指令）。"""
+        """切换进入工作台标签页时按需触发首次挂载，激活快捷键并将焦点移交画布（保留 type: ignore 指令）。"""
         super().showEvent(event)
         if self._xal_window is not None:
-            self._xal_window.scope_shortcuts()
+            self._xal_window.set_shortcuts_active(True)
+            QTimer.singleShot(0, self._focus_canvas_if_ready)
         elif not self._mount_failed and not self._mounting:
             QTimer.singleShot(0, self._auto_mount_on_show)
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        """切离工作台标签页时收起内部快捷键，避免在其他标签页输入或操作时误触（保留 type: ignore 指令）。"""
+        super().hideEvent(event)
+        if self._xal_window is not None:
+            self._xal_window.set_shortcuts_active(False)
 
     def _auto_mount_on_show(self) -> None:
         """在标签页切换绘制完成后异步完成工作台首次挂载。"""
@@ -488,7 +552,10 @@ class LabelingStudioTab(QWidget):
 
         self._current_dir = target_dir
         self._watch_directory(target_dir)
-        self._xal_window.scope_shortcuts()
+        is_active = self.isVisible()
+        self._xal_window.set_shortcuts_active(is_active)
+        if is_active:
+            QTimer.singleShot(0, self._focus_canvas_if_ready)
         self.status_label.setText(f"当前标注目录：{target_dir}")
         return True
 

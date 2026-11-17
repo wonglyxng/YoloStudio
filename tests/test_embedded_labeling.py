@@ -30,6 +30,7 @@ if XAL_ROOT.is_dir() and str(XAL_ROOT) not in sys.path:
 
 from PyQt6.QtCore import QCoreApplication, Qt, QThread  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
+from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from yolo_studio.gui.main_window import MainWindow  # noqa: E402
@@ -63,19 +64,102 @@ def _write_sample_frame(path: Path, size: tuple[int, int] = (160, 120)) -> None:
 def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证主窗口装配 6 个标签页、成功挂载原版 X-AnyLabeling，且快捷键隔离至工作台子层级。"""
+    """验证主窗口装配 6 个标签页，且内嵌 X-AnyLabeling 快捷键随可见态切换 WindowShortcut / WidgetShortcut。"""
     win = MainWindow(workspace_root=tmp_path)
+    win.show()
+    qt_app.processEvents()
     try:
         assert win.tabs.count() == 6
         assert win.tabs.tabText(1) == "2. 标注工作台 (X-AnyLabeling)"
         assert win.labeling_tab._xal_window is not None
 
+        # 初始位于第 1 页（视频抽帧），工作台不可见，快捷键处于收起隔离态
         actions = [a for a in win.labeling_tab._xal_window.findChildren(QAction) if a.shortcuts()]
         assert len(actions) > 10
         assert all(
-            action.shortcutContext() == Qt.ShortcutContext.WidgetWithChildrenShortcut
+            action.shortcutContext() == Qt.ShortcutContext.WidgetShortcut
             for action in actions
         )
+
+        # 切入第 2 页（标注工作台）后激活原生 WindowShortcut
+        win.tabs.setCurrentIndex(1)
+        qt_app.processEvents()
+        assert all(
+            action.shortcutContext() == Qt.ShortcutContext.WindowShortcut
+            for action in actions
+        )
+
+        # 切离第 2 页后再次收起为 WidgetShortcut
+        win.tabs.setCurrentIndex(2)
+        qt_app.processEvents()
+        assert all(
+            action.shortcutContext() == Qt.ShortcutContext.WidgetShortcut
+            for action in actions
+        )
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+def test_embedded_workbench_keyboard_shortcuts_and_tab_isolation(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """用真实按键验证内嵌工作台 R/A/D 快捷键生效、搜索框打字不误触、切至其他标签页不串键。"""
+    frames_dir = tmp_path / "shortcut_frames"
+    _write_sample_frame(frames_dir / "f1.jpg")
+    _write_sample_frame(frames_dir / "f2.jpg")
+
+    win = MainWindow(workspace_root=tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    win.activateWindow()
+    qt_app.processEvents()
+    try:
+        win.dataset_tab.set_frames_dir(str(frames_dir))
+        win.dataset_tab._on_open_in_workbench()
+        qt_app.processEvents()
+
+        assert win.tabs.currentIndex() == 1
+        lw = win.labeling_tab._label_widget()
+        assert lw is not None
+        assert qt_app.focusWidget() is lw.canvas
+        assert Path(str(lw.filename)).name == "f1.jpg"
+
+        # 1) 工作台内按 D 切下一张、按 A 切回上一张、按 R 进入画矩形框模式
+        QTest.keyClick(lw.canvas, Qt.Key.Key_D)
+        qt_app.processEvents()
+        assert Path(str(lw.filename)).name == "f2.jpg"
+
+        QTest.keyClick(lw.canvas, Qt.Key.Key_A)
+        qt_app.processEvents()
+        assert Path(str(lw.filename)).name == "f1.jpg"
+
+        QTest.keyClick(lw.canvas, Qt.Key.Key_R)
+        qt_app.processEvents()
+        assert lw.canvas.drawing() is True
+        assert lw.canvas.create_mode == "rectangle"
+
+        # 2) 聚焦工作台内文件搜索框打字 d、r 时走文本输入，不触发翻页或模式切换
+        lw.set_edit_mode()
+        lw.file_search.setFocus()
+        qt_app.processEvents()
+        QTest.keyClick(lw.file_search, Qt.Key.Key_D)
+        QTest.keyClick(lw.file_search, Qt.Key.Key_R)
+        qt_app.processEvents()
+        assert lw.file_search.text() == "dr"
+        assert lw.canvas.editing() is True
+        lw.file_search.clear()
+        qt_app.processEvents()
+
+        # 3) 切回第 1 页（视频抽帧）后按 D、R 不影响工作台状态
+        win.tabs.setCurrentIndex(0)
+        win.extract_tab.start_btn.setFocus()
+        qt_app.processEvents()
+        QTest.keyClick(win.extract_tab.start_btn, Qt.Key.Key_D)
+        QTest.keyClick(win.extract_tab.start_btn, Qt.Key.Key_R)
+        qt_app.processEvents()
+        assert Path(str(lw.filename)).name == "f1.jpg"
+        assert lw.canvas.editing() is True
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
