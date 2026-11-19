@@ -254,11 +254,17 @@ class MainWindow(QMainWindow):
         self.review_tab.set_weights_path(weights_path)
 
     def _restore_settings(self) -> None:
-        """从持久化 `QSettings` 恢复上次保存的工作区目录与训练超参数偏好（如存在）。"""
+        """从持久化 `QSettings` 恢复上次保存的工作区目录、MLLM 策略与训练超参数偏好（如存在）。"""
         last_dir = self.settings.value("last_frames_dir", "")
-        if isinstance(last_dir, str) and last_dir and Path(last_dir).is_dir():
+        if (
+            isinstance(last_dir, str)
+            and last_dir
+            and "pytest-of-" not in last_dir.lower()
+            and Path(last_dir).is_dir()
+        ):
             self.dataset_tab.set_frames_dir(last_dir)
             self.review_tab.set_images_dir(last_dir)
+        self.review_tab.restore_settings(self.settings)
         self.train_tab.restore_settings(self.settings)
 
     def _running_workers(self) -> list[QThread]:
@@ -269,6 +275,7 @@ class MainWindow(QMainWindow):
             getattr(self.dataset_tab, "scan_worker", None),
             getattr(self.dataset_tab, "build_worker", None),
             getattr(self.review_tab, "worker", None),
+            getattr(self.review_tab, "conn_test_worker", None),
             getattr(self.train_tab, "worker", None),
             getattr(self.eval_tab, "val_worker", None),
             getattr(self.eval_tab, "pred_worker", None),
@@ -335,7 +342,8 @@ class MainWindow(QMainWindow):
             return
 
         cur_frames = self.dataset_tab.images_picker.text()
-        if cur_frames:
+        if cur_frames and "pytest-of-" not in cur_frames.lower():
             self.settings.setValue("last_frames_dir", cur_frames)
+        self.review_tab.save_settings(self.settings)
         self.train_tab.save_settings(self.settings)
         super().closeEvent(event)

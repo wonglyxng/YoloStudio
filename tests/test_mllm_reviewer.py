@@ -381,3 +381,177 @@ def test_openai_client_falls_back_only_on_bad_request() -> None:
     else:  # pragma: no cover
         raise AssertionError("鉴权错误不应被降级重试吞掉")
     assert auth_completions.calls == [True]
+
+
+def test_box_refine_flag_loose_routes_to_need_review(tmp_path: Path) -> None:
+    """验证 `FLAG_LOOSE` 模式仅标记过松框为 `refine_suspect` 并分流 `need_review`，不改动原坐标。"""
+    from yolo_studio.core.mllm_reviewer import BoxRefineMode
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    img = in_dir / "loose.jpg"
+    _write_img(img, (400, 200))
+    _person_json(img)
+
+    resp = MllmReviewResponse(
+        box_reviews=[BoxDecision(box_id=0, action="keep", box_quality="loose", reason="too much background")]
+    )
+    res = run_mllm_review(
+        _json_cfg(in_dir, out_dir, box_refine_mode=BoxRefineMode.FLAG_LOOSE),
+        client_override=_FakeMllmClient([resp]),
+    )
+    assert res.need_review_count == 1
+    rec = res.records[0]
+    assert rec.loose_flagged_count == 1
+    assert rec.refined_count == 0
+    assert rec.after_boxes[0].status == "refine_suspect"
+    assert (rec.after_boxes[0].x1, rec.after_boxes[0].y1) == (40.0, 20.0)
+
+
+def test_box_refine_mllm_crop_maps_coords_and_enforces_safety_gate(tmp_path: Path) -> None:
+    """验证 `MLLM_CROP` 模式将局部裁剪坐标精确映射回原图，并对超安全门禁的极端缩框兜底保护。"""
+    from yolo_studio.core.mllm_reviewer import BoxRefineMode
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+
+    # img1：合理收紧 -> 通过门禁并进入 llm_fixed，记录 original_xyxy 供虚线对比图渲染
+    img1 = in_dir / "a_tighten.jpg"
+    _write_img(img1, (400, 200))
+    _person_json(img1)  # 原框 [40, 20, 160, 180] (宽120, 高160)；外扩 20% 裁剪区域约为 (16, 0, 184, 200)
+
+    # img2：极端缩成极小点 -> 触发安全门禁保留原框并分流 need_review
+    img2 = in_dir / "b_overshrink.jpg"
+    _write_img(img2, (400, 200))
+    _person_json(img2)
+
+    resp_good = MllmReviewResponse(
+        box_reviews=[
+            BoxDecision(
+                box_id=0,
+                action="keep",
+                box_quality="loose",
+                # 在局部裁剪图内合理向内收紧约 15%
+                refined_box_2d=[200, 220, 820, 780],
+                reason="tightened to person body",
+            )
+        ]
+    )
+    resp_bad = MllmReviewResponse(
+        box_reviews=[
+            BoxDecision(
+                box_id=0,
+                action="keep",
+                box_quality="loose",
+                # 极端缩小到面积占比 < 5%，应被安全门禁拦截
+                refined_box_2d=[450, 450, 520, 520],
+                reason="bad tiny box",
+            )
+        ]
+    )
+
+    fake_client = _FakeMllmClient([resp_good, resp_bad])
+    res = run_mllm_review(
+        _json_cfg(in_dir, out_dir, include_crops=False, box_refine_mode=BoxRefineMode.MLLM_CROP),
+        client_override=fake_client,
+    )
+    # 即使 include_crops=False，MLLM_CROP 模式仍强制生成局部裁剪图
+    assert all(crop_cnt == 1 for _, crop_cnt in fake_client.calls)
+    assert res.llm_fixed_count == 1
+    assert res.need_review_count == 1
+
+    rec_good = next(r for r in res.records if r.image_path.name == "a_tighten.jpg")
+    assert rec_good.refined_count == 1
+    b_good = rec_good.after_boxes[0]
+    assert b_good.refined is True
+    assert b_good.status == "refined"
+    assert b_good.original_xyxy == (40.0, 20.0, 160.0, 180.0)
+    assert b_good.x1 > 40.0 and b_good.x2 < 160.0
+    # 对比图（含虚线原框与实线紧贴框）正常编码
+    assert render_review_comparison(rec_good)[:2] == b"\xff\xd8"
+
+    rec_bad = next(r for r in res.records if r.image_path.name == "b_overshrink.jpg")
+    assert rec_bad.refined_count == 0
+    assert rec_bad.loose_flagged_count == 1
+    assert rec_bad.after_boxes[0].status == "refine_suspect"
+    assert (rec_bad.after_boxes[0].x1, rec_bad.after_boxes[0].x2) == (40.0, 160.0)
+
+
+def test_box_refine_sam_local_and_load_history_report_roundtrip(tmp_path: Path) -> None:
+    """验证 `SAM_LOCAL` 离线桩收紧（仅过松框 vs 全部保留框）以及历史审核报告 `load_review_report` 完整往返。"""
+    from yolo_studio.core.mllm_reviewer import BoxRefineMode, load_review_report
+
+    class _FakeSamRefiner:
+        def __init__(self) -> None:
+            self.called_ids: list[list[int]] = []
+
+        def refine_boxes(self, image_bgr, boxes: list[CandidateBox]):
+            self.called_ids.append([b.box_id for b in boxes])
+            return {b.box_id: (b.x1 + 12.0, b.y1 + 10.0, b.x2 - 12.0, b.y2 - 10.0) for b in boxes}
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    img = in_dir / "sam_case.jpg"
+    _write_img(img, (400, 200))
+    _person_json(img, score=0.95)
+
+    # 1) sam_refine_all_kept=False 且 MLLM 判定 tight -> 不触发 SAM，直接 auto_passed
+    refiner1 = _FakeSamRefiner()
+    res1 = run_mllm_review(
+        _json_cfg(in_dir, out_dir, box_refine_mode=BoxRefineMode.SAM_LOCAL, sam_refine_all_kept=False),
+        client_override=_FakeMllmClient(
+            [MllmReviewResponse(box_reviews=[BoxDecision(box_id=0, action="keep", box_quality="tight")])]
+        ),
+        refiner_override=refiner1,
+    )
+    assert refiner1.called_ids == []
+    assert res1.auto_passed_count == 1
+
+    # 2) sam_refine_all_kept=True 且 check_missing=False + 高置信度跳过 MLLM -> 仍自动触发 SAM 收紧并分流 llm_fixed
+    refiner2 = _FakeSamRefiner()
+    res2 = run_mllm_review(
+        _json_cfg(
+            in_dir,
+            out_dir,
+            check_missing=False,
+            box_refine_mode=BoxRefineMode.SAM_LOCAL,
+            sam_refine_all_kept=True,
+        ),
+        client_override=_FakeMllmClient([]),
+        refiner_override=refiner2,
+    )
+    assert refiner2.called_ids == [[0]]
+    assert res2.llm_fixed_count == 1
+    assert res2.records[0].refined_count == 1
+    assert res2.records[0].after_boxes[0].x1 == 52.0
+
+    # 3) 从 review_report.json 加载历史报告，精修计数与虚线原框信息完整保留
+    loaded = load_review_report(out_dir)
+    assert loaded.total_images == 1
+    assert loaded.llm_fixed_count == 1
+    assert loaded.records[0].refined_count == 1
+    assert loaded.records[0].after_boxes[0].refined is True
+    assert loaded.records[0].after_boxes[0].original_xyxy == (40.0, 20.0, 160.0, 180.0)
+
+
+def test_mllm_connection_check_handles_missing_credentials(monkeypatch) -> None:
+    """验证 `test_mllm_connection` 缺失 Key 或模型名时安全返回 `(False, 中文诊断)` 而不抛出异常。"""
+    from yolo_studio.core.mllm_reviewer import test_mllm_connection
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    ok_g, msg_g = test_mllm_connection(
+        MllmReviewConfig(images_dir=Path("."), output_dir=Path("."), provider=MllmProvider.GEMINI, api_key="")
+    )
+    assert ok_g is False
+    assert "GEMINI_API_KEY" in msg_g
+
+    ok_o, msg_o = test_mllm_connection(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.OPENAI_COMPAT,
+            model_name="",
+        )
+    )
+    assert ok_o is False
+    assert "模型名称" in msg_o

@@ -187,8 +187,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
-    """执行 `review` 子命令运行 MLLM 纠错清洗；无单图错误返回 0，否则返回 1。"""
+    """执行 `review` 子命令运行 MLLM 纠错清洗与可选边框紧贴修正；无单图错误返回 0，否则返回 1。"""
     from yolo_studio.core.mllm_reviewer import (
+        BoxRefineMode,
         MllmProvider,
         MllmReviewConfig,
         ReviewSourceMode,
@@ -219,11 +220,16 @@ def _cmd_review(args: argparse.Namespace) -> int:
         max_workers=args.workers,
         triage_subfolders=not args.flat,
         recursive=args.recursive,
+        box_refine_mode=BoxRefineMode(args.box_refine),
+        sam_model_name=args.sam_model,
+        sam_refine_all_kept=args.sam_refine_all,
     )
     res = run_mllm_review(cfg, log_callback=print)
+    refined_total = sum(r.refined_count for r in res.records)
     print(
         f"MLLM 清洗完成: 总计={res.total_images}, 自动通过={res.auto_passed_count}, "
-        f"已删改={res.llm_fixed_count}, 待人工复核={res.need_review_count}, 出错={res.error_count}"
+        f"已删改/收框={res.llm_fixed_count}(收紧 {refined_total} 框), "
+        f"待人工复核={res.need_review_count}, 出错={res.error_count}"
     )
     return 0 if res.error_count == 0 else 1
 
@@ -350,6 +356,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_rv.add_argument("--no-check-missing", action="store_true")
     p_rv.add_argument("--no-add-missing", action="store_true")
     p_rv.add_argument("--no-crops", action="store_true")
+    p_rv.add_argument(
+        "--box-refine",
+        choices=["off", "flag_loose", "mllm_crop", "sam_local"],
+        default="off",
+        help="边框紧贴标准化修正模式：off / flag_loose / mllm_crop / sam_local",
+    )
+    p_rv.add_argument("--sam-model", default="sam2.1_t.pt", help="sam_local 模式使用的 SAM 权重名或本地 .pt 路径")
+    p_rv.add_argument(
+        "--sam-refine-all",
+        action="store_true",
+        help="sam_local 模式下对全部保留框执行像素级收紧（默认仅收紧 MLLM 判定过松的框）",
+    )
     p_rv.add_argument("--workers", type=int, default=2)
     p_rv.add_argument("--flat", action="store_true", help="不按状态分建子目录")
     p_rv.add_argument("-r", "--recursive", action="store_true", help="递归扫描输入子目录")

@@ -28,7 +28,7 @@ XAL_ROOT = PROJECT_ROOT / "third_party" / "X-AnyLabeling"
 if XAL_ROOT.is_dir() and str(XAL_ROOT) not in sys.path:
     sys.path.insert(0, str(XAL_ROOT))
 
-from PyQt6.QtCore import QCoreApplication, Qt, QThread  # noqa: E402
+from PyQt6.QtCore import QCoreApplication, QSettings, Qt, QThread  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
@@ -38,6 +38,12 @@ from yolo_studio.gui.tab_labeling import (  # noqa: E402
     ensure_cuda_dll_search_paths,
     ensure_xanylabeling_runtime_initialized,
 )
+
+
+def _make_window(tmp_path: Path, *, lazy_init: bool = False) -> MainWindow:
+    """构造使用临时独立 `QSettings` 的 `MainWindow`，防止自动化测试读写宿主机真实用户配置。"""
+    settings = QSettings(str(tmp_path / "_test_settings.ini"), QSettings.Format.IniFormat)
+    return MainWindow(workspace_root=tmp_path, lazy_init=lazy_init, settings=settings)
 
 
 @pytest.fixture(scope="module")
@@ -65,7 +71,7 @@ def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
     """验证主窗口装配 6 个标签页，且内嵌 X-AnyLabeling 快捷键随可见态切换 WindowShortcut / WidgetShortcut。"""
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     win.show()
     qt_app.processEvents()
     try:
@@ -109,7 +115,7 @@ def test_embedded_workbench_keyboard_shortcuts_and_tab_isolation(
     _write_sample_frame(frames_dir / "f1.jpg")
     _write_sample_frame(frames_dir / "f2.jpg")
 
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     win.show()
     QTest.qWaitForWindowExposed(win)
     win.activateWindow()
@@ -174,7 +180,7 @@ def test_switching_next_image_with_long_path_does_not_resize_mainwindow(
     long_name = "img_002_" + ("very_long_frame_filename_" * 5) + ".jpg"
     _write_sample_frame(deep_dir / long_name, size=(2560, 1440))
 
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     win.show()
     qt_app.processEvents()
     try:
@@ -216,7 +222,7 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
     classes_file = tmp_path / "classes.txt"
     classes_file.write_text("person\nhelmet\n", encoding="utf-8")
 
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     try:
         # 从「3. 数据集准备」触发跳转至「2. 标注工作台」并定位第二张图
         win.tabs.setCurrentIndex(2)
@@ -265,7 +271,7 @@ def test_close_waits_for_running_workers(
     qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """验证关闭主窗口时会请求后台线程停止，并在线程结束后才真正关闭，不在运行中析构 `QThread`。"""
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     worker = _CancellableThread()
     win.train_tab.worker = worker
     worker.start()
@@ -297,7 +303,7 @@ def test_xal_label_bridge_and_defensive_fallback(qt_app: QApplication, tmp_path:
     classes_file = tmp_path / "classes.txt"
     classes_file.write_text("worker\nvest\ngoggles\n", encoding="utf-8")
 
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     try:
         count = win.labeling_tab.load_classes_file(classes_file)
         assert count == 3
@@ -321,7 +327,7 @@ def test_gpu_guard_shared_device_and_eval_onnx_half_toggle(
         staticmethod(lambda _p, title, text: warnings_shown.append(f"{title}:{text}")),
     )
 
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     worker = _CancellableThread()
     try:
         # 三个标签页共享同一份硬件快照与互斥协调器
@@ -396,7 +402,7 @@ def test_async_video_probe_and_review_preview_cache(
 
     monkeypatch.setattr("yolo_studio.gui.tab_review.render_review_comparison", _counting_render)
 
-    win = MainWindow(workspace_root=tmp_path)
+    win = _make_window(tmp_path)
     try:
         # 1) 验证异步视频探测线程不阻塞主线程并将结果填入列表
         win.extract_tab._add_video_paths([video_path])
@@ -438,7 +444,7 @@ def test_lazy_init_fast_startup_and_async_device_probe_and_on_demand_mount(
     frames_dir = tmp_path / "lazy_frames"
     _write_sample_frame(frames_dir / "f001.jpg")
 
-    win = MainWindow(workspace_root=tmp_path, lazy_init=True)
+    win = _make_window(tmp_path, lazy_init=True)
     try:
         # 1) 首屏秒开阶段：内嵌工作台处于未挂载占位态，设备处于后台探测态
         assert win.labeling_tab._xal_window is None
@@ -859,3 +865,166 @@ def test_compute_device_control_across_tabs_4_5_6_and_multi_gpu_and_amp_fp16_gua
         assert eval_tab.half_chk.isEnabled() is True
     finally:
         eval_tab.close()
+
+
+def test_review_tab_box_refine_filters_history_report_and_persistence(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证第 4 页边框修正模式联动、高置信度阈值角色切换、环境变量提示、分流筛选、历史报告加载与持久化记忆。"""
+    import json
+
+    from yolo_studio.core.mllm_reviewer import (
+        BoxDecision,
+        BoxRefineMode,
+        CandidateBox,
+        MllmProvider,
+        MllmReviewConfig,
+        MllmReviewResponse,
+        ReviewSourceMode,
+        run_mllm_review,
+    )
+    from yolo_studio.core.trainer import DeviceInfo
+    from yolo_studio.gui.tab_review import MllmReviewTab
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    ini_path = tmp_path / "review_settings.ini"
+    settings = QSettings(str(ini_path), QSettings.Format.IniFormat)
+    gpu_info = DeviceInfo(
+        cuda_available=True,
+        device_count=1,
+        device_name="Mock RTX 3060",
+        vram_gb=6.0,
+        recommended_device="0",
+        gpu_devices=(("0", "Mock RTX 3060", 6.0),),
+    )
+
+    # 先离线跑出一份包含 auto_passed / llm_fixed(含收框) / need_review 的真实审核报告
+    in_dir = tmp_path / "imgs"
+    out_dir = tmp_path / "reviewed"
+    for name in ("a_pass.jpg", "b_tight.jpg", "c_need.jpg"):
+        p = in_dir / name
+        _write_sample_frame(p, (400, 200))
+        payload = {
+            "shapes": [
+                {
+                    "label": "target",
+                    "score": 0.45,
+                    "points": [[40.0, 20.0], [160.0, 180.0]],
+                    "shape_type": "rectangle",
+                }
+            ],
+            "imageWidth": 400,
+            "imageHeight": 200,
+        }
+        p.with_suffix(".json").write_text(json.dumps(payload), encoding="utf-8")
+
+    class _StubClient:
+        def __init__(self) -> None:
+            self.idx = 0
+            self.resps = [
+                MllmReviewResponse(box_reviews=[BoxDecision(box_id=0, action="keep", box_quality="tight")]),
+                MllmReviewResponse(
+                    box_reviews=[
+                        BoxDecision(
+                            box_id=0,
+                            action="keep",
+                            box_quality="loose",
+                            refined_box_2d=[200, 220, 820, 780],
+                            reason="tighten",
+                        )
+                    ]
+                ),
+                MllmReviewResponse(
+                    box_reviews=[BoxDecision(box_id=0, action="keep", box_quality="tight")],
+                    has_missing=True,
+                    missing_note="missed one",
+                ),
+            ]
+
+        def review_image(self, *_args, **_kwargs):
+            r = self.resps[self.idx]
+            self.idx += 1
+            return r
+
+    run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.EXISTING_JSON,
+            allowed_classes=["target"],
+            max_workers=1,
+            box_refine_mode=BoxRefineMode.MLLM_CROP,
+        ),
+        client_override=_StubClient(),
+    )
+
+    tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=gpu_info)
+    try:
+        # 1) 环境变量缺失提示
+        assert "未检测到环境变量 GEMINI_API_KEY" in tab1.api_key_status_label.text()
+
+        # 2) 默认开启漏标检查 + 局部裁剪 -> 阈值角色为“优先裁剪阈值”；关掉裁剪 -> 禁用；关掉漏标 -> 恢复“高置信度免审阈值”
+        assert "优先裁剪阈值" in tab1.high_conf_label.text()
+        tab1.crops_chk.setChecked(False)
+        qt_app.processEvents()
+        assert tab1.high_conf_spin.isEnabled() is False
+        tab1.check_missing_chk.setChecked(False)
+        qt_app.processEvents()
+        assert tab1.high_conf_spin.isEnabled() is True
+        assert "免审阈值" in tab1.high_conf_label.text()
+
+        # 3) 边框紧贴修正模式联动：SAM_LOCAL 显示 SAM 行，MLLM_CROP 强制勾选并锁定局部裁剪
+        assert tab1.sam_row_widget.isHidden() is True
+        sam_idx = tab1.refine_mode_combo.findData(BoxRefineMode.SAM_LOCAL)
+        tab1.refine_mode_combo.setCurrentIndex(sam_idx)
+        qt_app.processEvents()
+        assert tab1.sam_row_widget.isHidden() is False
+
+        crop_idx = tab1.refine_mode_combo.findData(BoxRefineMode.MLLM_CROP)
+        tab1.refine_mode_combo.setCurrentIndex(crop_idx)
+        qt_app.processEvents()
+        assert tab1.sam_row_widget.isHidden() is True
+        assert tab1.crops_chk.isChecked() is True
+        assert tab1.crops_chk.isEnabled() is False
+
+        # 4) 加载历史审核报告并验证分流筛选与对比预览
+        tab1.load_history_report(out_dir / "review_report.json")
+        qt_app.processEvents()
+        assert tab1.result_table.rowCount() == 3
+        assert "全部 (3)" in tab1.filter_buttons["all"].text()
+        assert "已删改/收框 (1)" in tab1.filter_buttons["llm_fixed"].text()
+        assert "待复核 (1)" in tab1.filter_buttons["need_review"].text()
+        assert tab1.send_ds_btn.isEnabled() is True
+
+        # 筛选仅看待复核：只显示第 2 行，前两行隐藏
+        tab1.set_result_filter("need_review")
+        assert tab1.result_table.isRowHidden(0) is True
+        assert tab1.result_table.isRowHidden(1) is True
+        assert tab1.result_table.isRowHidden(2) is False
+        # 单击含收框记录的行（row=1），能正常渲染对比图
+        tab1.set_result_filter("all")
+        tab1._on_row_selected(1)
+        assert tab1.preview_label.pixmap() is not None and not tab1.preview_label.pixmap().isNull()
+
+        # 5) 持久化策略（手动填入的明文 API Key 不落盘）
+        tab1.refine_mode_combo.setCurrentIndex(sam_idx)
+        tab1.sam_refine_all_chk.setChecked(True)
+        tab1.classes_edit.setText("hero, boss")
+        tab1.guideline_edit.setText("紧贴主体边缘")
+        tab1.api_key_edit.setText("secret-key-should-not-persist")
+        tab1.save_settings(settings)
+        settings.sync()
+    finally:
+        tab1.close()
+
+    tab2 = MllmReviewTab(workspace_root=tmp_path, device_info=gpu_info)
+    try:
+        tab2.restore_settings(settings)
+        assert tab2.refine_mode_combo.currentData() == BoxRefineMode.SAM_LOCAL
+        assert tab2.sam_refine_all_chk.isChecked() is True
+        assert tab2.sam_row_widget.isHidden() is False
+        assert tab2.classes_edit.text() == "hero, boss"
+        assert tab2.guideline_edit.text() == "紧贴主体边缘"
+        assert tab2.api_key_edit.text() == ""  # 明文 API Key 绝不持久化
+    finally:
+        tab2.close()

@@ -23,12 +23,13 @@ import json
 import os
 import re
 import shutil
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Callable, Literal, Protocol
 
 import cv2
@@ -63,6 +64,30 @@ class MllmProvider(str, Enum):
     OPENAI_COMPAT = "openai_compat"
 
 
+class BoxRefineMode(str, Enum):
+    """已有候选框的边框紧贴标准化修正模式。"""
+
+    OFF = "off"
+    FLAG_LOOSE = "flag_loose"
+    MLLM_CROP = "mllm_crop"
+    SAM_LOCAL = "sam_local"
+
+
+BOX_REFINE_MODE_ITEMS: list[tuple[BoxRefineMode, str]] = [
+    (BoxRefineMode.OFF, "关闭（仅纠错类 / 删误检 / 补漏）"),
+    (BoxRefineMode.FLAG_LOOSE, "仅标记过松框 → 转入待人工复核"),
+    (BoxRefineMode.MLLM_CROP, "MLLM 局部放大图精修（懂业务规则，零额外模型）"),
+    (BoxRefineMode.SAM_LOCAL, "本地 SAM 像素级收紧（轮廓最贴边 + 安全门禁）"),
+]
+
+SAM_REFINE_MODELS: list[tuple[str, str]] = [
+    ("sam2.1_t.pt", "SAM 2.1 Tiny (速度快，显存占用最低，推荐)"),
+    ("sam2.1_s.pt", "SAM 2.1 Small (速度与贴边精度均衡)"),
+    ("sam2.1_b.pt", "SAM 2.1 Base (更高边缘精度)"),
+    ("mobile_sam.pt", "MobileSAM (超轻量快速分割)"),
+]
+
+
 OPENAI_PRESETS: list[tuple[str, str, str]] = [
     ("通义千问 DashScope (Qwen-VL)", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-vl-max-latest"),
     ("硅基流动 SiliconFlow", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-VL-72B-Instruct"),
@@ -79,7 +104,7 @@ GEMINI_MODELS: list[tuple[str, str]] = [
 
 
 class BoxDecision(BaseModel):
-    """针对单个已有候选框的审核决策。"""
+    """针对单个已有候选框的审核与边框紧贴评估决策。"""
 
     box_id: int = Field(description="Candidate box ID shown in the overview image.")
     action: Literal["keep", "relabel", "delete"] = Field(
@@ -88,6 +113,17 @@ class BoxDecision(BaseModel):
     new_label: str | None = Field(
         default=None,
         description="Corrected class name from the allowed class list when action is relabel.",
+    )
+    box_quality: Literal["tight", "loose", "partial"] = Field(
+        default="tight",
+        description="tight if box fits object tightly; loose if too much background is included; partial if clipped.",
+    )
+    refined_box_2d: list[int] | None = Field(
+        default=None,
+        description=(
+            "Optional tight [ymin, xmin, ymax, xmax] normalized to 0-1000 inside the zoomed crop image "
+            "for this box_id when box_quality is loose or partial."
+        ),
     )
     reason: str = Field(default="", description="Brief explanation in Chinese or English.")
 
@@ -128,11 +164,14 @@ class CandidateBox:
     x2: float
     y2: float
     confidence: float | None = None
-    # 状态取值：original | kept | relabeled | relabel_invalid | deleted | llm_added；
-    # relabel_invalid 表示模型要求改类但给出的新类别不在允许清单中，保留原类别并强制进入人工复核
+    # 状态取值：original | kept | relabeled | relabel_invalid | deleted | llm_added | refined | refine_suspect；
+    # relabel_invalid 表示模型要求改类但给出的新类别不在允许清单中，保留原类别并强制进入人工复核；
+    # refine_suspect 表示判定过松或自动收框幅度超出安全门禁，保留原框并强制进入人工复核
     status: str = "original"
     reason: str = ""
     original_label: str = ""
+    refined: bool = False
+    original_xyxy: tuple[float, float, float, float] | None = None
 
 
 @dataclass
@@ -149,6 +188,8 @@ class ImageReviewRecord:
     relabeled_count: int = 0
     deleted_count: int = 0
     added_count: int = 0
+    refined_count: int = 0
+    loose_flagged_count: int = 0
     has_missing: bool = False
     missing_note: str = ""
     skipped_mllm: bool = False
@@ -161,7 +202,11 @@ class MllmReviewConfig:
 
     关键字段说明：
         `yolo_conf` / `yolo_iou` / `high_conf_skip`：置信度与 IoU 阈值，取值范围 `(0, 1]`；
-        仅当已有候选框非空、所有框均具有不低于 `high_conf_skip` 的置信度且 `check_missing=False` 时跳过 MLLM。
+            仅当已有候选框非空、所有框均具有不低于 `high_conf_skip` 的置信度、`check_missing=False`
+            且未启用要求全框收紧的边框修正时跳过 MLLM。
+        `box_refine_mode`：边框紧贴标准化修正模式（`off` / `flag_loose` / `mllm_crop` / `sam_local`）。
+        `sam_model_name` / `sam_refine_all_kept`：本地 SAM 收框使用的权重与触发范围（默认仅收紧过松框）。
+        `refine_min_area_ratio` / `refine_min_iou`：自动收框安全门禁下限，超限时保留原框并转 `need_review`。
         `max_crops_per_image`：每张图最多附带的局部放大裁剪数；`max_image_dim` 为送审图最长边像素限制。
         `max_workers`：并发审核线程池工作线程数（至少为 `1`）。
     """
@@ -192,6 +237,11 @@ class MllmReviewConfig:
     max_workers: int = 2
     triage_subfolders: bool = True
     recursive: bool = False
+    box_refine_mode: BoxRefineMode = BoxRefineMode.OFF
+    sam_model_name: str = "sam2.1_t.pt"
+    sam_refine_all_kept: bool = False
+    refine_min_area_ratio: float = 0.15
+    refine_min_iou: float = 0.25
 
 
 @dataclass
@@ -221,6 +271,14 @@ class MllmClient(Protocol):
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse: ...
+
+
+class BoxRefinerProtocol(Protocol):
+    """本地像素级边框紧贴修正器抽象协议（输入原图与待修正框列表，返回 `box_id -> 紧贴 xyxy` 映射）。"""
+
+    def refine_boxes(
+        self, image_bgr: np.ndarray, boxes: list[CandidateBox]
+    ) -> dict[int, tuple[float, float, float, float] | None]: ...
 
 
 def _read_image_unicode_safe(image_path: Path) -> np.ndarray:
@@ -435,6 +493,129 @@ def build_mllm_client(config: MllmReviewConfig) -> MllmClient:
     )
 
 
+def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
+    """向配置的 MLLM 接口发送极简纯文本探针请求，快速校验 API Key、Base URL 与模型名称是否连通。
+
+    返回值与失败行为：
+        不抛出网络或鉴权异常，统一返回 `(是否连通, 中文结果摘要)`；
+        探针不上传任何图片以将延迟和费用降至最低。
+    """
+    t0 = time.perf_counter()
+    try:
+        if config.provider == MllmProvider.GEMINI:
+            from google import genai
+
+            resolved_key = config.api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+            if not resolved_key:
+                return False, "未提供 Gemini API Key（请在界面填写或设置环境变量 GEMINI_API_KEY）。"
+            model_name = config.model_name.strip() or "gemini-3.8-flash"
+            client = genai.Client(api_key=resolved_key)
+            interaction = client.interactions.create(
+                model=model_name,
+                input=[{"type": "text", "text": "Reply OK."}],
+                store=False,
+            )
+            reply = (getattr(interaction, "output_text", None) or "").strip()
+            elapsed = time.perf_counter() - t0
+            preview = reply[:40].replace("\n", " ") if reply else "(空响应)"
+            return True, f"Gemini 接口连通正常（模型: {model_name}，耗时 {elapsed:.2f}s，回复: {preview}）"
+
+        from openai import OpenAI
+
+        resolved_key = config.api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip() or "ollama"
+        resolved_url = config.base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        model_name = config.model_name.strip()
+        if not model_name:
+            return False, "请先填写模型名称（如 qwen-vl-max-latest）。"
+        client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=20.0)
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "Reply OK."}],
+            max_tokens=12,
+            temperature=0.0,
+        )
+        reply = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+        elapsed = time.perf_counter() - t0
+        preview = reply[:40].replace("\n", " ") if reply else "(空响应)"
+        return True, f"OpenAI 兼容接口连通正常（模型: {model_name}，耗时 {elapsed:.2f}s，回复: {preview}）"
+    except Exception as exc:
+        elapsed = time.perf_counter() - t0
+        return False, f"接口连接失败（耗时 {elapsed:.2f}s）: {exc}"
+
+
+class UltralyticsSamBoxRefiner:
+    """基于 `ultralytics.SAM` 的本地像素级边框紧贴修正器（Box Prompt → 掩码最小外接矩形）。
+
+    线程安全与运行环境：
+        内部持有 `threading.Lock` 串行化 GPU/CPU 模型推理，保证多并发 MLLM 审核线程共享同一 SAM 实例时
+        不发生 CUDA 上下文争抢；若本地不存在权重，Ultralytics 会按模型名称自动下载。
+    """
+
+    def __init__(self, model_name: str = "sam2.1_t.pt", device: str = "0") -> None:
+        from ultralytics import SAM
+
+        from yolo_studio.core.trainer import ensure_torch_cpu_threads, resolve_pretrained_weights
+
+        ensure_torch_cpu_threads()
+        resolved = resolve_pretrained_weights(model_name.strip() or "sam2.1_t.pt")
+        self.model_source = resolved
+        self.device = device
+        self._lock = Lock()
+        self._model = SAM(resolved)
+
+    def refine_boxes(
+        self, image_bgr: np.ndarray, boxes: list[CandidateBox]
+    ) -> dict[int, tuple[float, float, float, float] | None]:
+        """对 `boxes` 执行 Box-Prompt 掩码分割并在原框容差范围内提取最小紧贴外接矩形。"""
+        if not boxes:
+            return {}
+        img_h, img_w = image_bgr.shape[:2]
+        bboxes_arg = [[float(b.x1), float(b.y1), float(b.x2), float(b.y2)] for b in boxes]
+        with self._lock:
+            results = self._model.predict(
+                source=image_bgr,
+                bboxes=bboxes_arg,
+                device=self.device,
+                verbose=False,
+            )
+
+        refined_map: dict[int, tuple[float, float, float, float] | None] = {b.box_id: None for b in boxes}
+        if not results:
+            return refined_map
+        masks = getattr(results[0], "masks", None)
+        if masks is None or getattr(masks, "data", None) is None:
+            return refined_map
+
+        mask_arr = masks.data.detach().cpu().numpy()
+        for idx, box in enumerate(boxes):
+            if idx >= len(mask_arr):
+                break
+            mask = mask_arr[idx]
+            mh, mw = mask.shape[:2]
+            if mh != img_h or mw != img_w:
+                mask = cv2.resize(mask.astype(np.float32), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+            binary = mask > 0.5
+
+            # 限制在原框向外最多 5% 容差范围内取紧贴轮廓，防止分割泄漏到远处无关物体
+            bw = max(1.0, box.x2 - box.x1)
+            bh = max(1.0, box.y2 - box.y1)
+            rx1 = max(0, int(np.floor(box.x1 - bw * 0.05)))
+            ry1 = max(0, int(np.floor(box.y1 - bh * 0.05)))
+            rx2 = min(img_w, int(np.ceil(box.x2 + bw * 0.05)))
+            ry2 = min(img_h, int(np.ceil(box.y2 + bh * 0.05)))
+            roi = binary[ry1:ry2, rx1:rx2]
+            ys, xs = np.nonzero(roi)
+            if len(xs) == 0 or len(ys) == 0:
+                continue
+            nx1 = float(rx1 + int(xs.min()))
+            ny1 = float(ry1 + int(ys.min()))
+            nx2 = float(rx1 + int(xs.max()) + 1)
+            ny2 = float(ry1 + int(ys.max()) + 1)
+            if (nx2 - nx1) > 2.0 and (ny2 - ny1) > 2.0:
+                refined_map[box.box_id] = (nx1, ny1, min(float(img_w), nx2), min(float(img_h), ny2))
+        return refined_map
+
+
 def _render_overview_and_crops(
     image_bgr: np.ndarray,
     boxes: list[CandidateBox],
@@ -442,8 +623,10 @@ def _render_overview_and_crops(
     max_crops: int,
     high_conf_skip: float,
     max_dim: int,
-) -> tuple[bytes, list[tuple[int, str, bytes]]]:
-    """在图片上绘制带编号的候选框总览图，并为低置信度候选框提取外扩 20% 的局部放大裁剪图。"""
+    *,
+    force_crops: bool = False,
+) -> tuple[bytes, list[tuple[int, str, bytes]], dict[int, tuple[int, int, int, int]]]:
+    """绘制带编号候选框总览图，并提取外扩 20% 的局部放大裁剪图及其在原图上的像素裁剪区域映射。"""
     h, w = image_bgr.shape[:2]
     canvas = image_bgr.copy()
     palette = [
@@ -482,16 +665,19 @@ def _render_overview_and_crops(
     overview_jpeg = _encode_jpeg_bytes(canvas, max_dim=max_dim, quality=90)
 
     crops: list[tuple[int, str, bytes]] = []
-    if include_crops and boxes:
-        # 优先按置信度从低到高排序，确保低置信度可疑框优先获得局部裁剪放大图
+    crop_regions: dict[int, tuple[int, int, int, int]] = {}
+    if (include_crops or force_crops) and boxes:
+        # 优先按置信度从低到高排序，确保低置信度可疑框优先获得局部裁剪放大图；
+        # 当 `force_crops=True`（MLLM 局部精修模式）时放宽上限以尽量覆盖全部候选框
+        limit = max(max_crops, len(boxes)) if force_crops else max_crops
         prioritized = sorted(
             boxes,
             key=lambda b: b.confidence if b.confidence is not None else 0.5,
         )
         for box in prioritized:
-            if len(crops) >= max_crops:
+            if len(crops) >= limit:
                 break
-            if box.confidence is not None and box.confidence >= high_conf_skip and len(boxes) > max_crops:
+            if not force_crops and box.confidence is not None and box.confidence >= high_conf_skip and len(boxes) > limit:
                 continue
             bw = max(1.0, box.x2 - box.x1)
             bh = max(1.0, box.y2 - box.y1)
@@ -505,8 +691,9 @@ def _render_overview_and_crops(
                 continue
             crop_bgr = image_bgr[cy1:cy2, cx1:cx2]
             crops.append((box.box_id, box.label, _encode_jpeg_bytes(crop_bgr, max_dim=512, quality=92)))
+            crop_regions[box.box_id] = (cx1, cy1, cx2, cy2)
 
-    return overview_jpeg, crops
+    return overview_jpeg, crops, crop_regions
 
 
 def _overview_scale(img_w: int, img_h: int, max_dim: int) -> float:
@@ -523,12 +710,35 @@ def _build_prompts(
     config: MllmReviewConfig,
     coord_scale: float = 1.0,
 ) -> tuple[str, str]:
-    """构造系统提示词与用户提示词。
-
-    `coord_scale` 为送审总览图相对原图的缩放系数；提示词中的 `xyxy` 会乘以该系数，
-    使坐标与模型实际看到的图片像素一致（候选框内部仍以原图像素坐标保存）。
-    """
+    """构造系统提示词与用户提示词，并按 `config.box_refine_mode` 附加边框贴合度评估与局部精修要求。"""
     classes_str = ", ".join(allowed_classes) if allowed_classes else "(any relevant object)"
+    refine_mode = config.box_refine_mode
+
+    refine_rule_sys = ""
+    refine_rule_user = ""
+    if refine_mode != BoxRefineMode.OFF:
+        refine_rule_sys = (
+            "\n3. Evaluate bounding box tightness (`box_quality`) for every kept/relabeled box:\n"
+            "   - 'tight': box closely hugs the target object boundary according to YOLO standards.\n"
+            "   - 'loose': box is noticeably too large and includes excessive background margin.\n"
+            "   - 'partial': box cuts off a significant part of the target object."
+        )
+        if refine_mode == BoxRefineMode.MLLM_CROP:
+            refine_rule_sys += (
+                "\n4. When box_quality is 'loose' or 'partial', provide `refined_box_2d` as "
+                "[ymin, xmin, ymax, xmax] integers normalized to 0-1000 INSIDE THAT BOX'S ZOOMED CROP IMAGE "
+                "(not the full overview image) tightly enclosing the target object."
+            )
+            refine_rule_user = (
+                "For each candidate box where box_quality is 'loose' or 'partial', return `refined_box_2d` "
+                "in [ymin, xmin, ymax, xmax] (0-1000) relative to its corresponding zoomed crop image.\n"
+            )
+        else:
+            refine_rule_user = (
+                "Also set `box_quality` ('tight', 'loose', or 'partial') for each kept/relabeled box; "
+                "leave `refined_box_2d` as null.\n"
+            )
+
     system_prompt = (
         "You are a strict, accurate computer vision data quality reviewer. "
         "Your job is to inspect candidate bounding boxes drawn on an image and output ONLY valid JSON "
@@ -540,6 +750,7 @@ def _build_prompts(
         "   - 'relabel': the box encloses a valid target object, but its class is wrong; set new_label to an EXACT name from Allowed target classes.\n"
         "   - 'delete': false positive / background noise / severely wrong non-object region.\n"
         "2. Check if there are any unannotated target objects from Allowed target classes that are completely missing a box."
+        f"{refine_rule_sys}"
     )
     if config.custom_guideline.strip():
         system_prompt += f"\nDomain Annotation Guidelines:\n{config.custom_guideline.strip()}"
@@ -570,8 +781,9 @@ def _build_prompts(
         f"Review the candidate bounding boxes shown on the first image (numbered [0], [1], ...).\n"
         f"Candidate xyxy coordinates are in pixels of the first image as sent to you.\n"
         f"Candidate boxes:\n{boxes_summary}\n\n"
+        f"{refine_rule_user}"
         f"{missing_instr}\n\n"
-        "Return strict JSON with keys: box_reviews (list of {box_id, action, new_label, reason}), "
+        "Return strict JSON with keys: box_reviews (list of {box_id, action, new_label, box_quality, refined_box_2d, reason}), "
         "has_missing (bool), missing_note (str), added_boxes (list of {label, box_2d, reason})."
     )
     return system_prompt, user_prompt
@@ -623,6 +835,146 @@ def _box_2d_to_pixel_xyxy(
     return x1, y1, x2, y2
 
 
+def map_crop_box_2d_to_image_xyxy(
+    box_2d: list[int],
+    crop_region: tuple[int, int, int, int],
+    img_w: int,
+    img_h: int,
+) -> tuple[float, float, float, float] | None:
+    """将局部裁剪图坐标系（`0..1000` 的 `[ymin, xmin, ymax, xmax]`）精确映射回原图像素坐标 `(x1, y1, x2, y2)`。"""
+    if len(box_2d) != 4:
+        return None
+    cx1, cy1, cx2, cy2 = crop_region
+    cw = max(1, cx2 - cx1)
+    ch = max(1, cy2 - cy1)
+    ymin, xmin, ymax, xmax = box_2d
+    x1 = cx1 + (float(xmin) / 1000.0) * cw
+    y1 = cy1 + (float(ymin) / 1000.0) * ch
+    x2 = cx1 + (float(xmax) / 1000.0) * cw
+    y2 = cy1 + (float(ymax) / 1000.0) * ch
+    x1 = max(0.0, min(float(img_w), x1))
+    y1 = max(0.0, min(float(img_h), y1))
+    x2 = max(0.0, min(float(img_w), x2))
+    y2 = max(0.0, min(float(img_h), y2))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    if (x2 - x1) <= 2.0 or (y2 - y1) <= 2.0:
+        return None
+    return x1, y1, x2, y2
+
+
+def evaluate_box_refinement(
+    orig_box: CandidateBox,
+    new_xyxy: tuple[float, float, float, float],
+    *,
+    min_area_ratio: float = 0.15,
+    max_area_ratio: float = 1.60,
+    min_iou: float = 0.25,
+) -> Literal["accepted", "unchanged", "suspect"]:
+    """对自动收紧后的新边界框执行安全门禁评估，防止缩过头或偏移到无关目标。
+
+    判定结果：
+        - `"unchanged"`：新旧框 IoU >= 0.96 且四边最大像素偏移 <= 2.0px，认为原框已足够紧贴；
+        - `"suspect"`：面积比超出 `[min_area_ratio, max_area_ratio]` 或 IoU < `min_iou`，
+          认为疑似误抠局部/偏移异常，调用方应保留原框并分流人工复核；
+        - `"accepted"`：收紧幅度合理，可安全采用新框坐标。
+    """
+    nx1, ny1, nx2, ny2 = new_xyxy
+    old_area = max(1.0, (orig_box.x2 - orig_box.x1) * (orig_box.y2 - orig_box.y1))
+    new_area = max(0.0, (nx2 - nx1) * (ny2 - ny1))
+    if new_area <= 4.0:
+        return "suspect"
+
+    probe = CandidateBox(box_id=orig_box.box_id, label=orig_box.label, x1=nx1, y1=ny1, x2=nx2, y2=ny2)
+    iou = _box_iou(orig_box, probe)
+    max_edge_delta = max(
+        abs(nx1 - orig_box.x1),
+        abs(ny1 - orig_box.y1),
+        abs(nx2 - orig_box.x2),
+        abs(ny2 - orig_box.y2),
+    )
+    if iou >= 0.96 and max_edge_delta <= 2.0:
+        return "unchanged"
+
+    area_ratio = new_area / old_area
+    if area_ratio < min_area_ratio or area_ratio > max_area_ratio or iou < min_iou:
+        return "suspect"
+    return "accepted"
+
+
+def _apply_candidate_refinement(
+    target_box: CandidateBox,
+    new_xyxy: tuple[float, float, float, float] | None,
+    *,
+    source_tag: str,
+    min_area_ratio: float,
+    min_iou: float,
+    mark_missing_as_suspect: bool = True,
+) -> None:
+    """将单框精修坐标经安全门禁后原地更新至 `target_box`；超门禁时保留原框并标为 `refine_suspect`。"""
+    if new_xyxy is None:
+        if mark_missing_as_suspect and target_box.status != "relabel_invalid":
+            target_box.status = "refine_suspect"
+            target_box.reason = f"{source_tag}未检出有效紧贴轮廓，需人工确认; {target_box.reason}".strip("; ")
+        return
+
+    verdict = evaluate_box_refinement(
+        target_box, new_xyxy, min_area_ratio=min_area_ratio, min_iou=min_iou
+    )
+    if verdict == "accepted":
+        target_box.original_xyxy = (target_box.x1, target_box.y1, target_box.x2, target_box.y2)
+        target_box.x1, target_box.y1, target_box.x2, target_box.y2 = new_xyxy
+        target_box.refined = True
+        if target_box.status == "kept":
+            target_box.status = "refined"
+        target_box.reason = f"{source_tag}已收紧边框; {target_box.reason}".strip("; ")
+    elif verdict == "suspect":
+        if target_box.status != "relabel_invalid":
+            target_box.status = "refine_suspect"
+        target_box.reason = f"{source_tag}收框幅度超安全门禁已保留原框; {target_box.reason}".strip("; ")
+
+
+def apply_sam_box_refinement(
+    image_bgr: np.ndarray,
+    after_boxes: list[CandidateBox],
+    response: MllmReviewResponse | None,
+    refiner: BoxRefinerProtocol,
+    *,
+    refine_all_kept: bool = False,
+    min_area_ratio: float = 0.15,
+    min_iou: float = 0.25,
+) -> None:
+    """在原地对满足条件的保留/改类候选框执行本地 SAM 像素级收框并套用安全门禁。"""
+    decision_map = {d.box_id: d for d in response.box_reviews} if response is not None else {}
+    targets: list[CandidateBox] = []
+    explicit_loose_ids: set[int] = set()
+    for b in after_boxes:
+        if b.status in {"llm_added", "relabel_invalid"}:
+            continue
+        dec = decision_map.get(b.box_id)
+        is_loose = dec is not None and dec.box_quality in {"loose", "partial"}
+        if is_loose:
+            explicit_loose_ids.add(b.box_id)
+        if refine_all_kept or is_loose:
+            targets.append(b)
+
+    if not targets:
+        return
+
+    refined_map = refiner.refine_boxes(image_bgr, targets)
+    for b in targets:
+        _apply_candidate_refinement(
+            b,
+            refined_map.get(b.box_id),
+            source_tag="SAM",
+            min_area_ratio=min_area_ratio,
+            min_iou=min_iou,
+            mark_missing_as_suspect=b.box_id in explicit_loose_ids,
+        )
+
+
 def apply_review_decisions(
     before_boxes: list[CandidateBox],
     response: MllmReviewResponse,
@@ -630,25 +982,63 @@ def apply_review_decisions(
     img_w: int,
     img_h: int,
     add_missing_boxes: bool = True,
+    *,
+    box_refine_mode: BoxRefineMode = BoxRefineMode.OFF,
+    crop_regions: dict[int, tuple[int, int, int, int]] | None = None,
+    refine_min_area_ratio: float = 0.15,
+    refine_min_iou: float = 0.25,
 ) -> tuple[list[CandidateBox], int, int, int, int]:
-    """将 MLLM 审核决策合并到候选框集合中，并过滤重复补充框。
+    """将 MLLM 审核与边框紧贴决策合并到候选框集合中，并过滤重复补充框。
 
-    返回 `(after_boxes, kept, relabeled, deleted, added)`；
+    返回兼容的 5 元组 `(after_boxes, kept, relabeled, deleted, added)`；
     未出现在 `box_reviews` 中的候选框按保留（`kept`）处理，
-    要求改为非允许类别的框计入 `kept` 但状态为 `relabel_invalid`（调用方据此分流到 `need_review`），
+    要求改为非允许类别的框计入 `kept` 但状态为 `relabel_invalid`，
+    启用 `FLAG_LOOSE` 或 `MLLM_CROP` 时同步将过松或超安全门禁的框标记为 `refine_suspect`（调用方据此分流到 `need_review`），
     新增补充框若与同类别现有框 IoU > 0.65 则视为重复并跳过。
     """
     decision_map = {d.box_id: d for d in response.box_reviews}
+    regions = crop_regions or {}
     after_boxes: list[CandidateBox] = []
     kept = relabeled = deleted = added = 0
     next_id = max((b.box_id for b in before_boxes), default=-1) + 1
 
     for box in before_boxes:
         decision = decision_map.get(box.box_id)
+        out_box: CandidateBox | None = None
         if decision is None or decision.action == "keep":
             kept += 1
-            after_boxes.append(
-                CandidateBox(
+            out_box = CandidateBox(
+                box_id=box.box_id,
+                label=box.label,
+                x1=box.x1,
+                y1=box.y1,
+                x2=box.x2,
+                y2=box.y2,
+                confidence=box.confidence,
+                status="kept",
+                reason=decision.reason if decision else "",
+                original_label=box.label,
+            )
+        elif decision.action == "relabel":
+            resolved = _normalize_class_name(decision.new_label, allowed_classes)
+            if resolved and resolved != box.label:
+                relabeled += 1
+                out_box = CandidateBox(
+                    box_id=box.box_id,
+                    label=resolved,
+                    x1=box.x1,
+                    y1=box.y1,
+                    x2=box.x2,
+                    y2=box.y2,
+                    confidence=box.confidence,
+                    status="relabeled",
+                    reason=decision.reason,
+                    original_label=box.label,
+                )
+            else:
+                kept += 1
+                invalid = bool(decision.new_label) and resolved is None
+                out_box = CandidateBox(
                     box_id=box.box_id,
                     label=box.label,
                     x1=box.x1,
@@ -656,54 +1046,42 @@ def apply_review_decisions(
                     x2=box.x2,
                     y2=box.y2,
                     confidence=box.confidence,
-                    status="kept",
-                    reason=decision.reason if decision else "",
+                    status="relabel_invalid" if invalid else "kept",
+                    reason=(
+                        f"模型建议改为非法类别 '{decision.new_label}'; {decision.reason}"
+                        if invalid
+                        else decision.reason
+                    ),
                     original_label=box.label,
-                )
-            )
-        elif decision.action == "relabel":
-            resolved = _normalize_class_name(decision.new_label, allowed_classes)
-            if resolved and resolved != box.label:
-                relabeled += 1
-                after_boxes.append(
-                    CandidateBox(
-                        box_id=box.box_id,
-                        label=resolved,
-                        x1=box.x1,
-                        y1=box.y1,
-                        x2=box.x2,
-                        y2=box.y2,
-                        confidence=box.confidence,
-                        status="relabeled",
-                        reason=decision.reason,
-                        original_label=box.label,
-                    )
-                )
-            else:
-                # 新类别为空、与原类别相同或不在允许清单中：保留原类别；
-                # 若模型确实给出了不同但非法的类别，标记为 relabel_invalid 以强制人工复核
-                kept += 1
-                invalid = bool(decision.new_label) and resolved is None
-                after_boxes.append(
-                    CandidateBox(
-                        box_id=box.box_id,
-                        label=box.label,
-                        x1=box.x1,
-                        y1=box.y1,
-                        x2=box.x2,
-                        y2=box.y2,
-                        confidence=box.confidence,
-                        status="relabel_invalid" if invalid else "kept",
-                        reason=(
-                            f"模型建议改为非法类别 '{decision.new_label}'; {decision.reason}"
-                            if invalid
-                            else decision.reason
-                        ),
-                        original_label=box.label,
-                    )
                 )
         elif decision.action == "delete":
             deleted += 1
+
+        if out_box is not None:
+            if (
+                decision is not None
+                and decision.box_quality in {"loose", "partial"}
+                and out_box.status != "relabel_invalid"
+            ):
+                if box_refine_mode == BoxRefineMode.FLAG_LOOSE:
+                    out_box.status = "refine_suspect"
+                    q_label = "边框过松含过多背景" if decision.box_quality == "loose" else "边框截断不完整"
+                    out_box.reason = f"{q_label}; {out_box.reason}".strip("; ")
+                elif box_refine_mode == BoxRefineMode.MLLM_CROP:
+                    mapped_xyxy: tuple[float, float, float, float] | None = None
+                    if decision.refined_box_2d and box.box_id in regions:
+                        mapped_xyxy = map_crop_box_2d_to_image_xyxy(
+                            decision.refined_box_2d, regions[box.box_id], img_w, img_h
+                        )
+                    _apply_candidate_refinement(
+                        out_box,
+                        mapped_xyxy,
+                        source_tag="MLLM局部精修",
+                        min_area_ratio=refine_min_area_ratio,
+                        min_iou=refine_min_iou,
+                        mark_missing_as_suspect=True,
+                    )
+            after_boxes.append(out_box)
 
     if add_missing_boxes:
         for item in response.added_boxes:
@@ -758,7 +1136,7 @@ def _write_xanylabeling_json(
                 "description": b.status if not b.reason else f"{b.status}: {b.reason}",
                 "difficult": False,
                 "shape_type": "rectangle",
-                "flags": {"llm_added": b.status == "llm_added"},
+                "flags": {"llm_added": b.status == "llm_added", "box_refined": b.refined},
             }
         )
     payload = {
@@ -955,14 +1333,158 @@ def _remove_stale_bucket_outputs(output_dir: Path, out_name: str, keep_bucket: s
                 stale.unlink()
 
 
+def _serialize_candidate_box(b: CandidateBox) -> dict[str, object]:
+    """将 `CandidateBox` 序列化为可写入 `review_report.json` 的纯 JSON 字典。"""
+    return {
+        "box_id": b.box_id,
+        "label": b.label,
+        "x1": round(b.x1, 2),
+        "y1": round(b.y1, 2),
+        "x2": round(b.x2, 2),
+        "y2": round(b.y2, 2),
+        "confidence": round(b.confidence, 4) if b.confidence is not None else None,
+        "status": b.status,
+        "reason": b.reason,
+        "original_label": b.original_label,
+        "refined": b.refined,
+        "original_xyxy": [round(v, 2) for v in b.original_xyxy] if b.original_xyxy else None,
+    }
+
+
+def _deserialize_candidate_box(raw: dict[str, object], fallback_id: int = 0) -> CandidateBox:
+    """将 `review_report.json` 中记录的框字典还原为 `CandidateBox`。"""
+    orig_raw = raw.get("original_xyxy")
+    orig_xyxy: tuple[float, float, float, float] | None = None
+    if isinstance(orig_raw, list) and len(orig_raw) == 4:
+        orig_xyxy = (float(orig_raw[0]), float(orig_raw[1]), float(orig_raw[2]), float(orig_raw[3]))
+    conf_raw = raw.get("confidence")
+    return CandidateBox(
+        box_id=int(raw.get("box_id", fallback_id)),  # type: ignore[arg-type]
+        label=str(raw.get("label", "")),
+        x1=float(raw.get("x1", 0.0)),  # type: ignore[arg-type]
+        y1=float(raw.get("y1", 0.0)),  # type: ignore[arg-type]
+        x2=float(raw.get("x2", 0.0)),  # type: ignore[arg-type]
+        y2=float(raw.get("y2", 0.0)),  # type: ignore[arg-type]
+        confidence=float(conf_raw) if conf_raw is not None else None,  # type: ignore[arg-type]
+        status=str(raw.get("status", "kept")),
+        reason=str(raw.get("reason", "")),
+        original_label=str(raw.get("original_label", "")),
+        refined=bool(raw.get("refined", False)),
+        original_xyxy=orig_xyxy,
+    )
+
+
+def load_review_report(report_or_dir: Path) -> MllmReviewResult:
+    """从已有清洗输出目录或 `review_report.json` 加载历史审核记录以供界面复核与对比预览。
+
+    兼容策略：
+        优先读取报告中保存的 `before_boxes` / `after_boxes`（保留完整删改、精修虚线对比信息）；
+        若为旧版报告缺失框明细，则尽力从 `output_json` 或源图片同目录 `.json` 回退还原。
+        文件不存在或 JSON 格式损坏时抛出 `FileNotFoundError` / `ValueError`。
+    """
+    report_path = report_or_dir / "review_report.json" if report_or_dir.is_dir() else report_or_dir
+    if not report_path.is_file():
+        raise FileNotFoundError(f"未找到审核报告文件: {report_path}")
+
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"无法解析审核报告 {report_path.name}: {exc}") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise ValueError(f"审核报告格式无效（缺少 items 列表）: {report_path}")
+
+    out_dir = report_path.parent
+    classes_raw = payload.get("classes") or []
+    classes = [str(c).strip() for c in classes_raw if str(c).strip()]
+    cls_file = out_dir / "classes.txt"
+    if not classes and cls_file.is_file():
+        classes = [
+            line.strip() for line in cls_file.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+
+    records: list[ImageReviewRecord] = []
+    for item in payload["items"]:
+        if not isinstance(item, dict):
+            continue
+        src_path = Path(str(item.get("source") or (out_dir / str(item.get("image", "")))))
+        out_img_str = str(item.get("output_image") or "").strip()
+        out_json_str = str(item.get("output_json") or "").strip()
+        out_img = Path(out_img_str) if out_img_str else None
+        out_json = Path(out_json_str) if out_json_str else None
+
+        before_raw = item.get("before_boxes")
+        after_raw = item.get("after_boxes")
+        before_boxes: list[CandidateBox] = (
+            [_deserialize_candidate_box(b, idx) for idx, b in enumerate(before_raw) if isinstance(b, dict)]
+            if isinstance(before_raw, list)
+            else []
+        )
+        after_boxes: list[CandidateBox] = (
+            [_deserialize_candidate_box(b, idx) for idx, b in enumerate(after_raw) if isinstance(b, dict)]
+            if isinstance(after_raw, list)
+            else []
+        )
+        if not after_boxes and out_json and out_json.is_file():
+            try:
+                after_boxes = _load_existing_json_boxes(out_json)
+            except Exception:
+                pass
+        if not before_boxes and src_path.with_suffix(".json").is_file():
+            try:
+                before_boxes = _load_existing_json_boxes(src_path.with_suffix(".json"))
+            except Exception:
+                pass
+
+        records.append(
+            ImageReviewRecord(
+                image_path=src_path,
+                output_image_path=out_img,
+                output_json_path=out_json,
+                triage_bucket=str(item.get("bucket") or BUCKET_NEED_REVIEW),
+                before_boxes=before_boxes,
+                after_boxes=after_boxes,
+                kept_count=int(item.get("kept", 0) or 0),
+                relabeled_count=int(item.get("relabeled", 0) or 0),
+                deleted_count=int(item.get("deleted", 0) or 0),
+                added_count=int(item.get("added", 0) or 0),
+                refined_count=int(item.get("refined", 0) or 0),
+                loose_flagged_count=int(item.get("loose_flagged", 0) or 0),
+                has_missing=bool(item.get("has_missing", False)),
+                missing_note=str(item.get("missing_note") or ""),
+                error=str(item.get("error") or ""),
+            )
+        )
+
+    auto_passed = sum(1 for r in records if r.triage_bucket == BUCKET_AUTO_PASSED)
+    llm_fixed = sum(1 for r in records if r.triage_bucket == BUCKET_LLM_FIXED)
+    need_review = sum(1 for r in records if r.triage_bucket == BUCKET_NEED_REVIEW)
+    error_count = sum(1 for r in records if r.error)
+    return MllmReviewResult(
+        output_dir=out_dir,
+        classes=classes,
+        total_images=len(records),
+        auto_passed_count=auto_passed,
+        llm_fixed_count=llm_fixed,
+        need_review_count=need_review,
+        error_count=error_count,
+        records=records,
+        report_path=report_path,
+        classes_txt_path=cls_file if cls_file.is_file() else None,
+        cancelled=bool(payload.get("cancelled", False)),
+    )
+
+
 def run_mllm_review(
     config: MllmReviewConfig,
     client_override: MllmClient | None = None,
     progress_callback: Callable[[int, int, ImageReviewRecord], None] | None = None,
     log_callback: Callable[[str], None] | None = None,
     cancel_event: Event | None = None,
+    *,
+    refiner_override: BoxRefinerProtocol | None = None,
 ) -> MllmReviewResult:
-    """执行基准候选框获取、MLLM 并发审核、结果分流与 X-AnyLabeling `.json` 导出。
+    """执行基准候选框获取、MLLM 并发审核、可选边框紧贴修正、结果分流与 X-AnyLabeling `.json` 导出。
 
     前置条件与失败方式：
         `images_dir` 不存在抛出 `FileNotFoundError`，无图片抛出 `ValueError`；
@@ -972,17 +1494,9 @@ def run_mllm_review(
         保证 `review_report.json` 最终一定写出。
 
     分流规则：
-        存在漏标提示、LLM 补框或 `relabel_invalid` 框 → `need_review`；有改类或删框 → `llm_fixed`；
-        其余 → `auto_passed`。纠错后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`
-        （避免被数据集构建当作显式负样本），只复制图片。
-
-    并发、取消与输出产物：
-        使用 `ThreadPoolExecutor(max_workers=max(1, config.max_workers))` 并发处理各图；
-        若通过 `cancel_event` 请求停止，将停止提交新任务并尝试取消尚未开始的任务
-        （基准推理阶段收到取消时不会提交任何审核任务）。
-        会在 `config.output_dir` 下写出分流图片与 `.json`（视 `triage_subfolders` 决定是否建子目录，
-        输出文件名由 `_plan_output_names` 消歧）、`classes.txt`（当类别非空时）及 `review_report.json`；
-        分桶模式下会删除同名图片在其他桶中的旧结果（见 `_remove_stale_bucket_outputs`）。
+        存在漏标提示、LLM 补框、`relabel_invalid` 框或过松/超门禁标记 `refine_suspect` 框 → `need_review`；
+        有改类、删框或通过门禁的自动收框 → `llm_fixed`；其余 → `auto_passed`。
+        纠错后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`，只复制图片。
     """
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
@@ -1003,11 +1517,25 @@ def run_mllm_review(
 
     allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
     client: MllmClient = client_override or build_mllm_client(config)
+    sam_refiner: BoxRefinerProtocol | None = None
+    if config.box_refine_mode == BoxRefineMode.SAM_LOCAL:
+        if refiner_override is not None:
+            sam_refiner = refiner_override
+        else:
+            if log_callback:
+                log_callback(f"正在加载本地 SAM 边框紧贴模型: {config.sam_model_name} (device={config.yolo_device})...")
+            sam_refiner = UltralyticsSamBoxRefiner(
+                model_name=config.sam_model_name,
+                device=config.yolo_device,
+            )
+
     output_names = _plan_output_names(images, config.images_dir)
 
     if log_callback:
+        refine_desc = config.box_refine_mode.value
         log_callback(
-            f"开始 MLLM 纠错审核（共 {len(images)} 张图，类别: {allowed_classes}，并发={config.max_workers}）..."
+            f"开始 MLLM 纠错审核（共 {len(images)} 张图，类别: {allowed_classes}，"
+            f"边框修正: {refine_desc}，并发={config.max_workers}）..."
         )
 
     def _bucket_dir(bucket: str) -> Path:
@@ -1073,19 +1601,24 @@ def run_mllm_review(
             with Image.open(img_path) as pil_img:
                 img_w, img_h = pil_img.size
 
-            # 已有框全部达到高置信度阈值且未开启漏标巡检，或无候选框且未开启漏标巡检时，
-            # MLLM 无事可审，直接跳过调用以节省费用
+            # 当未开启漏标巡检且无需借助 MLLM 判定框紧贴度时，高置信度图或空框图可直接跳过 MLLM
+            needs_mllm_for_refine = bool(before_boxes) and (
+                config.box_refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP}
+                or (config.box_refine_mode == BoxRefineMode.SAM_LOCAL and not config.sam_refine_all_kept)
+            )
             all_high_conf = bool(before_boxes) and all(
                 (b.confidence is not None and b.confidence >= config.high_conf_skip)
                 for b in before_boxes
             )
             skip_reason = ""
-            if not config.check_missing:
+            if not config.check_missing and not needs_mllm_for_refine:
                 if all_high_conf:
                     skip_reason = "高置信度跳过 MLLM"
                 elif not before_boxes:
                     skip_reason = "无候选框且未开启漏标检查，跳过 MLLM"
 
+            img_bgr: np.ndarray | None = None
+            response: MllmReviewResponse | None = None
             if skip_reason:
                 after_boxes = [
                     CandidateBox(
@@ -1108,13 +1641,15 @@ def run_mllm_review(
                 skipped_mllm = True
             else:
                 img_bgr = _read_image_unicode_safe(img_path)
-                overview_jpeg, crops = _render_overview_and_crops(
+                force_crops = config.box_refine_mode == BoxRefineMode.MLLM_CROP
+                overview_jpeg, crops, crop_regions = _render_overview_and_crops(
                     img_bgr,
                     before_boxes,
                     include_crops=config.include_crops,
                     max_crops=config.max_crops_per_image,
                     high_conf_skip=config.high_conf_skip,
                     max_dim=config.max_image_dim,
+                    force_crops=force_crops,
                 )
                 system_prompt, user_prompt = _build_prompts(
                     before_boxes,
@@ -1130,15 +1665,35 @@ def run_mllm_review(
                     img_w=img_w,
                     img_h=img_h,
                     add_missing_boxes=config.add_missing_boxes,
+                    box_refine_mode=config.box_refine_mode,
+                    crop_regions=crop_regions,
+                    refine_min_area_ratio=config.refine_min_area_ratio,
+                    refine_min_iou=config.refine_min_iou,
                 )
                 has_missing = response.has_missing
                 missing_note = response.missing_note
                 skipped_mllm = False
 
+            if config.box_refine_mode == BoxRefineMode.SAM_LOCAL and sam_refiner is not None and after_boxes:
+                if img_bgr is None:
+                    img_bgr = _read_image_unicode_safe(img_path)
+                apply_sam_box_refinement(
+                    img_bgr,
+                    after_boxes,
+                    response,
+                    sam_refiner,
+                    refine_all_kept=config.sam_refine_all_kept,
+                    min_area_ratio=config.refine_min_area_ratio,
+                    min_iou=config.refine_min_iou,
+                )
+
+            refined_count = sum(1 for b in after_boxes if b.refined)
+            loose_flagged_count = sum(1 for b in after_boxes if b.status == "refine_suspect")
             has_invalid_relabel = any(b.status == "relabel_invalid" for b in after_boxes)
-            if has_missing or added > 0 or has_invalid_relabel:
+
+            if has_missing or added > 0 or has_invalid_relabel or loose_flagged_count > 0:
                 bucket = BUCKET_NEED_REVIEW
-            elif relabeled > 0 or deleted > 0:
+            elif relabeled > 0 or deleted > 0 or refined_count > 0:
                 bucket = BUCKET_LLM_FIXED
             else:
                 bucket = BUCKET_AUTO_PASSED
@@ -1156,7 +1711,6 @@ def run_mllm_review(
                     missing_note=missing_note,
                 )
             else:
-                # 空结果未经漏标确认：不写 `.json`，并清理该位置可能残留的旧标注
                 if out_json_path.is_file() and out_json_path.resolve() != img_path.with_suffix(".json").resolve():
                     out_json_path.unlink()
                 out_json_path = None
@@ -1174,12 +1728,13 @@ def run_mllm_review(
                 relabeled_count=relabeled,
                 deleted_count=deleted,
                 added_count=added,
+                refined_count=refined_count,
+                loose_flagged_count=loose_flagged_count,
                 has_missing=has_missing,
                 missing_note=missing_note,
                 skipped_mllm=skipped_mllm,
             )
         except Exception as exc:
-            # 单图审核异常时保留图片与原始框并分流至 need_review，防止样本丢失
             return _write_error_record(img_path, before_boxes, exc)
 
     records: list[ImageReviewRecord] = []
@@ -1206,7 +1761,6 @@ def run_mllm_review(
             try:
                 rec = fut.result()
             except Exception as exc:
-                # 理论上 `_process_one` 已兜底所有异常，此处再保护一层，保证报告一定写出
                 src = futures[fut]
                 rec = ImageReviewRecord(
                     image_path=src,
@@ -1225,9 +1779,12 @@ def run_mllm_review(
             if progress_callback:
                 progress_callback(completed_count, total, rec)
             if log_callback:
+                refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
+                loose_part = f", 过松:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
                 log_callback(
                     f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                    f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}, 补漏:{rec.added_count})"
+                    f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
+                    f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
                 )
 
     records.sort(key=lambda r: str(r.image_path))
@@ -1249,6 +1806,7 @@ def run_mllm_review(
         "errors": error_count,
         "cancelled": cancelled,
         "classes": allowed_classes,
+        "box_refine_mode": config.box_refine_mode.value,
         "items": [
             {
                 "image": r.image_path.name,
@@ -1258,11 +1816,15 @@ def run_mllm_review(
                 "relabeled": r.relabeled_count,
                 "deleted": r.deleted_count,
                 "added": r.added_count,
+                "refined": r.refined_count,
+                "loose_flagged": r.loose_flagged_count,
                 "has_missing": r.has_missing,
                 "missing_note": r.missing_note,
                 "error": r.error,
                 "output_image": str(r.output_image_path) if r.output_image_path else "",
                 "output_json": str(r.output_json_path) if r.output_json_path else "",
+                "before_boxes": [_serialize_candidate_box(b) for b in r.before_boxes],
+                "after_boxes": [_serialize_candidate_box(b) for b in r.after_boxes],
             }
             for r in records
         ],
@@ -1285,6 +1847,26 @@ def run_mllm_review(
     )
 
 
+def _draw_dashed_rect(
+    canvas: np.ndarray,
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 1,
+    dash_len: int = 8,
+) -> None:
+    """在图像上绘制虚线矩形，用于对比展示自动收紧前的原始松垮边界框位置。"""
+    x1, y1 = p1
+    x2, y2 = p2
+    step = max(4, dash_len * 2)
+    for x in range(x1, x2, step):
+        cv2.line(canvas, (x, y1), (min(x + dash_len, x2), y1), color, thickness, cv2.LINE_AA)
+        cv2.line(canvas, (x, y2), (min(x + dash_len, x2), y2), color, thickness, cv2.LINE_AA)
+    for y in range(y1, y2, step):
+        cv2.line(canvas, (x1, y), (x1, min(y + dash_len, y2)), color, thickness, cv2.LINE_AA)
+        cv2.line(canvas, (x2, y), (x2, min(y + dash_len, y2)), color, thickness, cv2.LINE_AA)
+
+
 def _draw_labeled_boxes(
     base_bgr: np.ndarray, boxes: list[CandidateBox], banner_text: str, use_status_colors: bool
 ) -> np.ndarray:
@@ -1298,17 +1880,29 @@ def _draw_labeled_boxes(
         "relabeled": (0, 140, 255),
         "relabel_invalid": (60, 60, 255),
         "llm_added": (255, 220, 0),
+        "refined": (255, 210, 40),
+        "refine_suspect": (200, 40, 220),
     }
 
     for b in boxes:
         color = status_colors.get(b.status, (0, 200, 0)) if use_status_colors else (200, 180, 0)
+        # 在 After 侧用虚线叠加原框位置，直观呈现收紧前后背景裁除幅度
+        if use_status_colors and b.refined and b.original_xyxy is not None:
+            op1 = (int(round(b.original_xyxy[0])), int(round(b.original_xyxy[1])))
+            op2 = (int(round(b.original_xyxy[2])), int(round(b.original_xyxy[3])))
+            _draw_dashed_rect(canvas, op1, op2, (160, 160, 160), max(1, thickness - 1))
+
         p1 = (int(round(b.x1)), int(round(b.y1)))
         p2 = (int(round(b.x2)), int(round(b.y2)))
         cv2.rectangle(canvas, p1, p2, color, thickness)
         if b.status == "relabeled" and b.original_label:
-            tag = f"{b.original_label}->{b.label}"
+            tag = f"{b.original_label}->{b.label}" + (" [Tight]" if b.refined else "")
         elif b.status == "llm_added":
             tag = f"+{b.label} (LLM)"
+        elif b.status == "refined":
+            tag = f"{b.label} [Tight]"
+        elif b.status == "refine_suspect":
+            tag = f"{b.label} [Loose?]"
         else:
             tag = b.label
         (tw, th), baseline = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)

@@ -35,6 +35,7 @@ from yolo_studio.core.mllm_reviewer import (
     MllmReviewConfig,
     MllmReviewResult,
     run_mllm_review,
+    test_mllm_connection,
 )
 from yolo_studio.core.trainer import (
     DeviceInfo,
@@ -360,3 +361,18 @@ class MllmReviewWorker(QThread):
             self.finished_result.emit(res)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class MllmConnectionTestWorker(QThread):
+    """在后台线程执行 MLLM 接口轻量连通性探针，避免网络请求阻塞界面主线程。"""
+
+    finished_test = Signal(bool, str)  # 信号参数：(是否连通, 诊断摘要)
+
+    def __init__(self, config: MllmReviewConfig) -> None:
+        super().__init__()
+        self.config = config
+
+    def run(self) -> None:
+        """线程入口：调用 `test_mllm_connection` 并将诊断结果派发至主线程。"""
+        ok, msg = test_mllm_connection(self.config)
+        self.finished_test.emit(ok, msg)
