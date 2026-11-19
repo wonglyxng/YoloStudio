@@ -8,7 +8,7 @@
 2. **单进程内嵌 X-AnyLabeling 标注工作台**：在「2. 标注工作台 (X-AnyLabeling)」标签页内直接托管原版 X-AnyLabeling（`PyQt6` + `onnxruntime-gpu`），无需额外寻找或启动 `.exe`；支持人工画框与 SAM / YOLO 等 GPU AI 辅助标注，并与前后标签页一键联动打开目录、导入 `classes.txt` 或定位单张图片。
 3. **数据集转换与校验**：同时支持 **X-AnyLabeling 原生 `.json`** 与 **导出的 YOLO `.txt` + `classes.txt`**，自动校验、统计类别并划分为 `train/val/test` 生成 `data.yaml`。
 4. **MLLM 自动标注纠错与补漏**：支持 **基准模型低阈值推理** 或 **已有 `.json`** 两种来源，集成 **Google Gemini API (`google-genai`)** 与 **OpenAI 兼容多模态接口**（通义千问 Qwen-VL / 硅基流动 / 本地 Ollama / vLLM），自动绘制编号框 + 局部裁剪图送审，剔除误检、修正错标类、发现/补充漏标并分流至 `auto_passed` / `llm_fixed` / `need_review`，支持界面对比预览及双击结果行直接跳转内嵌工作台精修。
-5. **YOLO26 目标检测训练与评估导出**：支持 `yolo26n.pt` / `yolo26s.pt` / `yolo26m.pt` / `yolo26l.pt` / `yolo26x.pt` 及自定义 `.pt` 权重，实时展示指标与训练日志，支持安全停止、断点续训、验证推理预览及一键导出 `ONNX`、`TorchScript`、`TensorRT`。
+5. **YOLO26 目标检测训练与评估导出**：支持 `yolo26n.pt` / `yolo26s.pt` / `yolo26m.pt` / `yolo26l.pt` / `yolo26x.pt` 及自定义 `.pt` 权重，内置场景超参数预设（通用自然场景 / 游戏与 UI 弱增强 / 小样本微调）、优化器与数据增强细粒度调节及任意附加参数透传，训练日志完整输出提交配置与实际生效超参数，支持安全停止、断点续训、验证推理预览及一键导出 `ONNX`、`TorchScript`、`TensorRT`。
 
 ## 开源协议
 

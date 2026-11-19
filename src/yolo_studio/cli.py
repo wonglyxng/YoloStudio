@@ -92,9 +92,17 @@ def _cmd_dataset(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_train(args: argparse.Namespace) -> int:
-    """执行 `train` 子命令启动 YOLO26 训练并将实时日志打印到标准输出，成功返回 0。"""
-    from yolo_studio.core.trainer import TrainConfig, train_yolo26
+def _build_cli_train_config(args: argparse.Namespace) -> "object":
+    """按『默认值 → `--preset` 预设 → 显式 CLI 选项 → `--extra-arg` 附加项』的优先级构建 `TrainConfig`。
+
+    失败方式：
+        `--extra-arg` 语法非法或预设名无效时抛出 `ValueError`。
+    """
+    from yolo_studio.core.trainer import (
+        TrainConfig,
+        apply_hyp_preset,
+        parse_extra_train_args,
+    )
 
     cfg = TrainConfig(
         data_yaml=Path(args.data),
@@ -108,7 +116,72 @@ def _cmd_train(args: argparse.Namespace) -> int:
         resume=args.resume,
         exist_ok=args.exist_ok,
     )
-    res = train_yolo26(cfg, log_callback=print)
+    if getattr(args, "preset", ""):
+        apply_hyp_preset(cfg, args.preset)
+
+    override_fields = (
+        "optimizer",
+        "lr0",
+        "lrf",
+        "warmup_epochs",
+        "nbs",
+        "patience",
+        "workers",
+        "seed",
+        "cos_lr",
+        "amp",
+        "cache",
+        "deterministic",
+        "plots",
+        "val",
+        "mosaic",
+        "close_mosaic",
+        "mixup",
+        "cutmix",
+        "copy_paste",
+        "degrees",
+        "translate",
+        "scale",
+        "shear",
+        "perspective",
+        "flipud",
+        "fliplr",
+        "hsv_h",
+        "hsv_s",
+        "hsv_v",
+    )
+    for field_name in override_fields:
+        val = getattr(args, field_name, None)
+        if val is not None:
+            setattr(cfg, field_name, val)
+
+    merged_extra: dict[str, object] = {}
+    for raw_item in getattr(args, "extra_arg", None) or []:
+        merged_extra.update(parse_extra_train_args(raw_item))
+    cfg.extra_args = merged_extra
+    return cfg
+
+
+def _cli_print_line(line: str) -> None:
+    """将训练日志行直接写入原始标准输出流，保留前导缩进并避免被当前线程捕获器二次剥离空格。"""
+    target = getattr(sys.stdout, "original", None) or sys.stdout
+    if target is not None:
+        target.write(f"{line}\n")
+        target.flush()
+
+
+def _cmd_train(args: argparse.Namespace) -> int:
+    """执行 `train` 子命令启动 YOLO26 训练并将超参数与实时日志打印到标准输出，成功返回 0。"""
+    from yolo_studio.core.trainer import TrainConfig, train_yolo26
+
+    try:
+        cfg = _build_cli_train_config(args)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    assert isinstance(cfg, TrainConfig)
+    res = train_yolo26(cfg, log_callback=_cli_print_line)
     print(f"训练完成，输出目录: {res.save_dir}, best.pt: {res.best_weights}")
     return 0
 
@@ -204,10 +277,53 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr = sub.add_parser("train", help="启动 YOLO26 模型训练")
     p_tr.add_argument("-d", "--data", required=True, help="data.yaml 路径")
     p_tr.add_argument("-m", "--model", default="yolo26s.pt", help="YOLO26 权重文件；续训时可直接指定 last.pt")
+    p_tr.add_argument(
+        "--preset",
+        choices=("default", "game_ui", "small_sample_finetune"),
+        default="",
+        help="可选超参数预设：default(通用自然场景) / game_ui(游戏与UI弱增强) / small_sample_finetune(小样本微调)",
+    )
     p_tr.add_argument("--epochs", type=int, default=100)
     p_tr.add_argument("--imgsz", type=int, default=640)
     p_tr.add_argument("--batch", type=int, default=16)
+    p_tr.add_argument("--nbs", type=int, default=None, help="名义批大小 (梯度累积基准，默认 64，game_ui 预设 16)")
     p_tr.add_argument("--device", default="0")
+    p_tr.add_argument("--workers", type=int, default=None, help="DataLoader 工作进程数 (默认 4)")
+    p_tr.add_argument("--optimizer", default=None, help="优化器：auto / AdamW / SGD / MuSGD / Adam 等")
+    p_tr.add_argument("--lr0", type=float, default=None, help="初始学习率 (需配合非 auto 优化器严格固定)")
+    p_tr.add_argument("--lrf", type=float, default=None, help="最终学习率比例 (终值 = lr0 * lrf)")
+    p_tr.add_argument("--warmup-epochs", type=float, default=None, help="学习率预热轮数")
+    p_tr.add_argument("--patience", type=int, default=None, help="早停容忍轮数 (默认 50)")
+    p_tr.add_argument("--seed", type=int, default=None, help="随机种子 (默认 0)")
+    p_tr.add_argument("--cos-lr", action=argparse.BooleanOptionalAction, default=None, help="是否启用余弦退火调度")
+    p_tr.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None, help="是否启用混合精度 AMP")
+    p_tr.add_argument("--cache", action=argparse.BooleanOptionalAction, default=None, help="是否将图片缓存至内存")
+    p_tr.add_argument(
+        "--deterministic", action=argparse.BooleanOptionalAction, default=None, help="是否启用确定性算子"
+    )
+    p_tr.add_argument("--plots", action=argparse.BooleanOptionalAction, default=None, help="是否保存训练评估图表")
+    p_tr.add_argument("--val", action=argparse.BooleanOptionalAction, default=None, help="是否在训练期间运行验证")
+    p_tr.add_argument("--mosaic", type=float, default=None, help="Mosaic 四图拼接增强概率 (0.0~1.0)")
+    p_tr.add_argument("--close-mosaic", type=int, default=None, help="最后 N 轮关闭 Mosaic")
+    p_tr.add_argument("--mixup", type=float, default=None, help="MixUp 混合增强概率")
+    p_tr.add_argument("--cutmix", type=float, default=None, help="CutMix 混合增强概率")
+    p_tr.add_argument("--copy-paste", type=float, default=None, help="目标复制粘贴增强比例")
+    p_tr.add_argument("--degrees", type=float, default=None, help="随机旋转角度范围 (+/-)")
+    p_tr.add_argument("--translate", type=float, default=None, help="随机平移比例")
+    p_tr.add_argument("--scale", type=float, default=None, help="随机缩放增益比例")
+    p_tr.add_argument("--shear", type=float, default=None, help="随机错切角度范围 (+/-)")
+    p_tr.add_argument("--perspective", type=float, default=None, help="随机透视变换比例")
+    p_tr.add_argument("--flipud", type=float, default=None, help="上下翻转概率")
+    p_tr.add_argument("--fliplr", type=float, default=None, help="左右翻转概率")
+    p_tr.add_argument("--hsv-h", type=float, default=None, help="HSV 色调抖动幅度")
+    p_tr.add_argument("--hsv-s", type=float, default=None, help="HSV 饱和度抖动幅度")
+    p_tr.add_argument("--hsv-v", type=float, default=None, help="HSV 明度抖动幅度")
+    p_tr.add_argument(
+        "--extra-arg",
+        action="append",
+        default=[],
+        help="透传任意其他 Ultralytics 参数（可多次指定，支持 JSON 或 key=value，如 --extra-arg box=7.5）",
+    )
     p_tr.add_argument("--project", default="runs/detect")
     p_tr.add_argument("--name", default="yolo26_train")
     p_tr.add_argument("--resume", action="store_true", help="从 last.pt 断点续训")

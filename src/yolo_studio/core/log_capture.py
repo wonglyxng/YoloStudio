@@ -42,6 +42,9 @@ class _LineAssembler:
     def __init__(self, callback: Callable[[str], None]) -> None:
         self._callback = callback
         self._buffer = ""
+        # 标记当前是否正处于 `_callback` 调用栈内；若回调自身再次写向 stdout/stderr（例如 `callback=print`），
+        # `_RoutingStream.write` 据此绕过再次捕获并直接写往原始流，防止无限递归
+        self._emitting = False
 
     def feed(self, text: str) -> None:
         """追加文本并对每个完整行调用回调（空白行被忽略）。"""
@@ -61,7 +64,11 @@ class _LineAssembler:
             line = line.rsplit("\r", 1)[1]
         stripped = line.strip()
         if stripped:
-            self._callback(stripped)
+            self._emitting = True
+            try:
+                self._callback(stripped)
+            finally:
+                self._emitting = False
 
     def flush(self) -> None:
         """刷出尾部未换行的残留内容并清空缓冲。"""
@@ -82,7 +89,7 @@ class _RoutingStream(io.TextIOBase):
 
     def write(self, s: str) -> int:
         route = _ROUTES.get(threading.get_ident())
-        if route is not None:
+        if route is not None and not route._emitting:
             route.feed(s)
             return len(s)
         if self.original is not None:

@@ -465,3 +465,69 @@ def test_lazy_init_fast_startup_and_async_device_probe_and_on_demand_mount(
             win._device_probe_worker.wait(3000)
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_train_tab_hyperparameter_presets_and_config_builder(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证训练标签页场景预设联动、手动微调自动切换“自定义”状态，以及附加超参数组装与语法校验。"""
+    from yolo_studio.gui.tab_train import TrainTab
+
+    yaml_file = tmp_path / "data.yaml"
+    yaml_file.write_text("names: [icon]\n", encoding="utf-8")
+
+    tab = TrainTab(workspace_root=tmp_path)
+    try:
+        tab.set_data_yaml(str(yaml_file))
+        # 默认为通用自然场景预设
+        assert tab.preset_combo.currentData() == "default"
+        assert tab.mosaic_spin.value() == pytest.approx(1.0)
+        assert tab.nbs_spin.value() == 64
+
+        # 切换到游戏/UI 弱增强预设，所有关联控件自动同步
+        game_idx = tab.preset_combo.findData("game_ui")
+        assert game_idx >= 0
+        tab.preset_combo.setCurrentIndex(game_idx)
+        qt_app.processEvents()
+
+        assert tab.optimizer_combo.currentData() == "AdamW"
+        assert tab.lr0_spin.value() == pytest.approx(0.001)
+        assert tab.lrf_spin.value() == pytest.approx(0.05)
+        assert tab.nbs_spin.value() == 16
+        assert tab.mosaic_spin.value() == pytest.approx(0.0)
+        assert tab.scale_spin.value() == pytest.approx(0.15)
+        assert tab.translate_spin.value() == pytest.approx(0.03)
+        assert tab.hsv_s_spin.value() == pytest.approx(0.2)
+
+        # 手动修改单个增强参数后，预设下拉框自动切为 custom
+        tab.scale_spin.setValue(0.20)
+        qt_app.processEvents()
+        assert tab.preset_combo.currentData() == "custom"
+
+        # 填写附加超参数并构建 TrainConfig
+        tab.epochs_spin.setValue(160)
+        tab.patience_spin.setValue(160)
+        tab.imgsz_combo.setCurrentText("960")
+        tab.batch_spin.setValue(4)
+        tab.workers_spin.setValue(0)
+        tab.amp_chk.setChecked(False)
+        tab.plots_chk.setChecked(False)
+        tab.extra_args_edit.setPlainText("box=7.5, weight_decay=0.0005")
+
+        cfg = tab.build_train_config()
+        assert cfg.optimizer == "AdamW"
+        assert cfg.lr0 == pytest.approx(0.001)
+        assert cfg.lrf == pytest.approx(0.05)
+        assert cfg.nbs == 16
+        assert cfg.mosaic == pytest.approx(0.0)
+        assert cfg.scale == pytest.approx(0.20)
+        assert cfg.amp is False
+        assert cfg.plots is False
+        assert cfg.extra_args == {"box": 7.5, "weight_decay": 0.0005}
+
+        # 非法附加参数在构建阶段立即抛出中文 ValueError
+        tab.extra_args_edit.setPlainText("invalid_arg_without_sep")
+        with pytest.raises(ValueError, match="分隔符"):
+            tab.build_train_config()
+    finally:
+        tab.close()

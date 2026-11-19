@@ -16,11 +16,15 @@
 
 from __future__ import annotations
 
+import ast
+import json
+import math
 import os
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
-from typing import Callable
 
 import cv2
 
@@ -34,6 +38,96 @@ YOLO26_DETECT_MODELS = [
     ("yolo26l.pt", "YOLO26l (Large - 高精度，建议适当减小 batch)"),
     ("yolo26x.pt", "YOLO26x (XLarge - 最高精度，显存需求较高)"),
 ]
+
+YOLO26_OPTIMIZERS: list[tuple[str, str]] = [
+    ("auto", "auto (自动选择，会覆盖自定义 LR0)"),
+    ("AdamW", "AdamW (小样本/微调推荐，建议 LR0=0.001)"),
+    ("SGD", "SGD (常规大数据集，建议 LR0=0.01)"),
+    ("MuSGD", "MuSGD (混合动量 SGD)"),
+    ("Adam", "Adam"),
+    ("NAdam", "NAdam"),
+    ("RAdam", "RAdam"),
+    ("RMSProp", "RMSProp"),
+]
+
+TRAIN_PRESET_ITEMS: list[tuple[str, str]] = [
+    ("default", "通用自然场景 (Ultralytics 默认)"),
+    ("game_ui", "游戏画面 / UI 弱增强 (去畸变 + AdamW)"),
+    ("small_sample_finetune", "小样本 / 小目标平稳微调 (AdamW + 余弦退火)"),
+]
+
+# 各训练场景预设对应的 `TrainConfig` 超参数覆盖表；未列出的字段（如路径、设备、轮数、批大小）保持用户当前设置
+TRAIN_HYP_PRESETS: dict[str, dict[str, object]] = {
+    "default": {
+        "optimizer": "auto",
+        "lr0": 0.01,
+        "lrf": 0.01,
+        "warmup_epochs": 3.0,
+        "nbs": 64,
+        "cos_lr": False,
+        "mosaic": 1.0,
+        "close_mosaic": 10,
+        "mixup": 0.0,
+        "cutmix": 0.0,
+        "copy_paste": 0.0,
+        "degrees": 0.0,
+        "translate": 0.1,
+        "scale": 0.5,
+        "shear": 0.0,
+        "perspective": 0.0,
+        "flipud": 0.0,
+        "fliplr": 0.5,
+        "hsv_h": 0.015,
+        "hsv_s": 0.7,
+        "hsv_v": 0.4,
+    },
+    "game_ui": {
+        "optimizer": "AdamW",
+        "lr0": 0.001,
+        "lrf": 0.05,
+        "warmup_epochs": 3.0,
+        "nbs": 16,
+        "cos_lr": False,
+        "mosaic": 0.0,
+        "close_mosaic": 0,
+        "mixup": 0.0,
+        "cutmix": 0.0,
+        "copy_paste": 0.0,
+        "degrees": 0.0,
+        "translate": 0.03,
+        "scale": 0.15,
+        "shear": 0.0,
+        "perspective": 0.0,
+        "flipud": 0.0,
+        "fliplr": 0.5,
+        "hsv_h": 0.01,
+        "hsv_s": 0.2,
+        "hsv_v": 0.2,
+    },
+    "small_sample_finetune": {
+        "optimizer": "AdamW",
+        "lr0": 0.001,
+        "lrf": 0.05,
+        "warmup_epochs": 3.0,
+        "nbs": 16,
+        "cos_lr": True,
+        "mosaic": 0.5,
+        "close_mosaic": 15,
+        "mixup": 0.0,
+        "cutmix": 0.0,
+        "copy_paste": 0.0,
+        "degrees": 0.0,
+        "translate": 0.05,
+        "scale": 0.25,
+        "shear": 0.0,
+        "perspective": 0.0,
+        "flipud": 0.0,
+        "fliplr": 0.5,
+        "hsv_h": 0.01,
+        "hsv_s": 0.3,
+        "hsv_v": 0.25,
+    },
+}
 
 
 @dataclass
@@ -53,14 +147,26 @@ class TrainConfig:
     """YOLO26 训练任务超参数与路径配置。
 
     关键字段说明：
-        `batch`：批大小，设为 `-1` 时由 Ultralytics 自动探测最大可用批次。
-        `lr0`：初始学习率；`patience`：早停容忍轮数；`workers`：DataLoader 工作进程数。
-        `project_dir` / `run_name`：训练产物保存根目录与子实验名。
-        `exist_ok`：默认 `False`，同名实验目录已存在时由 Ultralytics 自动递增为 `run_name2` 等，
-            避免覆盖上一次的权重与曲线；设为 `True` 时直接写入并覆盖同名目录。
-        `resume`：断点续训。此时 `model_name` 若指向已存在的非官方预训练 `.pt`（如某次的 `last.pt`）
-            则以其为断点，否则使用 `project_dir/run_name/weights/last.pt`；断点不存在时训练前抛出
-            `FileNotFoundError`。续训的超参数与保存目录由断点记录决定。
+        核心与硬件：
+            `batch`：批大小，设为 `-1` 时由 Ultralytics 自动探测最大可用批次。
+            `nbs`：名义批大小（Nominal Batch Size），梯度累积步数近似为 `max(round(nbs / batch), 1)`。
+            `workers`：DataLoader 工作进程数（Windows 下设为 `0` 可改为主进程直接加载）。
+        优化器与学习率调度：
+            `optimizer`：优化器名称（如 `"auto"`、`"AdamW"`、`"SGD"`）；注意设为 `"auto"` 时 Ultralytics
+                会自动选定优化器并覆盖 `lr0`，显式指定非 `"auto"` 优化器时 `lr0` 按原值生效。
+            `lr0` / `lrf`：初始学习率与最终学习率比例（终值 `lr0 * lrf`）；`warmup_epochs`：预热轮数；
+            `cos_lr`：是否启用余弦退火调度；`patience`：验证指标无提升的早停容忍轮数（设为 `0` 或等于 `epochs` 关闭早停）。
+        数据增强与复现性：
+            `mosaic` / `close_mosaic` / `mixup` / `cutmix` / `copy_paste`：多图合成增强概率及末期关闭轮数。
+            `degrees` / `translate` / `scale` / `shear` / `perspective` / `flipud` / `fliplr`：几何变换幅度与翻转概率。
+            `hsv_h` / `hsv_s` / `hsv_v`：色调、饱和度与明度抖动比例。
+            `seed` / `deterministic`：随机种子与确定性算子开关；`plots` / `save` / `val` / `pretrained`：工程运行开关。
+        路径、续训与扩展参数：
+            `project_dir` / `run_name`：训练产物保存根目录与子实验名。
+            `exist_ok`：默认 `False`，同名实验目录已存在时自动递增为 `run_name2` 等，避免覆盖历史产物。
+            `resume`：断点续训。优先使用非官方预训练的自定义 `.pt`（如 `last.pt`），否则查找
+                `project_dir/run_name/weights/last.pt`，缺失时训练前抛出 `FileNotFoundError`。
+            `extra_args`：透传给 `model.train()` 的任意附加参数字典，同名键优先级高于本配置类的同名字段。
     """
 
     data_yaml: Path
@@ -78,6 +184,32 @@ class TrainConfig:
     run_name: str = "yolo26_train"
     resume: bool = False
     exist_ok: bool = False
+    optimizer: str = "auto"
+    lrf: float = 0.01
+    warmup_epochs: float = 3.0
+    nbs: int = 64
+    cos_lr: bool = False
+    mosaic: float = 1.0
+    close_mosaic: int = 10
+    mixup: float = 0.0
+    cutmix: float = 0.0
+    copy_paste: float = 0.0
+    degrees: float = 0.0
+    translate: float = 0.1
+    scale: float = 0.5
+    shear: float = 0.0
+    perspective: float = 0.0
+    flipud: bool | float = 0.0
+    fliplr: bool | float = 0.5
+    hsv_h: float = 0.015
+    hsv_s: float = 0.7
+    hsv_v: float = 0.4
+    seed: int = 0
+    deterministic: bool = True
+    plots: bool = True
+    pretrained: bool = True
+    save: bool = True
+    val: bool = True
     extra_args: dict[str, object] = field(default_factory=dict)
 
 
@@ -240,6 +372,380 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def apply_hyp_preset(config: TrainConfig, preset_name: str) -> TrainConfig:
+    """按预设名称原地更新 `config` 中的优化器与数据增强超参数并返回 `config`。
+
+    调用约束与失败行为：
+        `preset_name` 须属于 `TRAIN_HYP_PRESETS`（`"default"`、`"game_ui"`、`"small_sample_finetune"`），
+        否则抛出 `ValueError`。仅覆盖预设字典中声明的优化与增强字段，不改动 `data_yaml`、`model_name`、
+        `epochs`、`imgsz`、`batch`、`device` 与保存目录等工程路径配置。
+    """
+    if preset_name not in TRAIN_HYP_PRESETS:
+        valid = ", ".join(TRAIN_HYP_PRESETS.keys())
+        raise ValueError(f"未知的训练超参数预设 '{preset_name}'，可选值: {valid}")
+    for key, val in TRAIN_HYP_PRESETS[preset_name].items():
+        setattr(config, key, val)
+    return config
+
+
+def _split_top_level_entries(text: str) -> list[str]:
+    """按顶层逗号、分号或换行切分键值条目，忽略引号与括号内部的分隔符；引号或括号未闭合时抛出 `ValueError`。"""
+    entries: list[str] = []
+    buf: list[str] = []
+    quote_char: str | None = None
+    escaped = False
+    depth = 0
+    pairs = {"[": "]", "{": "}", "(": ")"}
+    closing = {"]", "}", ")"}
+
+    for ch in text:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if quote_char is not None:
+            buf.append(ch)
+            if ch == "\\":
+                escaped = True
+            elif ch == quote_char:
+                quote_char = None
+            continue
+
+        if ch in {"'", '"'}:
+            quote_char = ch
+            buf.append(ch)
+        elif ch in pairs:
+            depth += 1
+            buf.append(ch)
+        elif ch in closing:
+            depth -= 1
+            if depth < 0:
+                raise ValueError("附加超参数存在多余的右括号。")
+            buf.append(ch)
+        elif depth == 0 and ch in {",", ";", "\n", "\r"}:
+            piece = "".join(buf).strip()
+            if piece:
+                entries.append(piece)
+            buf.clear()
+        else:
+            buf.append(ch)
+
+    if quote_char is not None or depth != 0:
+        raise ValueError("附加超参数存在未闭合的引号或括号。")
+    tail = "".join(buf).strip()
+    if tail:
+        entries.append(tail)
+    return entries
+
+
+def _find_key_value_sep(entry: str) -> int:
+    """查找单条键值表达式中顶层第一个 `=` 或 `:` 的索引，不存在时返回 `-1`。"""
+    quote_char: str | None = None
+    escaped = False
+    depth = 0
+    for idx, ch in enumerate(entry):
+        if escaped:
+            escaped = False
+            continue
+        if quote_char is not None:
+            if ch == "\\":
+                escaped = True
+            elif ch == quote_char:
+                quote_char = None
+            continue
+        if ch in {"'", '"'}:
+            quote_char = ch
+        elif ch in {"[", "{", "("}:
+            depth += 1
+        elif ch in {"]", "}", ")"}:
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch in {"=", ":"}:
+            return idx
+    return -1
+
+
+def _normalize_parsed_value(val: object) -> object:
+    """将 `ast.literal_eval` 可能产生的元组递归规范为列表，并校验值属于受支持的基础或容器类型。"""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        if isinstance(val, float) and not math.isfinite(val):
+            raise ValueError("超参数浮点值不能为 NaN 或无穷大。")
+        return val
+    if isinstance(val, (list, tuple)):
+        return [_normalize_parsed_value(item) for item in val]
+    if isinstance(val, dict):
+        out: dict[str, object] = {}
+        for k, v in val.items():
+            if not isinstance(k, str) or not k:
+                raise ValueError(f"字典类型的超参数键必须为非空字符串: {k!r}")
+            out[k] = _normalize_parsed_value(v)
+        return out
+    raise ValueError(f"不支持的超参数值类型: {type(val).__name__}")
+
+
+def _parse_arg_value(raw_val: str) -> object:
+    """将单个超参数字符串字面量解析为布尔、`None`、整数、浮点数、列表/字典或原始字符串。"""
+    val_str = raw_val.strip()
+    if not val_str:
+        raise ValueError("超参数值不能为空。")
+    lower = val_str.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if lower in {"null", "none"}:
+        return None
+
+    if val_str[0] not in {"'", '"', "[", "{", "("}:
+        if re.fullmatch(r"[+-]?\d+", val_str):
+            return int(val_str)
+        try:
+            num = float(val_str)
+            if math.isfinite(num):
+                return num
+            raise ValueError("超参数浮点值不能为 NaN 或无穷大。")
+        except ValueError as exc:
+            if "NaN" in str(exc):
+                raise
+        return val_str
+
+    cleaned = re.sub(r",\s*([}\]])", r"\1", val_str)
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return _normalize_parsed_value(loader(cleaned))
+        except Exception:
+            continue
+    raise ValueError(f"无法解析超参数值: {raw_val!r}")
+
+
+def parse_extra_train_args(raw: str) -> dict[str, object]:
+    """解析用户输入的附加训练超参数文本，返回可直接合入 `TrainConfig.extra_args` 的字典。
+
+    支持的输入格式：
+        1. JSON / Python 字典格式（兼容末尾多余逗号）：如 `'{"box": 7.5, "plots": false}'`；
+        2. 无外层花括号的 JSON 键值片段：如 `'\"mosaic\": 0.0, \"scale\": 0.15,'`；
+        3. 简洁键值对格式（支持逗号、分号或换行分隔）：如 `'box=7.5, weight_decay=0.0005, freeze=[0, 1]'`。
+
+    失败行为：
+        空白输入返回空字典 `{}`；语法错误、未闭合括号/引号或键名非合法 Python 标识符时抛出中文 `ValueError`。
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return {}
+
+    if stripped.startswith("{"):
+        body = stripped[:-1].rstrip() if stripped.endswith(",") else stripped
+        cleaned = re.sub(r",\s*([}\]])", r"\1", body)
+        parsed_obj: object | None = None
+        parsed_ok = False
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                parsed_obj = loader(cleaned)
+                parsed_ok = True
+                break
+            except Exception:
+                continue
+        if not parsed_ok or not isinstance(parsed_obj, dict):
+            raise ValueError("附加超参数 JSON/字典格式有误，请检查花括号、引号与逗号是否配对。")
+
+        result: dict[str, object] = {}
+        for k, v in parsed_obj.items():
+            if not isinstance(k, str) or not k.isidentifier():
+                raise ValueError(f"非法的超参数名称: {k!r}（必须为合法的参数标识符）")
+            result[k] = _normalize_parsed_value(v)
+        return result
+
+    entries = _split_top_level_entries(stripped)
+    result = {}
+    for entry in entries:
+        sep_idx = _find_key_value_sep(entry)
+        if sep_idx <= 0:
+            raise ValueError(f"附加超参数条目缺少 '=' 或 ':' 分隔符: {entry!r}")
+        raw_key = entry[:sep_idx].strip()
+        if len(raw_key) >= 2 and raw_key[0] == raw_key[-1] and raw_key[0] in {"'", '"'}:
+            key = raw_key[1:-1].strip()
+        else:
+            key = raw_key
+        if not key or not key.isidentifier():
+            raise ValueError(f"非法的超参数名称: {raw_key!r}（必须为合法的参数标识符）")
+        raw_val = entry[sep_idx + 1 :]
+        result[key] = _parse_arg_value(raw_val)
+    return result
+
+
+def build_train_kwargs(config: TrainConfig) -> dict[str, object]:
+    """将 `TrainConfig` 规范化转换为传递给 Ultralytics `model.train(**kwargs)` 的完整参数字典。
+
+    合并优先级：
+        先按结构化字段填充基础硬件、优化调度、复现开关与数据增强参数，最后以 `config.extra_args` 覆盖同名键。
+    """
+    train_kwargs: dict[str, object] = {
+        "data": str(config.data_yaml),
+        "epochs": int(config.epochs),
+        "imgsz": int(config.imgsz),
+        "batch": int(config.batch),
+        "nbs": int(config.nbs),
+        "device": config.device,
+        "workers": int(config.workers),
+        "project": str(config.project_dir.resolve()),
+        "name": config.run_name,
+        "exist_ok": bool(config.exist_ok),
+        "pretrained": bool(config.pretrained),
+        "resume": bool(config.resume),
+        "optimizer": str(config.optimizer).strip() or "auto",
+        "lr0": float(config.lr0),
+        "lrf": float(config.lrf),
+        "warmup_epochs": float(config.warmup_epochs),
+        "cos_lr": bool(config.cos_lr),
+        "patience": int(config.patience),
+        "seed": int(config.seed),
+        "deterministic": bool(config.deterministic),
+        "amp": bool(config.amp),
+        "cache": config.cache if isinstance(config.cache, str) else bool(config.cache),
+        "plots": bool(config.plots),
+        "save": bool(config.save),
+        "val": bool(config.val),
+        "mosaic": float(config.mosaic),
+        "close_mosaic": int(config.close_mosaic),
+        "mixup": float(config.mixup),
+        "cutmix": float(config.cutmix),
+        "copy_paste": float(config.copy_paste),
+        "degrees": float(config.degrees),
+        "shear": float(config.shear),
+        "perspective": float(config.perspective),
+        "translate": float(config.translate),
+        "scale": config.scale if isinstance(config.scale, (list, tuple)) else float(config.scale),
+        "flipud": float(config.flipud),
+        "fliplr": float(config.fliplr),
+        "hsv_h": float(config.hsv_h),
+        "hsv_s": float(config.hsv_s),
+        "hsv_v": float(config.hsv_v),
+    }
+    train_kwargs.update(config.extra_args)
+    return train_kwargs
+
+
+def format_submitted_hyperparams(
+    train_kwargs: Mapping[str, object], *, resume: bool = False
+) -> str:
+    """将提交给 Ultralytics 的训练参数字典格式化为带提示说明的可读多行日志文本。"""
+    json_lines = json.dumps(dict(train_kwargs), ensure_ascii=False, indent=2, default=str).splitlines()
+    if json_lines:
+        json_lines[0] = f'"arguments": {json_lines[0]}'
+    lines = [
+        "=== 训练超参数配置 (提交至 Ultralytics) ===",
+        *json_lines,
+    ]
+    if resume:
+        lines.append(
+            "[提示] 已启用断点续训 (resume=True)，实际训练超参数将优先以断点权重 last.pt 中记录的配置为准。"
+        )
+    elif str(train_kwargs.get("optimizer", "auto")).strip().lower() == "auto":
+        lines.append(
+            '[提示] 当前 optimizer="auto"，Ultralytics 将按类别数与迭代步数自动选定优化器并重算 lr0；'
+            "如需严格固定 lr0，请显式选择 AdamW / SGD 等优化器。"
+        )
+    return "\n".join(lines)
+
+
+def format_effective_hyperparams(
+    trainer: object, extra_keys: Sequence[str] = ()
+) -> str:
+    """在 `on_train_start` 阶段提取 `trainer.args` 经自动推导或断点恢复后的最终实际生效超参数并格式化。"""
+    args_obj = getattr(trainer, "args", None)
+    if isinstance(args_obj, Mapping):
+        args_map: dict[str, object] = dict(args_obj)
+    elif args_obj is not None and hasattr(args_obj, "__dict__"):
+        args_map = dict(vars(args_obj))
+    else:
+        return ""
+
+    if not args_map:
+        return ""
+
+    effective_amp = getattr(trainer, "amp", args_map.get("amp"))
+    if isinstance(effective_amp, bool):
+        args_map["amp"] = effective_amp
+    accumulate = getattr(trainer, "accumulate", None)
+
+    def _fmt_group(keys: Sequence[str]) -> str:
+        parts: list[str] = []
+        for k in keys:
+            if k not in args_map:
+                continue
+            val = args_map[k]
+            if k == "nbs" and accumulate is not None:
+                parts.append(f"nbs={val} (accumulate={accumulate})")
+            else:
+                parts.append(f"{k}={val}")
+        return ", ".join(parts)
+
+    core_keys = ("epochs", "imgsz", "batch", "nbs", "device", "workers", "amp", "cache")
+    opt_keys = (
+        "optimizer",
+        "lr0",
+        "lrf",
+        "momentum",
+        "weight_decay",
+        "warmup_epochs",
+        "cos_lr",
+        "patience",
+    )
+    aug_keys = (
+        "mosaic",
+        "close_mosaic",
+        "mixup",
+        "cutmix",
+        "copy_paste",
+        "translate",
+        "scale",
+        "degrees",
+        "shear",
+        "perspective",
+        "flipud",
+        "fliplr",
+        "hsv_h",
+        "hsv_s",
+        "hsv_v",
+    )
+    eng_keys = (
+        "seed",
+        "deterministic",
+        "pretrained",
+        "plots",
+        "save",
+        "val",
+        "exist_ok",
+        "resume",
+    )
+
+    shown = set(core_keys) | set(opt_keys) | set(aug_keys) | set(eng_keys) | {"data", "project", "name"}
+    custom_keys = [k for k in extra_keys if k not in shown and k in args_map]
+
+    lines = ["=== 实际生效训练超参数 (Trainer 初始化完成) ==="]
+    for label, group_keys in (
+        ("[核心与硬件]", core_keys),
+        ("[优化与调度]", opt_keys),
+        ("[数据增强]  ", aug_keys),
+        ("[工程与复现]", eng_keys),
+    ):
+        formatted = _fmt_group(group_keys)
+        if formatted:
+            lines.append(f"  {label} {formatted}")
+    if custom_keys:
+        lines.append(f"  [附加参数]   {_fmt_group(custom_keys)}")
+    return "\n".join(lines)
+
+
+def _emit_multiline_log(
+    log_callback: Callable[[str], None] | None, text: str
+) -> None:
+    """将多行日志块逐行发送至 `log_callback`（忽略空文本块）。"""
+    if log_callback is None or not text:
+        return
+    for line in text.splitlines():
+        log_callback(line)
+
+
 def train_yolo26(
     config: TrainConfig,
     epoch_callback: Callable[[EpochMetrics], None] | None = None,
@@ -254,7 +760,10 @@ def train_yolo26(
         （`exist_ok=False` 时同名目录存在会自动递增）写出训练日志、指标曲线及 `weights/best.pt`、`last.pt`，
         实际目录以返回值 `TrainResult.save_dir` 为准。
 
-    回调与安全停训约束：
+    回调、超参数日志与安全停训约束：
+        训练提交前先向 `log_callback` 输出本次传入的完整 `"arguments"` 参数字典；
+        在 Ultralytics `on_train_start` 阶段（已完成 `AutoBatch`、优化器自动推导、AMP 校验与断点恢复）
+        再输出最终实际生效的分类超参数摘要。
         通过 `on_train_epoch_end` 与 `on_fit_epoch_end` 回调派发 `EpochMetrics` 并检查 `cancel_event`；
         若收到取消信号，将设置 `trainer.stop = True`，等待当前轮次完成并保存断点权重后再退出，
         此时 `TrainResult.stopped_early=True`（训练已自然结束后才设置的取消信号不计入）。
@@ -279,6 +788,11 @@ def train_yolo26(
     ensure_torch_cpu_threads()
     model = YOLO(model_source)
     stop_requested = {"value": False}
+    extra_keys = tuple(config.extra_args.keys())
+
+    def _on_train_start(trainer: object) -> None:
+        effective_log = format_effective_hyperparams(trainer, extra_keys=extra_keys)
+        _emit_multiline_log(log_callback, effective_log)
 
     def _check_cancel(trainer: object) -> None:
         if cancel_event and cancel_event.is_set() and not stop_requested["value"]:
@@ -318,26 +832,14 @@ def train_yolo26(
             epoch_callback(em)
         _check_cancel(trainer)
 
+    model.add_callback("on_train_start", _on_train_start)
     model.add_callback("on_train_epoch_end", _check_cancel)
     model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
 
-    train_kwargs: dict[str, object] = {
-        "data": str(config.data_yaml),
-        "epochs": int(config.epochs),
-        "imgsz": int(config.imgsz),
-        "batch": int(config.batch),
-        "device": config.device,
-        "lr0": float(config.lr0),
-        "patience": int(config.patience),
-        "workers": int(config.workers),
-        "amp": bool(config.amp),
-        "cache": bool(config.cache),
-        "project": str(config.project_dir.resolve()),
-        "name": config.run_name,
-        "exist_ok": bool(config.exist_ok),
-        "resume": bool(config.resume),
-    }
-    train_kwargs.update(config.extra_args)
+    train_kwargs = build_train_kwargs(config)
+    _emit_multiline_log(
+        log_callback, format_submitted_hyperparams(train_kwargs, resume=config.resume)
+    )
 
     with capture_thread_output(log_callback):
         results = model.train(**train_kwargs)
