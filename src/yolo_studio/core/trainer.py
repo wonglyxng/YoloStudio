@@ -572,6 +572,123 @@ def parse_extra_train_args(raw: str) -> dict[str, object]:
     return result
 
 
+# 桌面训练界面拥有专用表单控件的 Ultralytics 参数键集合（用于附加参数覆盖提醒与 JSON 导入分流）
+TRAIN_UI_MANAGED_KEYS: frozenset[str] = frozenset(
+    {
+        "data",
+        "model",
+        "epochs",
+        "imgsz",
+        "batch",
+        "nbs",
+        "device",
+        "workers",
+        "project",
+        "name",
+        "resume",
+        "optimizer",
+        "lr0",
+        "lrf",
+        "warmup_epochs",
+        "cos_lr",
+        "patience",
+        "seed",
+        "deterministic",
+        "amp",
+        "cache",
+        "plots",
+        "val",
+        "mosaic",
+        "close_mosaic",
+        "mixup",
+        "cutmix",
+        "copy_paste",
+        "degrees",
+        "shear",
+        "perspective",
+        "translate",
+        "scale",
+        "flipud",
+        "fliplr",
+        "hsv_h",
+        "hsv_s",
+        "hsv_v",
+    }
+)
+
+# 与具体项目目录或模型文件绑定的路径/标识键；导入外部 JSON 参数时默认保护不被误覆盖，由用户按需勾选导入
+TRAIN_PATH_KEYS: frozenset[str] = frozenset({"data", "project", "name", "model"})
+
+
+def parse_train_arguments_text(raw: str) -> dict[str, object]:
+    """解析用于界面导入的训练参数 JSON / 日志片段，返回扁平化的参数字典。
+
+    兼容输入形式：
+        1. 标准 JSON 对象：`{"epochs": 160, "optimizer": "AdamW", ...}`；
+        2. 外层含 `"arguments"` 键的对象：`{"arguments": {"epochs": 160, ...}}`；
+        3. 直接截取的配置/日志片段：`"arguments": { ... },` 或带 `=== ... ===`、`[提示] ...` 装饰行的训练日志；
+        4. `key=value` / `key: value` 键值对文本。
+
+    失败方式：
+        输入为空、无有效键值对或语法错误时抛出中文 `ValueError`。
+    """
+    filtered_lines = [
+        line
+        for line in raw.splitlines()
+        if not line.strip().startswith("===") and not line.strip().startswith("[提示]")
+    ]
+    cleaned = "\n".join(filtered_lines).strip()
+    if not cleaned:
+        raise ValueError("请输入要导入的训练参数 JSON 或键值对文本。")
+
+    wrapped = re.match(r'^["\']?arguments["\']?\s*[:=]\s*(\{.*)$', cleaned, flags=re.DOTALL)
+    if wrapped:
+        cleaned = wrapped.group(1).strip()
+
+    parsed = parse_extra_train_args(cleaned)
+    if len(parsed) == 1 and "arguments" in parsed and isinstance(parsed["arguments"], dict):
+        inner: dict[str, object] = {}
+        for k, v in parsed["arguments"].items():
+            if not isinstance(k, str) or not k.isidentifier():
+                raise ValueError(f"非法的超参数名称: {k!r}（必须为合法的参数标识符）")
+            inner[k] = _normalize_parsed_value(v)
+        parsed = inner
+
+    if not parsed:
+        raise ValueError("未解析到任何有效的训练超参数。")
+    return parsed
+
+
+def split_known_and_extra_train_args(
+    args_map: Mapping[str, object], *, include_paths: bool = False
+) -> tuple[dict[str, object], dict[str, object]]:
+    """将导入的参数字典拆分为『界面专用控件字段』与『附加参数字段』两部分。
+
+    参数说明：
+        `include_paths`：为 `False`（默认）时跳过 `data`、`project`、`name`、`model` 路径与实验名键，
+            避免导入外部项目的超参数 JSON 时误覆盖当前工作区路径；为 `True` 时一并纳入 `known`。
+        部分与界面默认语义完全一致且无需放入附加参数框的常规只读布尔项（如 `save=True`、`pretrained=True`、
+        `exist_ok=False`）仅在其偏离本工具默认值时才保留在 `extra` 中，保持附加参数框整洁。
+    """
+    implicit_defaults: dict[str, object] = {
+        "save": True,
+        "pretrained": True,
+        "exist_ok": False,
+    }
+    known: dict[str, object] = {}
+    extra: dict[str, object] = {}
+    for key, value in args_map.items():
+        if key in TRAIN_PATH_KEYS and not include_paths:
+            continue
+        if key in TRAIN_UI_MANAGED_KEYS:
+            known[key] = value
+        elif key in implicit_defaults and value == implicit_defaults[key]:
+            continue
+        else:
+            extra[key] = value
+    return known, extra
+
+
 def build_train_kwargs(config: TrainConfig) -> dict[str, object]:
     """将 `TrainConfig` 规范化转换为传递给 Ultralytics `model.train(**kwargs)` 的完整参数字典。
 

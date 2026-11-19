@@ -88,12 +88,17 @@ class MainWindow(QMainWindow):
         关闭时先委派内嵌 `LabelingStudioTab` 核查未保存标注再持久化主窗口状态。
     """
 
-    def __init__(self, workspace_root: Path, lazy_init: bool = False) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        lazy_init: bool = False,
+        settings: QSettings | None = None,
+    ) -> None:
         super().__init__()
         self.workspace_root = workspace_root
         self._lazy_init = lazy_init
         self._device_probe_worker: DeviceProbeWorker | None = None
-        self.settings = QSettings("YOLO26Studio", "VideoToYOLO26")
+        self.settings = settings or QSettings("YOLO26Studio", "VideoToYOLO26")
         self.setWindowTitle(
             "YOLO26 视频抽帧与训练工具 (Video → 内嵌 X-AnyLabeling → MLLM纠错 → YOLO26)"
         )
@@ -248,11 +253,12 @@ class MainWindow(QMainWindow):
         self.review_tab.set_weights_path(weights_path)
 
     def _restore_settings(self) -> None:
-        """从持久化 `QSettings` 恢复上次保存的工作区目录偏好（如存在）。"""
+        """从持久化 `QSettings` 恢复上次保存的工作区目录与训练超参数偏好（如存在）。"""
         last_dir = self.settings.value("last_frames_dir", "")
         if isinstance(last_dir, str) and last_dir and Path(last_dir).is_dir():
             self.dataset_tab.set_frames_dir(last_dir)
             self.review_tab.set_images_dir(last_dir)
+        self.train_tab.restore_settings(self.settings)
 
     def _running_workers(self) -> list[QThread]:
         """收集各标签页中仍在运行的后台 `QThread`（属性不存在或尚未创建时忽略）。"""
@@ -330,4 +336,5 @@ class MainWindow(QMainWindow):
         cur_frames = self.dataset_tab.images_picker.text()
         if cur_frames:
             self.settings.setValue("last_frames_dir", cur_frames)
+        self.train_tab.save_settings(self.settings)
         super().closeEvent(event)

@@ -367,3 +367,51 @@ def test_cli_train_preset_and_overrides_build_expected_config(tmp_path: Path) ->
     # 非法 --extra-arg 返回退出码 2
     bad_code = cli_main(["train", "-d", str(data_yaml), "--extra-arg", "broken_entry"])
     assert bad_code == 2
+
+
+def test_parse_train_arguments_text_and_split_known_extra() -> None:
+    """验证训练参数 JSON / 日志片段导入解析与界面字段/附加参数分流保护逻辑。"""
+    from yolo_studio.core.trainer import (
+        parse_train_arguments_text,
+        split_known_and_extra_train_args,
+    )
+
+    sample = """
+    === 训练超参数配置 (提交至 Ultralytics) ===
+    "arguments": {
+      "data": "C:\\\\other\\\\data.yaml",
+      "project": "C:\\\\other\\\\runs",
+      "name": "gpu-training",
+      "epochs": 160,
+      "optimizer": "AdamW",
+      "lr0": 0.001,
+      "exist_ok": false,
+      "pretrained": true,
+      "save": true,
+      "box": 7.5
+    },
+    [提示] 示例提示行
+    """
+    parsed = parse_train_arguments_text(sample)
+    assert parsed["epochs"] == 160
+    assert parsed["optimizer"] == "AdamW"
+    assert parsed["box"] == 7.5
+
+    # 默认不导入外部路径，且过滤与默认行为一致的 exist_ok/pretrained/save
+    known, extra = split_known_and_extra_train_args(parsed, include_paths=False)
+    assert "data" not in known and "project" not in known and "name" not in known
+    assert known["epochs"] == 160
+    assert known["optimizer"] == "AdamW"
+    assert extra == {"box": 7.5}
+
+    # 显式开启 include_paths 时纳入路径与实验名
+    known_with_paths, _ = split_known_and_extra_train_args(parsed, include_paths=True)
+    assert known_with_paths["name"] == "gpu-training"
+    assert known_with_paths["data"] == "C:\\other\\data.yaml"
+
+    # 外层包一层 {"arguments": {...}} 同样支持解包
+    wrapped = parse_train_arguments_text('{"arguments": {"mosaic": 0.0, "scale": 0.15}}')
+    assert wrapped == {"mosaic": 0.0, "scale": 0.15}
+
+    with pytest.raises(ValueError, match="请输入"):
+        parse_train_arguments_text("   \n=== 仅标题 ===\n")

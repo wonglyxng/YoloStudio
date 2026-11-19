@@ -531,3 +531,200 @@ def test_train_tab_hyperparameter_presets_and_config_builder(
             tab.build_train_config()
     finally:
         tab.close()
+
+
+def test_train_tab_guard_states_extra_validation_and_collapsible_panel(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证防呆联动禁用态（auto 置灰 LR0、自定义权重置灰官方模型、Mosaic=0 置灰 CloseMosaic）、实时附加校验与增强区折叠。"""
+    from yolo_studio.gui.tab_train import TrainTab
+
+    tab = TrainTab(workspace_root=tmp_path)
+    try:
+        # 1) 默认 optimizer=auto 时 LR0 自动置灰并带提示标签
+        assert tab.optimizer_combo.currentData() == "auto"
+        assert tab.lr0_spin.isEnabled() is False
+        assert "自动" in tab.lr0_label.text()
+
+        # 切换为 AdamW 后 LR0 恢复可编辑
+        adamw_idx = tab.optimizer_combo.findData("AdamW")
+        tab.optimizer_combo.setCurrentIndex(adamw_idx)
+        qt_app.processEvents()
+        assert tab.lr0_spin.isEnabled() is True
+        assert tab.lr0_label.text() == "LR0:"
+
+        # 2) 自定义权重路径非空时置灰官方预训练模型下拉框，清空后恢复
+        assert tab.model_combo.isEnabled() is True
+        tab.custom_model_edit.setText(str(tmp_path / "custom.pt"))
+        qt_app.processEvents()
+        assert tab.model_combo.isEnabled() is False
+        tab.custom_model_edit.clear()
+        qt_app.processEvents()
+        assert tab.model_combo.isEnabled() is True
+
+        # 3) Mosaic 为 0 时置灰 CloseMosaic，调大后恢复
+        tab.mosaic_spin.setValue(0.0)
+        qt_app.processEvents()
+        assert tab.close_mosaic_spin.isEnabled() is False
+        tab.mosaic_spin.setValue(0.5)
+        qt_app.processEvents()
+        assert tab.close_mosaic_spin.isEnabled() is True
+
+        # 4) 折叠与展开增强区并展示摘要
+        assert tab.aug_body.isHidden() is False
+        tab.toggle_aug_btn.click()
+        qt_app.processEvents()
+        assert tab.aug_body.isHidden() is True
+        assert "展开" in tab.toggle_aug_btn.text()
+        assert "Mosaic=0.50" in tab.aug_summary_label.text()
+        tab.toggle_aug_btn.click()
+        qt_app.processEvents()
+        assert tab.aug_body.isHidden() is False
+
+        # 5) 附加参数实时状态校验：合法项、覆盖提醒、语法错误
+        assert tab.extra_args_status_label.isHidden() is True
+        tab.extra_args_edit.setPlainText("box=7.5")
+        qt_app.processEvents()
+        assert tab.extra_args_status_label.isHidden() is False
+        assert "已解析 1 项" in tab.extra_args_status_label.text()
+
+        tab.extra_args_edit.setPlainText("box=7.5, mosaic=0.2")
+        qt_app.processEvents()
+        assert "覆盖上方界面设置: mosaic" in tab.extra_args_status_label.text()
+
+        tab.extra_args_edit.setPlainText("broken_without_sep")
+        qt_app.processEvents()
+        assert "语法错误" in tab.extra_args_status_label.text()
+    finally:
+        tab.close()
+
+
+def test_train_tab_import_export_json_reset_and_qsettings_persistence(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证训练参数 JSON 导入回填、往返导出、恢复默认，以及在异步硬件探测场景下的 QSettings 持久记忆。"""
+    from PyQt6.QtCore import QSettings
+
+    from yolo_studio.core.trainer import DeviceInfo, parse_train_arguments_text
+    from yolo_studio.gui.tab_train import TrainTab
+
+    ini_path = tmp_path / "train_settings.ini"
+    settings = QSettings(str(ini_path), QSettings.Format.IniFormat)
+
+    gpu_info = DeviceInfo(
+        cuda_available=True,
+        device_count=1,
+        device_name="Mock RTX 3060",
+        vram_gb=6.0,
+        recommended_device="0",
+        probing=False,
+    )
+    probing_info = DeviceInfo(
+        cuda_available=False,
+        device_count=0,
+        device_name="正在后台检测计算设备...",
+        vram_gb=0.0,
+        recommended_device="cpu",
+        probing=True,
+    )
+
+    sample_json = """
+    "arguments": {
+      "data": "C:\\\\other_project\\\\data.yaml",
+      "epochs": 160,
+      "imgsz": 960,
+      "batch": 4,
+      "nbs": 16,
+      "device": 0,
+      "workers": 0,
+      "project": "C:\\\\other_project\\\\runs",
+      "name": "gpu-training",
+      "exist_ok": false,
+      "pretrained": true,
+      "optimizer": "AdamW",
+      "lr0": 0.001,
+      "lrf": 0.05,
+      "warmup_epochs": 3.0,
+      "patience": 160,
+      "seed": 0,
+      "deterministic": true,
+      "amp": false,
+      "cache": false,
+      "plots": false,
+      "save": true,
+      "val": true,
+      "mosaic": 0.0,
+      "mixup": 0.0,
+      "cutmix": 0.0,
+      "copy_paste": 0.0,
+      "degrees": 0.0,
+      "shear": 0.0,
+      "perspective": 0.0,
+      "translate": 0.03,
+      "scale": 0.15,
+      "flipud": 0.0,
+      "fliplr": 0.5,
+      "hsv_h": 0.01,
+      "hsv_s": 0.2,
+      "hsv_v": 0.2,
+      "box": 7.5
+    },
+    """
+
+    tab1 = TrainTab(workspace_root=tmp_path, device_info=gpu_info)
+    try:
+        orig_yaml = tab1.yaml_picker.text()
+        applied, extra_keys = tab1.import_arguments_from_text(sample_json, include_paths=False)
+        assert "epochs" in applied and "optimizer" in applied
+        assert extra_keys == ["box"]
+        # 路径默认受保护不覆盖，且自动识别为 game_ui 预设
+        assert tab1.yaml_picker.text() == orig_yaml
+        assert tab1.preset_combo.currentData() == "game_ui"
+        assert tab1.epochs_spin.value() == 160
+        assert tab1.imgsz_combo.currentText() == "960"
+        assert tab1.batch_spin.value() == 4
+        assert tab1.nbs_spin.value() == 16
+        assert tab1.workers_spin.value() == 0
+        assert tab1.amp_chk.isChecked() is False
+        assert tab1.plots_chk.isChecked() is False
+        assert tab1.close_mosaic_spin.value() == 0
+        assert tab1.close_mosaic_spin.isEnabled() is False
+
+        # 导出 JSON 可无损往返解析
+        exported = tab1.export_arguments_json()
+        re_parsed = parse_train_arguments_text(exported)
+        assert re_parsed["epochs"] == 160
+        assert re_parsed["optimizer"] == "AdamW"
+        assert re_parsed["box"] == 7.5
+
+        # 折叠增强区并持久化
+        tab1.set_aug_panel_expanded(False)
+        tab1.save_settings(settings)
+        settings.sync()
+    finally:
+        tab1.close()
+
+    # 模拟下次以 lazy_init (probing=True) 启动并恢复持久化，再完成异步 GPU 探测
+    tab2 = TrainTab(workspace_root=tmp_path, device_info=probing_info)
+    try:
+        tab2.restore_settings(settings)
+        tab2.apply_device_info(gpu_info)
+
+        assert tab2.preset_combo.currentData() == "game_ui"
+        assert tab2.epochs_spin.value() == 160
+        assert tab2.batch_spin.value() == 4  # 不被探测返回的默认 16 覆盖
+        assert tab2.amp_chk.isChecked() is False  # 不被探测返回的默认 True 覆盖
+        assert tab2.device_edit.text() == "0"
+        assert tab2.aug_body.isHidden() is True
+        assert '"box": 7.5' in tab2.extra_args_edit.toPlainText()
+
+        # 一键恢复默认
+        tab2.reset_defaults()
+        assert tab2.preset_combo.currentData() == "default"
+        assert tab2.epochs_spin.value() == 100
+        assert tab2.batch_spin.value() == 16
+        assert tab2.amp_chk.isChecked() is True
+        assert tab2.lr0_spin.isEnabled() is False
+        assert tab2.extra_args_edit.toPlainText() == ""
+    finally:
+        tab2.close()
