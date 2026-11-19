@@ -181,6 +181,7 @@ class MainWindow(QMainWindow):
         self.device_info.device_name = info.device_name
         self.device_info.vram_gb = info.vram_gb
         self.device_info.recommended_device = info.recommended_device
+        self.device_info.gpu_devices = info.gpu_devices
         self.device_info.probing = False
 
         self.review_tab.apply_device_info(self.device_info)

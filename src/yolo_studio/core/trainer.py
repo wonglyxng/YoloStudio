@@ -132,7 +132,11 @@ TRAIN_HYP_PRESETS: dict[str, dict[str, object]] = {
 
 @dataclass
 class DeviceInfo:
-    """可用计算硬件与显存摘要；`vram_gb` 单位为 GiB，`probing=True` 表示后台异步探测尚在进行中。"""
+    """可用计算硬件与显存摘要；`vram_gb` 单位为 GiB，`probing=True` 表示后台异步探测尚在进行中。
+
+    `gpu_devices` 按索引顺序记录本机可用 CUDA GPU 清单，每项为 `(设备编号字符串, 显卡名称, 显存 GiB)`；
+    无可用 GPU 或尚未完成探测时为空元组。
+    """
 
     cuda_available: bool
     device_count: int
@@ -140,6 +144,7 @@ class DeviceInfo:
     vram_gb: float
     recommended_device: str
     probing: bool = False
+    gpu_devices: tuple[tuple[str, str, float], ...] = ()
 
 
 @dataclass
@@ -343,14 +348,19 @@ def detect_compute_device(refresh: bool = False) -> DeviceInfo:
     import torch
 
     if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        props = torch.cuda.get_device_properties(0)
-        vram_gb = props.total_memory / (1024**3)
+        count = torch.cuda.device_count()
+        gpu_list: list[tuple[str, str, float]] = []
+        for idx in range(count):
+            p = torch.cuda.get_device_properties(idx)
+            gpu_list.append((str(idx), p.name, p.total_memory / (1024**3)))
+        first_name, first_vram = gpu_list[0][1], gpu_list[0][2]
         info = DeviceInfo(
             cuda_available=True,
-            device_count=torch.cuda.device_count(),
-            device_name=props.name,
-            vram_gb=vram_gb,
+            device_count=count,
+            device_name=first_name,
+            vram_gb=first_vram,
             recommended_device="0",
+            gpu_devices=tuple(gpu_list),
         )
     else:
         info = DeviceInfo(
@@ -359,6 +369,7 @@ def detect_compute_device(refresh: bool = False) -> DeviceInfo:
             device_name="CPU (未检测到可用 CUDA GPU)",
             vram_gb=0.0,
             recommended_device="cpu",
+            gpu_devices=(),
         )
     _CACHED_DEVICE_INFO = info
     return info

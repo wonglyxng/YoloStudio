@@ -50,7 +50,13 @@ from yolo_studio.core.mllm_reviewer import (
     render_review_comparison,
 )
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
-from yolo_studio.gui.common import GpuTaskGuard, LOG_MAX_LINES, PathPickerRow, open_local_path
+from yolo_studio.gui.common import (
+    LOG_MAX_LINES,
+    ComputeDeviceControl,
+    GpuTaskGuard,
+    PathPickerRow,
+    open_local_path,
+)
 from yolo_studio.gui.workers import MllmReviewWorker
 
 # 左右对比预览 JPEG 字节流的 LRU 缓存容量上限（按结果表行号索引，每次重新开始审核时清空）
@@ -85,15 +91,12 @@ class MllmReviewTab(QWidget):
         self._preview_cache: OrderedDict[int, bytes] = OrderedDict()
         self._last_output_dir: Path = workspace_root / "data" / "reviewed_frames"
         self._last_classes_txt: str = ""
-        self._auto_device_text: str = self.device_info.recommended_device
         self._init_ui()
 
     def apply_device_info(self, info: DeviceInfo) -> None:
-        """异步硬件探测完成后刷新基准推理设备默认值（保留用户已手动修改的值）。"""
+        """异步硬件探测完成后刷新基准推理设备开关与提示（保留用户已手动修改的选择）。"""
         self.device_info = info
-        if self.yolo_device_edit.text().strip() == self._auto_device_text:
-            self.yolo_device_edit.setText(info.recommended_device)
-        self._auto_device_text = info.recommended_device
+        self.yolo_device_ctrl.apply_device_info(info)
 
     def set_images_dir(self, path_str: str) -> None:
         """跨页写入：同步待纠错图片目录输入框。"""
@@ -157,16 +160,20 @@ class MllmReviewTab(QWidget):
         self.yolo_imgsz_spin.setRange(128, 2048)
         self.yolo_imgsz_spin.setSingleStep(32)
         self.yolo_imgsz_spin.setValue(640)
-        self.yolo_device_edit = QLineEdit(self.device_info.recommended_device)
-        self.yolo_device_edit.setFixedWidth(55)
+        self.yolo_device_ctrl = ComputeDeviceControl(
+            self.device_info,
+            show_status_text=False,
+            allow_multi_gpu=False,
+            checkbox_text="GPU 加速",
+            compact_status=True,
+        )
         yolo_row.addWidget(QLabel("低阈值Conf:"))
         yolo_row.addWidget(self.yolo_conf_spin)
         yolo_row.addWidget(QLabel("IoU:"))
         yolo_row.addWidget(self.yolo_iou_spin)
         yolo_row.addWidget(QLabel("ImgSz:"))
         yolo_row.addWidget(self.yolo_imgsz_spin)
-        yolo_row.addWidget(QLabel("Dev:"))
-        yolo_row.addWidget(self.yolo_device_edit)
+        yolo_row.addWidget(self.yolo_device_ctrl)
         s_form.addRow("基准推理参数:", yolo_row)
 
         self.ann_picker = PathPickerRow(
@@ -355,7 +362,7 @@ class MllmReviewTab(QWidget):
         self.yolo_conf_spin.setEnabled(is_yolo)
         self.yolo_iou_spin.setEnabled(is_yolo)
         self.yolo_imgsz_spin.setEnabled(is_yolo)
-        self.yolo_device_edit.setEnabled(is_yolo)
+        self.yolo_device_ctrl.setEnabled(is_yolo)
         self.ann_picker.setEnabled(not is_yolo)
 
     def _on_provider_changed(self) -> None:
@@ -421,7 +428,7 @@ class MllmReviewTab(QWidget):
             yolo_conf=self.yolo_conf_spin.value(),
             yolo_iou=self.yolo_iou_spin.value(),
             yolo_imgsz=self.yolo_imgsz_spin.value(),
-            yolo_device=self.yolo_device_edit.text().strip() or "0",
+            yolo_device=self.yolo_device_ctrl.device(),
             provider=self.provider_combo.currentData(),
             model_name=self.model_edit.text().strip(),
             api_key=self.api_key_edit.text().strip(),

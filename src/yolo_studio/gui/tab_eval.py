@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
 from yolo_studio.core.dataset_converter import IMAGE_EXTENSIONS
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.common import (
+    ComputeDeviceControl,
     GpuTaskGuard,
     LOG_MAX_LINES,
     PathPickerRow,
@@ -66,7 +67,6 @@ class EvalTab(QWidget):
         self.val_worker: ValidateWorker | None = None
         self.pred_worker: PredictWorker | None = None
         self.export_worker: ExportWorker | None = None
-        self._auto_device_text: str = self.device_info.recommended_device
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -76,8 +76,8 @@ class EvalTab(QWidget):
         left = QVBoxLayout()
         left.setSpacing(10)
 
-        # 分组 1：模型权重与验证配置
-        model_group = QGroupBox("1. 模型权重与验证配置")
+        # 分组 1：模型权重、运行设备与验证配置
+        model_group = QGroupBox("1. 模型权重与运行设备")
         m_form = QFormLayout(model_group)
 
         self.weights_picker = PathPickerRow(
@@ -94,18 +94,24 @@ class EvalTab(QWidget):
         )
         m_form.addRow("data.yaml:", self.yaml_picker)
 
+        self.device_ctrl = ComputeDeviceControl(
+            self.device_info,
+            show_status_text=True,
+            allow_multi_gpu=False,
+            checkbox_text="启用 GPU 加速",
+            compact_status=True,
+        )
+        m_form.addRow("运行设备:", self.device_ctrl)
+
         hw_row = QHBoxLayout()
         self.imgsz_spin = QSpinBox()
         self.imgsz_spin.setRange(128, 2048)
         self.imgsz_spin.setSingleStep(32)
         self.imgsz_spin.setValue(640)
-        self.device_edit = QLineEdit(self.device_info.recommended_device)
-        self.device_edit.setFixedWidth(70)
         self.val_btn = QPushButton("运行验证 (Val)")
         hw_row.addWidget(QLabel("ImgSz:"))
         hw_row.addWidget(self.imgsz_spin)
-        hw_row.addWidget(QLabel("Device:"))
-        hw_row.addWidget(self.device_edit)
+        hw_row.addStretch(1)
         hw_row.addWidget(self.val_btn)
         m_form.addRow("验证设置:", hw_row)
         left.addWidget(model_group)
@@ -198,27 +204,34 @@ class EvalTab(QWidget):
         self.open_pred_btn.clicked.connect(lambda: open_local_path(self.pred_out_picker.path()))
         self.export_btn.clicked.connect(self._on_export)
         self.format_combo.currentIndexChanged.connect(self._on_export_format_changed)
+        self.device_ctrl.device_changed.connect(self._on_export_format_changed)
         self._on_export_format_changed()
 
-    def _on_export_format_changed(self) -> None:
-        """同步半精度选项状态：ONNX 固定在 CPU 上导出，不支持 FP16，需在界面上置灰提示。"""
+    def _on_export_format_changed(self, *_args: object) -> None:
+        """同步半精度选项状态：ONNX 导出或 CPU 运行模式下均不支持 FP16，需在界面上置灰提示。"""
         is_onnx = str(self.format_combo.currentData()) == "onnx"
+        using_gpu = self.device_ctrl.is_using_gpu() and not self.device_info.probing
         if is_onnx:
             self.half_chk.setChecked(False)
             self.half_chk.setEnabled(False)
             self.half_chk.setToolTip(
                 "ONNX 导出固定使用 CPU 以规避图追踪设备冲突，不支持 FP16 半精度；选择 TorchScript 或 TensorRT 时可启用"
             )
+        elif not using_gpu:
+            self.half_chk.setChecked(False)
+            self.half_chk.setEnabled(False)
+            self.half_chk.setToolTip(
+                "当前运行设备为 CPU 模式，不支持 FP16 半精度导出；请在上方启用 GPU 加速后再开启"
+            )
         else:
             self.half_chk.setEnabled(True)
-            self.half_chk.setToolTip("以 FP16 半精度导出权重（通常需在 GPU 设备上执行）")
+            self.half_chk.setToolTip("以 FP16 半精度导出权重（需在 GPU 模式下执行）")
 
     def apply_device_info(self, info: DeviceInfo) -> None:
-        """异步硬件探测完成后刷新默认设备输入框（不覆盖用户已手动修改的值）。"""
+        """异步硬件探测完成后刷新运行设备开关与导出 FP16 可用状态（保留用户已手动修改的选择）。"""
         self.device_info = info
-        if self.device_edit.text().strip() == self._auto_device_text:
-            self.device_edit.setText(info.recommended_device)
-        self._auto_device_text = info.recommended_device
+        self.device_ctrl.apply_device_info(info)
+        self._on_export_format_changed()
 
     def set_weights_and_yaml(self, weights_path: str, yaml_path: str) -> None:
         """跨页写入：同步更新待评估权重与 `data.yaml` 路径。"""
@@ -272,7 +285,7 @@ class EvalTab(QWidget):
             Path(w),
             Path(y),
             imgsz=self.imgsz_spin.value(),
-            device=self.device_edit.text().strip() or "0",
+            device=self.device_ctrl.device(),
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.val_worker, "模型验证 (Val)")
@@ -315,7 +328,7 @@ class EvalTab(QWidget):
             conf=self.conf_spin.value(),
             iou=self.iou_spin.value(),
             imgsz=self.imgsz_spin.value(),
-            device=self.device_edit.text().strip() or "0",
+            device=self.device_ctrl.device(),
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.pred_worker, "模型推理预览")
@@ -361,8 +374,8 @@ class EvalTab(QWidget):
             weights_path=Path(w),
             export_format=fmt,
             imgsz=self.imgsz_spin.value(),
-            half=self.half_chk.isChecked(),
-            device=self.device_edit.text().strip() or "0",
+            half=self.half_chk.isChecked() and self.device_ctrl.is_using_gpu(),
+            device=self.device_ctrl.device(),
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.export_worker, f"模型导出 ({fmt})")

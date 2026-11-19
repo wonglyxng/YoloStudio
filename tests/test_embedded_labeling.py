@@ -330,13 +330,23 @@ def test_gpu_guard_shared_device_and_eval_onnx_half_toggle(
         assert win.eval_tab.device_info is win.device_info
         assert win.train_tab.gpu_guard is win.gpu_guard
 
-        # 默认导出格式为 ONNX：FP16 复选框应自动置灰且未勾选；切换至 TorchScript 后启用
+        # 默认导出格式为 ONNX：FP16 复选框应自动置灰且未勾选；切换至 TorchScript 时仅在启用 GPU 下可用
         assert win.eval_tab.format_combo.currentData() == "onnx"
         assert not win.eval_tab.half_chk.isEnabled()
         assert not win.eval_tab.half_chk.isChecked()
         win.eval_tab.format_combo.setCurrentIndex(1)  # torchscript
-        assert win.eval_tab.half_chk.isEnabled()
-        win.eval_tab.half_chk.setChecked(True)
+        if win.eval_tab.device_ctrl.is_using_gpu():
+            assert win.eval_tab.half_chk.isEnabled()
+            win.eval_tab.half_chk.setChecked(True)
+            # 在 TorchScript 下手动关闭 GPU 开关切为 CPU，FP16 亦自动取消并置灰
+            win.eval_tab.device_ctrl.gpu_chk.setChecked(False)
+            assert not win.eval_tab.half_chk.isEnabled()
+            assert not win.eval_tab.half_chk.isChecked()
+            win.eval_tab.device_ctrl.gpu_chk.setChecked(True)
+            assert win.eval_tab.half_chk.isEnabled()
+            win.eval_tab.half_chk.setChecked(True)
+        else:
+            assert not win.eval_tab.half_chk.isEnabled()
         win.eval_tab.format_combo.setCurrentIndex(0)  # 切回 onnx 自动取消勾选并置灰
         assert not win.eval_tab.half_chk.isEnabled()
         assert not win.eval_tab.half_chk.isChecked()
@@ -435,8 +445,8 @@ def test_lazy_init_fast_startup_and_async_device_probe_and_on_demand_mount(
         assert win.device_info.probing is True
         assert "正在后台检测" in win.train_tab.hw_label.text()
 
-        # 模拟用户在探测返回前手动改写了第 6 页的设备输入框
-        win.eval_tab.device_edit.setText("custom:1")
+        # 模拟用户在探测返回前手动改写了第 6 页的运行设备
+        win.eval_tab.device_ctrl.set_device("custom:1")
 
         # 2) 启动后台硬件探测并等待信号回传
         win.start_background_warmup()
@@ -450,9 +460,9 @@ def test_lazy_init_fast_startup_and_async_device_probe_and_on_demand_mount(
         assert win.device_info.probing is False
         assert win.train_tab.device_info is win.device_info
         assert "正在后台检测" not in win.train_tab.hw_label.text()
-        assert win.train_tab.device_edit.text() == win.device_info.recommended_device
+        assert win.train_tab.device_ctrl.device() == win.device_info.recommended_device
         # 用户手动修改过的设备值不被后台探测覆盖
-        assert win.eval_tab.device_edit.text() == "custom:1"
+        assert win.eval_tab.device_ctrl.device() == "custom:1"
 
         # 3) 从第 1 页发送抽帧目录时，第 2 页自动按需挂载内嵌 X-AnyLabeling 并打开目录
         assert win.tabs.currentIndex() == 0
@@ -714,7 +724,7 @@ def test_train_tab_import_export_json_reset_and_qsettings_persistence(
         assert tab2.epochs_spin.value() == 160
         assert tab2.batch_spin.value() == 4  # 不被探测返回的默认 16 覆盖
         assert tab2.amp_chk.isChecked() is False  # 不被探测返回的默认 True 覆盖
-        assert tab2.device_edit.text() == "0"
+        assert tab2.device_ctrl.device() == "0"
         assert tab2.aug_body.isHidden() is True
         assert '"box": 7.5' in tab2.extra_args_edit.toPlainText()
 
@@ -728,3 +738,124 @@ def test_train_tab_import_export_json_reset_and_qsettings_persistence(
         assert tab2.extra_args_edit.toPlainText() == ""
     finally:
         tab2.close()
+
+
+def test_compute_device_control_across_tabs_4_5_6_and_multi_gpu_and_amp_fp16_guards(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证统一设备控件在单卡/多卡/无卡状态下的展示与交互，以及 4/5/6 页的联动防呆与梯度累积换算。"""
+    from yolo_studio.core.trainer import DeviceInfo
+    from yolo_studio.gui.tab_eval import EvalTab
+    from yolo_studio.gui.tab_review import MllmReviewTab
+    from yolo_studio.gui.tab_train import TrainTab
+
+    single_gpu = DeviceInfo(
+        cuda_available=True,
+        device_count=1,
+        device_name="Mock RTX 3060",
+        vram_gb=6.0,
+        recommended_device="0",
+        gpu_devices=(("0", "Mock RTX 3060", 6.0),),
+    )
+    multi_gpu = DeviceInfo(
+        cuda_available=True,
+        device_count=2,
+        device_name="Mock RTX 4090",
+        vram_gb=24.0,
+        recommended_device="0",
+        gpu_devices=(("0", "Mock RTX 4090", 24.0), ("1", "Mock RTX 3060", 6.0)),
+    )
+    cpu_only = DeviceInfo(
+        cuda_available=False,
+        device_count=0,
+        device_name="CPU",
+        vram_gb=0.0,
+        recommended_device="cpu",
+        gpu_devices=(),
+    )
+
+    # 1) 标签页 5（训练页）：单卡隐藏多卡下拉、切 CPU 联动置灰 AMP 且切回 GPU 恢复、实时梯度累积换算、多卡可选 0,1
+    train_tab = TrainTab(workspace_root=tmp_path, device_info=single_gpu)
+    try:
+        assert train_tab.device_ctrl.gpu_chk.isChecked() is True
+        assert train_tab.device_ctrl.gpu_combo.isHidden() is True
+        assert train_tab.device_ctrl.device() == "0"
+        assert train_tab.amp_chk.isEnabled() is True
+        assert train_tab.amp_chk.isChecked() is True
+
+        # 梯度累积实时换算：默认 batch=16, nbs=64 -> 每 4 步；改 batch=4, nbs=16 -> 每 4 步；batch=-1 -> AutoBatch
+        assert train_tab.accum_hint_label.text() == "每 4 步更新"
+        train_tab.batch_spin.setValue(4)
+        train_tab.nbs_spin.setValue(32)
+        assert train_tab.accum_hint_label.text() == "每 8 步更新"
+        train_tab.batch_spin.setValue(-1)
+        assert "AutoBatch" in train_tab.accum_hint_label.text()
+
+        # 取消勾选 GPU -> 切为 CPU，AMP 自动取消并置灰；再勾回 GPU -> 自动恢复 AMP 勾选状态
+        train_tab.device_ctrl.gpu_chk.setChecked(False)
+        qt_app.processEvents()
+        assert train_tab.device_ctrl.device() == "cpu"
+        assert train_tab.amp_chk.isEnabled() is False
+        assert train_tab.amp_chk.isChecked() is False
+        assert "CPU" in train_tab.hw_label.text()
+
+        train_tab.device_ctrl.gpu_chk.setChecked(True)
+        qt_app.processEvents()
+        assert train_tab.device_ctrl.device() == "0"
+        assert train_tab.amp_chk.isEnabled() is True
+        assert train_tab.amp_chk.isChecked() is True
+
+        # JSON 导入 device="cpu" 自动联动顶部 GPU 开关
+        train_tab.import_arguments_from_text('{"device": "cpu", "epochs": 20}')
+        assert train_tab.device_ctrl.gpu_chk.isChecked() is False
+        assert train_tab.device_ctrl.device() == "cpu"
+
+        # 切换为多卡硬件快照并重置：自动显现多卡下拉并支持全部多卡并行 (0,1)
+        train_tab.apply_device_info(multi_gpu)
+        train_tab.device_ctrl.reset_to_recommended()
+        assert train_tab.device_ctrl.gpu_combo.isHidden() is False
+        all_idx = train_tab.device_ctrl.gpu_combo.findData("0,1")
+        assert all_idx >= 0
+        train_tab.device_ctrl.gpu_combo.setCurrentIndex(all_idx)
+        assert train_tab.device_ctrl.device() == "0,1"
+    finally:
+        train_tab.close()
+
+    # 2) 标签页 4（MLLM 审核页）：单卡行内紧凑开关，切至已有 .json 模式时随推理参数一并禁用；无卡环境置灰 CPU
+    review_tab = MllmReviewTab(workspace_root=tmp_path, device_info=single_gpu)
+    try:
+        assert review_tab.yolo_device_ctrl.device() == "0"
+        assert review_tab.yolo_device_ctrl.status_label.isHidden() is True
+        review_tab.source_mode_combo.setCurrentIndex(1)  # EXISTING_JSON
+        qt_app.processEvents()
+        assert review_tab.yolo_device_ctrl.isEnabled() is False
+        review_tab.source_mode_combo.setCurrentIndex(0)  # YOLO_PREDICT
+        qt_app.processEvents()
+        assert review_tab.yolo_device_ctrl.isEnabled() is True
+
+        review_tab.apply_device_info(cpu_only)
+        assert review_tab.yolo_device_ctrl.gpu_chk.isEnabled() is False
+        assert review_tab.yolo_device_ctrl.device() == "cpu"
+    finally:
+        review_tab.close()
+
+    # 3) 标签页 6（验证/推理/导出页）：全局运行设备开关 + 切 CPU 联动置灰 TorchScript FP16 导出
+    eval_tab = EvalTab(workspace_root=tmp_path, device_info=single_gpu)
+    try:
+        assert eval_tab.device_ctrl.device() == "0"
+        eval_tab.format_combo.setCurrentIndex(1)  # torchscript
+        qt_app.processEvents()
+        assert eval_tab.half_chk.isEnabled() is True
+        eval_tab.half_chk.setChecked(True)
+
+        eval_tab.device_ctrl.gpu_chk.setChecked(False)
+        qt_app.processEvents()
+        assert eval_tab.device_ctrl.device() == "cpu"
+        assert eval_tab.half_chk.isEnabled() is False
+        assert eval_tab.half_chk.isChecked() is False
+
+        eval_tab.device_ctrl.gpu_chk.setChecked(True)
+        qt_app.processEvents()
+        assert eval_tab.half_chk.isEnabled() is True
+    finally:
+        eval_tab.close()

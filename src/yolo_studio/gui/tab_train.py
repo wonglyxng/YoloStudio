@@ -60,6 +60,7 @@ from yolo_studio.core.trainer import (
 )
 from yolo_studio.gui.common import (
     LOG_MAX_LINES,
+    ComputeDeviceControl,
     GpuTaskGuard,
     PathPickerRow,
     make_metric_card,
@@ -204,10 +205,10 @@ class TrainTab(QWidget):
     """YOLO26 模型训练功能标签页（标签页 5）。
 
     内部状态：
-        持有硬件探测结果 `device_info`、跨页计算设备互斥协调器 `gpu_guard`、训练工作线程 `worker`、
-        预设/持久化批量写入重入锁 `_applying_preset` / `_restoring_state`、用户修改脏标记 `_settings_dirty`、
-        硬件自适应项覆盖标记（`_auto_device_text`、`_auto_batch_value`、`_amp_user_overridden`），
-        以及最近实验目录 `_last_save_dir` 与最近最佳权重路径 `_last_best_pt`。
+        持有硬件探测结果 `device_info`、统一设备控制组件 `device_ctrl`、跨页计算设备互斥协调器 `gpu_guard`、
+        训练工作线程 `worker`、预设/持久化批量写入重入锁 `_applying_preset` / `_restoring_state`、
+        用户修改脏标记 `_settings_dirty`、硬件自适应项覆盖标记（`_auto_batch_value`、`_amp_user_overridden`、
+        `_amp_saved_before_cpu`），以及最近实验目录 `_last_save_dir` 与最近最佳权重路径 `_last_best_pt`。
     """
 
     send_best_weights = Signal(str, str)  # 信号参数：(weights_path, data_yaml)
@@ -230,9 +231,9 @@ class TrainTab(QWidget):
         self._aug_expanded: bool = True
         self._last_save_dir: Path = workspace_root / "runs" / "detect"
         self._last_best_pt: str = ""
-        self._auto_device_text: str = self.device_info.recommended_device
         self._auto_batch_value: int = 16 if self.device_info.cuda_available else 4
         self._amp_user_overridden: bool = False
+        self._amp_saved_before_cpu: bool | None = None
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -250,13 +251,20 @@ class TrainTab(QWidget):
         form_stack.setContentsMargins(0, 0, 4, 0)
         form_stack.setSpacing(8)
 
-        # 1. 计算设备状态横幅（限制最大垂直高度，避免空占上半屏空间）
-        hw_group = QGroupBox("1. 计算设备状态")
+        # 1. 计算设备（GPU 加速开关 + 硬件状态合一，多卡时自动展开选卡下拉框）
+        hw_group = QGroupBox("1. 计算设备")
         hw_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         hw_layout = QHBoxLayout(hw_group)
-        self.hw_label = QLabel()
-        self._refresh_hw_banner()
-        hw_layout.addWidget(self.hw_label)
+        self.device_ctrl = ComputeDeviceControl(
+            self.device_info,
+            show_status_text=True,
+            allow_multi_gpu=True,
+            checkbox_text="启用 GPU 加速",
+            compact_status=False,
+        )
+        # 保留 `hw_label` 别名指向内部状态标签，兼容外部检查与测试引用
+        self.hw_label = self.device_ctrl.status_label
+        hw_layout.addWidget(self.device_ctrl, 1)
         form_stack.addWidget(hw_group)
 
         # 2. 模型、预设与核心训练参数
@@ -374,10 +382,14 @@ class TrainTab(QWidget):
         self.seed_spin.setMinimumWidth(64)
         self.seed_spin.setToolTip("随机种子 (seed)，配合确定性算子提升实验可复现性")
 
-        self.device_edit = QLineEdit(self.device_info.recommended_device)
-        self.device_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.device_edit.setMinimumWidth(64)
-        self.device_edit.setToolTip("训练设备：如 0（0 号 CUDA GPU）、0,1（多卡）或 cpu")
+        self.accum_hint_label = QLabel()
+        self.accum_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.accum_hint_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.accum_hint_label.setMinimumWidth(64)
+        self.accum_hint_label.setStyleSheet(
+            "color: #57606a; background: #f3f4f6; border: 1px solid #d8dee4; "
+            "border-radius: 4px; padding: 2px 6px; font-size: 12px;"
+        )
 
         core_grid.addWidget(_make_grid_label("Epochs:"), 0, 0)
         core_grid.addWidget(self.epochs_spin, 0, 1)
@@ -394,11 +406,11 @@ class TrainTab(QWidget):
         core_grid.addWidget(self.workers_spin, 1, 3)
         core_grid.addWidget(_make_grid_label("Seed:"), 1, 4)
         core_grid.addWidget(self.seed_spin, 1, 5)
-        core_grid.addWidget(_make_grid_label("Device:"), 1, 6)
-        core_grid.addWidget(self.device_edit, 1, 7)
+        core_grid.addWidget(_make_grid_label("梯度累积:"), 1, 6)
+        core_grid.addWidget(self.accum_hint_label, 1, 7)
         for col in (1, 3, 5, 7):
             core_grid.setColumnStretch(col, 1)
-        form.addRow("规模与硬件:", core_grid_widget)
+        form.addRow("规模与批次:", core_grid_widget)
 
         opt_sched_row = QHBoxLayout()
         opt_sched_row.setSpacing(6)
@@ -682,6 +694,7 @@ class TrainTab(QWidget):
         root.addLayout(right, 2)
 
         # 信号与槽连接
+        self.device_ctrl.device_changed.connect(self._on_device_changed)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         self.import_json_btn.clicked.connect(self._on_import_json_dialog)
         self.export_json_btn.clicked.connect(self._on_export_json_clicked)
@@ -691,6 +704,8 @@ class TrainTab(QWidget):
         self.custom_model_edit.textChanged.connect(self._on_control_state_inputs_changed)
         self.optimizer_combo.currentIndexChanged.connect(self._on_control_state_inputs_changed)
         self.mosaic_spin.valueChanged.connect(self._on_control_state_inputs_changed)
+        self.batch_spin.valueChanged.connect(self._refresh_accum_hint)
+        self.nbs_spin.valueChanged.connect(self._refresh_accum_hint)
         self.extra_args_edit.textChanged.connect(self._on_extra_args_changed)
         self.amp_chk.toggled.connect(self._on_amp_toggled)
         self._bind_preset_dirty_watchers()
@@ -705,8 +720,9 @@ class TrainTab(QWidget):
             else None
         )
 
-        # 初始同步防呆联动与增强摘要
+        # 初始同步防呆联动、梯度累积换算与增强摘要
         self._sync_control_states()
+        self._refresh_accum_hint()
         self._refresh_extra_args_status()
 
     def _bind_preset_dirty_watchers(self) -> None:
@@ -741,8 +757,9 @@ class TrainTab(QWidget):
         for combo in (self.model_combo, self.preset_combo, self.optimizer_combo):
             combo.currentIndexChanged.connect(self._mark_settings_dirty)
         self.imgsz_combo.currentTextChanged.connect(self._mark_settings_dirty)
-        for edit in (self.custom_model_edit, self.device_edit, self.run_name_edit):
+        for edit in (self.custom_model_edit, self.run_name_edit):
             edit.textChanged.connect(self._mark_settings_dirty)
+        self.device_ctrl.device_changed.connect(self._mark_settings_dirty)
         self.extra_args_edit.textChanged.connect(self._mark_settings_dirty)
         for chk in (
             self.amp_chk,
@@ -809,11 +826,31 @@ class TrainTab(QWidget):
         if preset_key and preset_key != _CUSTOM_PRESET_KEY:
             self.apply_preset(preset_key)
 
+    def _on_device_changed(self, _device: str) -> None:
+        self._sync_control_states()
+
     def _on_control_state_inputs_changed(self, *_args: object) -> None:
         self._sync_control_states()
 
+    def _refresh_accum_hint(self, *_args: object) -> None:
+        """按当前 `Batch` 与 `NBS` 实时换算梯度累积步数并刷新只读提示标签。"""
+        batch_val = self.batch_spin.value()
+        nbs_val = self.nbs_spin.value()
+        if batch_val <= 0:
+            self.accum_hint_label.setText("自动 (AutoBatch)")
+            self.accum_hint_label.setToolTip(
+                "Batch=-1 时由 Ultralytics 先自动探测最大可用 Batch，再按 max(round(NBS / Batch), 1) 计算梯度累积步数"
+            )
+            return
+        steps = max(round(nbs_val / batch_val), 1)
+        self.accum_hint_label.setText(f"每 {steps} 步更新")
+        self.accum_hint_label.setToolTip(
+            f"当前 NBS={nbs_val}、Batch={batch_val}，Ultralytics 每累积 {steps} 个 Batch 执行一次权重更新 "
+            "（公式：max(round(NBS / Batch), 1)）"
+        )
+
     def _sync_control_states(self) -> None:
-        """统一维护防呆联动禁用态：auto 优化器置灰 LR0、自定义权重置灰官方下拉框、Mosaic=0 置灰 CloseMosaic。"""
+        """统一维护防呆联动禁用态：auto 置灰 LR0、自定义权重置灰官方模型、Mosaic=0 置灰 CloseMosaic、CPU 置灰 AMP。"""
         is_auto_opt = str(self.optimizer_combo.currentData() or "auto").lower() == "auto"
         self.lr0_spin.setEnabled(not is_auto_opt)
         self.lr0_label.setText("LR0(自动):" if is_auto_opt else "LR0:")
@@ -839,6 +876,34 @@ class TrainTab(QWidget):
             if mosaic_enabled
             else "当前 Mosaic 概率为 0，已彻底关闭拼接增强，CloseMosaic 不再生效"
         )
+
+        # CPU 模式或探测期间联动置灰混合精度 AMP，重新启用 GPU 时恢复用户原有偏好
+        if self.device_info.probing:
+            self.amp_chk.setEnabled(False)
+            self.amp_chk.setToolTip("正在检测计算设备，探测完成后自动更新混合精度 AMP 可用状态")
+        elif not self.device_ctrl.is_using_gpu():
+            if self.amp_chk.isEnabled():
+                self._amp_saved_before_cpu = self.amp_chk.isChecked()
+            prev_restoring = self._restoring_state
+            self._restoring_state = True
+            try:
+                self.amp_chk.setChecked(False)
+            finally:
+                self._restoring_state = prev_restoring
+            self.amp_chk.setEnabled(False)
+            self.amp_chk.setToolTip("当前为 CPU 模式，不支持 CUDA 混合精度 AMP；在顶部启用 GPU 加速后可开启")
+        else:
+            if not self.amp_chk.isEnabled() and self._amp_saved_before_cpu is not None:
+                prev_restoring = self._restoring_state
+                self._restoring_state = True
+                try:
+                    self.amp_chk.setChecked(self._amp_saved_before_cpu)
+                finally:
+                    self._restoring_state = prev_restoring
+                self._amp_saved_before_cpu = None
+            self.amp_chk.setEnabled(True)
+            self.amp_chk.setToolTip("开启自动混合精度 (FP16 AMP) 可节省显存并提速；如需严格对标 FP32 数值可关闭")
+
         self._refresh_aug_summary()
 
     def _on_toggle_aug_panel(self) -> None:
@@ -994,7 +1059,7 @@ class TrainTab(QWidget):
         _set_int(self.seed_spin, "seed")
 
         if "device" in known and known["device"] is not None:
-            self.device_edit.setText(str(known["device"]))
+            self.device_ctrl.set_device(str(known["device"]), user_action=not self._restoring_state)
             applied.append("device")
 
         if "optimizer" in known and known["optimizer"] is not None:
@@ -1147,9 +1212,9 @@ class TrainTab(QWidget):
             self.patience_spin.setValue(50)
             self.workers_spin.setValue(4)
             self.seed_spin.setValue(0)
-            self._auto_device_text = self.device_info.recommended_device
-            self.device_edit.setText(self._auto_device_text)
+            self.device_ctrl.reset_to_recommended()
             self._amp_user_overridden = False
+            self._amp_saved_before_cpu = None
             self.amp_chk.setChecked(self.device_info.cuda_available)
             self.cache_chk.setChecked(False)
             self.resume_chk.setChecked(False)
@@ -1209,7 +1274,11 @@ class TrainTab(QWidget):
         """
         if not force and not self._settings_dirty:
             return
-        dev_text = self.device_edit.text().strip()
+        saved_amp = (
+            self._amp_saved_before_cpu
+            if (not self.device_ctrl.is_using_gpu() and self._amp_saved_before_cpu is not None)
+            else self.amp_chk.isChecked()
+        )
         state: dict[str, object] = {
             "version": 1,
             "preset": str(self.preset_combo.currentData() or _CUSTOM_PRESET_KEY),
@@ -1227,8 +1296,8 @@ class TrainTab(QWidget):
             "patience": self.patience_spin.value(),
             "workers": self.workers_spin.value(),
             "seed": self.seed_spin.value(),
-            "custom_device": "" if dev_text == self._auto_device_text else dev_text,
-            "amp": self.amp_chk.isChecked(),
+            "custom_device": self.device_ctrl.device() if self.device_ctrl.is_user_modified() else "",
+            "amp": saved_amp,
             "amp_user_overridden": self._amp_user_overridden,
             "cos_lr": self.cos_lr_chk.isChecked(),
             "cache": self.cache_chk.isChecked(),
@@ -1292,14 +1361,13 @@ class TrainTab(QWidget):
                 self._auto_batch_value = -999
 
             self._amp_user_overridden = bool(state.get("amp_user_overridden", False))
+            self._amp_saved_before_cpu = None
             if not self._amp_user_overridden:
                 self.amp_chk.setChecked(self.device_info.cuda_available)
 
             custom_dev = str(state.get("custom_device") or "").strip()
             if custom_dev:
-                # 仅在当前设备兼容（非探测中且无 GPU 时不恢复 CUDA 卡号）时应用自定义设备
-                if self.device_info.probing or self.device_info.cuda_available or custom_dev.lower() == "cpu":
-                    self.device_edit.setText(custom_dev)
+                self.device_ctrl.set_device(custom_dev, user_action=True)
 
             if "run_name" in state and state.get("run_name"):
                 self.run_name_edit.setText(str(state["run_name"]))
@@ -1321,37 +1389,17 @@ class TrainTab(QWidget):
             self._restoring_state = False
 
         self._sync_control_states()
+        self._refresh_accum_hint()
         self._refresh_extra_args_status()
 
-    def _refresh_hw_banner(self) -> None:
-        """按当前 `device_info` 状态更新顶部计算设备提示横幅文案与配色。"""
-        if self.device_info.probing:
-            hw_text = "正在后台检测计算设备 (CUDA GPU / CPU)..."
-            hw_color = "#0969da"
-        elif self.device_info.cuda_available:
-            hw_text = (
-                f"已就绪 GPU: {self.device_info.device_name} "
-                f"({self.device_info.vram_gb:.1f} GB 显存) | CUDA 可用"
-            )
-            hw_color = "#1f7a1f"
-        else:
-            hw_text = "未检测到可用 CUDA GPU，将使用 CPU 训练（速度较慢）"
-            hw_color = "#b25900"
-        self.hw_label.setText(hw_text)
-        self.hw_label.setStyleSheet(f"color: {hw_color}; font-weight: 600;")
-
     def apply_device_info(self, info: DeviceInfo) -> None:
-        """异步硬件探测完成后刷新横幅与尚未被用户手动改动的默认训练参数。"""
+        """异步硬件探测完成后刷新顶部设备控件与尚未被用户手动改动的默认训练参数。"""
         was_probing = self.device_info.probing
         self.device_info = info
-        self._refresh_hw_banner()
 
         self._restoring_state = True
         try:
-            cur_dev = self.device_edit.text().strip()
-            if cur_dev == self._auto_device_text or (not info.cuda_available and cur_dev.isdigit()):
-                self.device_edit.setText(info.recommended_device)
-            self._auto_device_text = info.recommended_device
+            self.device_ctrl.apply_device_info(info)
 
             target_batch = 16 if info.cuda_available else 4
             if self.batch_spin.value() == self._auto_batch_value:
@@ -1363,9 +1411,12 @@ class TrainTab(QWidget):
                 and not self._amp_user_overridden
                 and (self.worker is None or not self.worker.isRunning())
             ):
-                self.amp_chk.setChecked(info.cuda_available)
+                self.amp_chk.setChecked(self.device_ctrl.is_using_gpu())
         finally:
             self._restoring_state = False
+
+        self._sync_control_states()
+        self._refresh_accum_hint()
 
     def set_data_yaml(self, yaml_path: str) -> None:
         """跨页写入：更新训练集配置文件 `data.yaml` 路径。"""
@@ -1405,11 +1456,11 @@ class TrainTab(QWidget):
             epochs=self.epochs_spin.value(),
             imgsz=imgsz,
             batch=self.batch_spin.value(),
-            device=self.device_edit.text().strip() or "0",
+            device=self.device_ctrl.device(),
             lr0=self.lr0_spin.value(),
             patience=self.patience_spin.value(),
             workers=self.workers_spin.value(),
-            amp=self.amp_chk.isChecked(),
+            amp=self.amp_chk.isChecked() and self.device_ctrl.is_using_gpu(),
             cache=self.cache_chk.isChecked(),
             project_dir=proj_dir,
             run_name=run_name,

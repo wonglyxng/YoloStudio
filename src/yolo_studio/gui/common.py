@@ -1,8 +1,8 @@
 """PyQt6 界面共享辅助控件、跨页计算任务互斥协调器与本地路径/图像工具函数。
 
 职责：
-    提供路径选择器行控件、系统文件管理器跳转、等比缩略图加载、紧凑型指标卡片构建，
-    以及防止多标签页同时启动本地模型任务争抢显存的 `GpuTaskGuard`。
+    提供路径选择器行控件、友好型 GPU/CPU 计算设备切换控件、系统文件管理器跳转、等比缩略图加载、
+    紧凑型指标卡片构建，以及防止多标签页同时启动本地模型任务争抢显存的 `GpuTaskGuard`。
 
 运行环境与协作边界：
     Python >= 3.11 + `PyQt6`；供 `gui` 各标签页与 `MainWindow` 复用，不持有模块级可变全局状态，也不自行创建后台线程。
@@ -10,11 +10,15 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QThread, Qt, QUrl
+from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal as Signal
 from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -23,6 +27,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QWidget,
 )
+
+if TYPE_CHECKING:
+    from yolo_studio.core.trainer import DeviceInfo
 
 # 长任务日志框（`QPlainTextEdit.setMaximumBlockCount`）保留的最大行数；超出后自动丢弃最早的行，
 # 避免长时间训练日志无限增长拖慢界面
@@ -151,3 +158,324 @@ class GpuTaskGuard:
         """登记即将启动或刚启动的后台模型工作线程。"""
         self._active_worker = worker
         self._active_name = task_name
+
+
+_CUDA_INDEX_RE = re.compile(r"^\d+(,\d+)*$")
+
+
+def _resolve_gpu_list(info: "DeviceInfo") -> list[tuple[str, str, float]]:
+    """从 `DeviceInfo` 提取标准化的 `(设备编号, 型号名, 显存 GiB)` 列表；缺少 `gpu_devices` 明细时自动兜底。"""
+    if not info.cuda_available or info.device_count <= 0:
+        return []
+    if info.gpu_devices:
+        return list(info.gpu_devices)
+    gpus: list[tuple[str, str, float]] = [("0", info.device_name, info.vram_gb)]
+    for idx in range(1, info.device_count):
+        gpus.append((str(idx), f"CUDA GPU {idx}", 0.0))
+    return gpus
+
+
+class ComputeDeviceControl(QWidget):
+    """用户友好的 GPU/CPU 计算设备切换与硬件状态一体化控件（供标签页 4 / 5 / 6 共用）。
+
+    职责与展示模式：
+        用直观的「启用 GPU 加速」开关替代晦涩的 `Device: 0` 文本输入框：
+        - 单卡环境：仅展示 GPU 开关 + 型号/显存状态（无多余选卡下拉框）；
+        - 多卡环境（`device_count > 1`）：勾选 GPU 开关时自动浮现显卡选择下拉框，
+          `allow_multi_gpu=True` 时额外提供「全部多卡并行 (0,1,...)」选项；
+        - 无 GPU 环境：自动取消勾选并置灰开关，安全回退为 `cpu`；
+        - 后台探测期（`probing=True`）：暂时禁用开关并蓝字提示正在检测，探测完毕自动就绪。
+
+    内部状态与并发约束：
+        仅在 PyQt6 主线程中访问；通过 `_user_modified`、`_pending_device` 与 `_custom_override`
+        保证异步硬件探测完成时既能自动启用本机 GPU，又不会覆写用户已显式指定的 CPU 或自定义设备。
+    """
+
+    device_changed = Signal(str)  # 信号参数：切换后最终传给 Ultralytics 的 device 字符串
+
+    def __init__(
+        self,
+        device_info: "DeviceInfo",
+        *,
+        show_status_text: bool = True,
+        allow_multi_gpu: bool = False,
+        checkbox_text: str = "启用 GPU 加速",
+        compact_status: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.device_info = device_info
+        self._show_status_text = show_status_text
+        self._allow_multi_gpu = allow_multi_gpu
+        self._compact_status = compact_status
+        self._updating: bool = False
+        self._user_modified: bool = False
+        self._pending_device: str | None = None
+        self._custom_override: str = ""
+        self._gpu_list: list[tuple[str, str, float]] = []
+        self._last_emitted_device: str = ""
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.gpu_chk = QCheckBox(checkbox_text)
+        self.gpu_chk.setStyleSheet("font-weight: 600;")
+
+        self.gpu_combo = QComboBox()
+        self.gpu_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.gpu_combo.setMinimumContentsLength(12)
+        self.gpu_combo.setVisible(False)
+
+        self.status_label = QLabel()
+        self.status_label.setVisible(show_status_text)
+
+        layout.addWidget(self.gpu_chk)
+        layout.addWidget(self.gpu_combo)
+        if show_status_text:
+            layout.addWidget(self.status_label, 1)
+
+        self.gpu_chk.toggled.connect(self._on_gpu_toggled)
+        self.gpu_combo.currentIndexChanged.connect(self._on_gpu_combo_changed)
+
+        self._rebuild_from_device_info(initial=True)
+        self._last_emitted_device = self.device()
+
+    def device(self) -> str:
+        """返回最终应传递给 Ultralytics 的计算设备标识（如 `'0'`、`'0,1'` 或 `'cpu'`）。"""
+        if self._custom_override:
+            return self._custom_override
+        if self.device_info.probing:
+            if self._pending_device:
+                return self._pending_device
+            return self.device_info.recommended_device or "cpu"
+        if not self.device_info.cuda_available or not self.gpu_chk.isChecked():
+            return "cpu"
+        if len(self._gpu_list) > 1:
+            selected = str(self.gpu_combo.currentData() or "").strip()
+            if selected:
+                return selected
+        return self._gpu_list[0][0] if self._gpu_list else (self.device_info.recommended_device or "0")
+
+    def is_using_gpu(self) -> bool:
+        """判断当前生效设备是否为 GPU（非 `cpu`）。"""
+        return self.device().strip().lower() != "cpu"
+
+    def is_user_modified(self) -> bool:
+        """返回用户或导入流程是否已手动改变过默认设备选择。"""
+        return self._user_modified
+
+    def reset_to_recommended(self) -> None:
+        """清除手动覆盖并恢复为当前本机硬件推荐设备。"""
+        self._user_modified = False
+        self._pending_device = None
+        self._custom_override = ""
+        self._rebuild_from_device_info(initial=False)
+        self._emit_if_changed()
+
+    def set_device(self, device_str: str, *, user_action: bool = True) -> None:
+        """按 Ultralytics 设备字符串（如 `'0'`、`'cpu'`、`'0,1'`）同步开关与选卡状态。
+
+        调用与兜底约束：
+            若仍处于异步硬件探测期（`probing=True`），先暂存至 `_pending_device`，待 `apply_device_info`
+            到达后再依据真实硬件落地；若无 CUDA GPU 而传入纯数字 CUDA 卡号，则安全回退为 `'cpu'`。
+        """
+        dev = str(device_str).strip()
+        if not dev:
+            self.reset_to_recommended()
+            return
+
+        if user_action:
+            self._user_modified = True
+
+        if self.device_info.probing:
+            self._pending_device = dev
+            if dev.lower() != "cpu" and not _CUDA_INDEX_RE.fullmatch(dev):
+                self._custom_override = dev
+            else:
+                self._custom_override = ""
+            self._refresh_visuals()
+            self._emit_if_changed()
+            return
+
+        self._apply_device_string_now(dev)
+        self._refresh_visuals()
+        self._emit_if_changed()
+
+    def apply_device_info(self, info: "DeviceInfo") -> None:
+        """接收最新硬件探测结果，刷新选项与状态文案，同时尊重用户既有选择。"""
+        self.device_info = info
+        self._rebuild_from_device_info(initial=False)
+        self._emit_if_changed()
+
+    def _populate_gpu_combo(self) -> None:
+        prev_data = str(self.gpu_combo.currentData() or "")
+        self.gpu_combo.blockSignals(True)
+        try:
+            self.gpu_combo.clear()
+            for dev_id, name, vram in self._gpu_list:
+                vram_txt = f" ({vram:.1f} GB)" if vram > 0 else ""
+                self.gpu_combo.addItem(f"GPU {dev_id}: {name}{vram_txt}", dev_id)
+            if self._allow_multi_gpu and len(self._gpu_list) > 1:
+                all_ids = ",".join(dev_id for dev_id, _, _ in self._gpu_list)
+                self.gpu_combo.addItem(f"全部多卡并行 ({all_ids})", all_ids)
+            if prev_data:
+                idx = self.gpu_combo.findData(prev_data)
+                if idx >= 0:
+                    self.gpu_combo.setCurrentIndex(idx)
+        finally:
+            self.gpu_combo.blockSignals(False)
+
+    def _apply_device_string_now(self, dev: str) -> None:
+        """在非探测状态下将具体 `dev` 字符串映射至复选框、下拉框或 `_custom_override`。"""
+        self._updating = True
+        try:
+            if dev.lower() == "cpu":
+                self._custom_override = ""
+                self.gpu_chk.setChecked(False)
+                return
+
+            if self.device_info.cuda_available and self._gpu_list:
+                self.gpu_chk.setChecked(True)
+                if len(self._gpu_list) == 1 and dev == self._gpu_list[0][0]:
+                    self._custom_override = ""
+                    return
+                idx = self.gpu_combo.findData(dev)
+                if idx >= 0:
+                    self.gpu_combo.setCurrentIndex(idx)
+                    self._custom_override = ""
+                    return
+                self._custom_override = dev
+                return
+
+            # 无可用 CUDA GPU：纯数字 CUDA 索引安全回退为 cpu，非纯数字非常规设备保留自定义覆盖
+            self.gpu_chk.setChecked(False)
+            if _CUDA_INDEX_RE.fullmatch(dev):
+                self._custom_override = ""
+            else:
+                self._custom_override = dev
+        finally:
+            self._updating = False
+
+    def _rebuild_from_device_info(self, *, initial: bool) -> None:
+        self._gpu_list = _resolve_gpu_list(self.device_info)
+        self._populate_gpu_combo()
+
+        self._updating = True
+        try:
+            if self.device_info.probing:
+                self.gpu_chk.setEnabled(False)
+                self.gpu_chk.setChecked(False)
+            elif not self.device_info.cuda_available:
+                self.gpu_chk.setEnabled(False)
+                self.gpu_chk.setChecked(False)
+                if self._pending_device:
+                    pending = self._pending_device
+                    self._pending_device = None
+                    self._apply_device_string_now(pending)
+                elif self._custom_override and _CUDA_INDEX_RE.fullmatch(self._custom_override):
+                    self._custom_override = ""
+            else:
+                self.gpu_chk.setEnabled(True)
+                if self._pending_device is not None:
+                    pending = self._pending_device
+                    self._pending_device = None
+                    self._apply_device_string_now(pending)
+                elif initial or not self._user_modified:
+                    self._custom_override = ""
+                    self.gpu_chk.setChecked(True)
+                    rec_idx = self.gpu_combo.findData(self.device_info.recommended_device)
+                    if rec_idx >= 0:
+                        self.gpu_combo.setCurrentIndex(rec_idx)
+        finally:
+            self._updating = False
+
+        self._refresh_visuals()
+
+    def _on_gpu_toggled(self, checked: bool) -> None:
+        if self._updating:
+            return
+        self._user_modified = True
+        self._pending_device = None
+        if not checked:
+            self._custom_override = ""
+        self._refresh_visuals()
+        self._emit_if_changed()
+
+    def _on_gpu_combo_changed(self, _index: int) -> None:
+        if self._updating:
+            return
+        self._user_modified = True
+        self._pending_device = None
+        self._custom_override = ""
+        self._refresh_visuals()
+        self._emit_if_changed()
+
+    def _refresh_visuals(self) -> None:
+        show_combo = (
+            not self.device_info.probing
+            and self.device_info.cuda_available
+            and len(self._gpu_list) > 1
+            and self.gpu_chk.isChecked()
+            and not self._custom_override
+        )
+        self.gpu_combo.setVisible(show_combo)
+
+        if self._custom_override:
+            text = f"自定义设备: {self._custom_override}"
+            color = "#6f42c1"
+            tip = f"当前使用自定义设备标识: {self._custom_override}（取消/重选开关可恢复自动识别）"
+        elif self.device_info.probing:
+            text = (
+                "正在检测设备..."
+                if self._compact_status
+                else "正在后台检测计算设备 (CUDA GPU / CPU)..."
+            )
+            color = "#0969da"
+            tip = "正在后台检测本地 CUDA GPU 与显存信息，完成后将自动就绪"
+        elif self.device_info.cuda_available:
+            first_name = self.device_info.device_name
+            first_vram = self.device_info.vram_gb
+            if self.gpu_chk.isChecked():
+                color = "#1f7a1f"
+                if len(self._gpu_list) > 1:
+                    text = (
+                        f"CUDA 可用 ({len(self._gpu_list)} 张 GPU)"
+                        if self._compact_status
+                        else f"已就绪 {len(self._gpu_list)} 张 CUDA GPU | CUDA 可用"
+                    )
+                    tip = f"当前使用 GPU 设备 ({self.device()})；可从旁侧下拉列表切换显卡"
+                else:
+                    text = (
+                        f"{first_name} ({first_vram:.1f} GB)"
+                        if self._compact_status
+                        else f"已就绪 GPU: {first_name} ({first_vram:.1f} GB 显存) | CUDA 可用"
+                    )
+                    tip = f"使用 GPU 加速：{first_name} ({first_vram:.1f} GB 显存，device={self.device()})"
+            else:
+                color = "#b25900"
+                text = (
+                    "CPU 模式（已关闭 GPU）"
+                    if self._compact_status
+                    else "已手动切换为 CPU 模式（速度较慢，重新勾选左侧开关可恢复 GPU 加速）"
+                )
+                tip = f"当前已关闭 GPU 加速（device=cpu）；本机可用显卡：{first_name} ({first_vram:.1f} GB)"
+        else:
+            color = "#b25900"
+            text = (
+                "CPU 模式（无可用 CUDA GPU）"
+                if self._compact_status
+                else "未检测到可用 CUDA GPU，将使用 CPU 运行（速度较慢）"
+            )
+            tip = "未检测到可用 CUDA GPU 或当前为 CPU 运行环境，固定使用 CPU 模式（device=cpu）"
+
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self.gpu_chk.setToolTip(tip)
+        self.status_label.setToolTip(tip)
+
+    def _emit_if_changed(self) -> None:
+        current = self.device()
+        if current != self._last_emitted_device:
+            self._last_emitted_device = current
+            self.device_changed.emit(current)
