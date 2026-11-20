@@ -980,7 +980,7 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         assert "共 2 张图片（含子目录）" in tab1.images_count_label.text()
         tab1.recursive_chk.setChecked(False)
         tab1._refresh_images_count()
-        assert "请勾选「递归扫描子目录」" in tab1.images_count_label.text()
+        assert "请勾选「包含子目录」" in tab1.images_count_label.text()
         tab1.recursive_chk.setChecked(True)
         tab1.set_images_dir(str(in_dir))
 

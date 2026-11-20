@@ -252,7 +252,7 @@ class MllmReviewTab(QWidget):
         )
         # 递归开关决定从图片目录取哪些图片，作为图片目录的从属选项紧贴输入框放置；
         # 默认开启，与内嵌标注工作台（递归列出子目录图片）及数据集页保持一致
-        self.recursive_chk = QCheckBox("递归扫描子目录")
+        self.recursive_chk = QCheckBox("包含子目录")
         self.recursive_chk.setChecked(True)
         self.recursive_chk.setToolTip(
             "默认开启，与标注工作台一致（工作台打开目录时同样包含子目录中的图片）；"
@@ -774,14 +774,14 @@ class MllmReviewTab(QWidget):
         if total == 0:
             if not recursive and nested_total > 0:
                 self._set_count_hint(
-                    f"顶层没有图片，子目录中有 {nested_total} 张，请勾选「递归扫描子目录」。", "#b25900"
+                    f"顶层没有图片，子目录中有 {nested_total} 张，请勾选「包含子目录」。", "#b25900"
                 )
             else:
                 self._set_count_hint("该目录及子目录中没有图片", "#9a6700")
             return
         msg = f"共 {total} 张图片（含子目录）" if recursive else f"共 {total} 张图片（仅顶层）"
         if not recursive and nested_total > top_total:
-            msg += f"；子目录另有 {nested_total - top_total} 张未包含，勾选递归可包含"
+            msg += f"；子目录另有 {nested_total - top_total} 张，勾选「包含子目录」可一并处理"
         limit = self.max_images_spin.value()
         if limit > 0 and total > limit:
             msg += f"（已设试跑上限：本次仅审核前 {limit} 张）"

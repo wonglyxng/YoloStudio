@@ -104,7 +104,7 @@ def test_scope_hint_next_to_images_dir(qt_app: QApplication, tmp_path: Path) -> 
     tab.set_frames_dir(str(root))
     tab._refresh_scope_counts()
     assert "顶层没有图片" in tab.scope_hint.text() and "6 张" in tab.scope_hint.text()
-    assert "请勾选「递归扫描子目录」" in tab.scope_hint.text()
+    assert "请勾选「包含子目录」" in tab.scope_hint.text()
 
     tab.recursive_chk.setChecked(True)
     assert "共 5 张" in tab.scope_hint.text() and "排除 need_review 中的 1 张" in tab.scope_hint.text()

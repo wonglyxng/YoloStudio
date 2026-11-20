@@ -220,7 +220,7 @@ class DatasetTab(QWidget):
         )
         form.addRow("图片目录:", self.images_picker)
 
-        self.recursive_chk = QCheckBox("递归扫描子目录")
+        self.recursive_chk = QCheckBox("包含子目录")
         self.recursive_chk.setChecked(True)
         self.recursive_chk.setToolTip(
             "默认开启，与标注工作台一致（工作台打开目录时同样包含子目录中的图片）；"
@@ -230,7 +230,7 @@ class DatasetTab(QWidget):
         self.exclude_need_review_chk.setChecked(True)
         self.exclude_need_review_chk.setToolTip(
             "MLLM 清洗结果中的 need_review 含 LLM 补框与审核出错样本，人工复核完成前不应进入训练；"
-            "确认已在工作台复核后可取消勾选。仅在递归扫描时生效。"
+            "确认已在工作台复核后可取消勾选。仅在勾选「包含子目录」时生效。"
         )
         self.scope_hint = QLabel()
         self.scope_hint.setWordWrap(True)
@@ -519,13 +519,13 @@ class DatasetTab(QWidget):
             self._set_scope_hint(msg, "ok" if kept else "error")
         elif counts.top_level == 0 and nested > 0:
             self._set_scope_hint(
-                f"顶层没有图片，子目录中有 {nested}{more} 张，请勾选「递归扫描子目录」。", "warn"
+                f"顶层没有图片，子目录中有 {nested}{more} 张，请勾选「包含子目录」。", "warn"
             )
         elif counts.top_level == 0:
             self._set_scope_hint("该目录及子目录中没有图片。", "error")
         elif nested > 0:
             self._set_scope_hint(
-                f"共 {counts.top_level} 张图片（仅顶层）；子目录另有 {nested}{more} 张未包含，勾选递归可包含。",
+                f"共 {counts.top_level} 张图片（仅顶层）；子目录另有 {nested}{more} 张，勾选「包含子目录」可一并纳入。",
                 "info",
             )
         else:
