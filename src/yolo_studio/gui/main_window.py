@@ -223,8 +223,12 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentWidget(self.labeling_tab)
 
     def _on_labeling_to_dataset(self, images_dir: str, classes_file: str) -> None:
-        """将工作台当前标注目录与类别清单同步至「4. 数据集准备」并切换过去。"""
-        self.dataset_tab.set_dataset_source(images_dir, classes_file, recursive=False)
+        """将工作台当前标注目录与类别清单同步至「4. 数据集准备」并切换过去。
+
+        内嵌 X-AnyLabeling 打开目录时会递归列出子目录中的图片，因此同步时开启递归扫描，
+        保证数据集页统计与生成的图片范围和工作台中标注的范围一致。
+        """
+        self.dataset_tab.set_dataset_source(images_dir, classes_file, recursive=True)
         self.tabs.setCurrentWidget(self.dataset_tab)
 
     def _on_labeling_to_review(self, images_dir: str) -> None:

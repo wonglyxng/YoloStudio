@@ -130,7 +130,7 @@ class DatasetTab(QWidget):
         `_last_yaml_path` / `_yaml_revision`：最近一次成功生成的 `data.yaml` 及其参数版本号；
             仅当版本号与当前参数一致时才允许“前往训练”，避免把与当前设置不符的数据集当作最新结果。
         `_busy`：是否有扫描或生成任务在运行；运行期间禁用扫描/生成/前往训练按钮。
-        `_scope_counts`：当前图片目录的图片计数预览（顶层/递归/need_review 内），仅用于图片范围提示；
+        `_scope_counts`：当前图片目录的图片计数预览（顶层/递归/need_review 内），仅用于图片目录下方的数量提示；
             目录为空或不存在时为 `None`，图片目录变化后经防抖定时器重新计算。
     """
 
@@ -201,11 +201,12 @@ class DatasetTab(QWidget):
         self._refresh_scope_counts()
 
     def _build_source_group(self) -> QGroupBox:
-        """分组 1：图片目录、图片范围（递归/排除 need_review）、打开工作台与扫描统计入口。
+        """分组 1：图片目录及其子目录开关（递归/排除 need_review）、打开工作台与扫描统计入口。
 
         设计原因：递归与排除开关决定从图片目录中取哪些图片，“扫描标注统计”与“生成数据集”都使用同一范围，
-        与图片目录强相关，因此紧贴目录输入框放置，
-        并实时显示顶层/子目录图片数，避免用户选了按子目录组织的数据却没注意到需要开启递归。
+        因此作为图片目录的从属选项紧贴输入框放置（不再单独设行标签），并实时显示图片数。
+        递归默认开启：内嵌 X-AnyLabeling 打开目录时同样递归列出子目录图片，按视频分建子目录的抽帧结果
+        与 MLLM 分流结果也都位于子目录；平铺目录开启递归结果不变，未复核的 need_review 默认排除。
         """
         group = QGroupBox("1. 标注源目录与工作台联动")
         form = QFormLayout(group)
@@ -219,7 +220,11 @@ class DatasetTab(QWidget):
         form.addRow("图片目录:", self.images_picker)
 
         self.recursive_chk = QCheckBox("递归扫描子目录")
-        self.recursive_chk.setToolTip("图片按子目录（如 video-001/、auto_passed/）组织时需勾选")
+        self.recursive_chk.setChecked(True)
+        self.recursive_chk.setToolTip(
+            "默认开启，与标注工作台一致（工作台打开目录时同样包含子目录中的图片）；"
+            "只想使用目录顶层图片时取消勾选"
+        )
         self.exclude_need_review_chk = QCheckBox()
         self.exclude_need_review_chk.setChecked(True)
         self.exclude_need_review_chk.setToolTip(
@@ -236,7 +241,7 @@ class DatasetTab(QWidget):
         scope_box.setSpacing(2)
         scope_box.addLayout(scope_row)
         scope_box.addWidget(self.scope_hint)
-        form.addRow("图片范围:", scope_box)
+        form.addRow("", scope_box)
 
         action_row = QHBoxLayout()
         self.open_workbench_btn = QPushButton("在「2. 标注工作台」中打开 →")
@@ -406,7 +411,7 @@ class DatasetTab(QWidget):
             self.images_picker.setText(path_str)
 
     def set_dataset_source(
-        self, images_dir: str, classes_file: str = "", recursive: bool = False
+        self, images_dir: str, classes_file: str = "", recursive: bool = True
     ) -> None:
         """跨页写入：接收 MLLM 清洗结果目录、类别文件并同步递归扫描开关，清空独立标注目录栏。"""
         if images_dir:
@@ -483,7 +488,7 @@ class DatasetTab(QWidget):
         self._scope_timer.start()
 
     def _refresh_scope_counts(self) -> None:
-        """在主线程遍历图片目录统计顶层/递归图片数并缓存，随后刷新图片范围提示。
+        """在主线程遍历图片目录统计顶层/递归图片数并缓存，随后刷新数量提示。
 
         `preview_image_counts` 只按扩展名计数并设有条目上限，正常目录耗时为毫秒级；
         目录为空或不存在时缓存置为 `None`，提示区显示对应状态。

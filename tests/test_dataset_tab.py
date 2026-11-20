@@ -82,9 +82,10 @@ def test_ratio_hint_format_hint_and_exclude_option(qt_app: QApplication, tmp_pat
     tab.format_combo.setCurrentIndex(0)
     assert "可选" in tab.classes_label.text()
 
-    assert not tab.exclude_need_review_chk.isEnabled()
-    tab.recursive_chk.setChecked(True)
+    assert tab.recursive_chk.isChecked()  # 默认递归，与标注工作台列图范围一致
     assert tab.exclude_need_review_chk.isEnabled()
+    tab.recursive_chk.setChecked(False)
+    assert not tab.exclude_need_review_chk.isEnabled()
 
 
 def test_scope_hint_next_to_images_dir(qt_app: QApplication, tmp_path: Path) -> None:
@@ -99,6 +100,7 @@ def test_scope_hint_next_to_images_dir(qt_app: QApplication, tmp_path: Path) -> 
     source_group = tab.images_picker.parentWidget()
     assert tab.recursive_chk.parentWidget() is source_group  # 与图片目录同在分组 1
 
+    tab.recursive_chk.setChecked(False)
     tab.set_frames_dir(str(root))
     tab._refresh_scope_counts()
     assert "顶层没有图片" in tab.scope_hint.text() and "6 张" in tab.scope_hint.text()
