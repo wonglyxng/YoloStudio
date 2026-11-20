@@ -3,7 +3,7 @@
 职责：
     在 YoloStudio 主进程与主窗口内直接托管原版 `anylabeling.views.mainwindow.MainWindow`
     （含完整画布、标注工具栏、标签/形状/文件面板与 AI 自动标注引擎），并提供顶部工作流联动栏，
-    与「1. 视频抽帧」「3. 数据集准备」「4. MLLM 标注纠错」双向衔接。
+    与「1. 视频抽帧」「3. MLLM 标注纠错」「4. 数据集准备」双向衔接。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程，依赖 `third_party/X-AnyLabeling`（`x-anylabeling-cvhub`）源码包及
@@ -341,16 +341,16 @@ class LabelingStudioTab(QWidget):
         self.open_dir_btn = QPushButton("打开图片目录...")
         self.load_classes_btn = QPushButton("导入 classes.txt...")
         self.refresh_btn = QPushButton("刷新目录")
-        self.to_dataset_btn = QPushButton("发送到「3. 数据集准备」→")
+        self.to_dataset_btn = QPushButton("发送到「4. 数据集准备」→")
         self.to_dataset_btn.setObjectName("primaryBtn")
-        self.to_review_btn = QPushButton("发送到「4. MLLM 纠错」→")
+        self.to_review_btn = QPushButton("发送到「3. MLLM 纠错」→")
 
         for btn in (
             self.open_dir_btn,
             self.load_classes_btn,
             self.refresh_btn,
-            self.to_dataset_btn,
             self.to_review_btn,
+            self.to_dataset_btn,
         ):
             # 防止点击顶部联动按钮后滞留键盘焦点，避免按 Space 平移画布时误触按钮点击
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)

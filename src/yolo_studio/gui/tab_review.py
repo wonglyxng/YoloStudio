@@ -1,4 +1,4 @@
-"""标签页 4：基准模型自动标注与 MLLM 纠错补漏界面。
+"""标签页 3：基准模型自动标注与 MLLM 纠错补漏界面。
 
 职责：
     配置候选框来源（基准 `.pt` 低阈值推理或已有 X-AnyLabeling `.json`）、MLLM 接口与预设、
@@ -136,7 +136,7 @@ class _ScaledPreviewLabel(QLabel):
 
 
 class MllmReviewTab(QWidget):
-    """MLLM 自动标注纠错、补漏与边框紧贴修正功能标签页（标签页 4）。
+    """MLLM 自动标注纠错、补漏与边框紧贴修正功能标签页（标签页 3）。
 
     内部状态：
         持有硬件探测信息 `device_info`、跨页计算设备互斥协调器 `gpu_guard`、后台审核线程 `worker`、
@@ -527,7 +527,7 @@ class MllmReviewTab(QWidget):
         self.stop_btn.setEnabled(False)
         self.open_need_review_btn = QPushButton("在工作台打开待复核目录")
         self.open_out_btn = QPushButton("打开输出目录")
-        self.send_ds_btn = QPushButton("发送到「3. 数据集准备」→")
+        self.send_ds_btn = QPushButton("发送到「4. 数据集准备」→")
         self.send_ds_btn.setEnabled(False)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)

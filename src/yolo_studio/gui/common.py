@@ -195,7 +195,7 @@ def _resolve_gpu_list(info: "DeviceInfo") -> list[tuple[str, str, float]]:
 
 
 class ComputeDeviceControl(QWidget):
-    """用户友好的 GPU/CPU 计算设备切换与硬件状态一体化控件（供标签页 4 / 5 / 6 共用）。
+    """用户友好的 GPU/CPU 计算设备切换与硬件状态一体化控件（供标签页 3 / 5 / 6 共用）。
 
     职责与展示模式：
         用直观的「启用 GPU 加速」开关替代晦涩的 `Device: 0` 文本输入框：

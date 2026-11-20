@@ -224,8 +224,8 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
 
     win = _make_window(tmp_path)
     try:
-        # 从「3. 数据集准备」触发跳转至「2. 标注工作台」并定位第二张图
-        win.tabs.setCurrentIndex(2)
+        # 从「3. MLLM 标注纠错」触发跳转至「2. 标注工作台」并定位第二张图
+        win.tabs.setCurrentWidget(win.review_tab)
         win.review_tab.open_in_workbench.emit(
             str(frames_dir), str(classes_file), str(img_b)
         )
@@ -238,14 +238,16 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
         assert lw.unique_label_list.count() == 2
         assert Path(str(lw.filename)).resolve() == img_b.resolve()
 
-        # 从「2. 标注工作台」发回「3. 数据集准备」与「4. MLLM 标注纠错」
+        # 从「2. 标注工作台」发回「4. 数据集准备」与「3. MLLM 标注纠错」
         win.labeling_tab.send_to_dataset.emit(str(frames_dir), str(classes_file))
-        assert win.tabs.currentIndex() == 2
+        assert win.tabs.currentWidget() is win.dataset_tab
+        assert win.tabs.tabText(win.tabs.currentIndex()) == "4. 数据集准备"
         assert Path(win.dataset_tab.images_picker.text()).resolve() == frames_dir.resolve()
         assert Path(win.dataset_tab.classes_picker.text()).resolve() == classes_file.resolve()
 
         win.labeling_tab.send_to_review.emit(str(frames_dir))
-        assert win.tabs.currentIndex() == 3
+        assert win.tabs.currentWidget() is win.review_tab
+        assert win.tabs.tabText(win.tabs.currentIndex()) == "3. MLLM 标注纠错"
         assert Path(win.review_tab.images_picker.text()).resolve() == frames_dir.resolve()
     finally:
         assert win.labeling_tab.prepare_for_close() is True
@@ -827,7 +829,7 @@ def test_compute_device_control_across_tabs_4_5_6_and_multi_gpu_and_amp_fp16_gua
     finally:
         train_tab.close()
 
-    # 2) 标签页 4（MLLM 审核页）：单卡行内紧凑开关，切至已有 .json 模式时随推理参数一并禁用；无卡环境置灰 CPU
+    # 2) 标签页 3（MLLM 审核页）：单卡行内紧凑开关，切至已有 .json 模式时随推理参数一并禁用；无卡环境置灰 CPU
     review_tab = MllmReviewTab(workspace_root=tmp_path, device_info=single_gpu)
     try:
         assert review_tab.yolo_device_ctrl.device() == "0"
@@ -870,7 +872,7 @@ def test_compute_device_control_across_tabs_4_5_6_and_multi_gpu_and_amp_fp16_gua
 def test_review_tab_box_refine_filters_history_report_and_persistence(
     qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证第 4 页边框修正模式联动、高置信度阈值角色切换、环境变量提示、分流筛选、历史报告加载与持久化记忆。"""
+    """验证第 3 页边框修正模式联动、高置信度阈值角色切换、环境变量提示、分流筛选、历史报告加载与持久化记忆。"""
     import json
 
     from yolo_studio.core.mllm_reviewer import (

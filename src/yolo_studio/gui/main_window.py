@@ -1,7 +1,7 @@
 """PyQt6 桌面主窗口模块，统筹六步工作流标签页及跨页数据流转。
 
 职责：
-    组装“1. 视频抽帧 → 2. 标注工作台 (X-AnyLabeling) → 3. 数据集准备 → 4. MLLM 标注纠错 →
+    组装“1. 视频抽帧 → 2. 标注工作台 (X-AnyLabeling) → 3. MLLM 标注纠错 → 4. 数据集准备 →
     5. YOLO26 训练 → 6. 验证、推理与导出”六个标签页，协调内嵌工作台联动与跨页路径同步。
 
 运行环境与协作边界：
@@ -139,8 +139,10 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.extract_tab, "1. 视频抽帧")
         self.tabs.addTab(self.labeling_tab, "2. 标注工作台 (X-AnyLabeling)")
-        self.tabs.addTab(self.dataset_tab, "3. 数据集准备")
-        self.tabs.addTab(self.review_tab, "4. MLLM 标注纠错")
+        # 标签页按“采集 → 标注 → 质检 → 组装 → 训练 → 评估”排列；页面跳转一律按控件对象切换，
+        # 不依赖序号，调整顺序时只需修改此处与界面文案中的编号
+        self.tabs.addTab(self.review_tab, "3. MLLM 标注纠错")
+        self.tabs.addTab(self.dataset_tab, "4. 数据集准备")
         self.tabs.addTab(self.train_tab, "5. YOLO26 训练")
         self.tabs.addTab(self.eval_tab, "6. 验证、推理与导出")
 
@@ -179,7 +181,7 @@ class MainWindow(QMainWindow):
         self._device_probe_worker.start()
 
     def _on_device_probed(self, info: DeviceInfo) -> None:
-        """接收后台硬件探测结果，原地更新共享 `device_info` 并刷新第 4/5/6 标签页控件。"""
+        """接收后台硬件探测结果，原地更新共享 `device_info` 并刷新第 3/5/6 标签页控件。"""
         self.device_info.cuda_available = info.cuda_available
         self.device_info.device_count = info.device_count
         self.device_info.device_name = info.device_name
@@ -206,7 +208,7 @@ class MainWindow(QMainWindow):
         """
         self.dataset_tab.set_frames_dir(frames_dir)
         self.review_tab.set_images_dir(frames_dir)
-        if self.tabs.currentIndex() == 0:
+        if self.tabs.currentWidget() is self.extract_tab:
             self._on_open_in_workbench(frames_dir, "", "")
 
     def _on_open_in_workbench(
@@ -218,33 +220,33 @@ class MainWindow(QMainWindow):
         if self.labeling_tab.open_directory(
             Path(target_dir), classes_file=cls_path, select_image=img_path
         ):
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentWidget(self.labeling_tab)
 
     def _on_labeling_to_dataset(self, images_dir: str, classes_file: str) -> None:
-        """将工作台当前标注目录与类别清单同步至「3. 数据集准备」并切换过去。"""
+        """将工作台当前标注目录与类别清单同步至「4. 数据集准备」并切换过去。"""
         self.dataset_tab.set_dataset_source(images_dir, classes_file, recursive=False)
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentWidget(self.dataset_tab)
 
     def _on_labeling_to_review(self, images_dir: str) -> None:
-        """将工作台当前图片目录同步至「4. MLLM 标注纠错」并切换过去。"""
+        """将工作台当前图片目录同步至「3. MLLM 标注纠错」并切换过去。"""
         self.review_tab.set_images_dir(images_dir)
-        self.tabs.setCurrentIndex(3)
+        self.tabs.setCurrentWidget(self.review_tab)
 
     def _on_annotations_changed(self, dir_path: str) -> None:
         """工作台内保存或更新 `.json` 后通知数据集页；由数据集页判断是否同目录并标记统计结果过期。"""
         self.dataset_tab.mark_annotations_changed(dir_path)
 
     def _on_cleaned_ready(self, images_dir: str, classes_txt: str, recursive: bool) -> None:
-        """将 MLLM 清洗输出目录与类别清单填入「3. 数据集准备」并切换至该页。"""
+        """将 MLLM 清洗输出目录与类别清单填入「4. 数据集准备」并切换至该页。"""
         self.dataset_tab.set_dataset_source(images_dir, classes_txt, recursive)
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentWidget(self.dataset_tab)
 
     def _on_yaml_ready(self, yaml_path: str) -> None:
         """将生成的 `data.yaml` 路径同步至「5. YOLO26 训练」。"""
         self.train_tab.set_data_yaml(yaml_path)
 
     def _on_weights_ready(self, weights_path: str, yaml_path: str) -> None:
-        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「4. MLLM 标注纠错」。"""
+        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「3. MLLM 标注纠错」。"""
         self.eval_tab.set_weights_and_yaml(weights_path, yaml_path)
         self.review_tab.set_weights_path(weights_path)
 

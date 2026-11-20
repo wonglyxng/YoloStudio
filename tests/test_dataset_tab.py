@@ -1,4 +1,4 @@
-"""「3. 数据集准备」标签页（`DatasetTab`）界面交互测试。
+"""「4. 数据集准备」标签页（`DatasetTab`）界面交互测试。
 
 职责：
     在离线 `offscreen` Qt 环境下验证数据集页的划分比例归一化提示、classes.txt 与 need_review 选项联动、

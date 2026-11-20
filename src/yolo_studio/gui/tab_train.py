@@ -7,7 +7,7 @@
 
 运行环境与协作边界：
     运行于 PyQt6 主线程；训练任务委托给 `gui.workers.TrainWorker`，
-    在训练产出有效 `best.pt` 时通过 `send_best_weights` 信号向主窗口同步给标签页 4 与标签页 6；
+    在训练产出有效 `best.pt` 时通过 `send_best_weights` 信号向主窗口同步给标签页 3 与标签页 6；
     持久化读写通过 `save_settings` / `restore_settings` 接受主窗口或外部注入的 `QSettings` 实例。
 """
 
