@@ -158,6 +158,15 @@ class DatasetTab(QWidget):
 
         left.addWidget(self._build_source_group())
         left.addWidget(self._build_split_group())
+        # 配置分组按内容高度排列，剩余空间放在分组与操作按钮之间，使操作栏与右侧面板底部对齐
+        left.addStretch(1)
+
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setRange(0, 0)  # 不定长模式：后台任务不上报进度，仅表示正在运行
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedHeight(6)
+        self.busy_bar.setVisible(False)
+        left.addWidget(self.busy_bar)
 
         btn_row = QHBoxLayout()
         self.build_btn = QPushButton("生成 YOLO26 数据集 (data.yaml)")
@@ -172,21 +181,6 @@ class DatasetTab(QWidget):
         btn_row.addWidget(self.send_train_btn)
         left.addLayout(btn_row)
 
-        self.busy_bar = QProgressBar()
-        self.busy_bar.setRange(0, 0)  # 不定长模式：后台任务不上报进度，仅表示正在运行
-        self.busy_bar.setTextVisible(False)
-        self.busy_bar.setFixedHeight(6)
-        self.busy_bar.setVisible(False)
-        left.addWidget(self.busy_bar)
-
-        log_group = QGroupBox("日志与告警")
-        log_layout = QVBoxLayout(log_group)
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setPlaceholderText("扫描、转换日志与告警信息将在此显示...")
-        log_layout.addWidget(self.log_box)
-        left.addWidget(log_group, 1)
-
         root.addLayout(left, 3)
         root.addWidget(self._build_stats_group(), 2)
 
@@ -198,7 +192,6 @@ class DatasetTab(QWidget):
     def _build_source_group(self) -> QGroupBox:
         """分组 1：图片目录、打开工作台与扫描统计入口。"""
         group = QGroupBox("1. 标注源目录与工作台联动")
-        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         form = QFormLayout(group)
 
         default_frames = str((self.workspace_root / "data" / "raw_frames").resolve())
@@ -230,7 +223,6 @@ class DatasetTab(QWidget):
     def _build_split_group(self) -> QGroupBox:
         """分组 2：标注格式、类别文件、输出目录、划分比例与附加选项。"""
         group = QGroupBox("2. 标注转换与 Train/Val/Test 数据集划分")
-        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         form = QFormLayout(group)
 
         self.ann_picker = PathPickerRow(
@@ -267,7 +259,7 @@ class DatasetTab(QWidget):
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 999999)
         self.seed_spin.setValue(42)
-        self.seed_spin.setFixedWidth(90)
+        self.seed_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.seed_spin.setToolTip("随机种子：输入与比例不变时，相同种子得到相同的划分结果")
 
         ratio_row = QHBoxLayout()
@@ -275,7 +267,6 @@ class DatasetTab(QWidget):
             ("Train", self.train_spin),
             ("Val", self.val_spin),
             ("Test", self.test_spin),
-            ("Seed", self.seed_spin),
         ):
             ratio_row.addWidget(QLabel(f"{text}:"))
             ratio_row.addWidget(spin)
@@ -289,6 +280,15 @@ class DatasetTab(QWidget):
         ratio_box.addLayout(ratio_row)
         ratio_box.addWidget(self.ratio_hint)
         form.addRow("划分比例:", ratio_box)
+
+        # 随机种子单独成行，避免与三项比例挤在一行把左栏撑宽、压缩右侧统计面板
+        seed_row = QHBoxLayout()
+        seed_row.addWidget(self.seed_spin)
+        seed_hint = QLabel("相同种子与输入得到相同划分")
+        seed_hint.setStyleSheet("color: #666666;")
+        seed_row.addWidget(seed_hint)
+        seed_row.addStretch(1)
+        form.addRow("随机种子:", seed_row)
 
         self.include_empty_chk = QCheckBox("保留无标注文件的图片作为负样本")
         self.include_empty_chk.setToolTip(
@@ -319,11 +319,12 @@ class DatasetTab(QWidget):
         spin.setSingleStep(0.05)
         spin.setDecimals(2)
         spin.setValue(value)
-        spin.setFixedWidth(72)
+        # 按控件自身 sizeHint 定宽：高 DPI 下箭头按钮更宽，写死像素宽度会裁掉数值
+        spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         return spin
 
     def _build_stats_group(self) -> QGroupBox:
-        """分组 3：状态提示、指标卡片与类别分布表。"""
+        """分组 3：状态提示、指标卡片、类别分布表与下方的扫描/转换日志。"""
         group = QGroupBox("3. 标注统计与校验结果")
         layout = QVBoxLayout(group)
 
@@ -344,7 +345,12 @@ class DatasetTab(QWidget):
         self.class_table.verticalHeader().setVisible(False)
         self.class_table.setAlternatingRowColors(True)
         self._set_table_columns(with_splits=False, with_test=False)
-        layout.addWidget(self.class_table, 1)
+        layout.addWidget(self.class_table, 3)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("扫描、转换日志与告警信息将在此显示...")
+        layout.addWidget(self.log_box, 2)
 
         self._reset_stats_view()
         return group
@@ -537,7 +543,7 @@ class DatasetTab(QWidget):
         if summary.excluded_images:
             status += f"；已按设置排除 {summary.excluded_images} 张图片"
         if warn_count:
-            status += f"；有 {warn_count} 条告警，详见左下方日志"
+            status += f"；有 {warn_count} 条告警，详见下方日志"
         self._finish_status(status, "warn" if warn_count else "ok")
 
         if summary.warnings:
@@ -625,7 +631,7 @@ class DatasetTab(QWidget):
             )
         self._append_warnings(result.warnings, prefix="[警告] ")
 
-        status = f"数据集已生成；有 {warn_count} 条告警，详见左下方日志" if warn_count else "数据集已生成"
+        status = f"数据集已生成；有 {warn_count} 条告警，详见下方日志" if warn_count else "数据集已生成"
         self._finish_status(status, "warn" if warn_count else "ok")
         self._refresh_send_btn()
         self.send_data_yaml.emit(self._last_yaml_path)
