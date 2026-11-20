@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -40,7 +41,13 @@ from yolo_studio.core.frame_extractor import (
     ExtractionProgress,
     ExtractionResult,
 )
-from yolo_studio.gui.common import PathPickerRow, load_pixmap_scaled, open_local_path
+from yolo_studio.gui.common import (
+    PathPickerRow,
+    align_form_labels,
+    configure_form_layout,
+    load_pixmap_scaled,
+    open_local_path,
+)
 from yolo_studio.gui.workers import FrameExtractWorker, VideoProbeWorker
 
 
@@ -91,7 +98,7 @@ class ExtractTab(QWidget):
 
         param_group = QGroupBox("2. 抽帧参数设置")
         form = QFormLayout(param_group)
-        form.setSpacing(8)
+        configure_form_layout(form, vertical_spacing=8)
 
         default_frames_dir = str((self.workspace_root / "data" / "raw_frames").resolve())
         self.output_picker = PathPickerRow(
@@ -111,67 +118,89 @@ class ExtractTab(QWidget):
         self.interval_spin.setSingleStep(0.5)
         self.interval_spin.setValue(1.0)
         self.interval_spin.setSuffix(" 秒")
+        self.interval_spin.setMinimumWidth(160)
+        self.interval_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         form.addRow("时间间隔:", self.interval_spin)
 
         self.frame_step_spin = QSpinBox()
         self.frame_step_spin.setRange(1, 100000)
         self.frame_step_spin.setValue(30)
         self.frame_step_spin.setSuffix(" 帧")
+        self.frame_step_spin.setMinimumWidth(160)
+        self.frame_step_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         form.addRow("帧步长:", self.frame_step_spin)
 
         self.target_count_spin = QSpinBox()
         self.target_count_spin.setRange(1, 100000)
         self.target_count_spin.setValue(100)
         self.target_count_spin.setSuffix(" 张/视频")
+        self.target_count_spin.setMinimumWidth(160)
+        self.target_count_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         form.addRow("目标帧数:", self.target_count_spin)
 
         time_row = QHBoxLayout()
+        time_row.setSpacing(6)
         self.start_sec_spin = QDoubleSpinBox()
         self.start_sec_spin.setRange(0.0, 86400.0)
         self.start_sec_spin.setValue(0.0)
         self.start_sec_spin.setSuffix(" 秒")
+        self.start_sec_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.end_sec_spin = QDoubleSpinBox()
         self.end_sec_spin.setRange(0.0, 86400.0)
         self.end_sec_spin.setValue(0.0)
         self.end_sec_spin.setSuffix(" 秒 (0=到结尾)")
+        self.end_sec_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         time_row.addWidget(QLabel("起:"))
         time_row.addWidget(self.start_sec_spin)
+        time_row.addSpacing(12)
         time_row.addWidget(QLabel("止:"))
         time_row.addWidget(self.end_sec_spin)
+        time_row.addStretch(1)
         form.addRow("截取时间段:", time_row)
 
         self.dedup_spin = QDoubleSpinBox()
         self.dedup_spin.setRange(0.0, 50.0)
         self.dedup_spin.setSingleStep(0.5)
         self.dedup_spin.setValue(2.0)
+        self.dedup_spin.setMinimumWidth(160)
+        self.dedup_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.dedup_spin.setToolTip("相邻保存帧灰度平均像素差低于该值时自动跳过，0 表示不去重")
         form.addRow("相似帧去重阈值:", self.dedup_spin)
 
         resize_row = QHBoxLayout()
+        resize_row.setSpacing(6)
         self.max_dim_spin = QSpinBox()
         self.max_dim_spin.setRange(0, 8192)
         self.max_dim_spin.setSingleStep(160)
         self.max_dim_spin.setValue(0)
+        self.max_dim_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.max_dim_spin.setToolTip("限制导出图片最长边像素，0 表示保持视频原始分辨率")
         self.format_combo = QComboBox()
         self.format_combo.addItems(["jpg", "png"])
+        self.format_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.quality_spin = QSpinBox()
         self.quality_spin.setRange(10, 100)
         self.quality_spin.setValue(95)
+        self.quality_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         resize_row.addWidget(self.max_dim_spin)
+        resize_row.addSpacing(12)
         resize_row.addWidget(QLabel("格式:"))
         resize_row.addWidget(self.format_combo)
+        resize_row.addSpacing(12)
         resize_row.addWidget(QLabel("JPG质量:"))
         resize_row.addWidget(self.quality_spin)
+        resize_row.addStretch(1)
         form.addRow("最长边(0=原尺寸):", resize_row)
 
         naming_row = QHBoxLayout()
+        naming_row.setSpacing(8)
         self.prefix_edit = QLineEdit()
         self.prefix_edit.setPlaceholderText("可选文件名前缀，如 cam1_")
         self.subfolder_chk = QCheckBox("按视频名分建子目录")
         naming_row.addWidget(self.prefix_edit, 1)
         naming_row.addWidget(self.subfolder_chk)
         form.addRow("命名选项:", naming_row)
+        align_form_labels([form])
 
         left.addWidget(param_group)
 

@@ -66,6 +66,8 @@ from yolo_studio.gui.common import (
     ComputeDeviceControl,
     GpuTaskGuard,
     PathPickerRow,
+    align_form_labels,
+    configure_form_layout,
     make_metric_card,
     open_local_path,
 )
@@ -295,7 +297,7 @@ class TrainTab(QWidget):
         # 2. 模型、预设与核心训练参数
         cfg_group = QGroupBox("2. 模型与核心训练参数")
         form = QFormLayout(cfg_group)
-        form.setSpacing(6)
+        configure_form_layout(form, vertical_spacing=6)
 
         default_yaml = str((self.workspace_root / "datasets" / "custom_yolo26" / "data.yaml").resolve())
         self.yaml_picker = PathPickerRow(
@@ -438,7 +440,7 @@ class TrainTab(QWidget):
         form.addRow("规模与批次:", core_grid_widget)
 
         opt_sched_row = QHBoxLayout()
-        opt_sched_row.setSpacing(6)
+        opt_sched_row.setSpacing(4)
         self.optimizer_combo = QComboBox()
         self.optimizer_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.optimizer_combo.setMinimumContentsLength(10)
@@ -457,6 +459,7 @@ class TrainTab(QWidget):
             step=0.001,
             tooltip="初始学习率：SGD 常用 0.01，AdamW 常用 0.001（需将优化器设为非 auto 才严格按此值生效）",
         )
+        self.lr0_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.lrf_spin = _make_double_spin(
             0.001,
             1.0,
@@ -465,6 +468,7 @@ class TrainTab(QWidget):
             step=0.01,
             tooltip="末期学习率衰减系数：最终学习率 = LR0 × LRF",
         )
+        self.lrf_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.warmup_spin = _make_double_spin(
             0.0,
             50.0,
@@ -473,12 +477,16 @@ class TrainTab(QWidget):
             step=0.5,
             tooltip="学习率预热轮数 (warmup_epochs)",
         )
+        self.warmup_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         opt_sched_row.addWidget(self.optimizer_combo, 1)
+        opt_sched_row.addSpacing(6)
         opt_sched_row.addWidget(self.lr0_label)
         opt_sched_row.addWidget(self.lr0_spin)
+        opt_sched_row.addSpacing(6)
         opt_sched_row.addWidget(QLabel("LRF:"))
         opt_sched_row.addWidget(self.lrf_spin)
+        opt_sched_row.addSpacing(6)
         opt_sched_row.addWidget(QLabel("Warmup:"))
         opt_sched_row.addWidget(self.warmup_spin)
         form.addRow("优化器与学习率:", opt_sched_row)
@@ -525,6 +533,7 @@ class TrainTab(QWidget):
 
         self.run_name_edit = QLineEdit("yolo26_train")
         form.addRow("实验名称:", self.run_name_edit)
+        align_form_labels([form])
 
         form_stack.addWidget(cfg_group)
 
@@ -638,8 +647,7 @@ class TrainTab(QWidget):
         aug_body_layout.addLayout(aug_grid)
 
         extra_form = QFormLayout()
-        extra_form.setContentsMargins(0, 2, 0, 0)
-        extra_form.setSpacing(4)
+        configure_form_layout(extra_form, horizontal_spacing=8, vertical_spacing=4, margins=(0, 2, 0, 0))
         self.extra_args_edit = QPlainTextEdit()
         self.extra_args_edit.setFixedHeight(48)
         self.extra_args_edit.setPlaceholderText(

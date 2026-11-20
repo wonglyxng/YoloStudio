@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QPlainTextEdit,
     QVBoxLayout,
@@ -39,6 +40,8 @@ from yolo_studio.gui.common import (
     GpuTaskGuard,
     LOG_MAX_LINES,
     PathPickerRow,
+    align_form_labels,
+    configure_form_layout,
     load_pixmap_scaled,
     open_local_path,
 )
@@ -79,6 +82,7 @@ class EvalTab(QWidget):
         # 分组 1：模型权重、运行设备与验证配置
         model_group = QGroupBox("1. 模型权重与运行设备")
         m_form = QFormLayout(model_group)
+        configure_form_layout(m_form)
 
         self.weights_picker = PathPickerRow(
             placeholder="选择训练好的 best.pt 权重",
@@ -104,10 +108,12 @@ class EvalTab(QWidget):
         m_form.addRow("运行设备:", self.device_ctrl)
 
         hw_row = QHBoxLayout()
+        hw_row.setSpacing(6)
         self.imgsz_spin = QSpinBox()
         self.imgsz_spin.setRange(128, 2048)
         self.imgsz_spin.setSingleStep(32)
         self.imgsz_spin.setValue(640)
+        self.imgsz_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.val_btn = QPushButton("运行验证 (Val)")
         hw_row.addWidget(QLabel("ImgSz:"))
         hw_row.addWidget(self.imgsz_spin)
@@ -119,8 +125,10 @@ class EvalTab(QWidget):
         # 分组 2：推理效果测试
         pred_group = QGroupBox("2. 推理效果测试")
         p_form = QFormLayout(pred_group)
+        configure_form_layout(p_form)
 
         src_row = QHBoxLayout()
+        src_row.setSpacing(6)
         self.source_edit = QLineEdit()
         self.source_edit.setPlaceholderText("选择测试图片、图片文件夹或测试视频")
         self.pick_file_btn = QPushButton("选图片/视频")
@@ -137,21 +145,26 @@ class EvalTab(QWidget):
         p_form.addRow("输出目录:", self.pred_out_picker)
 
         thr_row = QHBoxLayout()
+        thr_row.setSpacing(6)
         self.conf_spin = QDoubleSpinBox()
         self.conf_spin.setRange(0.01, 0.99)
         self.conf_spin.setSingleStep(0.05)
         self.conf_spin.setValue(0.25)
+        self.conf_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.iou_spin = QDoubleSpinBox()
         self.iou_spin.setRange(0.05, 0.99)
         self.iou_spin.setSingleStep(0.05)
         self.iou_spin.setValue(0.45)
+        self.iou_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.predict_btn = QPushButton("运行推理预览")
         self.predict_btn.setObjectName("primaryBtn")
         self.open_pred_btn = QPushButton("打开输出目录")
         thr_row.addWidget(QLabel("Conf:"))
         thr_row.addWidget(self.conf_spin)
+        thr_row.addSpacing(12)
         thr_row.addWidget(QLabel("IoU:"))
         thr_row.addWidget(self.iou_spin)
+        thr_row.addStretch(1)
         thr_row.addWidget(self.predict_btn)
         thr_row.addWidget(self.open_pred_btn)
         p_form.addRow("阈值与执行:", thr_row)
@@ -160,8 +173,10 @@ class EvalTab(QWidget):
         # 分组 3：模型格式导出
         exp_group = QGroupBox("3. 模型导出 (部署格式)")
         e_form = QFormLayout(exp_group)
+        configure_form_layout(e_form)
 
         exp_row = QHBoxLayout()
+        exp_row.setSpacing(6)
         self.format_combo = QComboBox()
         self.format_combo.addItem("ONNX (通用推理推荐)", "onnx")
         self.format_combo.addItem("TorchScript (.torchscript)", "torchscript")
@@ -172,6 +187,7 @@ class EvalTab(QWidget):
         exp_row.addWidget(self.half_chk)
         exp_row.addWidget(self.export_btn)
         e_form.addRow("导出格式:", exp_row)
+        align_form_labels([m_form, p_form, e_form])
         left.addWidget(exp_group)
 
         self.log_box = QPlainTextEdit()

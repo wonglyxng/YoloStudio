@@ -53,7 +53,12 @@ from yolo_studio.core.dataset_converter import (
     preview_image_counts,
 )
 from yolo_studio.core.mllm_reviewer import BUCKET_NEED_REVIEW
-from yolo_studio.gui.common import PathPickerRow, open_local_path
+from yolo_studio.gui.common import (
+    PathPickerRow,
+    align_form_labels,
+    configure_form_layout,
+    open_local_path,
+)
 from yolo_studio.gui.workers import DatasetBuildWorker, DatasetScanWorker
 
 # 日志框中最多逐条展示的告警数量；超出部分只给出剩余条数，避免海量告警拖慢界面
@@ -167,6 +172,7 @@ class DatasetTab(QWidget):
 
         left.addWidget(self._build_source_group())
         left.addWidget(self._build_split_group())
+        align_form_labels([self._source_form, self._split_form])
         # 配置分组按内容高度排列，剩余空间放在分组与操作按钮之间，使操作栏与右侧面板底部对齐
         left.addStretch(1)
 
@@ -211,6 +217,8 @@ class DatasetTab(QWidget):
         """
         group = QGroupBox("1. 数据来源")
         form = QFormLayout(group)
+        configure_form_layout(form)
+        self._source_form = form
 
         default_frames = str((self.workspace_root / "data" / "raw_frames").resolve())
         self.images_picker = PathPickerRow(
@@ -279,6 +287,8 @@ class DatasetTab(QWidget):
         """分组 2“划分与输出”：输出目录、Train/Val/Test 比例、随机种子与负样本选项，只影响生成结果。"""
         group = QGroupBox("2. 划分与输出")
         form = QFormLayout(group)
+        configure_form_layout(form)
+        self._split_form = form
 
         default_ds_out = str((self.workspace_root / "datasets" / "custom_yolo26").resolve())
         self.output_ds_picker = PathPickerRow(

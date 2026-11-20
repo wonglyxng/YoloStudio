@@ -77,6 +77,8 @@ from yolo_studio.gui.common import (
     ComputeDeviceControl,
     GpuTaskGuard,
     PathPickerRow,
+    align_form_labels,
+    configure_form_layout,
     open_local_path,
 )
 from yolo_studio.gui.workers import MllmConnectionTestWorker, MllmReviewWorker
@@ -193,11 +195,13 @@ class MllmReviewTab(QWidget):
 
     @staticmethod
     def _tune_form(form: QFormLayout) -> None:
-        """统一左侧三组表单的留白节奏：加大行距与组内边距，缓解控件堆叠带来的拥挤感。"""
-        form.setContentsMargins(12, 10, 12, 12)
-        form.setHorizontalSpacing(10)
-        form.setVerticalSpacing(8)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        """统一左侧三组表单的标签右对齐与留白节奏，保证标签紧邻右侧控件并缓解拥挤感。"""
+        configure_form_layout(
+            form,
+            horizontal_spacing=10,
+            vertical_spacing=8,
+            margins=(12, 10, 12, 12),
+        )
 
     def _init_ui(self) -> None:
         root = QHBoxLayout(self)
@@ -276,20 +280,23 @@ class MllmReviewTab(QWidget):
         self.yolo_params_widget = QWidget()
         yolo_row = QHBoxLayout(self.yolo_params_widget)
         yolo_row.setContentsMargins(0, 0, 0, 0)
-        yolo_row.setSpacing(6)
+        yolo_row.setSpacing(4)
         self.yolo_conf_spin = QDoubleSpinBox()
         self.yolo_conf_spin.setRange(0.01, 0.95)
         self.yolo_conf_spin.setSingleStep(0.02)
         self.yolo_conf_spin.setValue(0.12)
+        self.yolo_conf_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.yolo_conf_spin.setToolTip("建议设低（0.08~0.15）以尽量召回潜在漏标，再由 MLLM 筛除误检")
         self.yolo_iou_spin = QDoubleSpinBox()
         self.yolo_iou_spin.setRange(0.10, 0.95)
         self.yolo_iou_spin.setSingleStep(0.05)
         self.yolo_iou_spin.setValue(0.60)
+        self.yolo_iou_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.yolo_imgsz_spin = QSpinBox()
         self.yolo_imgsz_spin.setRange(128, 2048)
         self.yolo_imgsz_spin.setSingleStep(32)
         self.yolo_imgsz_spin.setValue(640)
+        self.yolo_imgsz_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.yolo_device_ctrl = ComputeDeviceControl(
             self.device_info,
             show_status_text=False,
@@ -299,11 +306,14 @@ class MllmReviewTab(QWidget):
         )
         yolo_row.addWidget(QLabel("低阈值Conf:"))
         yolo_row.addWidget(self.yolo_conf_spin)
+        yolo_row.addSpacing(4)
         yolo_row.addWidget(QLabel("IoU:"))
         yolo_row.addWidget(self.yolo_iou_spin)
+        yolo_row.addSpacing(4)
         yolo_row.addWidget(QLabel("ImgSz:"))
         yolo_row.addWidget(self.yolo_imgsz_spin)
-        yolo_row.addWidget(self.yolo_device_ctrl)
+        yolo_row.addSpacing(6)
+        yolo_row.addWidget(self.yolo_device_ctrl, 1)
         s_form.addRow("基准推理参数:", self.yolo_params_widget)
 
         self.ann_picker = PathPickerRow(
@@ -515,6 +525,7 @@ class MllmReviewTab(QWidget):
             "纠错选项:", _make_check_grid([self.check_missing_chk, self.add_missing_chk, self.crops_chk])
         )
         p_form.addRow("输出选项:", _make_check_grid([self.triage_dirs_chk]))
+        align_form_labels([s_form, l_form, p_form])
         form_stack.addWidget(pol_group)
         form_stack.addStretch(1)
 

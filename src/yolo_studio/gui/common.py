@@ -1,8 +1,9 @@
 """PyQt6 界面共享辅助控件、跨页计算任务互斥协调器与本地路径/图像工具函数。
 
 职责：
-    提供路径选择器行控件、友好型 GPU/CPU 计算设备切换控件、系统文件管理器跳转、等比缩略图加载、
-    紧凑型指标卡片构建，以及防止多标签页同时启动本地模型任务争抢显存的 `GpuTaskGuard`。
+    提供路径选择器行控件、友好型 GPU/CPU 计算设备切换控件、表单标签对齐与间距规范工具、
+    系统文件管理器跳转、等比缩略图加载、紧凑型指标卡片构建，
+    以及防止多标签页同时启动本地模型任务争抢显存的 `GpuTaskGuard`。
 
 运行环境与协作边界：
     Python >= 3.11 + `PyQt6`；供 `gui` 各标签页与 `MainWindow` 复用，不持有模块级可变全局状态，也不自行创建后台线程。
@@ -11,20 +12,23 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal as Signal
+from PyQt6.QtCore import QEvent, QObject, QThread, Qt, QUrl, pyqtSignal as Signal
 from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QWidget,
 )
 
@@ -34,6 +38,116 @@ if TYPE_CHECKING:
 # 长任务日志框（`QPlainTextEdit.setMaximumBlockCount`）保留的最大行数；超出后自动丢弃最早的行，
 # 避免长时间训练日志无限增长拖慢界面
 LOG_MAX_LINES = 5000
+
+# 表单标签与右侧字段控件（下拉框、输入框、微调框等）之间的默认水平间距（像素）
+FORM_LABEL_SPACING = 10
+
+
+def configure_form_layout(
+    form: QFormLayout,
+    *,
+    horizontal_spacing: int = FORM_LABEL_SPACING,
+    vertical_spacing: int | None = None,
+    margins: tuple[int, int, int, int] | None = None,
+) -> None:
+    """统一表单标签对齐方式与列间距，使每行标签紧邻其右侧控件保持合适距离。
+
+    设计原因：
+        Windows 原生 `QFormLayout` 默认将标签左对齐；当同一分组存在较长标签（如 `最长边(0=原尺寸):`、
+        `classes.txt(可选):`）时，短标签与右侧下拉框/输入框之间会被拉出大片空白。
+        改为右对齐并设定固定 `horizontal_spacing` 后，所有标签右端均与字段左边缘保持恒定距离。
+    """
+    form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    form.setHorizontalSpacing(horizontal_spacing)
+    if vertical_spacing is not None:
+        form.setVerticalSpacing(vertical_spacing)
+    if margins is not None:
+        form.setContentsMargins(*margins)
+
+
+class _FormLabelAligner(QObject):
+    """监听样式表/字体继承变化并自动重算跨分组 `QFormLayout` 统一标签列宽的事件过滤器。
+
+    设计原因：
+        各标签页在 `__init__` 构造表单时尚未挂载到 `MainWindow`，此时标签尚未继承主窗口样式表中的字号；
+        挂入 `MainWindow` 并首次完成样式应用（`Polish` / `StyleChange` / `FontChange`）后，字体宽度会变化。
+        本对象绑定到 `forms[0]` 的生命周期，在字体或样式生效后按最新 `sizeHint` 自动重算并保持像素级对齐。
+    """
+
+    _TRIGGER_EVENTS = (
+        QEvent.Type.Polish,
+        QEvent.Type.FontChange,
+        QEvent.Type.StyleChange,
+    )
+
+    def __init__(self, forms: Sequence[QFormLayout], extra_padding: int = 2) -> None:
+        super().__init__(forms[0])
+        self._forms = tuple(forms)
+        self._extra_padding = max(0, extra_padding)
+        self._syncing = False
+        self._last_width = -1
+
+        watched: set[int] = set()
+        for form in self._forms:
+            parent_widget = form.parentWidget()
+            if parent_widget is not None and id(parent_widget) not in watched:
+                parent_widget.installEventFilter(self)
+                watched.add(id(parent_widget))
+
+    def sync(self) -> int:
+        """基于当前字体/样式计算并同步全部关联表单的非空标签最小宽度，返回最新宽度（像素）。"""
+        if self._syncing:
+            return max(0, self._last_width)
+        self._syncing = True
+        try:
+            labels: list[QLabel] = []
+            for form in self._forms:
+                for row in range(form.rowCount()):
+                    item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                    widget = item.widget() if item is not None else None
+                    if isinstance(widget, QLabel) and widget.text():
+                        labels.append(widget)
+
+            if not labels:
+                self._last_width = 0
+                return 0
+
+            # 先清零旧 minimumWidth，防止上一次对齐值污染当前字体下的自然宽度测量
+            for label in labels:
+                label.setMinimumWidth(0)
+            max_width = max(label.sizeHint().width() for label in labels)
+            if max_width <= 0:
+                self._last_width = 0
+                return 0
+
+            target_width = max_width + self._extra_padding
+            for label in labels:
+                label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                label.setMinimumWidth(target_width)
+            self._last_width = target_width
+            return target_width
+        finally:
+            self._syncing = False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() in self._TRIGGER_EVENTS:
+            self.sync()
+        return super().eventFilter(watched, event)
+
+
+def align_form_labels(forms: Sequence[QFormLayout], *, extra_padding: int = 2) -> int:
+    """将同页多个 `QFormLayout` 的非空行标签统一为一致的右对齐列宽并返回当前最小宽度（像素）。
+
+    调用时机与约束：
+        应在相关 `QFormLayout` 的全部表单行添加完成后调用（支持包含当前处于隐藏状态的可切换行，
+        如 `Base URL:`、`SAM 分割模型:`），避免用户切换模式显示/隐藏行时整个表单左右抖动；
+        内部会挂接 `_FormLabelAligner` 在样式表与字体继承生效后自动重算，确保跨分组控件左边缘精确对齐。
+    """
+    valid_forms = [f for f in forms if f is not None]
+    if not valid_forms:
+        return 0
+    aligner = _FormLabelAligner(valid_forms, extra_padding=extra_padding)
+    return aligner.sync()
 
 
 def open_local_path(path: Path) -> None:
@@ -236,23 +350,35 @@ class ComputeDeviceControl(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(6 if (compact_status and not show_status_text) else 8)
 
         self.gpu_chk = QCheckBox(checkbox_text)
         self.gpu_chk.setStyleSheet("font-weight: 600;")
 
         self.gpu_combo = QComboBox()
         self.gpu_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.gpu_combo.setMinimumContentsLength(12)
         self.gpu_combo.setVisible(False)
 
         self.status_label = QLabel()
         self.status_label.setVisible(show_status_text)
 
         layout.addWidget(self.gpu_chk)
-        layout.addWidget(self.gpu_combo)
         if show_status_text:
+            self.gpu_combo.setMinimumContentsLength(12)
+            layout.addWidget(self.gpu_combo)
             layout.addWidget(self.status_label, 1)
+        else:
+            # 无状态文案的紧凑模式（如推理参数行）：多卡选卡下拉框按剩余空间弹性缩放，
+            # 防止撑出横向滚动条，同时保证下拉弹出列表有足够宽度完整显示显卡型号
+            if compact_status:
+                self.gpu_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+                self.gpu_combo.setMinimumWidth(64)
+                self.gpu_combo.setMaximumWidth(180)
+                self.gpu_combo.view().setMinimumWidth(260)
+            else:
+                self.gpu_combo.setMinimumContentsLength(12)
+            layout.addWidget(self.gpu_combo, 100)
+            layout.addStretch(1)
 
         self.gpu_chk.toggled.connect(self._on_gpu_toggled)
         self.gpu_combo.currentIndexChanged.connect(self._on_gpu_combo_changed)
@@ -491,6 +617,7 @@ class ComputeDeviceControl(QWidget):
         self.status_label.setText(text)
         self.status_label.setStyleSheet(f"color: {color}; font-weight: 600;")
         self.gpu_chk.setToolTip(tip)
+        self.gpu_combo.setToolTip(self.gpu_combo.currentText() or tip)
         self.status_label.setToolTip(tip)
 
     def _emit_if_changed(self) -> None:
