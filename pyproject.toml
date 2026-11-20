@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yolo-studio"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Desktop GUI and CLI studio with embedded X-AnyLabeling, MLLM review, and YOLO26 training."
 readme = "README.md"
 license = "GPL-3.0-only"
@@ -35,6 +35,9 @@ yolo-studio = "yolo_studio.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "yolo_studio._version.__version__"}
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

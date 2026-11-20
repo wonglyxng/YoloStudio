@@ -187,14 +187,69 @@ class BuildConfig:
     overwrite: bool = True
 
 
+VERSION_FILE_REL = Path("src") / "yolo_studio" / "_version.py"
+SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$")
+
+
 def read_project_version(repo_root: Path) -> str:
-    """从仓库 `pyproject.toml` 解析项目版本号；未匹配到时抛出 `RuntimeError`。"""
-    pyproject_file = repo_root / "pyproject.toml"
-    content = pyproject_file.read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', content, re.MULTILINE)
+    """从仓库单一版本源 `src/yolo_studio/_version.py` 解析项目版本号；缺失或格式非法时抛出 `RuntimeError`。"""
+    version_file = repo_root / VERSION_FILE_REL
+    if not version_file.is_file():
+        raise RuntimeError(f"未找到单一版本源文件: {version_file}")
+    content = version_file.read_text(encoding="utf-8")
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', content, re.MULTILINE)
     if not match:
-        raise RuntimeError(f"无法从 {pyproject_file} 解析 version 字段")
-    return match.group(1)
+        raise RuntimeError(f"无法从 {version_file} 解析 __version__ 字段")
+    version = match.group(1).strip()
+    if not SEMVER_PATTERN.match(version):
+        raise RuntimeError(f"单一版本源中的版本号格式不合法（需为 X.Y.Z）: {version}")
+    return version
+
+
+def write_project_version(repo_root: Path, new_version: str) -> str:
+    """校验并将新版本号写回单一版本源 `src/yolo_studio/_version.py`，返回规范化后的版本号字符串。"""
+    cleaned = new_version.strip().lstrip("vV")
+    if not SEMVER_PATTERN.match(cleaned):
+        raise ValueError(f"版本号格式不合法（需为 X.Y.Z，例如 0.3.1）: {new_version}")
+    version_file = repo_root / VERSION_FILE_REL
+    content = version_file.read_text(encoding="utf-8")
+    updated, count = re.subn(
+        r'^(__version__\s*=\s*)"[^"]+"',
+        rf'\g<1>"{cleaned}"',
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise RuntimeError(f"未能在 {version_file} 中定位 __version__ 赋值行")
+    version_file.write_text(updated, encoding="utf-8")
+    return cleaned
+
+
+def bump_project_version(repo_root: Path, part: str) -> str:
+    """按语义化版本规则递增单一版本源（`patch` / `minor` / `major`）并写回文件，返回新版本号。"""
+    current = read_project_version(repo_root)
+    match = SEMVER_PATTERN.match(current)
+    assert match is not None
+    major, minor, patch = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    kind = part.strip().lower()
+    if kind == "patch":
+        new_ver = f"{major}.{minor}.{patch + 1}"
+    elif kind == "minor":
+        new_ver = f"{major}.{minor + 1}.0"
+    elif kind == "major":
+        new_ver = f"{major + 1}.0.0"
+    else:
+        raise ValueError(f"不支持的版本递增类型: {part}（可选: patch / minor / major）")
+    return write_project_version(repo_root, new_ver)
+
+
+def _to_windows_four_part_version(version: str) -> str:
+    """将语义化版本号（如 `0.3.0` 或 `0.3.0-rc1`）转换为 Windows PE 要求的四段数字格式 `0.3.0.0`。"""
+    match = SEMVER_PATTERN.match(version.strip())
+    if not match:
+        return "0.0.0.0"
+    return f"{int(match.group(1))}.{int(match.group(2))}.{int(match.group(3))}.0"
 
 
 def parse_pyvenv_home(venv_dir: Path) -> Path:
@@ -930,9 +985,13 @@ if __name__ == "__main__":
         if cache_dir_item.is_dir():
             shutil.rmtree(cache_dir_item, ignore_errors=True)
 
-    # 清空包标记 __init__.py，消除明文注释但保留标准 Python 包结构
+    # 清空子包标记 __init__.py，顶层包仅保留单行版本导出以支持 `yolo_studio.__version__`
+    top_init = (pkg_root / "__init__.py").resolve()
     for init_file in pkg_root.rglob("__init__.py"):
-        init_file.write_text("", encoding="utf-8")
+        if init_file.resolve() == top_init:
+            init_file.write_text("from yolo_studio._version import __version__\n", encoding="utf-8")
+        else:
+            init_file.write_text("", encoding="utf-8")
 
     return compiled_pyds
 
@@ -1001,6 +1060,9 @@ def apply_code_protection(config: BuildConfig, bundle_root: Path) -> None:
         count_core = strip_source_to_pyc_only(
             yolo_pkg_dir, runtime_py, keep_empty_init_py=True
         )
+        top_init = yolo_pkg_dir / "__init__.py"
+        if top_init.is_file():
+            top_init.write_text("from yolo_studio._version import __version__\n", encoding="utf-8")
         print(f"[保护] 已将 {count_core} 个核心业务模块转为无明文源码的同级 .pyc。")
 
     if xal_pkg_dir.is_dir():
@@ -1045,33 +1107,49 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def generate_integrity_manifest_cs(bundle_root: Path, output_cs: Path) -> int:
-    """扫描核心启动脚本、`.pth` 路由与编译后的核心模块，生成内嵌于 `YoloStudio.exe` 的 C# 防篡改清单源码。
+def generate_integrity_manifest_cs(
+    bundle_root: Path,
+    output_cs: Path,
+    version: str = "0.0.0",
+    include_integrity: bool = True,
+) -> int:
+    """生成内嵌于 `YoloStudio.exe` 的 C# 版本元数据与可选 SHA-256 防篡改清单源码。
 
-    校验范围：
-        `app/main.py`、`app/cli.py`、`runtime/Lib/site-packages/yolo_studio_portable.pth`，
-        以及 `app/src/yolo_studio` 下的全部 `.pyd`、`.pyc` 与 `__init__.py`。
+    注入内容：
+        1. 按单一版本源 `version` 生成 Windows PE 的 `AssemblyVersion`、`AssemblyFileVersion`
+           与 `AssemblyInformationalVersion` 程序集属性；
+        2. 当 `include_integrity=True` 时，扫描 `app/main.py`、`app/cli.py`、
+           `runtime/Lib/site-packages/yolo_studio_portable.pth` 及 `app/src/yolo_studio` 下的全部
+           `.pyd` / `.pyc` / `.py` 文件计算 SHA-256 并硬编码写入；为 `False` 时写入空字典。
     返回纳入完整性校验的文件条目数。
     """
     monitored: list[Path] = []
-    for rel in (
-        Path("app/main.py"),
-        Path("app/cli.py"),
-        Path("runtime/Lib/site-packages/yolo_studio_portable.pth"),
-    ):
-        candidate = bundle_root / rel
-        if candidate.is_file():
-            monitored.append(candidate)
+    if include_integrity:
+        for rel in (
+            Path("app/main.py"),
+            Path("app/cli.py"),
+            Path("runtime/Lib/site-packages/yolo_studio_portable.pth"),
+        ):
+            candidate = bundle_root / rel
+            if candidate.is_file():
+                monitored.append(candidate)
 
-    yolo_pkg = bundle_root / "app" / "src" / "yolo_studio"
-    if yolo_pkg.is_dir():
-        for item in sorted(yolo_pkg.rglob("*")):
-            if item.is_file() and item.suffix.lower() in {".pyd", ".pyc", ".py"}:
-                monitored.append(item)
+        yolo_pkg = bundle_root / "app" / "src" / "yolo_studio"
+        if yolo_pkg.is_dir():
+            for item in sorted(yolo_pkg.rglob("*")):
+                if item.is_file() and item.suffix.lower() in {".pyd", ".pyc", ".py"}:
+                    monitored.append(item)
 
+    four_part_ver = _to_windows_four_part_version(version)
+    safe_info_ver = version.replace("\\", "\\\\").replace('"', '\\"')
     lines = [
-        "// 由 scripts/build_portable.py 自动生成的核心文件防篡改 SHA-256 指纹清单。",
+        "// 由 scripts/build_portable.py 按单一版本源自动生成的版本元数据与 SHA-256 防篡改清单。",
         "using System.Collections.Generic;",
+        "using System.Reflection;",
+        "",
+        f'[assembly: AssemblyVersion("{four_part_ver}")]',
+        f'[assembly: AssemblyFileVersion("{four_part_ver}")]',
+        f'[assembly: AssemblyInformationalVersion("{safe_info_ver}")]',
         "",
         "namespace YoloStudio.Launcher",
         "{",
@@ -1252,6 +1330,7 @@ def verify_portable_bundle(
     bundle_root: Path,
     skip_heavy_imports: bool = False,
     protect: str = "none",
+    expected_version: str = "",
 ) -> None:
     """对组装完成的便携整合包执行静态路径泄漏扫描、防篡改校验与隔离环境运行冒烟验证。"""
     required_files = [
@@ -1328,6 +1407,26 @@ def verify_portable_bundle(
     )
     if cli_res.returncode != 0:
         raise RuntimeError(f"便携包 CLI --help 自检失败:\n{cli_res.stdout}\n{cli_res.stderr}")
+
+    if expected_version:
+        ver_cmd_args: str | list[str] = (
+            f'cmd.exe /d /s /c ""{bundle_root / "YoloStudio-CLI.cmd"}" --version"'
+            if os.name == "nt"
+            else [str(py_exe), str(bundle_root / "app" / "cli.py"), "--version"]
+        )
+        ver_res = subprocess.run(
+            ver_cmd_args,
+            cwd=str(bundle_root / "workspace"),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if ver_res.returncode != 0 or f"v{expected_version}" not in (ver_res.stdout + ver_res.stderr):
+            raise RuntimeError(
+                f"便携包 CLI --version 自检不匹配 (期望 v{expected_version}):\n{ver_res.stdout}\n{ver_res.stderr}"
+            )
 
     heavy_flag = "0" if skip_heavy_imports else "1"
     probe_code = """
@@ -1520,20 +1619,24 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
         / "images"
         / "icon.ico"
     )
-    print("[启动器] 编译无黑框原生桌面启动器 YoloStudio.exe...")
-    if config.protect.strip().lower() in {"pyc", "pyd"}:
-        with tempfile.TemporaryDirectory(prefix="ys_manifest_") as manifest_tmp:
-            manifest_cs = Path(manifest_tmp) / "IntegrityManifest.g.cs"
-            entry_count = generate_integrity_manifest_cs(bundle_root, manifest_cs)
-            print(f"[防篡改] 已将 {entry_count} 个核心文件的 SHA-256 指纹硬编码嵌入 YoloStudio.exe。")
-            compile_windows_launcher(
-                launcher_cs,
-                bundle_root / "YoloStudio.exe",
-                icon_file=icon_path,
-                manifest_cs=manifest_cs,
-            )
-    else:
-        compile_windows_launcher(launcher_cs, bundle_root / "YoloStudio.exe", icon_file=icon_path)
+    print(f"[启动器] 编译无黑框原生桌面启动器 YoloStudio.exe (v{version})...")
+    enable_integrity = config.protect.strip().lower() in {"pyc", "pyd"}
+    with tempfile.TemporaryDirectory(prefix="ys_manifest_") as manifest_tmp:
+        manifest_cs = Path(manifest_tmp) / "IntegrityManifest.g.cs"
+        entry_count = generate_integrity_manifest_cs(
+            bundle_root,
+            manifest_cs,
+            version=version,
+            include_integrity=enable_integrity,
+        )
+        if enable_integrity:
+            print(f"[防篡改] 已将 {entry_count} 个核心文件的 SHA-256 指纹与 v{version} 元数据硬编码嵌入 YoloStudio.exe。")
+        compile_windows_launcher(
+            launcher_cs,
+            bundle_root / "YoloStudio.exe",
+            icon_file=icon_path,
+            manifest_cs=manifest_cs,
+        )
 
     write_cli_and_quickstart_files(bundle_root, version=version, variant=config.variant)
 
@@ -1542,6 +1645,7 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
             bundle_root,
             skip_heavy_imports=config.skip_heavy_imports,
             protect=config.protect,
+            expected_version=version,
         )
 
     archive_path = create_bundle_archive(bundle_root, config.archive_format)
@@ -1676,6 +1780,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="none",
         help="构建完成后是否自动打包为单文件压缩包（默认: none，可选 7z 或 zip）。",
     )
+    ver_group = parser.add_mutually_exclusive_group()
+    ver_group.add_argument(
+        "--bump",
+        choices=("patch", "minor", "major"),
+        default=None,
+        help="可选：构建前自动递增单一版本源 src/yolo_studio/_version.py（patch/minor/major）。",
+    )
+    ver_group.add_argument(
+        "--set-version",
+        default=None,
+        help="可选：构建前将单一版本源显式设置为指定语义化版本号（如 0.3.1）。",
+    )
     parser.add_argument(
         "--skip-smoke-test",
         action="store_true",
@@ -1690,8 +1806,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """命令行主入口：解析参数并驱动便携整合包构建与验证。"""
+    """命令行主入口：按需更新单一版本源、解析参数并驱动便携整合包构建与验证。"""
     args = build_arg_parser().parse_args(argv)
+    if args.bump:
+        new_ver = bump_project_version(REPO_ROOT, args.bump)
+        print(f"[版本] 已按 {args.bump} 规则更新单一版本源 -> v{new_ver}")
+    elif args.set_version:
+        new_ver = write_project_version(REPO_ROOT, args.set_version)
+        print(f"[版本] 已将单一版本源设置为 -> v{new_ver}")
+
     config = BuildConfig(
         repo_root=REPO_ROOT,
         mode=args.mode,

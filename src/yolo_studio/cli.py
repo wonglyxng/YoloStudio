@@ -26,6 +26,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from yolo_studio._version import __version__
+
 
 def _cmd_extract(args: argparse.Namespace) -> int:
     """执行 `extract` 子命令并将抽帧异常打印到 stderr；无错误返回 0，否则返回 1。"""
@@ -237,7 +239,13 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """构建包含 `extract`、`dataset`、`train`、`review` 四个子命令的 CLI 解析器。"""
-    parser = argparse.ArgumentParser(description="YOLO26 视频抽帧与训练 CLI 工具")
+    parser = argparse.ArgumentParser(description=f"YOLO26 视频抽帧与训练 CLI 工具 (v{__version__})")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"YoloStudio v{__version__}",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_ext = sub.add_parser("extract", help="从录制视频批量抽帧")

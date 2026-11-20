@@ -29,6 +29,8 @@ import tempfile
 import traceback
 from pathlib import Path
 
+from yolo_studio._version import __version__
+
 WORKSPACE_ENV_VAR = "YOLO_STUDIO_WORKSPACE"
 
 
@@ -205,7 +207,7 @@ def _create_startup_splash(app: object, icon_path: Path | None) -> object | None
     title_font = QFont("Microsoft YaHei UI", 16, QFont.Weight.Bold)
     painter.setFont(title_font)
     painter.setPen(QColor("#f0f6fc"))
-    painter.drawText(QRectF(text_x, 32, width - text_x - 24, 30), "YoloStudio")
+    painter.drawText(QRectF(text_x, 32, width - text_x - 24, 30), f"YoloStudio v{__version__}")
 
     sub_font = QFont("Microsoft YaHei UI", 9)
     painter.setFont(sub_font)
@@ -270,6 +272,7 @@ def main(workspace_root: Path | None = None) -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("YOLO26 Training Studio")
+    app.setApplicationVersion(__version__)
     icon_path = _find_app_icon_path(code_root, root)
     if icon_path is not None:
         app.setWindowIcon(QIcon(str(icon_path)))

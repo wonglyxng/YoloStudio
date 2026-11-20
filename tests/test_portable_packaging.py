@@ -368,12 +368,26 @@ def test_integrity_manifest_tamper_detection_and_runtime_cleanup(tmp_path: Path)
     assert not (bundle / "runtime" / "Scripts").exists()
 
     manifest_cs = tmp_path / "IntegrityManifest.g.cs"
-    count = bp.generate_integrity_manifest_cs(bundle, manifest_cs)
+    count = bp.generate_integrity_manifest_cs(bundle, manifest_cs, version="0.3.0", include_integrity=True)
     assert count == 5
 
     launcher_cs = REPO_ROOT / "packaging" / "launcher" / "YoloStudioLauncher.cs"
     out_exe = bundle / "YoloStudio.exe"
     bp.compile_windows_launcher(launcher_cs, out_exe, manifest_cs=manifest_cs)
+
+    # 校验 Windows PE 文件版本属性已与单一版本源自动对齐
+    ver_probe = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f"$v=(Get-Item -LiteralPath '{out_exe}').VersionInfo; Write-Output \"$($v.FileVersion)|$($v.ProductVersion)\"",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert ver_probe.stdout.strip() == "0.3.0.0|0.3.0"
 
     # 1) 文件完好时校验放行（返回码 0）
     ok_res = subprocess.run([str(out_exe), "--verify-only"], capture_output=True)
@@ -390,3 +404,37 @@ def test_integrity_manifest_tamper_detection_and_runtime_cleanup(tmp_path: Path)
     fake_pyd.write_bytes(b"MZ_MODIFIED_PAYLOAD!!!")
     tamper_pyd = subprocess.run([str(out_exe), "--verify-only"], capture_output=True)
     assert tamper_pyd.returncode == 2
+
+
+def test_single_source_version_read_write_bump_and_cli_version(tmp_path: Path) -> None:
+    """验证单一版本源读写、`patch`/`minor`/`major` 递增与 CLI `--version` 输出一致。"""
+    import subprocess
+    import yolo_studio
+
+    bp = _load_build_portable_module()
+
+    repo_ver = bp.read_project_version(REPO_ROOT)
+    assert yolo_studio.__version__ == repo_ver
+
+    # 隔离临时目录验证版本递增与格式校验
+    fake_repo = tmp_path / "repo"
+    ver_file = fake_repo / "src" / "yolo_studio" / "_version.py"
+    ver_file.parent.mkdir(parents=True)
+    ver_file.write_text('__version__ = "0.3.0"\n', encoding="utf-8")
+
+    assert bp.bump_project_version(fake_repo, "patch") == "0.3.1"
+    assert bp.bump_project_version(fake_repo, "minor") == "0.4.0"
+    assert bp.bump_project_version(fake_repo, "major") == "1.0.0"
+    assert bp.read_project_version(fake_repo) == "1.0.0"
+    assert bp._to_windows_four_part_version("1.2.3-rc1") == "1.2.3.0"
+
+    with pytest.raises(ValueError):
+        bp.write_project_version(fake_repo, "bad_version")
+
+    cli_res = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "cli.py"), "--version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert f"YoloStudio v{repo_ver}" in (cli_res.stdout + cli_res.stderr)

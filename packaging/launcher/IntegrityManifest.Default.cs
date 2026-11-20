@@ -1,15 +1,16 @@
-// YoloStudio 启动器默认完整性清单占位文件（用于 `--protect none` 未启用保护模式）。
+// YoloStudio 启动器默认元数据与完整性清单占位文件（供直接独立编译 `YoloStudioLauncher.cs` 时使用）。
 //
 // 职责：
-//     提供空的 `IntegrityManifest.Entries` 字典，保证在未生成编译期 SHA-256 清单时
-//     `YoloStudioLauncher.cs` 仍可独立通过 `csc.exe` 编译运行。
-//
-// 协作对象与职责边界：
-//     在启用 `--protect pyd` 或 `--protect pyc` 构建保护包时，
-//     `scripts/build_portable.py` 会生成包含真实 SHA-256 指纹的临时 `IntegrityManifest.g.cs`
-//     替代本文件参与编译。
+//     提供默认程序集版本占位与空的 `IntegrityManifest.Entries` 字典；
+//     在正常通过 `scripts/build_portable.py` 打包时，构建脚本会按 `src/yolo_studio/_version.py`
+//     动态生成包含准确版本号与防篡改指纹的临时清单源码替代本文件参与编译。
 
 using System.Collections.Generic;
+using System.Reflection;
+
+[assembly: AssemblyVersion("0.0.0.0")]
+[assembly: AssemblyFileVersion("0.0.0.0")]
+[assembly: AssemblyInformationalVersion("0.0.0-dev")]
 
 namespace YoloStudio.Launcher
 {

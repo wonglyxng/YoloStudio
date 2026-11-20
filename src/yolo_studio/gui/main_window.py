@@ -19,6 +19,7 @@ from PyQt6.QtCore import QSettings, QThread, QTimer
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget
 
+from yolo_studio._version import __version__
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.common import GpuTaskGuard
 from yolo_studio.gui.tab_dataset import DatasetTab
@@ -100,7 +101,7 @@ class MainWindow(QMainWindow):
         self._device_probe_worker: DeviceProbeWorker | None = None
         self.settings = settings or QSettings("YOLO26Studio", "VideoToYOLO26")
         self.setWindowTitle(
-            "YOLO26 视频抽帧与训练工具 (Video → 内嵌 X-AnyLabeling → MLLM纠错 → YOLO26)"
+            f"YOLO26 视频抽帧与训练工具 v{__version__} (Video → 内嵌 X-AnyLabeling → MLLM纠错 → YOLO26)"
         )
         self.resize(1380, 860)
         self.setStyleSheet(APP_STYLESHEET)
