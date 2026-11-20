@@ -182,6 +182,7 @@ class BuildConfig:
     download_weights: list[str] = field(default_factory=list)
     fix_opencv: bool = False
     archive_format: str = "none"
+    patch_archive: bool = False
     skip_smoke_test: bool = False
     skip_heavy_imports: bool = False
     overwrite: bool = True
@@ -1562,6 +1563,107 @@ def create_bundle_archive(bundle_root: Path, archive_format: str) -> Path | None
     raise ValueError(f"不支持的归档格式: {archive_format}（可选: none / 7z / zip）")
 
 
+def create_patch_archive(
+    bundle_root: Path,
+    version: str,
+    archive_format: str = "7z",
+    output_name: str | None = None,
+) -> Path:
+    """将已验证便携包中的轻量增量组件打包为可直接覆盖旧版目录的扁平热更新补丁包。
+
+    包含范围：
+        `YoloStudio.exe`（含匹配本版 `.pyd` 的 SHA-256 防篡改指纹）、`YoloStudio-CLI.cmd`、
+        `app/`、`docs/`、根目录协议与说明文件、`runtime/Lib/site-packages/yolo_studio_portable.pth`
+        以及自动生成的 `升级说明_覆盖解压到旧版根目录即可.txt`。
+        不包含数 GB 的 `runtime/` 第三方库、预置 `weights/` 与用户 `workspace/`，解压覆盖后完整保留用户历史数据。
+    """
+    fmt = archive_format.strip().lower()
+    if fmt in {"", "none"}:
+        fmt = "7z"
+    if fmt not in {"7z", "zip"}:
+        raise ValueError(f"不支持的补丁归档格式: {archive_format}（可选: 7z / zip）")
+
+    parent_dir = bundle_root.parent
+    stem = output_name or f"YoloStudio-v{version}-win64-patch"
+    archive_path = parent_dir / f"{stem}.{fmt}"
+    if archive_path.exists():
+        archive_path.unlink()
+
+    with tempfile.TemporaryDirectory(prefix="ys_patch_stage_") as stage_str:
+        stage_dir = Path(stage_str)
+        for rel_file in (
+            "YoloStudio.exe",
+            "YoloStudio-CLI.cmd",
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "README.md",
+            "项目文档索引.md",
+            "使用说明_请先解压后双击YoloStudio运行.txt",
+        ):
+            src = bundle_root / rel_file
+            if src.is_file():
+                shutil.copy2(src, stage_dir / rel_file)
+
+        pth_rel = Path("runtime") / "Lib" / "site-packages" / "yolo_studio_portable.pth"
+        pth_src = bundle_root / pth_rel
+        if pth_src.is_file():
+            pth_dst = stage_dir / pth_rel
+            pth_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pth_src, pth_dst)
+
+        for rel_dir in ("app", "docs"):
+            src_dir = bundle_root / rel_dir
+            if src_dir.is_dir():
+                shutil.copytree(src_dir, stage_dir / rel_dir)
+
+        upgrade_note = "\r\n".join(
+            [
+                f"YoloStudio v{version} 轻量热更新补丁包",
+                "============================================================",
+                "",
+                "【适用范围】",
+                "  - 适用于已解压旧版（如 v0.3.0）GPU 完整版或 CPU 轻量版的同系列便携包。",
+                "  - 不含数 GB 的 runtime 依赖库与预置模型权重，无需重新下载完整包。",
+                "",
+                "【升级步骤（约 3 秒完成）】",
+                "  1) 先关闭正在运行的 YoloStudio 程序窗口。",
+                "  2) 将本压缩包内的全部文件与文件夹【直接解压到旧版 YoloStudio 根目录】（与 YoloStudio.exe 同级）。",
+                "  3) 提示文件冲突时选择【全部替换】。",
+                "  4) 重新双击 YoloStudio.exe 即可看到窗口标题已更新为 v" + version + "；您的 workspace/ 历史数据与 weights/ 权重会完整保留。",
+                "",
+                "【注意事项】",
+                "  - 请确保同时替换 YoloStudio.exe 与 app/ 目录，避免旧版启动器内置的防篡改 SHA-256 指纹与新版模块不一致。",
+                "",
+            ]
+        )
+        (stage_dir / "升级说明_覆盖解压到旧版根目录即可.txt").write_bytes(upgrade_note.encode("utf-8"))
+
+        if fmt == "7z":
+            seven_zip = shutil.which("7z") or shutil.which("7z.exe")
+            if not seven_zip:
+                default_7z = Path(r"C:\Program Files\7-Zip\7z.exe")
+                if default_7z.is_file():
+                    seven_zip = str(default_7z)
+            if not seven_zip:
+                raise FileNotFoundError("未找到 7z.exe，无法生成 .7z 补丁包，请改用 --archive zip。")
+            print(f"[补丁] 正在使用 7-Zip 生成轻量热更新补丁包: {archive_path} ...")
+            subprocess.run(
+                [seven_zip, "a", "-t7z", "-mx=5", "-mmt=on", str(archive_path), "."],
+                cwd=str(stage_dir),
+                check=True,
+            )
+        else:
+            print(f"[补丁] 正在生成 ZIP 轻量热更新补丁包: {archive_path} ...")
+            with zipfile.ZipFile(
+                archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True
+            ) as zf:
+                for item in sorted(stage_dir.rglob("*")):
+                    if item.is_file():
+                        zf.write(item, item.relative_to(stage_dir).as_posix())
+
+    return archive_path
+
+
 def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
     """执行完整的独立便携整合包构建流水线，返回 `(便携包目录路径, 压缩包路径或None)`。"""
     version = read_project_version(config.repo_root)
@@ -1649,10 +1751,17 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
         )
 
     archive_path = create_bundle_archive(bundle_root, config.archive_format)
+    patch_path: Path | None = None
+    if config.patch_archive:
+        patch_fmt = config.archive_format if config.archive_format in {"7z", "zip"} else "7z"
+        patch_path = create_patch_archive(bundle_root, version=version, archive_format=patch_fmt)
     print(f"[完成] 独立便携整合包目录已就绪: {bundle_root}")
     if archive_path is not None:
         size_mb = archive_path.stat().st_size / (1024 * 1024)
         print(f"[完成] 发布压缩包已生成: {archive_path} ({size_mb:.1f} MiB)")
+    if patch_path is not None:
+        patch_mb = patch_path.stat().st_size / (1024 * 1024)
+        print(f"[完成] 轻量热更新补丁包已生成: {patch_path} ({patch_mb:.1f} MiB)")
     return bundle_root, archive_path
 
 
@@ -1780,6 +1889,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="none",
         help="构建完成后是否自动打包为单文件压缩包（默认: none，可选 7z 或 zip）。",
     )
+    parser.add_argument(
+        "--patch-archive",
+        action="store_true",
+        help="构建完成后额外生成轻量热更新补丁包（仅含 YoloStudio.exe + app/ + docs/ 等，供旧版直接覆盖升级）。",
+    )
     ver_group = parser.add_mutually_exclusive_group()
     ver_group.add_argument(
         "--bump",
@@ -1831,6 +1945,7 @@ def main(argv: list[str] | None = None) -> int:
         download_weights=list(args.download_weights),
         fix_opencv=bool(args.fix_opencv),
         archive_format=args.archive,
+        patch_archive=bool(args.patch_archive),
         skip_smoke_test=bool(args.skip_smoke_test),
         skip_heavy_imports=bool(args.skip_heavy_imports),
     )

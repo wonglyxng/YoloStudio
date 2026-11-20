@@ -438,3 +438,61 @@ def test_single_source_version_read_write_bump_and_cli_version(tmp_path: Path) -
         check=True,
     )
     assert f"YoloStudio v{repo_ver}" in (cli_res.stdout + cli_res.stderr)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅在 Windows 上测试补丁包覆盖升级后的原生启动器完整性校验")
+def test_create_patch_archive_overlays_cleanly_and_passes_integrity_check(tmp_path: Path) -> None:
+    """验证 `create_patch_archive` 仅打包轻量增量组件，覆盖旧版目录后保留用户数据且通过防篡改校验。"""
+    import subprocess
+    import zipfile
+
+    bp = _load_build_portable_module()
+
+    # 1) 模拟新构建完成的受保护便携包（含大体量 runtime 假库）
+    new_bundle = tmp_path / "dist" / "YoloStudio-v0.3.1-win64-cpu"
+    sp_dir = new_bundle / "runtime" / "Lib" / "site-packages"
+    sp_dir.mkdir(parents=True)
+    bp.write_portable_pth(sp_dir)
+    (sp_dir / "huge_torch_placeholder.bin").write_bytes(b"X" * 1024)
+    (new_bundle / "app" / "src" / "yolo_studio").mkdir(parents=True)
+    (new_bundle / "app" / "main.py").write_text("print('v0.3.1')\n", encoding="utf-8")
+    (new_bundle / "app" / "cli.py").write_text("print('cli')\n", encoding="utf-8")
+    (new_bundle / "app" / "src" / "yolo_studio" / "app.cp312-win_amd64.pyd").write_bytes(b"NEW_PYD")
+    (new_bundle / "docs").mkdir(parents=True)
+    (new_bundle / "docs" / "001.md").write_text("# doc\n", encoding="utf-8")
+    (new_bundle / "LICENSE").write_text("GPL", encoding="utf-8")
+
+    manifest_cs = tmp_path / "IntegrityManifest.g.cs"
+    bp.generate_integrity_manifest_cs(new_bundle, manifest_cs, version="0.3.1", include_integrity=True)
+    bp.compile_windows_launcher(
+        REPO_ROOT / "packaging" / "launcher" / "YoloStudioLauncher.cs",
+        new_bundle / "YoloStudio.exe",
+        manifest_cs=manifest_cs,
+    )
+
+    patch_zip = bp.create_patch_archive(new_bundle, version="0.3.1", archive_format="zip")
+    assert patch_zip.is_file()
+    with zipfile.ZipFile(patch_zip, "r") as zf:
+        names = set(zf.namelist())
+        assert "YoloStudio.exe" in names
+        assert "app/main.py" in names
+        assert "app/src/yolo_studio/app.cp312-win_amd64.pyd" in names
+        assert "runtime/Lib/site-packages/yolo_studio_portable.pth" in names
+        assert "升级说明_覆盖解压到旧版根目录即可.txt" in names
+        assert not any("huge_torch_placeholder" in n for n in names)
+
+    # 2) 模拟旧版 v0.3.0 目录（含用户历史 workspace 数据），覆盖解压补丁后校验完好
+    old_bundle = tmp_path / "old_user_install"
+    (old_bundle / "workspace" / "runs").mkdir(parents=True)
+    user_data = old_bundle / "workspace" / "runs" / "best.pt"
+    user_data.write_bytes(b"USER_TRAINED_MODEL")
+    (old_bundle / "app" / "main.py").parent.mkdir(parents=True, exist_ok=True)
+    (old_bundle / "app" / "main.py").write_text("print('old v0.3.0')\n", encoding="utf-8")
+
+    with zipfile.ZipFile(patch_zip, "r") as zf:
+        zf.extractall(old_bundle)
+
+    assert user_data.read_bytes() == b"USER_TRAINED_MODEL"
+    assert "v0.3.1" in (old_bundle / "app" / "main.py").read_text(encoding="utf-8")
+    verify_res = subprocess.run([str(old_bundle / "YoloStudio.exe"), "--verify-only"], capture_output=True)
+    assert verify_res.returncode == 0
