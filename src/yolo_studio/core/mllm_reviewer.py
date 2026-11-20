@@ -1383,12 +1383,40 @@ def _deserialize_candidate_box(raw: dict[str, object], fallback_id: int = 0) -> 
     )
 
 
-def count_review_images(images_dir: Path, recursive: bool = False) -> int:
-    """安全统计待审核目录内的受支持图片数量；目录不存在或无权限访问时返回 `0`。"""
+def collect_review_images(
+    images_dir: Path, recursive: bool = False, output_dir: Path | None = None
+) -> list[Path]:
+    """返回本次审核的输入图片列表（只读）；递归时跳过位于输入目录内部的输出目录。
+
+    设计原因：
+        递归扫描且 `output_dir` 位于 `images_dir` 内部（如 `raw_frames/reviewed/`）时，
+        上一轮写出的 `auto_passed` / `llm_fixed` / `need_review` 结果会被重新当作输入审核，
+        造成重复审核与结果互相覆盖，因此排除该输出子树。
+        `output_dir` 与 `images_dir` 相同、或输入目录位于输出目录内部（如复审 `out/need_review`
+        并输出回 `out`）时不做排除，保持原有复审行为。非递归扫描只看顶层，无需排除。
+    路径无法解析时按未排除处理，不抛出异常。
+    """
+    images = find_images(images_dir, recursive=recursive)
+    if not recursive or output_dir is None:
+        return images
+    try:
+        in_root = images_dir.resolve()
+        out_root = output_dir.resolve()
+    except OSError:
+        return images
+    if out_root == in_root or not out_root.is_relative_to(in_root):
+        return images
+    return [p for p in images if not p.resolve().is_relative_to(out_root)]
+
+
+def count_review_images(
+    images_dir: Path, recursive: bool = False, output_dir: Path | None = None
+) -> int:
+    """安全统计待审核目录内的受支持图片数量（口径同 `collect_review_images`）；目录不存在或无权限访问时返回 `0`。"""
     if not images_dir or not images_dir.is_dir():
         return 0
     try:
-        return len(find_images(images_dir, recursive=recursive))
+        return len(collect_review_images(images_dir, recursive=recursive, output_dir=output_dir))
     except OSError:
         return 0
 
@@ -1560,7 +1588,13 @@ def run_mllm_review(
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
 
-    images = find_images(config.images_dir, recursive=config.recursive)
+    images = collect_review_images(
+        config.images_dir, recursive=config.recursive, output_dir=config.output_dir
+    )
+    if config.recursive and log_callback:
+        skipped = len(find_images(config.images_dir, recursive=True)) - len(images)
+        if skipped > 0:
+            log_callback(f"输出目录位于输入目录内部，已跳过其中 {skipped} 张上一轮结果图片，避免重复审核。")
     if not images:
         raise ValueError(f"未在目录中找到任何图片: {config.images_dir}")
 

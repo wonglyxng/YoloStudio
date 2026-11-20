@@ -970,6 +970,20 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         tab1.set_images_dir(str(in_dir))
         assert "3 张图片" in tab1.images_count_label.text()
 
+        # 1b) 递归开关紧贴图片目录、默认勾选；取消后子目录有图而顶层无图时醒目提示
+        assert tab1.recursive_chk.isChecked()
+        assert tab1.recursive_chk.parentWidget() is tab1.images_picker.parentWidget()
+        nested_root = tmp_path / "nested_frames"
+        _write_sample_frame(nested_root / "video-001" / "f1.jpg")
+        _write_sample_frame(nested_root / "video-002" / "f2.jpg")
+        tab1.set_images_dir(str(nested_root))
+        assert "共 2 张图片（含子目录）" in tab1.images_count_label.text()
+        tab1.recursive_chk.setChecked(False)
+        tab1._refresh_images_count()
+        assert "请勾选「递归扫描子目录」" in tab1.images_count_label.text()
+        tab1.recursive_chk.setChecked(True)
+        tab1.set_images_dir(str(in_dir))
+
         # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行；切到 OpenAI 显示 Base URL
         tab1.source_mode_combo.setCurrentIndex(1)
         tab1.provider_combo.setCurrentIndex(1)

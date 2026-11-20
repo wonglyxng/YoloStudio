@@ -250,9 +250,19 @@ class MllmReviewTab(QWidget):
             mode="dir",
             default_path=default_frames,
         )
+        # 递归开关决定从图片目录取哪些图片，作为图片目录的从属选项紧贴输入框放置；
+        # 默认开启，与内嵌标注工作台（递归列出子目录图片）及数据集页保持一致
+        self.recursive_chk = QCheckBox("递归扫描子目录")
+        self.recursive_chk.setChecked(True)
+        self.recursive_chk.setToolTip(
+            "默认开启，与标注工作台一致（工作台打开目录时同样包含子目录中的图片）；"
+            "输出目录位于图片目录内部时会自动跳过，避免重复审核上一轮结果；只想处理顶层图片时取消勾选"
+        )
         self.images_count_label = QLabel()
         self.images_count_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        self.images_count_label.setWordWrap(True)
         img_dir_box.addWidget(self.images_picker)
+        img_dir_box.addWidget(self.recursive_chk)
         img_dir_box.addWidget(self.images_count_label)
         s_form.addRow("图片目录:", img_dir_box)
 
@@ -488,7 +498,6 @@ class MllmReviewTab(QWidget):
         self.triage_dirs_chk = QCheckBox("按结果分建子目录")
         self.triage_dirs_chk.setChecked(True)
         self.triage_dirs_chk.setToolTip("在输出目录下自动分建 auto_passed / llm_fixed / need_review 三个子目录")
-        self.recursive_chk = QCheckBox("递归扫描输入子目录")
 
         def _make_check_grid(boxes: list[QCheckBox]) -> QWidget:
             """按统一的 3 列等宽网格排列复选框，保证“纠错选项”与“输出选项”两行纵向对齐。"""
@@ -505,7 +514,7 @@ class MllmReviewTab(QWidget):
         p_form.addRow(
             "纠错选项:", _make_check_grid([self.check_missing_chk, self.add_missing_chk, self.crops_chk])
         )
-        p_form.addRow("输出选项:", _make_check_grid([self.triage_dirs_chk, self.recursive_chk]))
+        p_form.addRow("输出选项:", _make_check_grid([self.triage_dirs_chk]))
         form_stack.addWidget(pol_group)
         form_stack.addStretch(1)
 
@@ -676,6 +685,7 @@ class MllmReviewTab(QWidget):
         # 信号与槽连接
         self.images_picker.line_edit.textChanged.connect(self._schedule_images_count)
         self.recursive_chk.toggled.connect(self._schedule_images_count)
+        self.output_picker.line_edit.textChanged.connect(self._schedule_images_count)
         self.max_images_spin.valueChanged.connect(self._on_max_images_changed)
         self.trial_5_btn.toggled.connect(self._on_trial_5_toggled)
         self.test_conn_btn.clicked.connect(self._on_test_connection)
@@ -742,31 +752,44 @@ class MllmReviewTab(QWidget):
         self._count_timer.start()
 
     def _refresh_images_count(self) -> None:
-        """立即统计并展示当前待纠错图片目录中的受支持图片数及试跑上限提示。"""
+        """立即统计并展示待纠错图片数、递归提示及试跑上限提示（口径同实际审核的 `collect_review_images`）。
+
+        未勾选递归时额外统计子目录图片：顶层没有图片而子目录有图片时以橙色提示勾选递归，
+        这是按视频或分流子目录组织数据时最常见的配置遗漏；递归时排除位于输入目录内部的输出目录。
+        """
         raw_dir = self.images_picker.text()
         if not raw_dir:
-            self.images_count_label.setStyleSheet("color: #9a6700; font-size: 12px;")
-            self.images_count_label.setText("请选择待纠错图片目录")
+            self._set_count_hint("请选择待纠错图片目录", "#9a6700")
             return
         img_dir = Path(raw_dir)
         if not img_dir.is_dir():
-            self.images_count_label.setStyleSheet("color: #9a6700; font-size: 12px;")
-            self.images_count_label.setText("当前目录不存在，请重新选择或先完成抽帧")
+            self._set_count_hint("当前目录不存在，请重新选择或先完成抽帧", "#9a6700")
             return
-        total = count_review_images(img_dir, recursive=self.recursive_chk.isChecked())
-        limit = self.max_images_spin.value()
-        scope = "（含子目录）" if self.recursive_chk.isChecked() else ""
+        out_text = self.output_picker.text()
+        out_dir = Path(out_text) if out_text else None
+        recursive = self.recursive_chk.isChecked()
+        nested_total = count_review_images(img_dir, recursive=True, output_dir=out_dir)
+        top_total = count_review_images(img_dir, recursive=False)
+        total = nested_total if recursive else top_total
         if total == 0:
-            self.images_count_label.setStyleSheet("color: #9a6700; font-size: 12px;")
-            self.images_count_label.setText(f"当前目录{scope}暂未检测到图片")
+            if not recursive and nested_total > 0:
+                self._set_count_hint(
+                    f"顶层没有图片，子目录中有 {nested_total} 张，请勾选「递归扫描子目录」。", "#b25900"
+                )
+            else:
+                self._set_count_hint("该目录及子目录中没有图片", "#9a6700")
             return
-        self.images_count_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
+        msg = f"共 {total} 张图片（含子目录）" if recursive else f"共 {total} 张图片（仅顶层）"
+        if not recursive and nested_total > top_total:
+            msg += f"；子目录另有 {nested_total - top_total} 张未包含，勾选递归可包含"
+        limit = self.max_images_spin.value()
         if limit > 0 and total > limit:
-            self.images_count_label.setText(
-                f"目录{scope}共检测到 {total} 张图片（已设试跑上限：本次仅审核前 {limit} 张）"
-            )
-        else:
-            self.images_count_label.setText(f"目录{scope}共检测到 {total} 张图片")
+            msg += f"（已设试跑上限：本次仅审核前 {limit} 张）"
+        self._set_count_hint(msg, "#1a7f37")
+
+    def _set_count_hint(self, text: str, color: str) -> None:
+        self.images_count_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self.images_count_label.setText(text)
 
     def _on_trial_5_toggled(self, checked: bool) -> None:
         """一键在“仅试跑前 5 张”与“处理全部图片”之间切换。"""
@@ -1038,7 +1061,8 @@ class MllmReviewTab(QWidget):
             "add_missing": self.add_missing_chk.isChecked(),
             "include_crops": self.crops_chk.isChecked(),
             "triage_dirs": self.triage_dirs_chk.isChecked(),
-            "recursive": self.recursive_chk.isChecked(),
+            # 旧版键名 recursive 保存的多为旧默认值 False，改用新键名使“默认递归”对已有用户生效
+            "recursive_subdirs": self.recursive_chk.isChecked(),
             "box_refine_mode": refine_mode.value,
             "sam_model_name": self._resolve_sam_model_name(),
             "sam_refine_all": self.sam_refine_all_chk.isChecked(),
@@ -1102,8 +1126,8 @@ class MllmReviewTab(QWidget):
                 self.crops_chk.setChecked(bool(state["include_crops"]))
             if "triage_dirs" in state:
                 self.triage_dirs_chk.setChecked(bool(state["triage_dirs"]))
-            if "recursive" in state:
-                self.recursive_chk.setChecked(bool(state["recursive"]))
+            if "recursive_subdirs" in state:
+                self.recursive_chk.setChecked(bool(state["recursive_subdirs"]))
 
             refine_val = str(state.get("box_refine_mode") or "")
             for i in range(self.refine_mode_combo.count()):

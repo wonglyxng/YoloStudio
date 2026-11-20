@@ -627,3 +627,23 @@ def test_max_images_trial_limit_count_and_delete_reason_summary(tmp_path: Path) 
     loaded = load_review_report(out_dir)
     assert loaded.total_images == 2
     assert "地面阴影误检" in format_record_detail_summary(loaded.records[0])
+
+
+def test_collect_review_images_skips_output_inside_recursive_input(tmp_path: Path) -> None:
+    """验证递归扫描时跳过位于输入目录内部的输出目录，而输出与输入相同或输入位于输出内部时不排除。"""
+    from yolo_studio.core.mllm_reviewer import collect_review_images, count_review_images
+
+    root = tmp_path / "frames"
+    _write_img(root / "video-001" / "a.jpg", (64, 48))
+    _write_img(root / "video-002" / "b.jpg", (64, 48))
+    _write_img(root / "reviewed" / "auto_passed" / "a.jpg", (64, 48))
+
+    out_inside = root / "reviewed"
+    names = {p.relative_to(root).as_posix() for p in collect_review_images(root, True, out_inside)}
+    assert names == {"video-001/a.jpg", "video-002/b.jpg"}
+    assert count_review_images(root, recursive=True, output_dir=out_inside) == 2
+    assert count_review_images(root, recursive=True) == 3
+    assert count_review_images(root, recursive=False, output_dir=out_inside) == 0
+    # 输出与输入相同、或复审 out/need_review 输出回 out 时保持原行为
+    assert len(collect_review_images(root, True, root)) == 3
+    assert len(collect_review_images(out_inside, True, root)) == 1
