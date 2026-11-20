@@ -3,15 +3,16 @@
 // 职责：
 //     编译生成便携包根目录下的无控制台黑框可执行程序 `YoloStudio.exe`，
 //     以启动器自身所在目录为基准按纯相对路径定位内置独立 Python 运行时（`runtime\pythonw.exe`）
-//     与应用入口（`app\main.py`），装配进程级环境隔离变量后拉起桌面主界面。
+//     与应用入口（`app\main.py`），在启用保护模式时先对编译期内置的核心文件 SHA-256 指纹清单
+//     执行防篡改校验，通过后再装配进程级环境隔离变量并拉起桌面主界面。
 //
 // 运行环境：
 //     构建期由 Windows 10/11 系统内置 `.NET Framework 4.x` 编译器 `csc.exe` 编译（零外部 SDK 依赖）；
 //     运行期面向 Windows 10/11 x64 桌面环境，无需目标电脑预装 Python、CUDA Toolkit 或开发环境。
 //
 // 协作对象与职责边界：
-//     由 `scripts/build_portable.py` 在打包阶段调用 `csc.exe` 编译并嵌入应用图标；
-//     运行期仅负责校验解压完整性、隔离宿主 Python/Conda 环境变量并启动 `app\main.py`，
+//     由 `scripts/build_portable.py` 在打包阶段连同 `IntegrityManifest` 一起编译并嵌入应用图标；
+//     运行期仅负责解压完整性校验、防篡改哈希验证、隔离宿主 Python/Conda 环境变量与启动 `app\main.py`，
 //     子进程成功拉起后启动器自身立即退出，不驻留后台或接管业务状态。
 
 using System;
@@ -20,6 +21,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
 
@@ -32,7 +34,7 @@ using System.Windows.Forms;
 namespace YoloStudio.Launcher
 {
     /// <summary>
-    /// 便携包桌面启动入口类：负责路径校验、环境变量净化与子进程创建。
+    /// 便携包桌面启动入口类：负责路径校验、核心文件防篡改校验、环境变量净化与子进程创建。
     /// </summary>
     internal static class Program
     {
@@ -40,8 +42,9 @@ namespace YoloStudio.Launcher
         private static extern bool SetProcessDPIAware();
 
         /// <summary>
-        /// 启动器主入口；默认使用 `pythonw.exe` 静默启动 GUI，传入 `--console` 时改用 `python.exe` 显示终端便于排障。
-        /// 正常拉起子进程返回 `0`；文件缺失或进程创建失败时弹出中文提示框并返回 `1`。
+        /// 启动器主入口；默认使用 `pythonw.exe` 静默启动 GUI，支持 `--console` 显示终端排障，
+        /// 以及 `--verify-only` 仅执行无弹窗完整性校验供构建验收使用。
+        /// 退出码：`0` 正常；`1` 缺失运行文件或进程创建失败；`2` 检测到核心文件被篡改或损坏。
         /// </summary>
         [STAThread]
         private static int Main(string[] args)
@@ -61,6 +64,7 @@ namespace YoloStudio.Launcher
             );
 
             bool useConsole = false;
+            bool verifyOnly = false;
             List<string> forwardedArgs = new List<string>();
             if (args != null)
             {
@@ -70,11 +74,35 @@ namespace YoloStudio.Launcher
                     {
                         useConsole = true;
                     }
+                    else if (string.Equals(arg, "--verify-only", StringComparison.OrdinalIgnoreCase))
+                    {
+                        verifyOnly = true;
+                    }
                     else
                     {
                         forwardedArgs.Add(arg);
                     }
                 }
+            }
+
+            string integrityError;
+            if (!VerifyCoreIntegrity(bundleRoot, out integrityError))
+            {
+                if (!verifyOnly)
+                {
+                    MessageBox.Show(
+                        integrityError + "\n\n为确保运行安全已阻止启动，请联系管理员重新获取官方完整压缩包。",
+                        "YoloStudio 完整性校验失败",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error
+                    );
+                }
+                return 2;
+            }
+
+            if (verifyOnly)
+            {
+                return 0;
             }
 
             string runtimeDir = Path.Combine(bundleRoot, "runtime");
@@ -162,6 +190,69 @@ namespace YoloStudio.Launcher
         }
 
         /// <summary>
+        /// 按编译期嵌入的 SHA-256 指纹清单校验核心入口与二进制模块是否被篡改或缺失。
+        /// 清单为空（非保护模式）时直接放行返回 `true`。
+        /// </summary>
+        private static bool VerifyCoreIntegrity(string bundleRoot, out string errorMessage)
+        {
+            errorMessage = string.Empty;
+            if (IntegrityManifest.Entries == null || IntegrityManifest.Entries.Count == 0)
+            {
+                return true;
+            }
+
+            using (SHA256 sha = SHA256.Create())
+            {
+                foreach (KeyValuePair<string, string> pair in IntegrityManifest.Entries)
+                {
+                    string relPath = pair.Key.Replace('/', Path.DirectorySeparatorChar);
+                    string fullPath = Path.Combine(bundleRoot, relPath);
+                    if (!File.Exists(fullPath))
+                    {
+                        errorMessage = "核心程序文件缺失：" + pair.Key;
+                        return false;
+                    }
+
+                    try
+                    {
+                        string actualHash;
+                        using (FileStream fs = File.OpenRead(fullPath))
+                        {
+                            byte[] digest = sha.ComputeHash(fs);
+                            actualHash = ToLowerHex(digest);
+                        }
+
+                        if (!string.Equals(actualHash, pair.Value, StringComparison.OrdinalIgnoreCase))
+                        {
+                            errorMessage = "检测到核心程序文件被修改或损坏：" + pair.Key;
+                            return false;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        errorMessage = "无法读取核心程序文件：" + pair.Key + "\n" + ex.Message;
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// 将字节数组转换为小写十六进制哈希字符串。
+        /// </summary>
+        private static string ToLowerHex(byte[] bytes)
+        {
+            StringBuilder sb = new StringBuilder(bytes.Length * 2);
+            foreach (byte b in bytes)
+            {
+                sb.Append(b.ToString("x2"));
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
         /// 尝试创建目录，成功返回 `true`；位于只读介质或无权限时返回 `false`，交由 Python 端自动回退至用户目录。
         /// </summary>
         private static bool TryPrepareDirectory(string path)
@@ -230,11 +321,6 @@ namespace YoloStudio.Launcher
             if (Directory.Exists(libraryBinDir))
             {
                 prependPaths.Add(libraryBinDir);
-            }
-            string scriptsDir = Path.Combine(runtimeDir, "Scripts");
-            if (Directory.Exists(scriptsDir))
-            {
-                prependPaths.Add(scriptsDir);
             }
 
             string existingPath = psi.EnvironmentVariables["PATH"] ?? string.Empty;

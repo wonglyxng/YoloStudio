@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -33,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -109,6 +111,47 @@ PBS_LATEST_API_URL = (
 )
 
 
+# 保护模式下 X-AnyLabeling 内需要按 `.py` 原路径读取的极少数运行期脚本/配置文件
+XAL_KEEP_PY_REL_MARKERS: tuple[str, ...] = (
+    "services/auto_training/ultralytics/worker.py",
+    "services/auto_labeling/configs/",
+)
+
+# 保护模式下替换 `app/main.py` 与 `app/cli.py` 的极简无注释启动桩（仅转发至已编译的核心模块）
+PROTECTED_MAIN_STUB = (
+    "import multiprocessing, sys\n"
+    "from pathlib import Path\n"
+    "def main():\n"
+    "    root = Path(__file__).resolve().parent\n"
+    "    src = root / 'src'\n"
+    "    if src.is_dir() and str(src) not in sys.path:\n"
+    "        sys.path.insert(0, str(src))\n"
+    "    from yolo_studio.app import main as run_app, report_startup_crash, resolve_workspace_root\n"
+    "    ws = resolve_workspace_root(root)\n"
+    "    try:\n"
+    "        return run_app(workspace_root=ws)\n"
+    "    except Exception as exc:\n"
+    "        if getattr(sys.stderr, 'original', sys.stderr) is None:\n"
+    "            report_startup_crash(exc, workspace_root=ws, show_dialog=True)\n"
+    "            return 1\n"
+    "        raise\n"
+    "if __name__ == '__main__':\n"
+    "    multiprocessing.freeze_support()\n"
+    "    raise SystemExit(main())\n"
+)
+
+PROTECTED_CLI_STUB = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "src = Path(__file__).resolve().parent / 'src'\n"
+    "if src.is_dir() and str(src) not in sys.path:\n"
+    "    sys.path.insert(0, str(src))\n"
+    "from yolo_studio.cli import build_parser, main\n"
+    "if __name__ == '__main__':\n"
+    "    raise SystemExit(main())\n"
+)
+
+
 @dataclass
 class BuildConfig:
     """独立便携整合包单次构建参数配置。
@@ -116,6 +159,9 @@ class BuildConfig:
     关键字段说明：
         `mode`：`"clean"` 表示从纯净独立 Python 重新安装依赖；`"from-venv"` 表示克隆现有虚拟环境。
         `variant`：`"gpu"`（含 CUDA PyTorch 与 `onnxruntime-gpu`）或 `"cpu"`（轻量纯 CPU 推理/标注版）。
+        `protect`：源码保护级别，`"pyd"`（Cython 编译自研核心为原生 `.pyd` 机器码 + 剥离明文 `.py` +
+            启动器硬编码 SHA-256 防篡改校验，适合内部防查看与防篡改）、`"pyc"`（仅留同级 `.pyc` +
+            防篡改校验）或 `"none"`（保留明文源码，适合开源合规对外分发）。
         `output_root`：构建产物根目录（默认 `<仓库根>/dist`），最终包位于其下的 `<bundle_name>/`。
         `archive_format`：`"none"`、`"7z"` 或 `"zip"`。
     """
@@ -123,6 +169,7 @@ class BuildConfig:
     repo_root: Path = REPO_ROOT
     mode: str = "from-venv"
     variant: str = "gpu"
+    protect: str = "none"
     output_root: Path = REPO_ROOT / "dist"
     cache_dir: Path = REPO_ROOT / "build" / "portable_cache"
     venv_dir: Path = REPO_ROOT / ".venv"
@@ -594,26 +641,40 @@ def copy_app_and_docs(repo_root: Path, bundle_root: Path) -> None:
 
 
 def prepare_weights_and_workspace(config: BuildConfig, bundle_root: Path) -> list[str]:
-    """初始化 `workspace/` 与 `weights/` 目录，收集本地已有或指定预置的 `.pt` 模型权重。"""
+    """初始化 `workspace/` 与 `weights/` 目录，收集本地已有或指定预置的 `.pt` 模型权重。
+
+    失败方式：
+        通过 `--weights` 显式指定的权重文件不存在或为空时立即抛出 `FileNotFoundError`，避免静默漏打权重。
+        通过 `--download-weights` 下载的官方权重会缓存至 `config.cache_dir / "weights"` 供后续复用。
+    """
     (bundle_root / "workspace").mkdir(parents=True, exist_ok=True)
     weights_dir = bundle_root / "weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
+    cached_weights_dir = config.cache_dir / "weights"
+
+    for explicit_weight in config.extra_weights:
+        if not explicit_weight.is_file() or explicit_weight.stat().st_size == 0:
+            raise FileNotFoundError(f"通过 --weights 指定的权重文件不存在或为空: {explicit_weight}")
 
     staged_weights: list[str] = []
     candidate_files: list[Path] = list(config.extra_weights)
     for default_name in ("yolo26n.pt", "yolo26s.pt", "yolo26m.pt", "yolo26l.pt", "yolo26x.pt"):
-        for folder in (config.repo_root, config.repo_root / "weights"):
+        for folder in (config.repo_root, config.repo_root / "weights", cached_weights_dir):
             candidate = folder / default_name
-            if candidate.is_file() and candidate not in candidate_files:
+            if candidate.is_file() and candidate.stat().st_size > 0 and candidate not in candidate_files:
                 candidate_files.append(candidate)
+                break
 
     for weight_path in candidate_files:
         if weight_path.is_file() and weight_path.stat().st_size > 0:
             dst = weights_dir / weight_path.name
-            shutil.copy2(weight_path, dst)
-            staged_weights.append(weight_path.name)
+            if not dst.is_file() or dst.stat().st_size == 0:
+                shutil.copy2(weight_path, dst)
+            if weight_path.name not in staged_weights:
+                staged_weights.append(weight_path.name)
 
     if config.download_weights:
+        cached_weights_dir.mkdir(parents=True, exist_ok=True)
         py_exe = bundle_root / "runtime" / "python.exe"
         env = _isolated_subprocess_env(bundle_root / "runtime", bundle_root)
         dl_code = """
@@ -631,21 +692,410 @@ if not dst.is_file() or dst.stat().st_size == 0:
 print(f"downloaded_ok={dst.name} ({dst.stat().st_size} bytes)")
 """
         for model_name in config.download_weights:
-            target = weights_dir / Path(model_name).name
+            base_name = Path(model_name).name
+            target = weights_dir / base_name
+            cached = cached_weights_dir / base_name
             if target.is_file() and target.stat().st_size > 0:
-                staged_weights.append(target.name)
+                if base_name not in staged_weights:
+                    staged_weights.append(base_name)
+                continue
+            if cached.is_file() and cached.stat().st_size > 0:
+                shutil.copy2(cached, target)
+                staged_weights.append(base_name)
                 continue
             print(f"[权重] 下载预置模型权重至 weights/: {model_name}")
             subprocess.run(
-                [str(py_exe), "-c", dl_code, str(target)],
-                cwd=str(weights_dir),
+                [str(py_exe), "-c", dl_code, str(cached)],
+                cwd=str(cached_weights_dir),
                 env=env,
                 check=True,
             )
-            if target.is_file():
-                staged_weights.append(target.name)
+            shutil.copy2(cached, target)
+            if target.is_file() and base_name not in staged_weights:
+                staged_weights.append(base_name)
 
     return staged_weights
+
+
+def find_vs_vcvars64() -> Path:
+    """使用 `vswhere.exe` 定位本机 Visual Studio C++ 构建工具链的 `vcvars64.bat` 路径。
+
+    兼容范围：
+        支持 Visual Studio 2019 / 2022 / 2026（含 BuildTools 独立版）；
+        未找到时抛出 `FileNotFoundError`，提示安装 Visual Studio C++ Build Tools 或切换 `--protect pyc`。
+    """
+    program_files_x86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        res = subprocess.run(
+            [
+                str(vswhere),
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property",
+                "installationPath",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                install_dir = line.strip()
+                if not install_dir:
+                    continue
+                candidate = Path(install_dir) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if candidate.is_file():
+                    return candidate
+
+    raise FileNotFoundError(
+        "未检测到支持 x64 的 Visual Studio C++ Build Tools（缺少 vcvars64.bat），"
+        "无法执行 --protect pyd 原生二进制编译；请安装 Visual Studio C++ 生成工具，或改用 --protect pyc。"
+    )
+
+
+def ensure_cython_toolchain(
+    runtime_python: Path,
+    cache_dir: Path,
+    pip_index_url: str = "",
+) -> Path:
+    """在构建缓存目录中准备独立的 `Cython` + `setuptools` 工具集，绝不污染目标便携包的 `site-packages`。"""
+    ver_res = subprocess.run(
+        [str(runtime_python), "-c", "import sys; print(f'py{sys.version_info.major}{sys.version_info.minor}')"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    py_tag = ver_res.stdout.strip() or "py312"
+    tools_dir = (cache_dir / f"cython_tools_{py_tag}").resolve()
+    tools_dir.mkdir(parents=True, exist_ok=True)
+
+    probe_env = _isolated_subprocess_env(runtime_python.parent)
+    probe_env["PYTHONPATH"] = str(tools_dir)
+    probe = subprocess.run(
+        [str(runtime_python), "-c", "import Cython, setuptools"],
+        env=probe_env,
+        capture_output=True,
+    )
+    if probe.returncode == 0:
+        return tools_dir
+
+    print(f"[编译] 首次在构建缓存中准备 Cython 编译工具链 ({tools_dir})...")
+    installer_py = runtime_python
+    installer_env = _isolated_subprocess_env(runtime_python.parent)
+    if subprocess.run([str(runtime_python), "-m", "pip", "--version"], env=installer_env, capture_output=True).returncode != 0:
+        installer_py = Path(sys.executable)
+        installer_env = dict(os.environ)
+
+    cmd = [
+        str(installer_py),
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-warn-script-location",
+        "--target",
+        str(tools_dir),
+        "cython>=3.0.0",
+        "setuptools>=68.0",
+    ]
+    if pip_index_url:
+        cmd.extend(["-i", pip_index_url])
+    subprocess.run(cmd, env=installer_env, check=True)
+    return tools_dir
+
+
+def compile_yolo_studio_to_pyd(
+    bundle_root: Path,
+    cache_dir: Path,
+    pip_index_url: str = "",
+) -> list[Path]:
+    """将 `app/src/yolo_studio/**/*.py`（不含包标识 `__init__.py`）编译为原生 x64 `.pyd` 机器码并删除明文源码。
+
+    关键编译约束：
+        1. 使用 `annotation_typing=False` 保留完整 Python `__annotations__`，确保 Pydantic v2 模型与 dataclass 反射正常；
+        2. 使用 `binding=True` 保证 PyQt6 槽函数连接与签名绑定兼容，使用 `embedsignature=False` 避免在二进制内残留明文签名；
+        3. 通过 `vcvars64.bat` 配合 `DISTUTILS_USE_SDK=1` / `MSSdk=1` 兼容 Visual Studio 2019~2026 全系编译器。
+    """
+    runtime_dir = bundle_root / "runtime"
+    runtime_py = runtime_dir / "python.exe"
+    src_root = (bundle_root / "app" / "src").resolve()
+    pkg_root = src_root / "yolo_studio"
+    if not pkg_root.is_dir():
+        raise FileNotFoundError(f"未找到待编译的核心源码目录: {pkg_root}")
+
+    vcvars64 = find_vs_vcvars64()
+    cython_tools = ensure_cython_toolchain(runtime_py, cache_dir, pip_index_url=pip_index_url)
+
+    py_sources = sorted(
+        p for p in pkg_root.rglob("*.py") if p.name != "__init__.py"
+    )
+    if not py_sources:
+        raise RuntimeError(f"未在 {pkg_root} 中找到可编译的业务模块 .py 文件")
+
+    print(f"[保护] 正在使用 Cython + MSVC 将 {len(py_sources)} 个核心业务模块编译为原生 .pyd 机器码...")
+    with tempfile.TemporaryDirectory(prefix="ys_cython_build_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        build_temp = tmp_dir / "obj"
+        setup_script = tmp_dir / "setup_cython.py"
+        build_bat = tmp_dir / "run_cython_build.bat"
+
+        ext_specs: list[tuple[str, str]] = []
+        for py_file in py_sources:
+            rel_no_ext = py_file.relative_to(src_root).with_suffix("")
+            mod_name = ".".join(rel_no_ext.parts)
+            ext_specs.append((mod_name, str(py_file.resolve())))
+
+        setup_code = f"""
+import multiprocessing
+import os
+from setuptools import Extension, setup
+from Cython.Build import cythonize
+from Cython.Compiler import Options as CythonOptions
+
+CythonOptions.docstrings = False
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    ext_specs = {ext_specs!r}
+    extensions = [Extension(name, [src]) for name, src in ext_specs]
+    setup(
+        name="yolo_studio_protected",
+        ext_modules=cythonize(
+            extensions,
+            compiler_directives={{
+                "language_level": "3",
+                "annotation_typing": False,
+                "binding": True,
+                "embedsignature": False,
+            }},
+            build_dir={str((tmp_dir / "c_gen").resolve())!r},
+            nthreads=max(1, os.cpu_count() or 1),
+            quiet=True,
+        ),
+    )
+"""
+        setup_script.write_text(setup_code, encoding="utf-8")
+
+        jobs = max(1, os.cpu_count() or 1)
+        # 通过 cmd 批处理先初始化 Visual Studio x64 编译器环境，再由便携包自身 python.exe 匹配 ABI 编译
+        bat_lines = [
+            "@echo off",
+            "chcp 65001 >nul",
+            f'call "{vcvars64}" >nul',
+            "if errorlevel 1 exit /b %ERRORLEVEL%",
+            "set DISTUTILS_USE_SDK=1",
+            "set MSSdk=1",
+            f'set "PYTHONPATH={cython_tools}"',
+            f'"{runtime_py}" "{setup_script}" build_ext --inplace --parallel {jobs} --build-temp "{build_temp}" --build-lib "{src_root}"',
+            "exit /b %ERRORLEVEL%",
+        ]
+        build_bat.write_bytes(("\r\n".join(bat_lines) + "\r\n").encode("utf-8"))
+
+        env = _isolated_subprocess_env(runtime_dir, bundle_root)
+        res = subprocess.run(
+            ["cmd.exe", "/d", "/c", str(build_bat)],
+            cwd=str(src_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"Cython 编译核心模块为 .pyd 失败 (退出码 {res.returncode}):\n{res.stdout}\n{res.stderr}"
+            )
+
+    compiled_pyds: list[Path] = []
+    for py_file in py_sources:
+        matches = sorted(py_file.parent.glob(f"{py_file.stem}.*.pyd"))
+        if not matches:
+            matches = sorted(py_file.parent.glob(f"{py_file.stem}.pyd"))
+        if not matches or matches[0].stat().st_size == 0:
+            raise RuntimeError(f"模块编译后未生成有效的 .pyd 二进制文件: {py_file}")
+        compiled_pyds.append(matches[0])
+
+    # 校验全部 .pyd 生成完毕后，彻底删除原始 .py、残留 .c 与冗余 __pycache__
+    for py_file in py_sources:
+        py_file.unlink(missing_ok=True)
+        c_file = py_file.with_suffix(".c")
+        if c_file.is_file():
+            c_file.unlink()
+    for cache_dir_item in list(pkg_root.rglob("__pycache__")):
+        if cache_dir_item.is_dir():
+            shutil.rmtree(cache_dir_item, ignore_errors=True)
+
+    # 清空包标记 __init__.py，消除明文注释但保留标准 Python 包结构
+    for init_file in pkg_root.rglob("__init__.py"):
+        init_file.write_text("", encoding="utf-8")
+
+    return compiled_pyds
+
+
+def strip_source_to_pyc_only(
+    target_dir: Path,
+    runtime_python: Path,
+    keep_py_rel_markers: tuple[str, ...] = (),
+    keep_empty_init_py: bool = False,
+) -> int:
+    """将目录下 `.py` 编译为与源码同级的优化 `.pyc`（`-b` 模式）并删除非白名单明文 `.py`。
+
+    设计原因：
+        CPython 在缺少 `.py` 源码文件时，只会直接导入与原模块同路径的 `module.pyc`（`compileall -b` 产物），
+        不会自动导入位于 `__pycache__/module.cpython-312.pyc` 中的缓存文件。
+    返回成功转为无源码 `.pyc` 的文件数量。
+    """
+    if not target_dir.is_dir():
+        return 0
+
+    env = _isolated_subprocess_env(runtime_python.parent)
+    subprocess.run(
+        [str(runtime_python), "-m", "compileall", "-b", "-q", "-j", "0", str(target_dir)],
+        env=env,
+        check=True,
+    )
+
+    stripped_count = 0
+    for py_file in sorted(target_dir.rglob("*.py")):
+        rel_posix = py_file.relative_to(target_dir).as_posix()
+        if any(rel_posix == m or rel_posix.startswith(m) for m in keep_py_rel_markers):
+            continue
+        if keep_empty_init_py and py_file.name == "__init__.py":
+            py_file.write_text("", encoding="utf-8")
+            continue
+        pyc_file = py_file.with_suffix(".pyc")
+        if pyc_file.is_file() and pyc_file.stat().st_size > 0:
+            py_file.unlink()
+            stripped_count += 1
+
+    for cache_dir_item in list(target_dir.rglob("__pycache__")):
+        if cache_dir_item.is_dir():
+            shutil.rmtree(cache_dir_item, ignore_errors=True)
+    return stripped_count
+
+
+def apply_code_protection(config: BuildConfig, bundle_root: Path) -> None:
+    """按 `config.protect` 级别对便携包 `app/` 执行源码编译保护、防误改剥离与入口精简。"""
+    level = config.protect.strip().lower()
+    if level == "none":
+        return
+    if level not in {"pyc", "pyd"}:
+        raise ValueError(f"不支持的源码保护级别: {config.protect}（可选: pyd / pyc / none）")
+
+    runtime_py = bundle_root / "runtime" / "python.exe"
+    app_dir = bundle_root / "app"
+    yolo_pkg_dir = app_dir / "src" / "yolo_studio"
+    xal_pkg_dir = app_dir / "third_party" / "X-AnyLabeling" / "anylabeling"
+
+    if level == "pyd":
+        compiled = compile_yolo_studio_to_pyd(
+            bundle_root, cache_dir=config.cache_dir, pip_index_url=config.pip_index_url
+        )
+        print(f"[保护] 已生成 {len(compiled)} 个原生 .pyd 二进制模块并清除核心 .py 源码。")
+    else:
+        count_core = strip_source_to_pyc_only(
+            yolo_pkg_dir, runtime_py, keep_empty_init_py=True
+        )
+        print(f"[保护] 已将 {count_core} 个核心业务模块转为无明文源码的同级 .pyc。")
+
+    if xal_pkg_dir.is_dir():
+        count_xal = strip_source_to_pyc_only(
+            xal_pkg_dir,
+            runtime_py,
+            keep_py_rel_markers=XAL_KEEP_PY_REL_MARKERS,
+        )
+        print(f"[保护] 已将内嵌 X-AnyLabeling 的 {count_xal} 个模块转为同级 .pyc 防误改。")
+
+    # 替换入口为无注释极简启动桩，并移除无需在终端暴露的工程元数据文件
+    (app_dir / "main.py").write_text(PROTECTED_MAIN_STUB, encoding="utf-8")
+    (app_dir / "cli.py").write_text(PROTECTED_CLI_STUB, encoding="utf-8")
+    for meta_file in (
+        app_dir / "pyproject.toml",
+        app_dir / "third_party" / "X-AnyLabeling" / "pyproject.toml",
+    ):
+        if meta_file.is_file():
+            meta_file.unlink()
+
+
+def cleanup_runtime_artifacts(runtime_dir: Path) -> list[str]:
+    """清理 `runtime/` 下残留的构建机路径包装器（如 `Scripts/*.exe`）及冗余文档目录。"""
+    removed: list[str] = []
+    for rel in ("Scripts", "share/man"):
+        target = runtime_dir / rel
+        if target.exists():
+            _remove_path(target)
+            removed.append(rel)
+    return removed
+
+
+def _sha256_file(path: Path) -> str:
+    """计算单个文件的 SHA-256 小写十六进制摘要。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def generate_integrity_manifest_cs(bundle_root: Path, output_cs: Path) -> int:
+    """扫描核心启动脚本、`.pth` 路由与编译后的核心模块，生成内嵌于 `YoloStudio.exe` 的 C# 防篡改清单源码。
+
+    校验范围：
+        `app/main.py`、`app/cli.py`、`runtime/Lib/site-packages/yolo_studio_portable.pth`，
+        以及 `app/src/yolo_studio` 下的全部 `.pyd`、`.pyc` 与 `__init__.py`。
+    返回纳入完整性校验的文件条目数。
+    """
+    monitored: list[Path] = []
+    for rel in (
+        Path("app/main.py"),
+        Path("app/cli.py"),
+        Path("runtime/Lib/site-packages/yolo_studio_portable.pth"),
+    ):
+        candidate = bundle_root / rel
+        if candidate.is_file():
+            monitored.append(candidate)
+
+    yolo_pkg = bundle_root / "app" / "src" / "yolo_studio"
+    if yolo_pkg.is_dir():
+        for item in sorted(yolo_pkg.rglob("*")):
+            if item.is_file() and item.suffix.lower() in {".pyd", ".pyc", ".py"}:
+                monitored.append(item)
+
+    lines = [
+        "// 由 scripts/build_portable.py 自动生成的核心文件防篡改 SHA-256 指纹清单。",
+        "using System.Collections.Generic;",
+        "",
+        "namespace YoloStudio.Launcher",
+        "{",
+        "    internal static class IntegrityManifest",
+        "    {",
+        "        internal static readonly Dictionary<string, string> Entries = new Dictionary<string, string>",
+        "        {",
+    ]
+    for file_path in monitored:
+        rel_posix = file_path.relative_to(bundle_root).as_posix()
+        sha_hex = _sha256_file(file_path)
+        escaped = rel_posix.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'            {{ "{escaped}", "{sha_hex}" }},')
+    lines.extend(
+        [
+            "        };",
+            "    }",
+            "}",
+            "",
+        ]
+    )
+    output_cs.parent.mkdir(parents=True, exist_ok=True)
+    output_cs.write_text("\n".join(lines), encoding="utf-8")
+    return len(monitored)
 
 
 def find_csharp_compiler() -> Path:
@@ -669,10 +1119,17 @@ def compile_windows_launcher(
     launcher_cs: Path,
     output_exe: Path,
     icon_file: Path | None = None,
+    manifest_cs: Path | None = None,
 ) -> Path:
-    """调用系统内置 `csc.exe` 将 `YoloStudioLauncher.cs` 编译为原生无黑框 GUI 启动器 `YoloStudio.exe`。"""
+    """调用系统内置 `csc.exe` 将 `YoloStudioLauncher.cs` 与完整性清单编译为原生无黑框启动器 `YoloStudio.exe`。"""
     if not launcher_cs.is_file():
         raise FileNotFoundError(f"启动器源码不存在: {launcher_cs}")
+
+    effective_manifest = manifest_cs
+    if effective_manifest is None:
+        effective_manifest = launcher_cs.parent / "IntegrityManifest.Default.cs"
+    if not effective_manifest.is_file():
+        raise FileNotFoundError(f"启动器完整性清单源码不存在: {effective_manifest}")
 
     csc_path = find_csharp_compiler()
     output_exe.parent.mkdir(parents=True, exist_ok=True)
@@ -687,7 +1144,7 @@ def compile_windows_launcher(
     ]
     if icon_file is not None and icon_file.is_file():
         cmd.append(f"/win32icon:{icon_file}")
-    cmd.append(str(launcher_cs))
+    cmd.extend([str(launcher_cs), str(effective_manifest)])
 
     res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if res.returncode != 0 or not output_exe.is_file():
@@ -729,6 +1186,13 @@ def write_cli_and_quickstart_files(bundle_root: Path, version: str, variant: str
             "exit /b 1",
             "",
             ":runtime_ok",
+            'if not exist "%BUNDLE_ROOT%\\YoloStudio.exe" goto :after_verify',
+            '"%BUNDLE_ROOT%\\YoloStudio.exe" --verify-only',
+            "if not errorlevel 1 goto :after_verify",
+            "echo [错误] 检测到核心程序文件被修改或损坏，已阻止运行，请联系管理员重新获取官方安装包。",
+            "exit /b 2",
+            "",
+            ":after_verify",
             'if not "%~1"=="" goto :run_with_args',
             "echo ================================================================",
             f"echo   YoloStudio v{version} [{variant.upper()}] 独立便携命令行环境",
@@ -764,12 +1228,12 @@ def write_cli_and_quickstart_files(bundle_root: Path, version: str, variant: str
             "  4) 如遇极少数环境异常需查看底层终端输出，可在命令行运行：YoloStudio.exe --console",
             "",
             "【2. 目录说明】",
-            "  - YoloStudio.exe      : 桌面图形界面启动器（无黑框）",
+            "  - YoloStudio.exe      : 桌面图形界面启动器（无黑框，内置核心文件完整性防篡改校验）",
             "  - YoloStudio-CLI.cmd  : 无头批处理命令行入口",
             "  - workspace/          : 默认用户数据工作区（抽帧图片、构建的数据集与训练结果默认保存在此）",
             "  - weights/            : 预训练模型权重存放目录（可将离线下载的 yolo26n.pt / yolo26s.pt 放入此处）",
-            "  - runtime/            : 内置独立 Python 3.12 运行时与深度学习依赖库（请勿随意删除）",
-            "  - app/                : YoloStudio 与内嵌 X-AnyLabeling 应用源码（后续小版本补丁直接覆盖此目录即可）",
+            "  - runtime/            : 内置独立 Python 3.12 运行时与深度学习依赖库（请勿随意删除或修改）",
+            "  - app/                : YoloStudio 与内嵌 X-AnyLabeling 核心运行组件（请勿手动篡改）",
             "  - docs/               : 详细图文工作流与参数使用说明",
             "",
             "【3. 显卡加速说明】",
@@ -777,15 +1241,19 @@ def write_cli_and_quickstart_files(bundle_root: Path, version: str, variant: str
             "  - 未检测到可用 NVIDIA GPU 的电脑会自动回退至 CPU 模式运行。",
             "",
             "【4. 开源协议】",
-            "  - 本软件整体遵循 GNU General Public License v3.0 (GPL-3.0-only)，详见根目录 LICENSE 与 THIRD_PARTY_NOTICES.md。",
+            "  - 本软件所含第三方开源组件声明详见根目录 LICENSE 与 THIRD_PARTY_NOTICES.md。",
             "",
         ]
     )
     quickstart.write_bytes(quickstart_text.encode("utf-8"))
 
 
-def verify_portable_bundle(bundle_root: Path, skip_heavy_imports: bool = False) -> None:
-    """对组装完成的便携整合包执行静态路径泄漏扫描与隔离环境运行冒烟验证。"""
+def verify_portable_bundle(
+    bundle_root: Path,
+    skip_heavy_imports: bool = False,
+    protect: str = "none",
+) -> None:
+    """对组装完成的便携整合包执行静态路径泄漏扫描、防篡改校验与隔离环境运行冒烟验证。"""
     required_files = [
         bundle_root / "YoloStudio.exe",
         bundle_root / "YoloStudio-CLI.cmd",
@@ -802,6 +1270,9 @@ def verify_portable_bundle(bundle_root: Path, skip_heavy_imports: bool = False) 
     if (bundle_root / "runtime" / "pyvenv.cfg").exists():
         raise RuntimeError("便携包 runtime/ 中仍残留 pyvenv.cfg，会导致在目标电脑上寻找构建机路径失败。")
 
+    if (bundle_root / "runtime" / "Scripts").exists():
+        raise RuntimeError("便携包 runtime/ 中仍残留 Scripts 目录（含开发机绝对路径包装器）。")
+
     sp_dir = bundle_root / "runtime" / "Lib" / "site-packages"
     for pth_file in sp_dir.glob("*.pth"):
         for line in pth_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -810,6 +1281,32 @@ def verify_portable_bundle(bundle_root: Path, skip_heavy_imports: bool = False) 
                 continue
             if re.match(r"^[a-zA-Z]:[\\/]", stripped):
                 raise RuntimeError(f"检测到 .pth 文件含构建机绝对路径 ({pth_file.name}): {stripped}")
+
+    level = protect.strip().lower()
+    if level == "pyd":
+        yolo_pkg = bundle_root / "app" / "src" / "yolo_studio"
+        leaked_py = [
+            p.relative_to(bundle_root).as_posix()
+            for p in yolo_pkg.rglob("*.py")
+            if p.name != "__init__.py"
+        ]
+        if leaked_py:
+            raise RuntimeError(f"源码保护校验失败，核心目录仍存在未剥离的 .py 文件: {leaked_py}")
+        compiled_pyds = list(yolo_pkg.rglob("*.pyd"))
+        if len(compiled_pyds) < 10:
+            raise RuntimeError(f"源码保护校验失败，核心 .pyd 二进制数量异常: {len(compiled_pyds)}")
+
+    if os.name == "nt" and level in {"pyc", "pyd"}:
+        print("[自检] 验证 YoloStudio.exe 内置 SHA-256 防篡改完整性清单...")
+        v_res = subprocess.run(
+            [str(bundle_root / "YoloStudio.exe"), "--verify-only"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if v_res.returncode != 0:
+            raise RuntimeError(f"YoloStudio.exe --verify-only 防篡改自检失败 (退出码 {v_res.returncode})")
 
     py_exe = bundle_root / "runtime" / "python.exe"
     env = _isolated_subprocess_env(bundle_root / "runtime", bundle_root)
@@ -838,22 +1335,47 @@ import sys
 from pathlib import Path
 import cv2, yaml, PIL, pydantic, PyQt6.QtWidgets
 import yolo_studio, anylabeling
+import yolo_studio.app as ys_app
+import yolo_studio.cli as ys_cli
+from yolo_studio.core import mllm_reviewer
+from yolo_studio.gui import main_window
 
 bundle = Path(sys.argv[1]).resolve()
+protect_level = sys.argv[3]
 ys_path = Path(yolo_studio.__file__).resolve()
 al_path = Path(anylabeling.__file__).resolve()
 assert bundle in ys_path.parents, f"yolo_studio 未从便携包内加载: {ys_path}"
 assert bundle in al_path.parents, f"anylabeling 未从便携包内加载: {al_path}"
 
+if protect_level == "pyd":
+    for mod in (ys_app, ys_cli, mllm_reviewer, main_window):
+        mod_file = Path(mod.__file__).resolve()
+        assert mod_file.suffix.lower() == ".pyd", f"模块未加载自 .pyd 二进制: {mod_file}"
+
+# 校验 Cython 编译后 Pydantic v2 注解与校验逻辑完全正常
+decision = mllm_reviewer.BoxDecision(box_id=1, action="keep")
+assert decision.box_id == 1 and decision.action == "keep"
+
 if sys.argv[2] == "1":
     import torch, onnxruntime, ultralytics
-    print(f"probe_ok torch={torch.__version__} ort={onnxruntime.__version__} ultra={ultralytics.__version__}")
+    from PyQt6.QtCore import QCoreApplication, Qt
+    from PyQt6.QtWidgets import QApplication
+    from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
+
+    ensure_cuda_dll_search_paths()
+    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+    app = QApplication([])
+    win = main_window.MainWindow(bundle / "workspace", lazy_init=True)
+    assert win.labeling_tab.ensure_mounted() is True, "内嵌 X-AnyLabeling 挂载失败"
+    win.labeling_tab.prepare_for_close()
+    win.close()
+    print(f"probe_ok protect={protect_level} torch={torch.__version__} ort={onnxruntime.__version__} ultra={ultralytics.__version__}")
 else:
-    print("probe_ok light")
+    print(f"probe_ok light protect={protect_level}")
 """
-    print("[自检] 验证相对 .pth 模块挂载路径隔离与核心运行库导入...")
+    print("[自检] 验证相对 .pth 模块挂载路径隔离、二进制保护及核心运行库导入...")
     probe_res = subprocess.run(
-        [str(py_exe), "-c", probe_code, str(bundle_root), heavy_flag],
+        [str(py_exe), "-c", probe_code, str(bundle_root), heavy_flag, level],
         cwd=str(bundle_root / "workspace"),
         env=env,
         capture_output=True,
@@ -866,13 +1388,13 @@ else:
     print(f"[自检] 通过: {probe_res.stdout.strip()}")
 
 
-def precompile_bytecode(bundle_root: Path) -> None:
-    """使用内置解释器并行预编译 `app/` 与 `runtime/Lib/` 下的 `.pyc` 字节码缓存，加速用户首次冷启动。
+def precompile_bytecode(bundle_root: Path, protect: str = "none") -> None:
+    """使用内置解释器并行预编译 `.pyc` 字节码缓存，加速用户首次冷启动。
 
     设计说明：
-        对自有及内嵌应用目录 `app/` 强制校验编译零语法错误；
-        对第三方依赖所在的 `runtime/Lib/` 采用容错模式（部分科学计算包内含非运行态代码生成模板），
-        确保其余全部有效模块提前生成 `.pyc`，免去终端用户首次双击时的 AST 解析与大量小文件写盘。
+        非保护模式（`protect="none"`）下同时编译 `app/` 与 `runtime/Lib/`；
+        保护模式（`pyd`/`pyc`）下 `app/` 已由 `apply_code_protection` 转为 `.pyd` 或同级 `.pyc`，
+        本函数仅编译 `runtime/Lib/`，避免在 `app/` 内产生多余的 `__pycache__` 目录。
     """
     py_exe = bundle_root / "runtime" / "python.exe"
     if not py_exe.is_file():
@@ -880,7 +1402,7 @@ def precompile_bytecode(bundle_root: Path) -> None:
     env = _isolated_subprocess_env(bundle_root / "runtime", bundle_root)
     print("[优化] 正在并行预编译 Python 字节码缓存 (.pyc) 以加速首次启动...")
     app_dir = bundle_root / "app"
-    if app_dir.is_dir():
+    if protect.strip().lower() == "none" and app_dir.is_dir():
         subprocess.run(
             [str(py_exe), "-m", "compileall", "-q", "-j", "0", str(app_dir)],
             env=env,
@@ -980,6 +1502,14 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
     if staged_weights:
         print(f"[权重] 已内置模型权重: {', '.join(staged_weights)}")
 
+    apply_code_protection(config, bundle_root)
+
+    cleaned_runtime = cleanup_runtime_artifacts(runtime_dir)
+    if cleaned_runtime:
+        print(f"[清理] 已移除 runtime/ 下残留构建路径目录: {', '.join(cleaned_runtime)}")
+
+    precompile_bytecode(bundle_root, protect=config.protect)
+
     launcher_cs = config.repo_root / "packaging" / "launcher" / "YoloStudioLauncher.cs"
     icon_path = (
         config.repo_root
@@ -991,12 +1521,28 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
         / "icon.ico"
     )
     print("[启动器] 编译无黑框原生桌面启动器 YoloStudio.exe...")
-    compile_windows_launcher(launcher_cs, bundle_root / "YoloStudio.exe", icon_file=icon_path)
+    if config.protect.strip().lower() in {"pyc", "pyd"}:
+        with tempfile.TemporaryDirectory(prefix="ys_manifest_") as manifest_tmp:
+            manifest_cs = Path(manifest_tmp) / "IntegrityManifest.g.cs"
+            entry_count = generate_integrity_manifest_cs(bundle_root, manifest_cs)
+            print(f"[防篡改] 已将 {entry_count} 个核心文件的 SHA-256 指纹硬编码嵌入 YoloStudio.exe。")
+            compile_windows_launcher(
+                launcher_cs,
+                bundle_root / "YoloStudio.exe",
+                icon_file=icon_path,
+                manifest_cs=manifest_cs,
+            )
+    else:
+        compile_windows_launcher(launcher_cs, bundle_root / "YoloStudio.exe", icon_file=icon_path)
+
     write_cli_and_quickstart_files(bundle_root, version=version, variant=config.variant)
-    precompile_bytecode(bundle_root)
 
     if not config.skip_smoke_test:
-        verify_portable_bundle(bundle_root, skip_heavy_imports=config.skip_heavy_imports)
+        verify_portable_bundle(
+            bundle_root,
+            skip_heavy_imports=config.skip_heavy_imports,
+            protect=config.protect,
+        )
 
     archive_path = create_bundle_archive(bundle_root, config.archive_format)
     print(f"[完成] 独立便携整合包目录已就绪: {bundle_root}")
@@ -1060,6 +1606,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("gpu", "cpu"),
         default="gpu",
         help="硬件变体标识：gpu（默认，含 CUDA PyTorch 与 onnxruntime-gpu）或 cpu（轻量版）。",
+    )
+    parser.add_argument(
+        "--protect",
+        choices=("pyd", "pyc", "none"),
+        default="pyd",
+        help="源码保护级别：pyd（默认，Cython 编译核心为原生 .pyd 机器码 + 剥离 .py + SHA-256 防篡改校验，适合内部防查看防篡改）；pyc（仅留同级 .pyc + 防篡改校验）；none（保留明文源码，适合开源对外分发）。",
     )
     parser.add_argument(
         "--output-root",
@@ -1144,6 +1696,7 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=REPO_ROOT,
         mode=args.mode,
         variant=args.variant,
+        protect=args.protect,
         output_root=args.output_root,
         venv_dir=args.venv_dir,
         standalone_python_dir=args.standalone_python_dir,

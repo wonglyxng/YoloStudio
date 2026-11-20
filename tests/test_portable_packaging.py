@@ -300,3 +300,93 @@ def test_compile_windows_launcher_and_cli_cmd_with_parens_path(tmp_path: Path) -
     finally:
         # 先移除目录联接本身，避免清理临时目录时跟随进入宿主标准库
         subprocess.run(["cmd.exe", "/c", "rmdir", str(junction_dst)], capture_output=True)
+
+
+def test_strip_source_to_pyc_only_preserves_whitelist_and_imports(tmp_path: Path) -> None:
+    """验证 `strip_source_to_pyc_only` 将常规模块转为同级 `.pyc` 并删除 `.py`，同时保留白名单文件且可正常导入。"""
+    import subprocess
+
+    bp = _load_build_portable_module()
+
+    pkg_root = tmp_path / "pkg_root"
+    mod_dir = pkg_root / "demo_pkg"
+    cfg_dir = mod_dir / "configs"
+    cfg_dir.mkdir(parents=True)
+    (mod_dir / "__init__.py").write_text("# comment\n", encoding="utf-8")
+    (mod_dir / "logic.py").write_text("VALUE = 42\n", encoding="utf-8")
+    (cfg_dir / "model_cfg.py").write_text("CFG = 'ok'\n", encoding="utf-8")
+
+    count = bp.strip_source_to_pyc_only(
+        mod_dir,
+        Path(sys.executable),
+        keep_py_rel_markers=("configs/",),
+        keep_empty_init_py=True,
+    )
+    assert count == 1
+    assert not (mod_dir / "logic.py").exists()
+    assert (mod_dir / "logic.pyc").is_file()
+    assert (mod_dir / "__init__.py").read_text(encoding="utf-8") == ""
+    assert (cfg_dir / "model_cfg.py").is_file()
+    assert not any(mod_dir.rglob("__pycache__"))
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(pkg_root)
+    res = subprocess.run(
+        [sys.executable, "-c", "import demo_pkg.logic as m; print(m.VALUE)"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert res.stdout.strip() == "42"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅在 Windows 上测试原生启动器防篡改校验")
+def test_integrity_manifest_tamper_detection_and_runtime_cleanup(tmp_path: Path) -> None:
+    """验证清理 `runtime/Scripts` 及编译进 `YoloStudio.exe` 的 SHA-256 防篡改校验（完好放行、改动拦截）。"""
+    import subprocess
+
+    bp = _load_build_portable_module()
+
+    bundle = tmp_path / "protected_bundle"
+    (bundle / "runtime" / "Scripts").mkdir(parents=True)
+    (bundle / "runtime" / "Scripts" / "yolo.exe").write_bytes(b"fake_wrapper")
+    (bundle / "runtime" / "share" / "man").mkdir(parents=True)
+    (bundle / "runtime" / "Lib" / "site-packages").mkdir(parents=True)
+    bp.write_portable_pth(bundle / "runtime" / "Lib" / "site-packages")
+
+    pkg_dir = bundle / "app" / "src" / "yolo_studio"
+    pkg_dir.mkdir(parents=True)
+    (bundle / "app" / "main.py").write_text("print('main')\n", encoding="utf-8")
+    (bundle / "app" / "cli.py").write_text("print('cli')\n", encoding="utf-8")
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    fake_pyd = pkg_dir / "app.cp312-win_amd64.pyd"
+    fake_pyd.write_bytes(b"MZ_FAKE_BINARY_PAYLOAD")
+
+    removed = bp.cleanup_runtime_artifacts(bundle / "runtime")
+    assert "Scripts" in removed
+    assert not (bundle / "runtime" / "Scripts").exists()
+
+    manifest_cs = tmp_path / "IntegrityManifest.g.cs"
+    count = bp.generate_integrity_manifest_cs(bundle, manifest_cs)
+    assert count == 5
+
+    launcher_cs = REPO_ROOT / "packaging" / "launcher" / "YoloStudioLauncher.cs"
+    out_exe = bundle / "YoloStudio.exe"
+    bp.compile_windows_launcher(launcher_cs, out_exe, manifest_cs=manifest_cs)
+
+    # 1) 文件完好时校验放行（返回码 0）
+    ok_res = subprocess.run([str(out_exe), "--verify-only"], capture_output=True)
+    assert ok_res.returncode == 0
+
+    # 2) 篡改入口 main.py 任意字节后立即拦截（返回码 2）
+    orig_main = (bundle / "app" / "main.py").read_text(encoding="utf-8")
+    (bundle / "app" / "main.py").write_text(orig_main + "# tampered\n", encoding="utf-8")
+    tamper_main = subprocess.run([str(out_exe), "--verify-only"], capture_output=True)
+    assert tamper_main.returncode == 2
+    (bundle / "app" / "main.py").write_text(orig_main, encoding="utf-8")
+
+    # 3) 篡改核心 .pyd 二进制任意字节后立即拦截（返回码 2）
+    fake_pyd.write_bytes(b"MZ_MODIFIED_PAYLOAD!!!")
+    tamper_pyd = subprocess.run([str(out_exe), "--verify-only"], capture_output=True)
+    assert tamper_pyd.returncode == 2
