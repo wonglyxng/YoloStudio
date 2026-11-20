@@ -15,7 +15,16 @@
 
 输出及产物位置：
     默认输出目录为 `dist/YoloStudio-v<版本号>-win64-<gpu|cpu>/`；
-    启用 `--archive 7z` 或 `--archive zip` 时在同级 `dist/` 下生成对应的单文件压缩包。
+    启用 `--archive 7z` 或 `--archive zip` 时在同级 `dist/` 下生成对应的单文件压缩包；
+    启用 `--patch-only` 时跳过完整 `runtime/` 复制，以目录联接只读挂载已有同变体运行库并直接输出
+    `dist/YoloStudio-v<版本号>-win64-patch.<7z|zip>` 轻量热更新补丁包。
+
+提速与缓存机制：
+    1. Windows 下使用原生 `robocopy /E /MT:16` 多线程复制大目录，替代单线程递归拷贝；
+    2. 每次完整构建后在 `runtime/.yolo_studio_runtime_stamp.json` 写入与业务版本号无关的依赖指纹，
+       附加 `--reuse-runtime` 可自动原地或并行克隆复用未变更的已预编译运行库底座；
+    3. 附加 `--patch-only` 可在数十秒内完成 `.pyd` 编译、防篡改启动器生成、隔离冒烟测试与补丁包输出；
+    4. 通过 `--compression fast|normal|max` 按需切换 7-Zip / ZIP 压缩档位，兼顾极速内测与高压缩归档。
 
 环境依赖与失败方式：
     仅依赖 Python >= 3.11 标准库运行本构建脚本；编译 `YoloStudio.exe` 依赖 Windows 10/11 系统内置的
@@ -32,10 +41,13 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import tomllib
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -153,6 +165,30 @@ PROTECTED_CLI_STUB = (
 )
 
 
+# 运行时底座依赖指纹印章文件名与模式版本（写入已就绪且预编译完成的 `runtime/` 根目录）
+RUNTIME_STAMP_FILENAME = ".yolo_studio_runtime_stamp.json"
+RUNTIME_STAMP_SCHEMA_VERSION = 1
+
+# 归档压缩档位预设：兼顾日常极速内测与正式发布高压缩率
+COMPRESSION_PRESETS: dict[str, dict[str, object]] = {
+    "fast": {
+        "seven_zip_args": ("-mx=1", "-ms=off", "-mmt=on"),
+        "zip_level": 1,
+        "label": "极速档 (fast: -mx=1 -ms=off)",
+    },
+    "normal": {
+        "seven_zip_args": ("-mx=5", "-mmt=on"),
+        "zip_level": 6,
+        "label": "均衡档 (normal: -mx=5)",
+    },
+    "max": {
+        "seven_zip_args": ("-mx=7", "-mmt=on"),
+        "zip_level": 9,
+        "label": "高压缩档 (max: -mx=7)",
+    },
+}
+
+
 @dataclass
 class BuildConfig:
     """独立便携整合包单次构建参数配置。
@@ -165,6 +201,11 @@ class BuildConfig:
             防篡改校验）或 `"none"`（保留明文源码，适合开源合规对外分发）。
         `output_root`：构建产物根目录（默认 `<仓库根>/dist`），最终包位于其下的 `<bundle_name>/`。
         `archive_format`：`"none"`、`"7z"` 或 `"zip"`。
+        `compression`：归档压缩档位，`"fast"`（极速）、`"normal"`（默认均衡）或 `"max"`（高压缩率）。
+        `reuse_runtime`：为 `True` 时按依赖指纹自动复用已有且未变更的预编译 `runtime/` 底座，跳过重装与全量字节码编译。
+        `patch_only`：为 `True` 时不构建完整便携包目录，通过目录联接只读挂载已有 `runtime/`，仅编译应用代码、
+            生成新版 `YoloStudio.exe`、完成隔离自检并直接输出轻量热更新补丁包。
+        `runtime_source`：可选，显式指定供 `--reuse-runtime` 或 `--patch-only` 复用的已有便携包根目录或 `runtime/` 目录。
     """
 
     repo_root: Path = REPO_ROOT
@@ -183,7 +224,11 @@ class BuildConfig:
     download_weights: list[str] = field(default_factory=list)
     fix_opencv: bool = False
     archive_format: str = "none"
+    compression: str = "normal"
     patch_archive: bool = False
+    reuse_runtime: bool = False
+    patch_only: bool = False
+    runtime_source: Path | None = None
     skip_smoke_test: bool = False
     skip_heavy_imports: bool = False
     overwrite: bool = True
@@ -302,6 +347,429 @@ def _copy_tree_filtered(
             if name_lower.endswith(exclude_suffixes_lower):
                 continue
             shutil.copy2(item, target)
+
+
+def _fast_copy_tree(
+    src_dir: Path,
+    dst_dir: Path,
+    exclude_names_lower: frozenset[str] = frozenset({"__pycache__"}),
+    exclude_suffixes_lower: tuple[str, ...] = (".pyc", ".pyo"),
+    threads: int = 16,
+) -> None:
+    """优先使用 Windows 原生 `robocopy /E /MT:<N>` 多线程高速复制目录树，其他平台自动回退递归复制。
+
+    退出码语义与失败方式：
+        `robocopy` 退出码 `0..7` 均表示正常完成（包含部分文件无变更或仅复制差异文件），
+        `>= 8` 表示发生 I/O 或权限错误并抛出 `RuntimeError`。
+        当复制已预编译好的 `runtime/` 底座时，可传入空排除集合以完整保留 `.pyc` 缓存。
+    """
+    src_resolved = src_dir.resolve()
+    if not src_resolved.is_dir():
+        raise FileNotFoundError(f"待复制的源目录不存在: {src_resolved}")
+    dst_resolved = dst_dir.resolve()
+    dst_resolved.mkdir(parents=True, exist_ok=True)
+
+    robocopy_bin = shutil.which("robocopy") if os.name == "nt" else None
+    if not robocopy_bin:
+        _copy_tree_filtered(src_resolved, dst_resolved, exclude_names_lower, exclude_suffixes_lower)
+        return
+
+    def _norm_robocopy_path(path: Path) -> str:
+        raw = os.path.normpath(str(path))
+        if len(raw) > 3 and raw.endswith("\\"):
+            raw = raw.rstrip("\\")
+        return raw
+
+    mt = max(1, min(128, int(threads)))
+    cmd = [
+        robocopy_bin,
+        _norm_robocopy_path(src_resolved),
+        _norm_robocopy_path(dst_resolved),
+        "/E",
+        "/COPY:DAT",
+        "/DCOPY:DAT",
+        f"/MT:{mt}",
+        "/R:2",
+        "/W:1",
+        "/NFL",
+        "/NDL",
+        "/NJH",
+        "/NJS",
+        "/NP",
+    ]
+    if exclude_names_lower:
+        cmd.extend(["/XD", *sorted(exclude_names_lower)])
+    xf_patterns = [f"*{suf}" for suf in exclude_suffixes_lower]
+    xf_patterns.extend(sorted(exclude_names_lower))
+    if xf_patterns:
+        cmd.extend(["/XF", *xf_patterns])
+
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if res.returncode >= 8:
+        detail = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+        raise RuntimeError(
+            f"robocopy 多线程复制失败 (退出码 {res.returncode}): {src_resolved} -> {dst_resolved}\n{detail}"
+        )
+
+
+def _is_directory_junction(path: Path) -> bool:
+    """判断路径是否为 Windows 目录联接（Junction / Reparse Point）或符号链接。"""
+    if path.is_symlink():
+        return True
+    is_junc = getattr(os.path, "isjunction", None)
+    if callable(is_junc):
+        try:
+            if is_junc(path):
+                return True
+        except OSError:
+            pass
+    if os.name == "nt":
+        try:
+            st = os.lstat(path)
+            return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except OSError:
+            return False
+    return False
+
+
+def _mount_runtime_junction(src_runtime: Path, dst_runtime: Path) -> None:
+    """将已有 `runtime/` 目录通过 Windows 目录联接（无需管理员权限）或符号链接零拷贝挂载至 `dst_runtime`。"""
+    src_resolved = src_runtime.resolve()
+    if not src_resolved.is_dir():
+        raise FileNotFoundError(f"待挂载的源 runtime 目录不存在: {src_resolved}")
+    if dst_runtime.exists() or dst_runtime.is_symlink():
+        raise FileExistsError(f"目标挂载路径已存在，拒绝覆盖: {dst_runtime}")
+    dst_runtime.parent.mkdir(parents=True, exist_ok=True)
+
+    if os.name == "nt":
+        res = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(dst_runtime.resolve()), str(src_resolved)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if res.returncode != 0 or not _is_directory_junction(dst_runtime):
+            detail = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+            raise RuntimeError(f"创建 runtime 目录联接失败 (退出码 {res.returncode}): {detail}")
+    else:
+        os.symlink(src_resolved, dst_runtime, target_is_directory=True)
+
+
+def _unmount_runtime_junction(dst_runtime: Path) -> None:
+    """安全卸载由 `_mount_runtime_junction` 创建的目录联接或符号链接，绝不穿透删除源目录内容。"""
+    if not dst_runtime.exists() and not dst_runtime.is_symlink():
+        return
+    if not _is_directory_junction(dst_runtime):
+        raise RuntimeError(f"安全拦截：路径不是目录联接或符号链接，拒绝卸载: {dst_runtime}")
+    if dst_runtime.is_symlink():
+        dst_runtime.unlink()
+        return
+    try:
+        os.rmdir(dst_runtime)
+    except OSError:
+        if os.name == "nt":
+            subprocess.run(["cmd.exe", "/d", "/c", "rmdir", str(dst_runtime)], capture_output=True)
+        if dst_runtime.exists():
+            raise
+
+
+def _resolve_effective_torch_index(config: BuildConfig) -> str:
+    """解析 `clean` 模式下实际生效的 PyTorch 轮子索引地址；`from-venv` 模式下返回空串。"""
+    if config.mode != "clean":
+        return ""
+    explicit = config.torch_index_url.strip()
+    if explicit:
+        return explicit
+    return (
+        "https://download.pytorch.org/whl/cu126"
+        if config.variant == "gpu"
+        else "https://download.pytorch.org/whl/cpu"
+    )
+
+
+def _sha256_text(text: str) -> str:
+    """计算 UTF-8 文本的 SHA-256 小写十六进制摘要。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _hash_requirements_txt(req_file: Path) -> str:
+    """对 `requirements.txt` 剔除空行与注释后计算哈希，缺失时返回 `"missing"`。"""
+    if not req_file.is_file():
+        return "missing"
+    lines = [
+        line.strip()
+        for line in req_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    return _sha256_text("\n".join(lines))
+
+
+def _hash_pyproject_dependencies(pyproject_file: Path) -> str:
+    """提取 `pyproject.toml` 中的依赖声明段并计算哈希（刻意忽略项目版本号与描述字段）。"""
+    if not pyproject_file.is_file():
+        return "missing"
+    raw = pyproject_file.read_text(encoding="utf-8", errors="replace")
+    try:
+        parsed = tomllib.loads(raw)
+        project = parsed.get("project", {}) if isinstance(parsed, dict) else {}
+        payload = {
+            "requires-python": project.get("requires-python", ""),
+            "dependencies": project.get("dependencies", []),
+            "optional-dependencies": project.get("optional-dependencies", {}),
+        }
+        return _sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+    except Exception:
+        filtered = [
+            line.strip()
+            for line in raw.splitlines()
+            if line.strip() and not re.match(r"^version\s*=", line.strip(), re.IGNORECASE)
+        ]
+        return _sha256_text("\n".join(filtered))
+
+
+def _hash_venv_packages(venv_dir: Path) -> tuple[str, str]:
+    """为 `from-venv` 模式采集 `.venv/pyvenv.cfg` 与第三方运行时包 `*.dist-info` 清单哈希。
+
+    设计说明：
+        过滤掉开发测试专用包（如 `pytest`、`pluggy`）以及 `yolo_studio` 自身的可编辑安装元数据，
+        确保仅修改项目版本号 `src/yolo_studio/_version.py` 不会触发 6 GB 运行时底座缓存失效。
+    """
+    cfg_file = venv_dir / "pyvenv.cfg"
+    cfg_hash = (
+        _sha256_text(cfg_file.read_text(encoding="utf-8", errors="replace"))
+        if cfg_file.is_file()
+        else "missing"
+    )
+    sp_dir = venv_dir / "Lib" / "site-packages"
+    if not sp_dir.is_dir():
+        return cfg_hash, "missing"
+
+    entries: list[str] = []
+    for item in sp_dir.iterdir():
+        name_lower = item.name.lower()
+        if not (item.is_dir() and name_lower.endswith(".dist-info")):
+            continue
+        if name_lower.startswith(("yolo_studio-", "yolo-studio-")):
+            continue
+        if any(
+            name_lower.startswith(f"{prefix}-") or name_lower.startswith(f"{prefix}_")
+            for prefix in DEV_ONLY_PACKAGE_PREFIXES
+        ):
+            continue
+        meta_file = item / "METADATA"
+        meta_sig = ""
+        if meta_file.is_file():
+            name_val = ""
+            ver_val = ""
+            for line in meta_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line:
+                    break
+                if line.startswith("Name:"):
+                    name_val = line.split(":", 1)[1].strip()
+                elif line.startswith("Version:"):
+                    ver_val = line.split(":", 1)[1].strip()
+                if name_val and ver_val:
+                    break
+            meta_sig = f"{name_val}=={ver_val}"
+        entries.append(f"{item.name}|{meta_sig}")
+    entries.sort()
+    return cfg_hash, _sha256_text("\n".join(entries))
+
+
+def compute_runtime_fingerprint(config: BuildConfig) -> dict[str, object]:
+    """计算与业务版本号解耦的 `runtime/` 依赖指纹字典（含总摘要 `digest` 与明细 `details`）。
+
+    设计约束：
+        故意不包含 `src/yolo_studio/_version.py` 或业务 `.py` 源码内容，
+        因此日常迭代递增版本号或修复 GUI/核心逻辑时指纹保持不变，可直接复用已有预编译底座；
+        一旦切换模式/变体/Python 版本/PyTorch 源或增删升级第三方依赖，指纹立即变化并触发重建。
+    """
+    repo_root = config.repo_root.resolve()
+    details: dict[str, object] = {
+        "schema_version": RUNTIME_STAMP_SCHEMA_VERSION,
+        "mode": config.mode,
+        "variant": config.variant,
+        "python_version": config.python_version if config.mode == "clean" else "",
+        "torch_index_url": _resolve_effective_torch_index(config),
+        "fix_opencv": True if config.mode == "clean" else bool(config.fix_opencv),
+        "core_pip_requirements": list(CORE_PIP_REQUIREMENTS) if config.mode == "clean" else [],
+        "requirements_txt_sha256": _hash_requirements_txt(repo_root / "requirements.txt"),
+        "pyproject_deps_sha256": _hash_pyproject_dependencies(repo_root / "pyproject.toml"),
+        "xal_pyproject_deps_sha256": _hash_pyproject_dependencies(
+            repo_root / "third_party" / "X-AnyLabeling" / "pyproject.toml"
+        ),
+    }
+    if config.mode == "from-venv":
+        cfg_hash, pkg_hash = _hash_venv_packages(config.venv_dir.resolve())
+        details["venv_pyvenv_cfg_sha256"] = cfg_hash
+        details["venv_packages_sha256"] = pkg_hash
+
+    canonical = json.dumps(details, sort_keys=True, ensure_ascii=False)
+    return {
+        "schema_version": RUNTIME_STAMP_SCHEMA_VERSION,
+        "digest": _sha256_text(canonical),
+        "details": details,
+    }
+
+
+def write_runtime_stamp(runtime_dir: Path, fingerprint: dict[str, object]) -> Path:
+    """将依赖指纹印章写入已构建并预编译完成的 `runtime/.yolo_studio_runtime_stamp.json`。"""
+    stamp_file = runtime_dir / RUNTIME_STAMP_FILENAME
+    stamp_file.write_text(
+        json.dumps(fingerprint, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return stamp_file
+
+
+def read_runtime_stamp(runtime_dir: Path) -> dict[str, object] | None:
+    """读取 `runtime/.yolo_studio_runtime_stamp.json`；缺失或 JSON 损坏时返回 `None`。"""
+    stamp_file = runtime_dir / RUNTIME_STAMP_FILENAME
+    if not stamp_file.is_file():
+        return None
+    try:
+        data = json.loads(stamp_file.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) and isinstance(data.get("digest"), str) else None
+    except Exception:
+        return None
+
+
+def _is_valid_portable_runtime(runtime_dir: Path) -> bool:
+    """校验目录是否为结构完整、已脱壳（无 `pyvenv.cfg`）的独立便携 `runtime/`。"""
+    return (
+        runtime_dir.is_dir()
+        and (runtime_dir / "python.exe").is_file()
+        and (runtime_dir / "Lib" / "site-packages").is_dir()
+        and not (runtime_dir / "pyvenv.cfg").exists()
+    )
+
+
+def _resolve_explicit_runtime_source(source_path: Path) -> Path:
+    """解析用户通过 `--runtime-source` 显式指定的便携包根目录或 `runtime/` 目录，不合法则抛 `FileNotFoundError`。"""
+    resolved = source_path.resolve()
+    candidates = [resolved, resolved / "runtime"]
+    for cand in candidates:
+        if _is_valid_portable_runtime(cand):
+            return cand
+    raise FileNotFoundError(
+        f"--runtime-source 指定的路径不是有效的独立便携 runtime（需含 python.exe、Lib/site-packages 且无 pyvenv.cfg）: {resolved}"
+    )
+
+
+def find_reusable_runtime(
+    config: BuildConfig,
+    bundle_root: Path,
+    expected_fingerprint: dict[str, object] | None = None,
+) -> tuple[Path, str] | None:
+    """按优先级查找与当前依赖指纹匹配的已就绪 `runtime/` 底座，返回 `(runtime路径, 来源说明)` 或 `None`。
+
+    查找顺序：
+        1. 若显式传入 `config.runtime_source`，直接校验并采用该底座；
+        2. `bundle_root / "runtime"` 本身（命中时可原地零拷贝复用，仅刷新 `app/` 与启动器）；
+        3. `config.cache_dir / "runtimes" / f"win64-{config.variant}-{config.mode}"` 缓存底座；
+        4. `config.output_root`（默认 `dist/`）下同变体历史目录 `YoloStudio-v*-win64-<variant>/runtime`（按更新时间降序）。
+    """
+    if config.runtime_source is not None:
+        explicit_rt = _resolve_explicit_runtime_source(config.runtime_source)
+        return explicit_rt, f"显式指定 (--runtime-source): {explicit_rt}"
+
+    fp = expected_fingerprint or compute_runtime_fingerprint(config)
+    expected_digest = str(fp["digest"])
+
+    candidates: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+
+    def _add_candidate(rt_path: Path, desc: str) -> None:
+        try:
+            key = rt_path.resolve()
+        except OSError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((key, desc))
+
+    _add_candidate(bundle_root / "runtime", "当前输出目录原地复用")
+    _add_candidate(
+        config.cache_dir / "runtimes" / f"win64-{config.variant}-{config.mode}",
+        "本地底座缓存",
+    )
+
+    out_root = config.output_root.resolve()
+    if out_root.is_dir():
+        matched_dirs = sorted(
+            (
+                p
+                for p in out_root.glob(f"YoloStudio-v*-win64-{config.variant}")
+                if p.is_dir() and (p / "runtime").is_dir()
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for bundle_dir in matched_dirs:
+            _add_candidate(bundle_dir / "runtime", f"同变体历史构建复用 ({bundle_dir.name})")
+
+    for cand, desc in candidates:
+        if not _is_valid_portable_runtime(cand):
+            continue
+        if (cand / "Scripts").exists():
+            continue
+        stamp = read_runtime_stamp(cand)
+        if stamp is not None and stamp.get("digest") == expected_digest:
+            return cand, desc
+
+    return None
+
+
+def find_patch_mount_runtime(config: BuildConfig) -> tuple[Path, str]:
+    """为 `--patch-only` 极速补丁模式定位可只读挂载的本地便携 `runtime/`。
+
+    查找顺序：
+        1. 若显式传入 `config.runtime_source`，严格校验并返回；
+        2. 优先复用与当前依赖指纹一致的带印章底座（复用 `find_reusable_runtime`）；
+        3. 回退扫描 `config.output_root`（`dist/`）下任意现成有效的便携包 `runtime/`
+           （优先同 `config.variant`，其次另一变体，按更新时间降序），支持无缝承接升级脚本前已构建的旧包。
+    失败方式：
+        未找到任何可用便携运行时时抛出 `FileNotFoundError`，提示先执行一次完整构建或传入 `--runtime-source`。
+    """
+    if config.runtime_source is not None:
+        explicit_rt = _resolve_explicit_runtime_source(config.runtime_source)
+        return explicit_rt, f"显式指定 (--runtime-source): {explicit_rt}"
+
+    dummy_bundle = config.output_root.resolve() / f"YoloStudio-v0.0.0-win64-{config.variant}"
+    stamped = find_reusable_runtime(config, dummy_bundle)
+    if stamped is not None:
+        return stamped
+
+    out_root = config.output_root.resolve()
+    if out_root.is_dir():
+        other_variant = "cpu" if config.variant == "gpu" else "gpu"
+        for var in (config.variant, other_variant):
+            matched_dirs = sorted(
+                (
+                    p
+                    for p in out_root.glob(f"YoloStudio-v*-win64-{var}")
+                    if p.is_dir() and (p / "runtime").is_dir()
+                ),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for bundle_dir in matched_dirs:
+                rt_cand = (bundle_dir / "runtime").resolve()
+                if _is_valid_portable_runtime(rt_cand) and not (rt_cand / "Scripts").exists():
+                    return rt_cand, f"现有便携包只读挂载 ({bundle_dir.name})"
+
+    raise FileNotFoundError(
+        "未在输出目录或底座缓存中找到可供 --patch-only 只读挂载的便携 runtime/。"
+        "请先执行一次完整构建，或通过 --runtime-source 指定已解压的旧版便携包目录。"
+    )
 
 
 def clone_base_python_runtime(
@@ -475,13 +943,7 @@ def prepare_clean_runtime(config: BuildConfig, runtime_dir: Path) -> None:
     if config.pip_index_url:
         pip_common.extend(["-i", config.pip_index_url])
 
-    torch_index = config.torch_index_url.strip()
-    if not torch_index:
-        torch_index = (
-            "https://download.pytorch.org/whl/cu126"
-            if config.variant == "gpu"
-            else "https://download.pytorch.org/whl/cpu"
-        )
+    torch_index = _resolve_effective_torch_index(config)
 
     print(f"[依赖] 安装 PyTorch ({config.variant}): {torch_index}")
     subprocess.run(
@@ -543,8 +1005,8 @@ def prepare_from_venv_runtime(config: BuildConfig, runtime_dir: Path) -> None:
     clone_base_python_runtime(base_py, runtime_dir)
 
     target_sp = runtime_dir / "Lib" / "site-packages"
-    print(f"[运行时] 复制第三方依赖库: {venv_sp} -> {target_sp}（体积较大，请稍候）...")
-    _copy_tree_filtered(venv_sp, target_sp)
+    print(f"[运行时] 多线程复制第三方依赖库: {venv_sp} -> {target_sp} ...")
+    _fast_copy_tree(venv_sp, target_sp)
 
     if config.fix_opencv:
         py_exe = runtime_dir / "python.exe"
@@ -632,7 +1094,8 @@ def write_portable_pth(site_packages_dir: Path) -> Path:
             "",
         ]
     )
-    pth_file.write_text(pth_content, encoding="utf-8")
+    if not pth_file.is_file() or pth_file.read_text(encoding="utf-8", errors="replace") != pth_content:
+        pth_file.write_text(pth_content, encoding="utf-8")
     return pth_file
 
 
@@ -1508,8 +1971,14 @@ def verify_portable_bundle(
     skip_heavy_imports: bool = False,
     protect: str = "none",
     expected_version: str = "",
+    read_only_runtime: bool = False,
 ) -> None:
-    """对组装完成的便携整合包执行静态路径泄漏扫描、防篡改校验与隔离环境运行冒烟验证。"""
+    """对组装完成的便携整合包执行静态路径泄漏扫描、防篡改校验与隔离环境运行冒烟验证。
+
+    参数说明：
+        `read_only_runtime`：在 `--patch-only` 目录下通过目录联接只读挂载已有 `runtime/` 时设为 `True`，
+        向自检子进程注入 `PYTHONDONTWRITEBYTECODE=1`，防止向源 `runtime/` 目录写入任何字节码文件。
+    """
     required_files = [
         bundle_root / "YoloStudio.exe",
         bundle_root / "YoloStudio-CLI.cmd",
@@ -1567,6 +2036,8 @@ def verify_portable_bundle(
     py_exe = bundle_root / "runtime" / "python.exe"
     env = _isolated_subprocess_env(bundle_root / "runtime", bundle_root)
     env["QT_QPA_PLATFORM"] = "offscreen"
+    if read_only_runtime:
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     print("[自检] 验证隔离环境下 YoloStudio-CLI.cmd --help 启动...")
     if os.name == "nt":
@@ -1677,30 +2148,38 @@ else:
     print(f"[自检] 通过: {probe_res.stdout.strip()}")
 
 
-def precompile_bytecode(bundle_root: Path, protect: str = "none") -> None:
+def precompile_bytecode(
+    bundle_root: Path,
+    protect: str = "none",
+    include_runtime: bool = True,
+) -> None:
     """使用内置解释器并行预编译 `.pyc` 字节码缓存，加速用户首次冷启动。
 
     设计说明：
-        非保护模式（`protect="none"`）下同时编译 `app/` 与 `runtime/Lib/`；
-        保护模式（`pyd`/`pyc`）下 `app/` 已由 `apply_code_protection` 转为 `.pyd` 或同级 `.pyc`，
-        本函数仅编译 `runtime/Lib/`，避免在 `app/` 内产生多余的 `__pycache__` 目录。
+        非保护模式（`protect="none"`）下编译 `app/`；
+        保护模式（`pyd`/`pyc`）下 `app/` 已由 `apply_code_protection` 转为 `.pyd` 或同级 `.pyc`，不再重扫 `app/`；
+        当 `include_runtime=True` 时同时编译 `runtime/Lib/`，复用已预编译底座时设为 `False` 以省去数万文件扫描。
     """
     py_exe = bundle_root / "runtime" / "python.exe"
     if not py_exe.is_file():
         return
+    need_app = protect.strip().lower() == "none" and (bundle_root / "app").is_dir()
+    need_runtime = include_runtime and (bundle_root / "runtime" / "Lib").is_dir()
+    if not need_app and not need_runtime:
+        return
+
     env = _isolated_subprocess_env(bundle_root / "runtime", bundle_root)
-    print("[优化] 正在并行预编译 Python 字节码缓存 (.pyc) 以加速首次启动...")
-    app_dir = bundle_root / "app"
-    if protect.strip().lower() == "none" and app_dir.is_dir():
+    scope_desc = "app/ 与 runtime/Lib/" if (need_app and need_runtime) else ("runtime/Lib/" if need_runtime else "app/")
+    print(f"[优化] 正在并行预编译 {scope_desc} Python 字节码缓存 (.pyc) 以加速首次启动...")
+    if need_app:
         subprocess.run(
-            [str(py_exe), "-m", "compileall", "-q", "-j", "0", str(app_dir)],
+            [str(py_exe), "-m", "compileall", "-q", "-j", "0", str(bundle_root / "app")],
             env=env,
             check=True,
         )
-    lib_dir = bundle_root / "runtime" / "Lib"
-    if lib_dir.is_dir():
+    if need_runtime:
         subprocess.run(
-            [str(py_exe), "-m", "compileall", "-q", "-j", "0", str(lib_dir)],
+            [str(py_exe), "-m", "compileall", "-q", "-j", "0", str(bundle_root / "runtime" / "Lib")],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1708,11 +2187,25 @@ def precompile_bytecode(bundle_root: Path, protect: str = "none") -> None:
         )
 
 
-def create_bundle_archive(bundle_root: Path, archive_format: str) -> Path | None:
-    """按指定格式（`7z` 或 `zip`）将便携整合包目录打包为单文件压缩归档，保留顶层目录名。"""
+def _resolve_compression_preset(compression: str) -> dict[str, object]:
+    """校验并返回归档压缩档位预设（`fast` / `normal` / `max`）；非法值抛出 `ValueError`。"""
+    key = (compression or "normal").strip().lower()
+    preset = COMPRESSION_PRESETS.get(key)
+    if preset is None:
+        raise ValueError(f"不支持的压缩档位: {compression}（可选: fast / normal / max）")
+    return preset
+
+
+def create_bundle_archive(
+    bundle_root: Path,
+    archive_format: str,
+    compression: str = "normal",
+) -> Path | None:
+    """按指定格式（`7z` 或 `zip`）与压缩档位（`fast`/`normal`/`max`）打包便携目录，保留顶层目录名。"""
     fmt = archive_format.strip().lower()
     if fmt in {"", "none"}:
         return None
+    preset = _resolve_compression_preset(compression)
 
     parent_dir = bundle_root.parent
     if fmt == "7z":
@@ -1727,9 +2220,10 @@ def create_bundle_archive(bundle_root: Path, archive_format: str) -> Path | None
         archive_path = parent_dir / f"{bundle_root.name}.7z"
         if archive_path.exists():
             archive_path.unlink()
-        print(f"[归档] 正在使用 7-Zip 多线程压缩生成: {archive_path} ...")
+        seven_zip_args = tuple(str(x) for x in preset["seven_zip_args"])  # type: ignore[union-attr]
+        print(f"[归档] 正在使用 7-Zip [{preset['label']}] 生成: {archive_path} ...")
         subprocess.run(
-            [seven_zip, "a", "-t7z", "-mx=5", "-mmt=on", str(archive_path), bundle_root.name],
+            [seven_zip, "a", "-t7z", *seven_zip_args, str(archive_path), bundle_root.name],
             cwd=str(parent_dir),
             check=True,
         )
@@ -1739,9 +2233,10 @@ def create_bundle_archive(bundle_root: Path, archive_format: str) -> Path | None
         archive_path = parent_dir / f"{bundle_root.name}.zip"
         if archive_path.exists():
             archive_path.unlink()
-        print(f"[归档] 正在生成 ZIP 压缩包: {archive_path} ...")
+        zip_level = int(preset["zip_level"])  # type: ignore[arg-type]
+        print(f"[归档] 正在使用 ZIP [{preset['label']}] 生成: {archive_path} ...")
         with zipfile.ZipFile(
-            archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True
+            archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=zip_level, allowZip64=True
         ) as zf:
             for item in sorted(bundle_root.rglob("*")):
                 rel = item.relative_to(parent_dir)
@@ -1757,6 +2252,8 @@ def create_patch_archive(
     version: str,
     archive_format: str = "7z",
     output_name: str | None = None,
+    output_dir: Path | None = None,
+    compression: str = "normal",
 ) -> Path:
     """将已验证便携包中的轻量增量组件打包为可直接覆盖旧版目录的扁平热更新补丁包。
 
@@ -1771,10 +2268,12 @@ def create_patch_archive(
         fmt = "7z"
     if fmt not in {"7z", "zip"}:
         raise ValueError(f"不支持的补丁归档格式: {archive_format}（可选: 7z / zip）")
+    preset = _resolve_compression_preset(compression)
 
-    parent_dir = bundle_root.parent
+    target_dir = (output_dir.resolve() if output_dir is not None else bundle_root.parent)
+    target_dir.mkdir(parents=True, exist_ok=True)
     stem = output_name or f"YoloStudio-v{version}-win64-patch"
-    archive_path = parent_dir / f"{stem}.{fmt}"
+    archive_path = target_dir / f"{stem}.{fmt}"
     if archive_path.exists():
         archive_path.unlink()
 
@@ -1835,16 +2334,18 @@ def create_patch_archive(
                     seven_zip = str(default_7z)
             if not seven_zip:
                 raise FileNotFoundError("未找到 7z.exe，无法生成 .7z 补丁包，请改用 --archive zip。")
-            print(f"[补丁] 正在使用 7-Zip 生成轻量热更新补丁包: {archive_path} ...")
+            seven_zip_args = tuple(str(x) for x in preset["seven_zip_args"])  # type: ignore[union-attr]
+            print(f"[补丁] 正在使用 7-Zip [{preset['label']}] 生成轻量热更新补丁包: {archive_path} ...")
             subprocess.run(
-                [seven_zip, "a", "-t7z", "-mx=5", "-mmt=on", str(archive_path), "."],
+                [seven_zip, "a", "-t7z", *seven_zip_args, str(archive_path), "."],
                 cwd=str(stage_dir),
                 check=True,
             )
         else:
-            print(f"[补丁] 正在生成 ZIP 轻量热更新补丁包: {archive_path} ...")
+            zip_level = int(preset["zip_level"])  # type: ignore[arg-type]
+            print(f"[补丁] 正在使用 ZIP [{preset['label']}] 生成轻量热更新补丁包: {archive_path} ...")
             with zipfile.ZipFile(
-                archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True
+                archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=zip_level, allowZip64=True
             ) as zf:
                 for item in sorted(stage_dir.rglob("*")):
                     if item.is_file():
@@ -1853,53 +2354,8 @@ def create_patch_archive(
     return archive_path
 
 
-def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
-    """执行完整的独立便携整合包构建流水线，返回 `(便携包目录路径, 压缩包路径或None)`。"""
-    version = read_project_version(config.repo_root)
-    bundle_name = f"YoloStudio-v{version}-win64-{config.variant}"
-    bundle_root = (config.output_root / bundle_name).resolve()
-
-    if bundle_root.exists():
-        if not config.overwrite:
-            raise FileExistsError(f"输出目录已存在（未启用覆盖）: {bundle_root}")
-        print(f"[清理] 移除旧构建目录: {bundle_root}")
-        shutil.rmtree(bundle_root)
-
-    bundle_root.mkdir(parents=True, exist_ok=True)
-    runtime_dir = bundle_root / "runtime"
-
-    if config.mode == "clean":
-        prepare_clean_runtime(config, runtime_dir)
-    elif config.mode == "from-venv":
-        prepare_from_venv_runtime(config, runtime_dir)
-    else:
-        raise ValueError(f"未知构建模式: {config.mode}")
-
-    sp_dir = runtime_dir / "Lib" / "site-packages"
-    sanitized = sanitize_site_packages(sp_dir, remove_bundled_anylabeling_copy=True)
-    if sanitized:
-        print(f"[净化] 已清理 {len(sanitized)} 项本地路径/开发测试元数据。")
-
-    write_portable_pth(sp_dir)
-    bundled_dlls = bundle_msvc_runtime_dlls(runtime_dir)
-    if bundled_dlls:
-        print(f"[运行时] 补齐 MSVC 运行库 DLL: {', '.join(bundled_dlls)}")
-
-    print("[应用] 同步 YoloStudio 源码、精简版内嵌 X-AnyLabeling、文档与协议声明...")
-    copy_app_and_docs(config.repo_root, bundle_root)
-
-    staged_weights = prepare_weights_and_workspace(config, bundle_root)
-    if staged_weights:
-        print(f"[权重] 已内置模型权重: {', '.join(staged_weights)}")
-
-    apply_code_protection(config, bundle_root)
-
-    cleaned_runtime = cleanup_runtime_artifacts(runtime_dir)
-    if cleaned_runtime:
-        print(f"[清理] 已移除 runtime/ 下残留构建路径目录: {', '.join(cleaned_runtime)}")
-
-    precompile_bytecode(bundle_root, protect=config.protect)
-
+def _build_launcher_for_bundle(config: BuildConfig, bundle_root: Path, version: str) -> None:
+    """为指定便携包目录生成含单一版本元数据与可选 SHA-256 防篡改清单的原生 `YoloStudio.exe`。"""
     launcher_cs = config.repo_root / "packaging" / "launcher" / "YoloStudioLauncher.cs"
     icon_path = (
         config.repo_root
@@ -1929,6 +2385,177 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
             manifest_cs=manifest_cs,
         )
 
+
+def build_patch_only(config: BuildConfig) -> Path:
+    """极速纯补丁发版模式：零拷贝只读挂载已有 `runtime/`，仅编译 `app/` 与启动器、跑完自检并输出补丁包。
+
+    工作流与安全约束：
+        1. 通过 `find_patch_mount_runtime` 定位本地已有的健康便携 `runtime/`；
+        2. 在系统临时目录中通过 Windows 目录联接（`mklink /J`，无需管理员权限）挂载 `runtime/`，
+           全过程注入 `PYTHONDONTWRITEBYTECODE=1` 保障源 `runtime/` 严格只读零写入；
+        3. 完整执行源码保护编译（`.pyd`/`.pyc`）、SHA-256 防篡改启动器编译与隔离环境冒烟自检；
+        4. 将最终补丁包直接输出至 `config.output_root`（默认 `dist/`），并在 `finally` 中安全卸载联接点后再清理临时目录。
+    """
+    started = time.perf_counter()
+    version = read_project_version(config.repo_root)
+    _resolve_compression_preset(config.compression)
+    src_runtime, src_desc = find_patch_mount_runtime(config)
+
+    pth_file = src_runtime / "Lib" / "site-packages" / "yolo_studio_portable.pth"
+    if not pth_file.is_file():
+        raise FileNotFoundError(
+            f"挂载的源 runtime 缺少相对路径配置文件 {pth_file}，请先执行一次完整便携构建或指定有效的便携包。"
+        )
+
+    print(f"[补丁模式] 极速纯补丁发版 v{version}（{src_desc}）")
+    stage_root = Path(tempfile.mkdtemp(prefix="ys_patch_only_")).resolve()
+    runtime_mount = stage_root / "runtime"
+    prev_dont_write_bc = os.environ.get("PYTHONDONTWRITEBYTECODE")
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        _mount_runtime_junction(src_runtime, runtime_mount)
+        print("[应用] 同步 YoloStudio 源码、精简版内嵌 X-AnyLabeling、文档与协议声明...")
+        copy_app_and_docs(config.repo_root, stage_root)
+        (stage_root / "workspace").mkdir(parents=True, exist_ok=True)
+        (stage_root / "weights").mkdir(parents=True, exist_ok=True)
+
+        apply_code_protection(config, stage_root)
+        if config.protect.strip().lower() == "none":
+            precompile_bytecode(stage_root, protect="none", include_runtime=False)
+
+        _build_launcher_for_bundle(config, stage_root, version)
+        write_cli_and_quickstart_files(stage_root, version=version, variant=config.variant)
+
+        if not config.skip_smoke_test:
+            verify_portable_bundle(
+                stage_root,
+                skip_heavy_imports=config.skip_heavy_imports,
+                protect=config.protect,
+                expected_version=version,
+                read_only_runtime=True,
+            )
+
+        patch_fmt = config.archive_format if config.archive_format in {"7z", "zip"} else "7z"
+        patch_path = create_patch_archive(
+            stage_root,
+            version=version,
+            archive_format=patch_fmt,
+            output_dir=config.output_root.resolve(),
+            compression=config.compression,
+        )
+    finally:
+        if prev_dont_write_bc is None:
+            os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
+        else:
+            os.environ["PYTHONDONTWRITEBYTECODE"] = prev_dont_write_bc
+        _unmount_runtime_junction(runtime_mount)
+        if not runtime_mount.exists() and not runtime_mount.is_symlink():
+            shutil.rmtree(stage_root, ignore_errors=True)
+
+    elapsed = time.perf_counter() - started
+    patch_mb = patch_path.stat().st_size / (1024 * 1024)
+    print(f"[完成] 极速纯补丁包已生成: {patch_path} ({patch_mb:.1f} MiB，总耗时 {elapsed:.1f}s)")
+    return patch_path
+
+
+def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
+    """执行完整的独立便携整合包构建流水线，返回 `(便携包目录路径, 压缩包路径或None)`。
+
+    提速复用行为：
+        启用 `config.reuse_runtime=True` 时，按与版本号解耦的依赖指纹查找已有已预编译的 `runtime/` 底座：
+        命中同目录 `bundle_root/runtime` 时原地零拷贝保留并仅刷新应用层与启动器；
+        命中其他同变体历史目录或底座缓存时使用多线程 `robocopy /MT:16` 并行克隆（连同预编译 `.pyc` 一并复用），
+        跳过 `pip install`、OpenCV 重装、`sanitize` 与全量 `runtime/Lib/` 字节码扫描。
+    """
+    if config.patch_only:
+        patch_path = build_patch_only(config)
+        return config.output_root.resolve(), patch_path
+
+    started = time.perf_counter()
+    _resolve_compression_preset(config.compression)
+    version = read_project_version(config.repo_root)
+    bundle_name = f"YoloStudio-v{version}-win64-{config.variant}"
+    bundle_root = (config.output_root / bundle_name).resolve()
+    runtime_dir = bundle_root / "runtime"
+    runtime_fingerprint = compute_runtime_fingerprint(config)
+
+    reusable_match: tuple[Path, str] | None = None
+    if config.reuse_runtime:
+        reusable_match = find_reusable_runtime(config, bundle_root, expected_fingerprint=runtime_fingerprint)
+        if reusable_match is None:
+            print("[缓存] 未命中依赖指纹一致的已有 runtime/ 底座，将执行完整运行时构建并写入指纹印章。")
+
+    reused_runtime = False
+    if reusable_match is not None and reusable_match[0].resolve() == runtime_dir.resolve() and bundle_root.exists():
+        # 原地零拷贝复用当前目标目录下的 runtime/：清空除 runtime 与 weights 外的所有应用层文件
+        if not config.overwrite:
+            raise FileExistsError(f"输出目录已存在（未启用覆盖）: {bundle_root}")
+        print(f"[缓存] 命中 {reusable_match[1]}，原地保留 runtime/（跳过重装与全量字节码预编译）...")
+        for entry in list(bundle_root.iterdir()):
+            if entry.name.lower() in {"runtime", "weights"}:
+                continue
+            _remove_path(entry)
+        write_portable_pth(runtime_dir / "Lib" / "site-packages")
+        write_runtime_stamp(runtime_dir, runtime_fingerprint)
+        reused_runtime = True
+    else:
+        if bundle_root.exists():
+            if not config.overwrite:
+                raise FileExistsError(f"输出目录已存在（未启用覆盖）: {bundle_root}")
+            print(f"[清理] 移除旧构建目录: {bundle_root}")
+            shutil.rmtree(bundle_root)
+
+        bundle_root.mkdir(parents=True, exist_ok=True)
+        if reusable_match is not None:
+            src_rt, src_desc = reusable_match
+            print(f"[缓存] 命中 {src_desc}，正在 16 线程并行克隆已预编译 runtime/ ...")
+            _fast_copy_tree(
+                src_rt,
+                runtime_dir,
+                exclude_names_lower=frozenset(),
+                exclude_suffixes_lower=(),
+            )
+            write_portable_pth(runtime_dir / "Lib" / "site-packages")
+            cleanup_runtime_artifacts(runtime_dir)
+            write_runtime_stamp(runtime_dir, runtime_fingerprint)
+            reused_runtime = True
+        else:
+            if config.mode == "clean":
+                prepare_clean_runtime(config, runtime_dir)
+            elif config.mode == "from-venv":
+                prepare_from_venv_runtime(config, runtime_dir)
+            else:
+                raise ValueError(f"未知构建模式: {config.mode}")
+
+            sp_dir = runtime_dir / "Lib" / "site-packages"
+            sanitized = sanitize_site_packages(sp_dir, remove_bundled_anylabeling_copy=True)
+            if sanitized:
+                print(f"[净化] 已清理 {len(sanitized)} 项本地路径/开发测试元数据。")
+
+            write_portable_pth(sp_dir)
+            bundled_dlls = bundle_msvc_runtime_dlls(runtime_dir)
+            if bundled_dlls:
+                print(f"[运行时] 补齐 MSVC 运行库 DLL: {', '.join(bundled_dlls)}")
+
+    print("[应用] 同步 YoloStudio 源码、精简版内嵌 X-AnyLabeling、文档与协议声明...")
+    copy_app_and_docs(config.repo_root, bundle_root)
+
+    staged_weights = prepare_weights_and_workspace(config, bundle_root)
+    if staged_weights:
+        print(f"[权重] 已内置模型权重: {', '.join(staged_weights)}")
+
+    apply_code_protection(config, bundle_root)
+
+    if not reused_runtime:
+        cleaned_runtime = cleanup_runtime_artifacts(runtime_dir)
+        if cleaned_runtime:
+            print(f"[清理] 已移除 runtime/ 下残留构建路径目录: {', '.join(cleaned_runtime)}")
+
+    precompile_bytecode(bundle_root, protect=config.protect, include_runtime=not reused_runtime)
+    if not reused_runtime:
+        write_runtime_stamp(runtime_dir, runtime_fingerprint)
+
+    _build_launcher_for_bundle(config, bundle_root, version)
     write_cli_and_quickstart_files(bundle_root, version=version, variant=config.variant)
 
     if not config.skip_smoke_test:
@@ -1939,12 +2566,23 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
             expected_version=version,
         )
 
-    archive_path = create_bundle_archive(bundle_root, config.archive_format)
+    archive_path = create_bundle_archive(
+        bundle_root,
+        config.archive_format,
+        compression=config.compression,
+    )
     patch_path: Path | None = None
     if config.patch_archive:
         patch_fmt = config.archive_format if config.archive_format in {"7z", "zip"} else "7z"
-        patch_path = create_patch_archive(bundle_root, version=version, archive_format=patch_fmt)
-    print(f"[完成] 独立便携整合包目录已就绪: {bundle_root}")
+        patch_path = create_patch_archive(
+            bundle_root,
+            version=version,
+            archive_format=patch_fmt,
+            compression=config.compression,
+        )
+
+    elapsed = time.perf_counter() - started
+    print(f"[完成] 独立便携整合包目录已就绪: {bundle_root}（总耗时 {elapsed:.1f}s）")
     if archive_path is not None:
         size_mb = archive_path.stat().st_size / (1024 * 1024)
         print(f"[完成] 发布压缩包已生成: {archive_path} ({size_mb:.1f} MiB)")
@@ -1986,7 +2624,9 @@ def _isolated_subprocess_env(runtime_dir: Path, bundle_root: Path | None = None)
 
 
 def _remove_path(target: Path) -> None:
-    if target.is_dir() and not target.is_symlink():
+    if _is_directory_junction(target):
+        _unmount_runtime_junction(target)
+    elif target.is_dir():
         shutil.rmtree(target)
     else:
         target.unlink(missing_ok=True)
@@ -2079,9 +2719,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="构建完成后是否自动打包为单文件压缩包（默认: none，可选 7z 或 zip）。",
     )
     parser.add_argument(
+        "--compression",
+        choices=("fast", "normal", "max"),
+        default="normal",
+        help="压缩档位：fast（极速 -mx=1 -ms=off，内测提速显著）；normal（默认均衡 -mx=5）；max（高压缩率 -mx=7）。",
+    )
+    parser.add_argument(
         "--patch-archive",
         action="store_true",
-        help="构建完成后额外生成轻量热更新补丁包（仅含 YoloStudio.exe + app/ + docs/ 等，供旧版直接覆盖升级）。",
+        help="完整构建完成后额外生成轻量热更新补丁包（仅含 YoloStudio.exe + app/ + docs/ 等，供旧版直接覆盖升级）。",
+    )
+    parser.add_argument(
+        "--reuse-runtime",
+        action="store_true",
+        help="依赖指纹未变更时自动复用本地已有已预编译 runtime/ 底座（原地保留或 16 线程并行克隆），跳过重装与全量字节码编译。",
+    )
+    parser.add_argument(
+        "--patch-only",
+        action="store_true",
+        help="极速纯补丁发版模式：零拷贝只读挂载已有 runtime/，仅编译 app/ 与启动器、跑完隔离自检并直接输出轻量补丁包。",
+    )
+    parser.add_argument(
+        "--runtime-source",
+        type=Path,
+        default=None,
+        help="可选：为 --reuse-runtime 或 --patch-only 显式指定已有的便携包根目录或 runtime/ 目录。",
     )
     ver_group = parser.add_mutually_exclusive_group()
     ver_group.add_argument(
@@ -2109,7 +2771,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """命令行主入口：按需更新单一版本源、解析参数并驱动便携整合包构建与验证。"""
+    """命令行主入口：按需更新单一版本源、解析参数并驱动便携整合包构建或极速补丁发版。"""
     args = build_arg_parser().parse_args(argv)
     if args.bump:
         new_ver = bump_project_version(REPO_ROOT, args.bump)
@@ -2134,11 +2796,18 @@ def main(argv: list[str] | None = None) -> int:
         download_weights=list(args.download_weights),
         fix_opencv=bool(args.fix_opencv),
         archive_format=args.archive,
+        compression=args.compression,
         patch_archive=bool(args.patch_archive),
+        reuse_runtime=bool(args.reuse_runtime),
+        patch_only=bool(args.patch_only),
+        runtime_source=args.runtime_source,
         skip_smoke_test=bool(args.skip_smoke_test),
         skip_heavy_imports=bool(args.skip_heavy_imports),
     )
-    build_portable_bundle(config)
+    if config.patch_only:
+        build_patch_only(config)
+    else:
+        build_portable_bundle(config)
     return 0
 
 

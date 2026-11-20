@@ -587,3 +587,347 @@ def test_install_runtime_excepthook_logs_without_abort(
     assert log_file.is_file()
     content = log_file.read_text(encoding="utf-8")
     assert "ValueError: 模拟槽函数异常" in content
+
+
+def test_fast_copy_tree_filters_pycache_and_preserves_when_empty_exclusions(tmp_path: Path) -> None:
+    """验证 `_fast_copy_tree` 默认排除缓存字节码，且在底座复用空排除集合下完整保留 `.pyc`。"""
+    bp = _load_build_portable_module()
+
+    src = tmp_path / "src_tree"
+    (src / "pkg" / "__pycache__").mkdir(parents=True)
+    (src / "pkg" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+    (src / "pkg" / "stale.pyc").write_bytes(b"PYC_TOP")
+    (src / "pkg" / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"PYC_CACHE")
+
+    # 1) 默认模式：排除 __pycache__、.pyc 与 .pyo
+    dst_filtered = tmp_path / "dst_filtered"
+    bp._fast_copy_tree(src, dst_filtered)
+    assert (dst_filtered / "pkg" / "mod.py").is_file()
+    assert not (dst_filtered / "pkg" / "stale.pyc").exists()
+    assert not (dst_filtered / "pkg" / "__pycache__").exists()
+
+    # 2) 底座复用模式：空排除集合时连同预编译 .pyc 完整保留
+    dst_full = tmp_path / "dst_full"
+    bp._fast_copy_tree(src, dst_full, exclude_names_lower=frozenset(), exclude_suffixes_lower=())
+    assert (dst_full / "pkg" / "mod.py").is_file()
+    assert (dst_full / "pkg" / "stale.pyc").read_bytes() == b"PYC_TOP"
+    assert (dst_full / "pkg" / "__pycache__" / "mod.cpython-312.pyc").read_bytes() == b"PYC_CACHE"
+
+
+def test_runtime_fingerprint_ignores_version_changes_and_tracks_dependencies(tmp_path: Path) -> None:
+    """验证底座依赖指纹与项目版本号完全解耦，但对依赖、变体及 venv 三方包变化保持敏感。"""
+    bp = _load_build_portable_module()
+
+    fake_repo = tmp_path / "repo"
+    (fake_repo / "src" / "yolo_studio").mkdir(parents=True)
+    (fake_repo / "third_party" / "X-AnyLabeling").mkdir(parents=True)
+    ver_file = fake_repo / "src" / "yolo_studio" / "_version.py"
+    ver_file.write_text('__version__ = "0.3.3"\n', encoding="utf-8")
+    (fake_repo / "requirements.txt").write_text("# comment\nnumpy>=2.0.0\n", encoding="utf-8")
+    (fake_repo / "pyproject.toml").write_text(
+        '[project]\nname = "yolo-studio"\nrequires-python = ">=3.11"\ndependencies = ["numpy>=2.0.0"]\n',
+        encoding="utf-8",
+    )
+    (fake_repo / "third_party" / "X-AnyLabeling" / "pyproject.toml").write_text(
+        '[project]\nname = "x-anylabeling"\ndependencies = ["PyQt6>=6.6.0"]\n',
+        encoding="utf-8",
+    )
+
+    fake_venv = tmp_path / "venv"
+    sp = fake_venv / "Lib" / "site-packages"
+    sp.mkdir(parents=True)
+    (fake_venv / "pyvenv.cfg").write_text("home = C:\\Python312\nversion = 3.12.2\n", encoding="utf-8")
+    (sp / "numpy-2.1.0.dist-info").mkdir()
+    (sp / "numpy-2.1.0.dist-info" / "METADATA").write_text("Name: numpy\nVersion: 2.1.0\n", encoding="utf-8")
+    (sp / "yolo_studio-0.3.3.dist-info").mkdir()
+    (sp / "pytest-9.0.0.dist-info").mkdir()
+
+    cfg = bp.BuildConfig(repo_root=fake_repo, mode="from-venv", variant="gpu", venv_dir=fake_venv)
+    fp_base = bp.compute_runtime_fingerprint(cfg)
+
+    # 1) 仅修改版本号、自身 editable dist-info 或开发测试包 pytest，指纹应保持完全不变
+    ver_file.write_text('__version__ = "0.3.4"\n', encoding="utf-8")
+    (sp / "yolo_studio-0.3.3.dist-info").rename(sp / "yolo_studio-0.3.4.dist-info")
+    (sp / "pytest-9.0.0.dist-info").rename(sp / "pytest-9.1.0.dist-info")
+    assert bp.compute_runtime_fingerprint(cfg)["digest"] == fp_base["digest"]
+
+    # 2) 变更硬件变体（gpu -> cpu），指纹必须变化
+    cfg_cpu = bp.BuildConfig(repo_root=fake_repo, mode="from-venv", variant="cpu", venv_dir=fake_venv)
+    assert bp.compute_runtime_fingerprint(cfg_cpu)["digest"] != fp_base["digest"]
+
+    # 3) 变更 requirements.txt 实质依赖，指纹必须变化
+    (fake_repo / "requirements.txt").write_text("numpy>=2.1.0\nPillow>=10.0.0\n", encoding="utf-8")
+    fp_after_req = bp.compute_runtime_fingerprint(cfg)
+    assert fp_after_req["digest"] != fp_base["digest"]
+
+    # 4) 升级 venv 中真实运行时第三方包版本，指纹必须变化
+    (sp / "numpy-2.1.0.dist-info" / "METADATA").write_text("Name: numpy\nVersion: 2.2.0\n", encoding="utf-8")
+    assert bp.compute_runtime_fingerprint(cfg)["digest"] != fp_after_req["digest"]
+
+
+def test_find_reusable_runtime_priority_and_validation(tmp_path: Path) -> None:
+    """验证 `find_reusable_runtime` 的优先级（原地 > 缓存 > 历史构建）与无效目录拒绝规则。"""
+    bp = _load_build_portable_module()
+
+    def _make_runtime(rt_dir: Path, stamp: dict[str, object] | None, *, with_scripts: bool = False) -> None:
+        (rt_dir / "Lib" / "site-packages").mkdir(parents=True, exist_ok=True)
+        (rt_dir / "python.exe").write_bytes(b"MZ")
+        if with_scripts:
+            (rt_dir / "Scripts").mkdir(exist_ok=True)
+        if stamp is not None:
+            bp.write_runtime_stamp(rt_dir, stamp)
+
+    out_root = tmp_path / "dist"
+    cache_dir = tmp_path / "cache"
+    cfg = bp.BuildConfig(
+        repo_root=REPO_ROOT,
+        mode="clean",
+        variant="cpu",
+        output_root=out_root,
+        cache_dir=cache_dir,
+    )
+    fp = bp.compute_runtime_fingerprint(cfg)
+    stale_fp = {"schema_version": 1, "digest": "0" * 64, "details": {}}
+    target_bundle = out_root / "YoloStudio-v0.3.4-win64-cpu"
+
+    # 仅存在指纹过期与含残留 Scripts 的历史目录时应返回 None
+    _make_runtime(out_root / "YoloStudio-v0.3.1-win64-cpu" / "runtime", stale_fp)
+    _make_runtime(out_root / "YoloStudio-v0.3.2-win64-cpu" / "runtime", fp, with_scripts=True)
+    assert bp.find_reusable_runtime(cfg, target_bundle, expected_fingerprint=fp) is None
+
+    # 存在合法同变体历史目录时命中历史目录
+    hist_rt = out_root / "YoloStudio-v0.3.3-win64-cpu" / "runtime"
+    _make_runtime(hist_rt, fp)
+    found = bp.find_reusable_runtime(cfg, target_bundle, expected_fingerprint=fp)
+    assert found is not None and found[0] == hist_rt.resolve()
+
+    # 存在底座缓存时优先级高于历史目录
+    cache_rt = cache_dir / "runtimes" / "win64-cpu-clean"
+    _make_runtime(cache_rt, fp)
+    found_cache = bp.find_reusable_runtime(cfg, target_bundle, expected_fingerprint=fp)
+    assert found_cache is not None and found_cache[0] == cache_rt.resolve()
+
+    # 目标输出目录自身已含合法底座时优先级最高（原地零拷贝复用）
+    inplace_rt = target_bundle / "runtime"
+    _make_runtime(inplace_rt, fp)
+    found_inplace = bp.find_reusable_runtime(cfg, target_bundle, expected_fingerprint=fp)
+    assert found_inplace is not None and found_inplace[0] == inplace_rt.resolve()
+
+
+def test_compression_presets_and_arg_parser(tmp_path: Path) -> None:
+    """验证 `fast`/`normal`/`max` 压缩档位校验、ZIP 归档输出与新 CLI 参数解析。"""
+    import zipfile
+
+    bp = _load_build_portable_module()
+
+    bundle = tmp_path / "YoloStudio-v0.3.3-win64-cpu"
+    (bundle / "app").mkdir(parents=True)
+    (bundle / "app" / "hello.txt").write_text("hello yolo studio\n" * 100, encoding="utf-8")
+
+    for level in ("fast", "normal", "max"):
+        archive = bp.create_bundle_archive(bundle, "zip", compression=level)
+        assert archive is not None and archive.is_file()
+        with zipfile.ZipFile(archive, "r") as zf:
+            assert "YoloStudio-v0.3.3-win64-cpu/app/hello.txt" in zf.namelist()
+
+    with pytest.raises(ValueError, match="不支持的压缩档位"):
+        bp.create_bundle_archive(bundle, "zip", compression="ultra")
+
+    parsed = bp.build_arg_parser().parse_args(
+        [
+            "--variant",
+            "cpu",
+            "--compression",
+            "fast",
+            "--reuse-runtime",
+            "--patch-only",
+            "--runtime-source",
+            str(tmp_path),
+        ]
+    )
+    assert parsed.compression == "fast"
+    assert parsed.reuse_runtime is True
+    assert parsed.patch_only is True
+    assert parsed.runtime_source == tmp_path
+
+
+def _create_minimal_fake_repo(repo_dir: Path, version: str = "0.3.9") -> Path:
+    """在临时目录中构造可供完整打包/补丁打包离线单测使用的精简模拟仓库。"""
+    import shutil
+
+    (repo_dir / "src" / "yolo_studio").mkdir(parents=True)
+    (repo_dir / "src" / "yolo_studio" / "_version.py").write_text(
+        f'__version__ = "{version}"\n', encoding="utf-8"
+    )
+    (repo_dir / "src" / "yolo_studio" / "__init__.py").write_text(
+        "from yolo_studio._version import __version__\n", encoding="utf-8"
+    )
+    (repo_dir / "main.py").write_text("print('main')\n", encoding="utf-8")
+    (repo_dir / "cli.py").write_text("print('cli')\n", encoding="utf-8")
+    (repo_dir / "pyproject.toml").write_text(
+        '[project]\nname = "yolo-studio"\ndependencies = ["numpy>=2.0.0"]\n', encoding="utf-8"
+    )
+    (repo_dir / "requirements.txt").write_text("numpy>=2.0.0\n", encoding="utf-8")
+    (repo_dir / "LICENSE").write_text("GPL-3.0-only\n", encoding="utf-8")
+    (repo_dir / "THIRD_PARTY_NOTICES.md").write_text("# Notices\n", encoding="utf-8")
+    (repo_dir / "docs").mkdir(parents=True)
+    (repo_dir / "docs" / "001.md").write_text("# Doc\n", encoding="utf-8")
+    (repo_dir / "third_party" / "X-AnyLabeling" / "anylabeling").mkdir(parents=True)
+    (repo_dir / "third_party" / "X-AnyLabeling" / "anylabeling" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    (repo_dir / "third_party" / "X-AnyLabeling" / "pyproject.toml").write_text(
+        '[project]\nname = "x-anylabeling"\ndependencies = []\n', encoding="utf-8"
+    )
+    launcher_dst = repo_dir / "packaging" / "launcher"
+    launcher_dst.mkdir(parents=True)
+    shutil.copy2(
+        REPO_ROOT / "packaging" / "launcher" / "YoloStudioLauncher.cs",
+        launcher_dst / "YoloStudioLauncher.cs",
+    )
+    return repo_dir
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅在 Windows 上测试目录联接挂载与原生启动器补丁构建")
+def test_build_patch_only_mounts_junction_readonly_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 `build_patch_only` 通过目录联接只读挂载 `runtime/`、对源目录零写入并正确输出补丁包。"""
+    import zipfile
+
+    bp = _load_build_portable_module()
+
+    fake_repo = _create_minimal_fake_repo(tmp_path / "fake_repo", version="0.3.9")
+    out_root = tmp_path / "dist"
+    existing_rt = out_root / "YoloStudio-v0.3.8-win64-cpu" / "runtime"
+    sp = existing_rt / "Lib" / "site-packages"
+    sp.mkdir(parents=True)
+    (existing_rt / "python.exe").write_bytes(b"MZ")
+    (sp / "heavy_pkg.bin").write_bytes(b"DO_NOT_INCLUDE_IN_PATCH")
+    bp.write_portable_pth(sp)
+
+    before_snapshot = {
+        p.relative_to(existing_rt).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
+        for p in sorted(existing_rt.rglob("*"))
+        if p.is_file()
+    }
+
+    observed_mounts: list[tuple[Path, bool]] = []
+
+    def _capture_precompile(bundle_root: Path, protect: str = "none", include_runtime: bool = True) -> None:
+        # 验证补丁模式确实是通过目录联接挂载 runtime 且不扫描 runtime/Lib
+        assert include_runtime is False
+        rt_mount = bundle_root / "runtime"
+        observed_mounts.append((bundle_root, bp._is_directory_junction(rt_mount)))
+
+    monkeypatch.setattr(bp, "precompile_bytecode", _capture_precompile)
+
+    cfg = bp.BuildConfig(
+        repo_root=fake_repo,
+        mode="clean",
+        variant="cpu",
+        protect="none",
+        output_root=out_root,
+        archive_format="zip",
+        compression="fast",
+        patch_only=True,
+        skip_smoke_test=True,
+    )
+    patch_zip = bp.build_patch_only(cfg)
+
+    assert len(observed_mounts) == 1
+    stage_dir_used, was_junction = observed_mounts[0]
+    assert was_junction is True
+    # 验证临时工作区与目录联接均已安全卸载并清理
+    assert not stage_dir_used.exists()
+
+    assert patch_zip == (out_root / "YoloStudio-v0.3.9-win64-patch.zip").resolve()
+    assert patch_zip.is_file()
+    # 确认没有额外构建完整目录
+    assert not (out_root / "YoloStudio-v0.3.9-win64-cpu").exists()
+
+    # 确认源 runtime 严格只读零变动
+    after_snapshot = {
+        p.relative_to(existing_rt).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
+        for p in sorted(existing_rt.rglob("*"))
+        if p.is_file()
+    }
+    assert after_snapshot == before_snapshot
+
+    with zipfile.ZipFile(patch_zip, "r") as zf:
+        names = set(zf.namelist())
+        assert "YoloStudio.exe" in names
+        assert "YoloStudio-CLI.cmd" in names
+        assert "app/main.py" in names
+        assert "runtime/Lib/site-packages/yolo_studio_portable.pth" in names
+        assert "升级说明_覆盖解压到旧版根目录即可.txt" in names
+        assert not any("heavy_pkg.bin" in n for n in names)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅在 Windows 上测试带启动器编译的底座复用构建流水线")
+def test_reuse_runtime_cross_dir_and_inplace_skips_reinstall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 `--reuse-runtime` 在跨版本克隆与同版本原地重建时均跳过重装与全量字节码编译，且不留旧应用脏文件。"""
+    bp = _load_build_portable_module()
+
+    fake_repo = _create_minimal_fake_repo(tmp_path / "fake_repo", version="0.3.9")
+    out_root = tmp_path / "dist"
+    cache_dir = tmp_path / "cache"
+
+    cfg = bp.BuildConfig(
+        repo_root=fake_repo,
+        mode="clean",
+        variant="cpu",
+        protect="none",
+        output_root=out_root,
+        cache_dir=cache_dir,
+        reuse_runtime=True,
+        skip_smoke_test=True,
+    )
+    fp = bp.compute_runtime_fingerprint(cfg)
+
+    # 构造上一个版本的带印章且已预编译 .pyc 的历史底座
+    old_rt = out_root / "YoloStudio-v0.3.8-win64-cpu" / "runtime"
+    (old_rt / "Lib" / "site-packages" / "__pycache__").mkdir(parents=True)
+    (old_rt / "python.exe").write_bytes(b"MZ")
+    (old_rt / "Lib" / "site-packages" / "__pycache__" / "precompiled.cpython-312.pyc").write_bytes(b"PYC")
+    bp.write_portable_pth(old_rt / "Lib" / "site-packages")
+    bp.write_runtime_stamp(old_rt, fp)
+
+    def _forbid_prepare(*args: object, **kwargs: object) -> None:
+        raise AssertionError("命中可复用底座时不应重新执行运行时安装")
+
+    precompile_calls: list[tuple[str, bool]] = []
+
+    def _record_precompile(bundle_root: Path, protect: str = "none", include_runtime: bool = True) -> None:
+        precompile_calls.append((protect, include_runtime))
+
+    monkeypatch.setattr(bp, "prepare_clean_runtime", _forbid_prepare)
+    monkeypatch.setattr(bp, "prepare_from_venv_runtime", _forbid_prepare)
+    monkeypatch.setattr(bp, "precompile_bytecode", _record_precompile)
+
+    # 1) 跨版本复用（v0.3.8 -> v0.3.9）
+    bundle_dir, archive = bp.build_portable_bundle(cfg)
+    assert archive is None
+    assert bundle_dir == (out_root / "YoloStudio-v0.3.9-win64-cpu").resolve()
+    assert (bundle_dir / "YoloStudio.exe").is_file()
+    assert (
+        bundle_dir / "runtime" / "Lib" / "site-packages" / "__pycache__" / "precompiled.cpython-312.pyc"
+    ).read_bytes() == b"PYC"
+    assert bp.read_runtime_stamp(bundle_dir / "runtime")["digest"] == fp["digest"]
+    assert precompile_calls == [("none", False)]
+
+    # 2) 原地复用（重复构建 v0.3.9）：应保留 runtime 与 weights，清除 app 下陈旧残留文件
+    stale_app_file = bundle_dir / "app" / "stale_old_module.py"
+    stale_app_file.write_text("# stale\n", encoding="utf-8")
+    keep_weight = bundle_dir / "weights" / "custom.pt"
+    keep_weight.write_bytes(b"WEIGHT_KEEP")
+    sentinel_rt = bundle_dir / "runtime" / "inplace_sentinel.txt"
+    sentinel_rt.write_text("alive", encoding="utf-8")
+
+    bp.build_portable_bundle(cfg)
+    assert sentinel_rt.is_file()
+    assert keep_weight.read_bytes() == b"WEIGHT_KEEP"
+    assert not stale_app_file.exists()
+    assert precompile_calls == [("none", False), ("none", False)]

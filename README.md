@@ -42,10 +42,13 @@
 针对未安装 Python 或 CUDA Toolkit 的目标 Windows x64 电脑，可执行以下命令构建免安装绿色便携整合包（含无黑框原生启动器 `YoloStudio.exe` 与 `YoloStudio-CLI.cmd`）：
 
 ```powershell
-# 默认开启 --protect pyd（Cython 编译自研核心为原生 .pyd + 启动器内置 SHA-256 防篡改校验，适合团队内部防查看防篡改）
-.\scripts\build_portable.ps1 --archive 7z
+# 日常代码迭代极速发版（约 55 秒）：仅编译核心 .pyd + 启动器并输出 ~5.6 MiB 热更新补丁包
+.\scripts\build_portable.ps1 --bump patch --patch-only --variant cpu --protect pyd --archive 7z
 
-# 或从纯净独立 Python 3.12 全新安装构建（支持 --variant gpu / cpu；对外按 GPLv3 开源分发请附加 --protect none）
+# 依赖未变更时复用已预编译 runtime/ 底座快速产出完整包（配合 --compression fast 提速归档）
+.\scripts\build_portable.ps1 --mode clean --variant gpu --protect pyd --reuse-runtime --download-weights yolo26n.pt yolo26s.pt --archive 7z --compression fast --patch-archive
+
+# 首次全新构建完整包（默认开启 --protect pyd 防查看防篡改；对外按 GPLv3 开源分发请附加 --protect none）
 .\scripts\build_portable.ps1 --mode clean --variant gpu --protect pyd --download-weights yolo26n.pt yolo26s.pt --archive 7z
 ```
 
