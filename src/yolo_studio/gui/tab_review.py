@@ -20,7 +20,7 @@ import os
 from collections import OrderedDict
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, pyqtSignal as Signal
+from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QColor, QFont, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
 )
 
 from yolo_studio.core.mllm_reviewer import (
+    BOX_REFINE_MODE_HINTS,
     BOX_REFINE_MODE_ITEMS,
     BUCKET_AUTO_PASSED,
     BUCKET_LLM_FIXED,
@@ -63,6 +64,8 @@ from yolo_studio.core.mllm_reviewer import (
     MllmReviewConfig,
     MllmReviewResult,
     ReviewSourceMode,
+    count_review_images,
+    format_record_detail_summary,
     load_review_report,
     render_review_comparison,
 )
@@ -159,10 +162,15 @@ class MllmReviewTab(QWidget):
         self._records: list[ImageReviewRecord] = []
         self._preview_cache: OrderedDict[int, bytes] = OrderedDict()
         self._active_filter: str = "all"
+        self._selected_row: int = -1
         self._restoring_state: bool = False
         self._settings_dirty: bool = False
         self._last_output_dir: Path = workspace_root / "data" / "reviewed_frames"
         self._last_classes_txt: str = ""
+        self._count_timer = QTimer(self)
+        self._count_timer.setSingleShot(True)
+        self._count_timer.setInterval(150)
+        self._count_timer.timeout.connect(self._refresh_images_count)
         self._init_ui()
 
     def apply_device_info(self, info: DeviceInfo) -> None:
@@ -171,9 +179,10 @@ class MllmReviewTab(QWidget):
         self.yolo_device_ctrl.apply_device_info(info)
 
     def set_images_dir(self, path_str: str) -> None:
-        """跨页写入：同步待纠错图片目录输入框。"""
+        """跨页写入：同步待纠错图片目录输入框并立即刷新图片计数。"""
         if path_str:
             self.images_picker.setText(path_str)
+            self._refresh_images_count()
 
     def set_weights_path(self, path_str: str) -> None:
         """跨页写入：将新训练的 `best.pt` 路径更新至基准模型输入框。"""
@@ -202,6 +211,7 @@ class MllmReviewTab(QWidget):
         s_form.setContentsMargins(10, 6, 10, 8)
         s_form.setHorizontalSpacing(8)
         s_form.setVerticalSpacing(4)
+        self._src_form = s_form
 
         self.source_mode_combo = QComboBox()
         self.source_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -216,12 +226,19 @@ class MllmReviewTab(QWidget):
         s_form.addRow("工作模式:", self.source_mode_combo)
 
         default_frames = str((self.workspace_root / "data" / "raw_frames").resolve())
+        img_dir_box = QVBoxLayout()
+        img_dir_box.setContentsMargins(0, 0, 0, 0)
+        img_dir_box.setSpacing(3)
         self.images_picker = PathPickerRow(
             placeholder="待自动标注或复核的图片目录",
             mode="dir",
             default_path=default_frames,
         )
-        s_form.addRow("图片目录:", self.images_picker)
+        self.images_count_label = QLabel()
+        self.images_count_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        img_dir_box.addWidget(self.images_picker)
+        img_dir_box.addWidget(self.images_count_label)
+        s_form.addRow("图片目录:", img_dir_box)
 
         self.weights_picker = PathPickerRow(
             placeholder="选择基准模型 best.pt 权重（先手动标一批训练得出）",
@@ -230,7 +247,10 @@ class MllmReviewTab(QWidget):
         )
         s_form.addRow("基准模型 (.pt):", self.weights_picker)
 
-        yolo_row = QHBoxLayout()
+        self.yolo_params_widget = QWidget()
+        yolo_row = QHBoxLayout(self.yolo_params_widget)
+        yolo_row.setContentsMargins(0, 0, 0, 0)
+        yolo_row.setSpacing(6)
         self.yolo_conf_spin = QDoubleSpinBox()
         self.yolo_conf_spin.setRange(0.01, 0.95)
         self.yolo_conf_spin.setSingleStep(0.02)
@@ -258,7 +278,7 @@ class MllmReviewTab(QWidget):
         yolo_row.addWidget(QLabel("ImgSz:"))
         yolo_row.addWidget(self.yolo_imgsz_spin)
         yolo_row.addWidget(self.yolo_device_ctrl)
-        s_form.addRow("基准推理参数:", yolo_row)
+        s_form.addRow("基准推理参数:", self.yolo_params_widget)
 
         self.ann_picker = PathPickerRow(
             placeholder="可选：已有 .json 目录（留空则同图片目录）",
@@ -281,6 +301,7 @@ class MllmReviewTab(QWidget):
         l_form.setContentsMargins(10, 6, 10, 8)
         l_form.setHorizontalSpacing(8)
         l_form.setVerticalSpacing(4)
+        self._llm_form = l_form
 
         self.provider_combo = QComboBox()
         self.provider_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -307,7 +328,7 @@ class MllmReviewTab(QWidget):
 
         key_box = QVBoxLayout()
         key_box.setContentsMargins(0, 0, 0, 0)
-        key_box.setSpacing(3)
+        key_box.setSpacing(4)
         key_row = QHBoxLayout()
         key_row.setSpacing(6)
         self.api_key_edit = QLineEdit()
@@ -326,7 +347,7 @@ class MllmReviewTab(QWidget):
         key_row.addWidget(self.show_key_chk)
         key_row.addWidget(self.test_conn_btn)
         self.api_key_status_label = QLabel()
-        self.api_key_status_label.setStyleSheet("color: #57606a; font-size: 11px;")
+        self.api_key_status_label.setStyleSheet("color: #57606a; font-size: 12px;")
         key_box.addLayout(key_row)
         key_box.addWidget(self.api_key_status_label)
         l_form.addRow("API Key:", key_box)
@@ -338,6 +359,7 @@ class MllmReviewTab(QWidget):
         p_form.setContentsMargins(10, 6, 10, 8)
         p_form.setHorizontalSpacing(8)
         p_form.setVerticalSpacing(4)
+        self._pol_form = p_form
 
         cls_row = QHBoxLayout()
         cls_row.setSpacing(6)
@@ -354,6 +376,9 @@ class MllmReviewTab(QWidget):
         self.guideline_edit.setPlaceholderText("可选标注规则，如：远景模糊人影不标；框需紧贴主体不含特效背景")
         p_form.addRow("辅助判定规则:", self.guideline_edit)
 
+        refine_box = QVBoxLayout()
+        refine_box.setContentsMargins(0, 0, 0, 0)
+        refine_box.setSpacing(3)
         self.refine_mode_combo = QComboBox()
         self.refine_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.refine_mode_combo.setMinimumContentsLength(12)
@@ -362,9 +387,14 @@ class MllmReviewTab(QWidget):
         self.refine_mode_combo.setToolTip(
             "解决预训练模型框画偏大、包进多余背景的问题：可仅标记过松框转人工、由 MLLM 在局部放大图精修，或调用本地 SAM 像素级收紧"
         )
-        p_form.addRow("边框紧贴修正:", self.refine_mode_combo)
+        self.refine_hint_label = QLabel()
+        self.refine_hint_label.setWordWrap(True)
+        self.refine_hint_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        refine_box.addWidget(self.refine_mode_combo)
+        refine_box.addWidget(self.refine_hint_label)
+        p_form.addRow("边框紧贴修正:", refine_box)
 
-        # SAM 参数行：仅在选中 `SAM_LOCAL` 时展示，其余模式隐藏保持界面清爽
+        # SAM 参数行：仅在选中 `SAM_LOCAL` 时展示，其余模式通过 setRowVisible 折叠保持界面清爽
         self.sam_row_widget = QWidget()
         sam_row = QHBoxLayout(self.sam_row_widget)
         sam_row.setContentsMargins(0, 0, 0, 0)
@@ -389,24 +419,45 @@ class MllmReviewTab(QWidget):
         self._sam_row_label = p_form.labelForField(self.sam_row_widget)
 
         triage_row = QHBoxLayout()
-        triage_row.setSpacing(8)
-        self.high_conf_label = QLabel("高置信度免审阈值:")
+        triage_row.setSpacing(6)
+        self.high_conf_label = QLabel("免审阈值 ≥")
         self.high_conf_spin = QDoubleSpinBox()
         self.high_conf_spin.setRange(0.10, 1.00)
         self.high_conf_spin.setSingleStep(0.05)
         self.high_conf_spin.setValue(0.85)
-        self.high_conf_spin.setFixedWidth(78)
+        # 留足 Win11 原生并排上下箭头的宽度，防止两位小数被截断
+        self.high_conf_spin.setMinimumWidth(104)
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(1, 16)
         self.workers_spin.setValue(2)
-        self.workers_spin.setFixedWidth(68)
+        self.workers_spin.setMinimumWidth(84)
+        self.max_images_spin = QSpinBox()
+        self.max_images_spin.setRange(0, 100000)
+        self.max_images_spin.setValue(0)
+        self.max_images_spin.setSpecialValueText("全部")
+        self.max_images_spin.setSuffix(" 张")
+        self.max_images_spin.setMinimumWidth(104)
+        self.max_images_spin.setToolTip(
+            "0（显示为“全部”）表示处理目录中所有图片；可设为 5 等小数值先小批量试跑验证规则与收框效果，避免误耗 API 额度"
+        )
+        self.trial_5_btn = QPushButton("试跑 5 张")
+        self.trial_5_btn.setCheckable(True)
+        self.trial_5_btn.setStyleSheet(
+            "QPushButton { padding: 3px 8px; font-size: 12px; }"
+            "QPushButton:checked { background-color: #0969da; color: #ffffff; border-color: #085ec4; font-weight: 600; }"
+        )
+        self.trial_5_btn.setToolTip("一键切换仅审核前 5 张图用于快速试跑，再次点击恢复处理全部图片")
         triage_row.addWidget(self.high_conf_label)
         triage_row.addWidget(self.high_conf_spin)
-        triage_row.addSpacing(8)
-        triage_row.addWidget(QLabel("并发数:"))
+        triage_row.addSpacing(4)
+        triage_row.addWidget(QLabel("并发:"))
         triage_row.addWidget(self.workers_spin)
+        triage_row.addSpacing(4)
+        triage_row.addWidget(QLabel("上限:"))
+        triage_row.addWidget(self.max_images_spin)
+        triage_row.addWidget(self.trial_5_btn)
         triage_row.addStretch(1)
-        p_form.addRow("效率与并发:", triage_row)
+        p_form.addRow("效率与试跑:", triage_row)
 
         opts_widget = QWidget()
         opts_grid = QGridLayout(opts_widget)
@@ -506,11 +557,15 @@ class MllmReviewTab(QWidget):
         self.result_table.setHorizontalHeaderLabels(
             ["图片", "分流结果", "保留", "改类", "删误检", "收框", "补漏", "说明"]
         )
-        self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header = self.result_table.horizontalHeader()
+        header.setMinimumSectionSize(44)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.result_table.setColumnWidth(0, 155)
+        self.result_table.setColumnWidth(1, 88)
         for num_col in (2, 3, 4, 5, 6):
-            self.result_table.horizontalHeader().setSectionResizeMode(num_col, QHeaderView.ResizeMode.ResizeToContents)
-        self.result_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(num_col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.result_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.result_table.currentCellChanged.connect(self._on_row_selected)
@@ -518,13 +573,40 @@ class MllmReviewTab(QWidget):
         table_layout.addWidget(self.result_table)
         splitter.addWidget(table_group)
 
-        preview_group = QGroupBox("5. 纠错前后对比预览（After 侧虚线为收框前原位置）")
+        preview_group = QGroupBox("5. 纠错前后对比预览")
         preview_layout = QVBoxLayout(preview_group)
         preview_layout.setContentsMargins(6, 6, 6, 6)
-        self.preview_label = _ScaledPreviewLabel(
-            "单击表格行对比「纠错前 vs 纠错后」标注框；双击行可在「2. 标注工作台」定位该图精修"
+        preview_layout.setSpacing(4)
+        self.legend_label = QLabel(
+            "框色图例："
+            '<span style="color:#16a34a; font-weight:600;">■</span> 保留&nbsp;&nbsp;'
+            '<span style="color:#ea580c; font-weight:600;">■</span> 改类&nbsp;&nbsp;'
+            '<span style="color:#ca8a04; font-weight:600;">■</span> 补漏&nbsp;&nbsp;'
+            '<span style="color:#0284c7; font-weight:600;">■</span> 已收框(虚线为原框)&nbsp;&nbsp;'
+            '<span style="color:#c026d3; font-weight:600;">■</span> 过松/超门禁待修'
         )
-        preview_layout.addWidget(self.preview_label)
+        self.legend_label.setTextFormat(Qt.TextFormat.RichText)
+        self.legend_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        preview_layout.addWidget(self.legend_label)
+
+        self.preview_label = _ScaledPreviewLabel(
+            "单击表格行对比「纠错前 vs 纠错后」标注框；双击行或点右下按钮可在「2. 标注工作台」精修"
+        )
+        preview_layout.addWidget(self.preview_label, 1)
+
+        detail_row = QHBoxLayout()
+        detail_row.setContentsMargins(0, 2, 0, 0)
+        detail_row.setSpacing(8)
+        self.detail_label = QLabel("未选中图片：单击上方结果行可查看 MLLM 逐框判定理由与收框明细。")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setStyleSheet("color: #424a53; font-size: 12px;")
+        self.open_selected_btn = QPushButton("在工作台精修此图 →")
+        self.open_selected_btn.setStyleSheet("padding: 4px 10px; font-size: 12px;")
+        self.open_selected_btn.setEnabled(False)
+        self.open_selected_btn.setToolTip("跳转到「2. 标注工作台」并精确打开当前选中的图片微调标注框")
+        detail_row.addWidget(self.detail_label, 1)
+        detail_row.addWidget(self.open_selected_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        preview_layout.addLayout(detail_row)
         splitter.addWidget(preview_group)
 
         log_group = QGroupBox("6. 审核日志")
@@ -537,17 +619,22 @@ class MllmReviewTab(QWidget):
         log_layout.addWidget(self.log_box)
         splitter.addWidget(log_group)
 
-        splitter.setSizes([230, 290, 120])
+        splitter.setSizes([215, 315, 110])
         right.addWidget(splitter, 1)
 
         root.addLayout(left, 5)
         root.addLayout(right, 4)
 
         # 信号与槽连接
+        self.images_picker.line_edit.textChanged.connect(self._schedule_images_count)
+        self.recursive_chk.toggled.connect(self._schedule_images_count)
+        self.max_images_spin.valueChanged.connect(self._on_max_images_changed)
+        self.trial_5_btn.toggled.connect(self._on_trial_5_toggled)
         self.test_conn_btn.clicked.connect(self._on_test_connection)
         self.import_classes_btn.clicked.connect(self._on_import_classes_file)
         self.pick_sam_btn.clicked.connect(self._on_pick_sam_pt)
         self.load_report_btn.clicked.connect(self._on_load_report_dialog)
+        self.open_selected_btn.clicked.connect(self._on_open_selected_in_xal)
         self.api_key_edit.textChanged.connect(self._refresh_api_key_status)
         self.base_url_edit.textChanged.connect(self._refresh_api_key_status)
         self.refine_mode_combo.currentIndexChanged.connect(self._sync_strategy_states)
@@ -565,6 +652,7 @@ class MllmReviewTab(QWidget):
         self._on_provider_changed()
         self._sync_strategy_states()
         self._refresh_api_key_status()
+        self._refresh_images_count()
 
     def _bind_settings_dirty_watchers(self) -> None:
         """监听配置改动置位持久化脏标记，避免空打开/关闭窗口或测试覆写用户偏好。"""
@@ -584,6 +672,7 @@ class MllmReviewTab(QWidget):
             self.yolo_imgsz_spin,
             self.high_conf_spin,
             self.workers_spin,
+            self.max_images_spin,
         ):
             spin.valueChanged.connect(self._mark_settings_dirty)
         for chk in (
@@ -600,7 +689,52 @@ class MllmReviewTab(QWidget):
         if not self._restoring_state:
             self._settings_dirty = True
 
+    def _schedule_images_count(self, *_args: object) -> None:
+        """目录或递归勾选变更时防抖刷新待审核图片计数，避免连续输入路径时频繁扫盘。"""
+        self._count_timer.start()
+
+    def _refresh_images_count(self) -> None:
+        """立即统计并展示当前待纠错图片目录中的受支持图片数及试跑上限提示。"""
+        raw_dir = self.images_picker.text()
+        if not raw_dir:
+            self.images_count_label.setStyleSheet("color: #9a6700; font-size: 12px;")
+            self.images_count_label.setText("请选择待纠错图片目录")
+            return
+        img_dir = Path(raw_dir)
+        if not img_dir.is_dir():
+            self.images_count_label.setStyleSheet("color: #9a6700; font-size: 12px;")
+            self.images_count_label.setText("当前目录不存在，请重新选择或先完成抽帧")
+            return
+        total = count_review_images(img_dir, recursive=self.recursive_chk.isChecked())
+        limit = self.max_images_spin.value()
+        scope = "（含子目录）" if self.recursive_chk.isChecked() else ""
+        if total == 0:
+            self.images_count_label.setStyleSheet("color: #9a6700; font-size: 12px;")
+            self.images_count_label.setText(f"当前目录{scope}暂未检测到图片")
+            return
+        self.images_count_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
+        if limit > 0 and total > limit:
+            self.images_count_label.setText(
+                f"目录{scope}共检测到 {total} 张图片（已设试跑上限：本次仅审核前 {limit} 张）"
+            )
+        else:
+            self.images_count_label.setText(f"目录{scope}共检测到 {total} 张图片")
+
+    def _on_trial_5_toggled(self, checked: bool) -> None:
+        """一键在“仅试跑前 5 张”与“处理全部图片”之间切换。"""
+        target = 5 if checked else 0
+        if self.max_images_spin.value() != target:
+            self.max_images_spin.setValue(target)
+
+    def _on_max_images_changed(self, value: int) -> None:
+        """上限数值变化时同步快捷按钮勾选状态与目录计数提示。"""
+        self.trial_5_btn.blockSignals(True)
+        self.trial_5_btn.setChecked(value == 5)
+        self.trial_5_btn.blockSignals(False)
+        self._refresh_images_count()
+
     def _on_source_mode_changed(self) -> None:
+        """按候选框来源模式启用/禁用并动态折叠无关表单行，减少无效置灰项干扰。"""
         is_yolo = self.source_mode_combo.currentData() == ReviewSourceMode.YOLO_PREDICT
         self.weights_picker.setEnabled(is_yolo)
         self.yolo_conf_spin.setEnabled(is_yolo)
@@ -608,12 +742,17 @@ class MllmReviewTab(QWidget):
         self.yolo_imgsz_spin.setEnabled(is_yolo)
         self.yolo_device_ctrl.setEnabled(is_yolo)
         self.ann_picker.setEnabled(not is_yolo)
+        self._src_form.setRowVisible(self.weights_picker, is_yolo)
+        self._src_form.setRowVisible(self.yolo_params_widget, is_yolo)
+        self._src_form.setRowVisible(self.ann_picker, not is_yolo)
 
     def _on_provider_changed(self) -> None:
+        """切换 Gemini 与 OpenAI 兼容接口时更新常用预设并按需折叠 Base URL 行。"""
         provider = self.provider_combo.currentData()
+        is_gemini = provider == MllmProvider.GEMINI
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
-        if provider == MllmProvider.GEMINI:
+        if is_gemini:
             for model_id, label in GEMINI_MODELS:
                 self.preset_combo.addItem(label, (model_id, ""))
             self.base_url_edit.setEnabled(False)
@@ -625,6 +764,7 @@ class MllmReviewTab(QWidget):
             self.base_url_edit.setEnabled(True)
             self.base_url_edit.setText(OPENAI_PRESETS[0][1])
             self.model_edit.setText(OPENAI_PRESETS[0][2])
+        self._llm_form.setRowVisible(self.base_url_edit, not is_gemini)
         self.preset_combo.blockSignals(False)
         self._refresh_api_key_status()
 
@@ -643,17 +783,17 @@ class MllmReviewTab(QWidget):
         provider = self.provider_combo.currentData()
         manual_key = self.api_key_edit.text().strip()
         if manual_key:
-            self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 11px;")
+            self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
             self.api_key_status_label.setText("已使用上方手动填写的 API Key（默认不落盘明文保存）")
             return
 
         if provider == MllmProvider.GEMINI:
             has_env = bool(os.environ.get("GEMINI_API_KEY", "").strip())
             if has_env:
-                self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 11px;")
+                self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
                 self.api_key_status_label.setText("已检测到环境变量 GEMINI_API_KEY，上方输入框可保持留空")
             else:
-                self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 11px;")
+                self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 12px;")
                 self.api_key_status_label.setText("未检测到环境变量 GEMINI_API_KEY，请在上方填写或配置环境变量")
             return
 
@@ -661,13 +801,13 @@ class MllmReviewTab(QWidget):
         base_url = self.base_url_edit.text().strip().lower()
         is_local = any(host in base_url for host in ("localhost", "127.0.0.1"))
         if has_env:
-            self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 11px;")
+            self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
             self.api_key_status_label.setText("已检测到环境变量 OPENAI_API_KEY，上方输入框可保持留空")
         elif is_local:
-            self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 11px;")
+            self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 12px;")
             self.api_key_status_label.setText("当前为本地服务地址（如 Ollama / vLLM），API Key 可留空直接连接")
         else:
-            self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 11px;")
+            self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 12px;")
             self.api_key_status_label.setText("未检测到环境变量 OPENAI_API_KEY，请在上方填写或配置环境变量")
 
     def _sync_strategy_states(self, *_args: object) -> None:
@@ -676,9 +816,13 @@ class MllmReviewTab(QWidget):
         is_sam = refine_mode == BoxRefineMode.SAM_LOCAL
         is_mllm_crop = refine_mode == BoxRefineMode.MLLM_CROP
 
-        self.sam_row_widget.setVisible(is_sam)
-        if self._sam_row_label is not None:
-            self._sam_row_label.setVisible(is_sam)
+        self._pol_form.setRowVisible(self.sam_row_widget, is_sam)
+        if is_sam and self.sam_refine_all_chk.isChecked():
+            self.refine_hint_label.setText(
+                "已开启全量收紧：本地 SAM 对所有保留/改类框统一贴边收框（零额外 API 费），超门禁自动回退原框转待复核。"
+            )
+        else:
+            self.refine_hint_label.setText(BOX_REFINE_MODE_HINTS.get(refine_mode, ""))
 
         # MLLM 局部放大图精修必须依赖局部裁剪图坐标系
         if is_mllm_crop:
@@ -697,7 +841,7 @@ class MllmReviewTab(QWidget):
         check_missing = self.check_missing_chk.isChecked()
         self.add_missing_chk.setEnabled(check_missing)
 
-        # 精准反映 high_conf_skip 在当前策略组合下的真实生效角色
+        # 精准反映 high_conf_skip 在当前策略组合下的真实生效角色，并用方向符号（≥ / <）消除理解歧义
         needs_mllm_for_refine = refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP} or (
             is_sam and not self.sam_refine_all_chk.isChecked()
         )
@@ -705,22 +849,22 @@ class MllmReviewTab(QWidget):
         crops_active = self.crops_chk.isChecked() and (not is_mllm_crop)
 
         if can_skip_mllm:
-            self.high_conf_label.setText("高置信度免审阈值:")
+            self.high_conf_label.setText("免审阈值 ≥")
             self.high_conf_spin.setEnabled(True)
             self.high_conf_spin.setToolTip(
-                "当前未开启漏标检查，当整张图所有候选框置信度均 >= 此阈值时，直接跳过 MLLM 调用以节省费用"
+                "当前未开启漏标检查：整张图所有框置信度均 ≥ 此值时直接通过并跳过 MLLM 调用，省钱提速"
             )
         elif crops_active:
-            self.high_conf_label.setText("优先裁剪阈值:")
+            self.high_conf_label.setText("优先裁剪 <")
             self.high_conf_spin.setEnabled(True)
             self.high_conf_spin.setToolTip(
-                "当前开启了漏标检查或 MLLM 边框评估，不会整图跳过 MLLM；此阈值用于当框较多时优先为低于该阈值的可疑框生成局部放大图"
+                "当前已开启漏标或收框评估（不会跳过整图 MLLM）；单图目标超过 8 个时，优先为置信度 < 此值的框生成局部放大图"
             )
         else:
-            self.high_conf_label.setText("免审阈值(当前禁用):")
+            self.high_conf_label.setText("免审阈值(停用):")
             self.high_conf_spin.setEnabled(False)
             self.high_conf_spin.setToolTip(
-                "当前开启了漏标检查/局部精修且无需按置信度过滤裁剪，高置信度免审阈值暂不生效；取消漏标检查后恢复免审功能"
+                "当前开启了漏标检查/局部精修且无需按置信度筛裁剪，此阈值暂不生效；取消漏标检查后恢复高置信度免审"
             )
 
     def _resolve_sam_model_name(self) -> str:
@@ -788,6 +932,7 @@ class MllmReviewTab(QWidget):
             add_missing_boxes=self.check_missing_chk.isChecked() and self.add_missing_chk.isChecked(),
             include_crops=self.crops_chk.isChecked(),
             max_workers=self.workers_spin.value(),
+            max_images=self.max_images_spin.value(),
             triage_subfolders=self.triage_dirs_chk.isChecked(),
             recursive=self.recursive_chk.isChecked(),
             box_refine_mode=refine_mode,
@@ -802,7 +947,7 @@ class MllmReviewTab(QWidget):
         cfg = self._build_current_config()
         self.test_conn_btn.setEnabled(False)
         self.test_conn_btn.setText("测试中...")
-        self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 11px;")
+        self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 12px;")
         self.api_key_status_label.setText("正在向 MLLM 接口发送连通性探针...")
 
         self.conn_test_worker = MllmConnectionTestWorker(cfg)
@@ -813,7 +958,7 @@ class MllmReviewTab(QWidget):
         self.test_conn_btn.setEnabled(True)
         self.test_conn_btn.setText("测试连接")
         color = "#1a7f37" if ok else "#cf222e"
-        self.api_key_status_label.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 500;")
+        self.api_key_status_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 500;")
         self.api_key_status_label.setText(message)
         self.log_box.appendPlainText(f"[连接测试] {message}")
         if not ok:
@@ -839,6 +984,7 @@ class MllmReviewTab(QWidget):
             "guideline": self.guideline_edit.text().strip(),
             "high_conf_skip": self.high_conf_spin.value(),
             "max_workers": self.workers_spin.value(),
+            "max_images": self.max_images_spin.value(),
             "check_missing": self.check_missing_chk.isChecked(),
             "add_missing": self.add_missing_chk.isChecked(),
             "include_crops": self.crops_chk.isChecked(),
@@ -897,6 +1043,8 @@ class MllmReviewTab(QWidget):
                 self.high_conf_spin.setValue(float(state["high_conf_skip"]))
             if "max_workers" in state:
                 self.workers_spin.setValue(int(state["max_workers"]))
+            if "max_images" in state:
+                self.max_images_spin.setValue(max(0, int(state["max_images"])))
             if "check_missing" in state:
                 self.check_missing_chk.setChecked(bool(state["check_missing"]))
             if "add_missing" in state:
@@ -932,6 +1080,7 @@ class MllmReviewTab(QWidget):
         self._on_source_mode_changed()
         self._sync_strategy_states()
         self._refresh_api_key_status()
+        self._refresh_images_count()
 
     def _on_start(self) -> None:
         """校验图片目录、权重与参数，重置表格与记录缓存后启动 `MllmReviewWorker`。"""
@@ -972,7 +1121,11 @@ class MllmReviewTab(QWidget):
         self._last_output_dir = cfg.output_dir
         self._records.clear()
         self._preview_cache.clear()
+        self._selected_row = -1
         self.preview_label.clear_preview()
+        self.detail_label.setText("未选中图片：单击上方结果行可查看 MLLM 逐框判定理由与收框明细。")
+        self.detail_label.setToolTip("")
+        self.open_selected_btn.setEnabled(False)
         self.result_table.setRowCount(0)
         self._refresh_filter_counts()
         self.log_box.clear()
@@ -1055,8 +1208,8 @@ class MllmReviewTab(QWidget):
             note_parts.append(f"{rec.loose_flagged_count} 框过松/超门禁")
         if rec.missing_note and rec.missing_note not in note_parts:
             note_parts.append(rec.missing_note)
-        if not note_parts and rec.skipped_mllm:
-            note_parts.append("高置信度跳过 MLLM")
+        if not note_parts:
+            note_parts.append(format_record_detail_summary(rec))
         note = "；".join(note_parts)
 
         img_item = QTableWidgetItem(rec.image_path.name)
@@ -1066,6 +1219,8 @@ class MllmReviewTab(QWidget):
         bold_font = QFont(status_item.font())
         bold_font.setBold(True)
         status_item.setFont(bold_font)
+        note_item = QTableWidgetItem(note)
+        note_item.setToolTip(note)
 
         self.result_table.setItem(row, 0, img_item)
         self.result_table.setItem(row, 1, status_item)
@@ -1074,7 +1229,7 @@ class MllmReviewTab(QWidget):
         self.result_table.setItem(row, 4, QTableWidgetItem(str(rec.deleted_count)))
         self.result_table.setItem(row, 5, QTableWidgetItem(str(rec.refined_count)))
         self.result_table.setItem(row, 6, QTableWidgetItem(str(rec.added_count)))
-        self.result_table.setItem(row, 7, QTableWidgetItem(note))
+        self.result_table.setItem(row, 7, note_item)
         self.result_table.setRowHidden(row, not self._record_matches_filter(rec, self._active_filter))
 
     def _on_progress(self, cur: int, total: int, rec: ImageReviewRecord) -> None:
@@ -1089,7 +1244,11 @@ class MllmReviewTab(QWidget):
         res = load_review_report(report_or_dir)
         self._records = list(res.records)
         self._preview_cache.clear()
+        self._selected_row = -1
         self.preview_label.clear_preview()
+        self.detail_label.setText("未选中图片：单击上方结果行可查看 MLLM 逐框判定理由与收框明细。")
+        self.detail_label.setToolTip("")
+        self.open_selected_btn.setEnabled(False)
         self.result_table.setRowCount(0)
         for rec in self._records:
             self._append_record_row(rec)
@@ -1139,8 +1298,16 @@ class MllmReviewTab(QWidget):
 
     def _on_row_selected(self, row: int, *_args: object) -> None:
         if row < 0 or row >= len(self._records):
+            self._selected_row = -1
+            self.open_selected_btn.setEnabled(False)
             return
+        self._selected_row = row
         rec = self._records[row]
+        detail_text = format_record_detail_summary(rec)
+        full_detail = f"【{rec.image_path.name}】{detail_text}"
+        self.detail_label.setText(full_detail)
+        self.detail_label.setToolTip(full_detail)
+        self.open_selected_btn.setEnabled(True)
         try:
             jpeg_bytes = self._get_comparison_jpeg(row, rec)
             pix = QPixmap()
@@ -1149,6 +1316,12 @@ class MllmReviewTab(QWidget):
                 self.preview_label.set_preview_pixmap(pix)
         except Exception as exc:
             self.preview_label.clear_preview(f"预览渲染失败: {exc}")
+
+    def _on_open_selected_in_xal(self) -> None:
+        """点击预览区右下角按钮时，直接将当前选中行图片送入内嵌标注工作台精修。"""
+        if self._selected_row < 0 or self._selected_row >= len(self._records):
+            return
+        self._on_row_double_clicked(self._selected_row, 0)
 
     def _on_finished(self, res: MllmReviewResult) -> None:
         """恢复界面状态、记录产物路径、更新汇总栏并在存在结果时允许发送至数据集页。"""

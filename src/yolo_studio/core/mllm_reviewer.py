@@ -80,6 +80,13 @@ BOX_REFINE_MODE_ITEMS: list[tuple[BoxRefineMode, str]] = [
     (BoxRefineMode.SAM_LOCAL, "本地 SAM 像素级收紧（轮廓最贴边 + 安全门禁）"),
 ]
 
+BOX_REFINE_MODE_HINTS: dict[BoxRefineMode, str] = {
+    BoxRefineMode.OFF: "保持原有框坐标不变，仅执行删误检、纠错类与漏标检查，速度最快。",
+    BoxRefineMode.FLAG_LOOSE: "不改坐标，仅由 MLLM 识别偏松/截断框并分流到 need_review 供人工精修。",
+    BoxRefineMode.MLLM_CROP: "强制附带局部放大图，由 MLLM 在特写中输出更紧贴坐标（含安全门禁防缩坏，略增 Token）。",
+    BoxRefineMode.SAM_LOCAL: "本地加载 SAM 零额外 API 费用像素级收边（首次自动下载权重），超门禁自动回退原框并转待复核。",
+}
+
 SAM_REFINE_MODELS: list[tuple[str, str]] = [
     ("sam2.1_t.pt", "SAM 2.1 Tiny (速度快，显存占用最低，推荐)"),
     ("sam2.1_s.pt", "SAM 2.1 Small (速度与贴边精度均衡)"),
@@ -209,6 +216,7 @@ class MllmReviewConfig:
         `refine_min_area_ratio` / `refine_min_iou`：自动收框安全门禁下限，超限时保留原框并转 `need_review`。
         `max_crops_per_image`：每张图最多附带的局部放大裁剪数；`max_image_dim` 为送审图最长边像素限制。
         `max_workers`：并发审核线程池工作线程数（至少为 `1`）。
+        `max_images`：本次最多审核的图片数量上限（`0` 表示处理目录中全部图片，`> 0` 仅按顺序抽取前 `N` 张用于快速试跑验证）。
     """
 
     images_dir: Path
@@ -235,6 +243,7 @@ class MllmReviewConfig:
     max_crops_per_image: int = 8
     max_image_dim: int = 1280
     max_workers: int = 2
+    max_images: int = 0
     triage_subfolders: bool = True
     recursive: bool = False
     box_refine_mode: BoxRefineMode = BoxRefineMode.OFF
@@ -1374,6 +1383,56 @@ def _deserialize_candidate_box(raw: dict[str, object], fallback_id: int = 0) -> 
     )
 
 
+def count_review_images(images_dir: Path, recursive: bool = False) -> int:
+    """安全统计待审核目录内的受支持图片数量；目录不存在或无权限访问时返回 `0`。"""
+    if not images_dir or not images_dir.is_dir():
+        return 0
+    try:
+        return len(find_images(images_dir, recursive=recursive))
+    except OSError:
+        return 0
+
+
+def format_record_detail_summary(record: ImageReviewRecord) -> str:
+    """将单张审核记录的逐框删改/收框/补漏理由整理为界面可读的简明中文摘要。"""
+    parts: list[str] = []
+    if record.error:
+        parts.append(f"审核异常：{record.error}")
+
+    # 收集被删除框的理由（新版记录在 before_boxes 标记 status="deleted"，旧报告按 box_id 差集回退）
+    after_ids = {b.box_id for b in record.after_boxes}
+    for b in record.before_boxes:
+        if b.status == "deleted" or (b.box_id not in after_ids and record.deleted_count > 0):
+            reason = f"（{b.reason}）" if b.reason else ""
+            parts.append(f"删误检 #{b.box_id}[{b.label}]{reason}")
+
+    for b in record.after_boxes:
+        reason = f"（{b.reason}）" if b.reason else ""
+        if b.status == "relabeled":
+            arrow = f"{b.original_label}→{b.label}" if b.original_label else b.label
+            tight = "+收框" if b.refined else ""
+            parts.append(f"改类{tight} #{b.box_id}[{arrow}]{reason}")
+        elif b.status == "relabel_invalid":
+            parts.append(f"非法改类待修 #{b.box_id}[{b.label}]{reason}")
+        elif b.status == "refine_suspect":
+            parts.append(f"过松/超门禁待修 #{b.box_id}[{b.label}]{reason}")
+        elif b.refined or b.status == "refined":
+            parts.append(f"已收框 #{b.box_id}[{b.label}]{reason}")
+        elif b.status == "llm_added":
+            parts.append(f"补漏[{b.label}]{reason}")
+
+    if record.missing_note:
+        parts.append(f"漏标提示：{record.missing_note}")
+    elif record.has_missing and not any(b.status == "llm_added" for b in record.after_boxes):
+        parts.append("检测到疑似漏标，请人工核查")
+
+    if not parts:
+        if record.skipped_mllm:
+            return f"高置信度/空框跳过 MLLM（共 {len(record.after_boxes)} 框）"
+        return f"全部 {len(record.after_boxes)} 个目标核验通过，无删改或漏标"
+    return "；".join(parts)
+
+
 def load_review_report(report_or_dir: Path) -> MllmReviewResult:
     """从已有清洗输出目录或 `review_report.json` 加载历史审核记录以供界面复核与对比预览。
 
@@ -1504,6 +1563,14 @@ def run_mllm_review(
     images = find_images(config.images_dir, recursive=config.recursive)
     if not images:
         raise ValueError(f"未在目录中找到任何图片: {config.images_dir}")
+
+    total_discovered = len(images)
+    if config.max_images > 0 and total_discovered > config.max_images:
+        images = images[: config.max_images]
+        if log_callback:
+            log_callback(
+                f"已启用小批量试跑上限：目录共 {total_discovered} 张图，本次仅审核前 {len(images)} 张。"
+            )
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1674,6 +1741,33 @@ def run_mllm_review(
                 missing_note = response.missing_note
                 skipped_mllm = False
 
+            # 在不修改上游候选缓存的前提下，把删框理由写入记录快照，便于界面展示与历史报告回看
+            record_before_boxes = before_boxes
+            if response is not None and deleted > 0:
+                del_reasons = {
+                    d.box_id: d.reason
+                    for d in response.box_reviews
+                    if d.action == "delete"
+                }
+                if del_reasons:
+                    record_before_boxes = [
+                        CandidateBox(
+                            box_id=b.box_id,
+                            label=b.label,
+                            x1=b.x1,
+                            y1=b.y1,
+                            x2=b.x2,
+                            y2=b.y2,
+                            confidence=b.confidence,
+                            status="deleted" if b.box_id in del_reasons else b.status,
+                            reason=del_reasons.get(b.box_id, b.reason),
+                            original_label=b.original_label,
+                            refined=b.refined,
+                            original_xyxy=b.original_xyxy,
+                        )
+                        for b in before_boxes
+                    ]
+
             if config.box_refine_mode == BoxRefineMode.SAM_LOCAL and sam_refiner is not None and after_boxes:
                 if img_bgr is None:
                     img_bgr = _read_image_unicode_safe(img_path)
@@ -1722,7 +1816,7 @@ def run_mllm_review(
                 output_image_path=out_img_path,
                 output_json_path=out_json_path,
                 triage_bucket=bucket,
-                before_boxes=before_boxes,
+                before_boxes=record_before_boxes,
                 after_boxes=after_boxes,
                 kept_count=kept,
                 relabeled_count=relabeled,
@@ -1879,7 +1973,7 @@ def _draw_labeled_boxes(
         "kept": (0, 200, 0),
         "relabeled": (0, 140, 255),
         "relabel_invalid": (60, 60, 255),
-        "llm_added": (255, 220, 0),
+        "llm_added": (0, 220, 255),
         "refined": (255, 210, 40),
         "refine_suspect": (200, 40, 220),
     }

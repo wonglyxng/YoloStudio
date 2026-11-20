@@ -218,6 +218,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
         add_missing_boxes=not args.no_add_missing,
         include_crops=not args.no_crops,
         max_workers=args.workers,
+        max_images=max(0, args.max_images),
         triage_subfolders=not args.flat,
         recursive=args.recursive,
         box_refine_mode=BoxRefineMode(args.box_refine),
@@ -369,6 +370,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="sam_local 模式下对全部保留框执行像素级收紧（默认仅收紧 MLLM 判定过松的框）",
     )
     p_rv.add_argument("--workers", type=int, default=2)
+    p_rv.add_argument(
+        "--max-images",
+        type=int,
+        default=0,
+        help="最多审核前 N 张图片用于小批量试跑（0 表示处理目录中全部图片）",
+    )
     p_rv.add_argument("--flat", action="store_true", help="不按状态分建子目录")
     p_rv.add_argument("-r", "--recursive", action="store_true", help="递归扫描输入子目录")
     p_rv.set_defaults(func=_cmd_review)

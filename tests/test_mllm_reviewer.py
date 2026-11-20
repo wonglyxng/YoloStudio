@@ -555,3 +555,75 @@ def test_mllm_connection_check_handles_missing_credentials(monkeypatch) -> None:
     )
     assert ok_o is False
     assert "模型名称" in msg_o
+
+
+def test_max_images_trial_limit_count_and_delete_reason_summary(tmp_path: Path) -> None:
+    """验证 `max_images` 小批量试跑上限、`count_review_images` 以及删除理由写入报告与详情摘要。"""
+    from yolo_studio.core.mllm_reviewer import (
+        count_review_images,
+        format_record_detail_summary,
+        load_review_report,
+    )
+
+    in_dir = tmp_path / "imgs"
+    out_dir = tmp_path / "out"
+    for name in ("01.jpg", "02.jpg", "03.jpg", "04.jpg"):
+        img = in_dir / name
+        _write_img(img, (400, 200))
+        payload = {
+            "shapes": [
+                {
+                    "label": "hero",
+                    "score": 0.4,
+                    "points": [[20.0, 20.0], [100.0, 100.0]],
+                    "shape_type": "rectangle",
+                }
+            ],
+            "imageWidth": 400,
+            "imageHeight": 200,
+        }
+        img.with_suffix(".json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert count_review_images(in_dir) == 4
+    assert count_review_images(tmp_path / "not_exist") == 0
+
+    client = _FakeMllmClient(
+        [
+            MllmReviewResponse(
+                box_reviews=[BoxDecision(box_id=0, action="delete", reason="地面阴影误检")],
+                has_missing=False,
+            ),
+            MllmReviewResponse(
+                box_reviews=[BoxDecision(box_id=0, action="keep", reason="目标清晰")],
+                has_missing=False,
+            ),
+        ]
+    )
+    logs: list[str] = []
+    res = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.EXISTING_JSON,
+            allowed_classes=["hero"],
+            max_workers=1,
+            max_images=2,
+            check_missing=True,
+        ),
+        client_override=client,
+        log_callback=logs.append,
+    )
+
+    assert res.total_images == 2
+    assert any("小批量试跑上限" in line for line in logs)
+    del_rec = res.records[0]
+    assert del_rec.deleted_count == 1
+    assert del_rec.before_boxes[0].status == "deleted"
+    assert del_rec.before_boxes[0].reason == "地面阴影误检"
+    summary = format_record_detail_summary(del_rec)
+    assert "删误检" in summary and "地面阴影误检" in summary
+
+    # 历史报告往返加载后删框理由依然保留
+    loaded = load_review_report(out_dir)
+    assert loaded.total_images == 2
+    assert "地面阴影误检" in format_record_detail_summary(loaded.records[0])

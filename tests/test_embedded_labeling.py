@@ -960,11 +960,29 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
 
     tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=gpu_info)
     try:
-        # 1) 环境变量缺失提示
+        # 1) 环境变量缺失提示、目录计数与按模式自动隐藏无关置灰行
         assert "未检测到环境变量 GEMINI_API_KEY" in tab1.api_key_status_label.text()
+        assert tab1.high_conf_spin.minimumWidth() >= 100  # 防止 Win11 并排箭头截断两位小数
+        assert tab1.ann_picker.isHidden() is True
+        assert tab1.base_url_edit.isHidden() is True
 
-        # 2) 默认开启漏标检查 + 局部裁剪 -> 阈值角色为“优先裁剪阈值”；关掉裁剪 -> 禁用；关掉漏标 -> 恢复“高置信度免审阈值”
-        assert "优先裁剪阈值" in tab1.high_conf_label.text()
+        tab1.set_images_dir(str(in_dir))
+        assert "3 张图片" in tab1.images_count_label.text()
+
+        # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行；切到 OpenAI 显示 Base URL
+        tab1.source_mode_combo.setCurrentIndex(1)
+        tab1.provider_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+        assert tab1.weights_picker.isHidden() is True
+        assert tab1.yolo_params_widget.isHidden() is True
+        assert tab1.ann_picker.isHidden() is False
+        assert tab1.base_url_edit.isHidden() is False
+        tab1.source_mode_combo.setCurrentIndex(0)
+        tab1.provider_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+
+        # 2) 默认开启漏标检查 + 局部裁剪 -> 阈值角色为“优先裁剪 <”；关掉裁剪 -> 禁用；关掉漏标 -> 恢复“免审阈值 ≥”
+        assert "优先裁剪" in tab1.high_conf_label.text()
         tab1.crops_chk.setChecked(False)
         qt_app.processEvents()
         assert tab1.high_conf_spin.isEnabled() is False
@@ -973,12 +991,25 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         assert tab1.high_conf_spin.isEnabled() is True
         assert "免审阈值" in tab1.high_conf_label.text()
 
-        # 3) 边框紧贴修正模式联动：SAM_LOCAL 显示 SAM 行，MLLM_CROP 强制勾选并锁定局部裁剪
+        # 2b) 小批量试跑 5 张快捷按钮与上限微调框联动
+        assert tab1.max_images_spin.value() == 0
+        tab1.trial_5_btn.setChecked(True)
+        qt_app.processEvents()
+        assert tab1.max_images_spin.value() == 5
+        assert tab1._build_current_config().max_images == 5
+        tab1.max_images_spin.setValue(2)
+        qt_app.processEvents()
+        assert tab1.trial_5_btn.isChecked() is False
+        assert "仅审核前 2 张" in tab1.images_count_label.text()
+
+        # 3) 边框紧贴修正模式联动与动态人话说明：SAM_LOCAL 显示 SAM 行，MLLM_CROP 强制勾选并锁定局部裁剪
         assert tab1.sam_row_widget.isHidden() is True
+        assert "保持原有框坐标不变" in tab1.refine_hint_label.text()
         sam_idx = tab1.refine_mode_combo.findData(BoxRefineMode.SAM_LOCAL)
         tab1.refine_mode_combo.setCurrentIndex(sam_idx)
         qt_app.processEvents()
         assert tab1.sam_row_widget.isHidden() is False
+        assert "SAM" in tab1.refine_hint_label.text()
 
         crop_idx = tab1.refine_mode_combo.findData(BoxRefineMode.MLLM_CROP)
         tab1.refine_mode_combo.setCurrentIndex(crop_idx)
@@ -986,8 +1017,9 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         assert tab1.sam_row_widget.isHidden() is True
         assert tab1.crops_chk.isChecked() is True
         assert tab1.crops_chk.isEnabled() is False
+        assert "局部放大图" in tab1.refine_hint_label.text()
 
-        # 4) 加载历史审核报告并验证分流筛选与对比预览
+        # 4) 加载历史审核报告并验证分流筛选、对比预览、逐框判定理由详情与一键精修按钮
         tab1.load_history_report(out_dir / "review_report.json")
         qt_app.processEvents()
         assert tab1.result_table.rowCount() == 3
@@ -995,20 +1027,31 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         assert "已删改/收框 (1)" in tab1.filter_buttons["llm_fixed"].text()
         assert "待复核 (1)" in tab1.filter_buttons["need_review"].text()
         assert tab1.send_ds_btn.isEnabled() is True
+        assert tab1.open_selected_btn.isEnabled() is False
 
         # 筛选仅看待复核：只显示第 2 行，前两行隐藏
         tab1.set_result_filter("need_review")
         assert tab1.result_table.isRowHidden(0) is True
         assert tab1.result_table.isRowHidden(1) is True
         assert tab1.result_table.isRowHidden(2) is False
-        # 单击含收框记录的行（row=1），能正常渲染对比图
+        # 单击含收框记录的行（row=1），能正常渲染对比图、展示收框详情并激活“在工作台精修此图”按钮
         tab1.set_result_filter("all")
         tab1._on_row_selected(1)
         assert tab1.preview_label.pixmap() is not None and not tab1.preview_label.pixmap().isNull()
+        assert "b_tight.jpg" in tab1.detail_label.text()
+        assert "已收框" in tab1.detail_label.text()
+        assert tab1.open_selected_btn.isEnabled() is True
 
-        # 5) 持久化策略（手动填入的明文 API Key 不落盘）
+        emitted: list[tuple[str, str, str]] = []
+        tab1.open_in_workbench.connect(lambda d, c, f: emitted.append((d, c, f)))
+        tab1.open_selected_btn.click()
+        assert len(emitted) == 1
+        assert emitted[0][2].endswith("b_tight.jpg")
+
+        # 5) 持久化策略（含 max_images；手动填入的明文 API Key 不落盘）
         tab1.refine_mode_combo.setCurrentIndex(sam_idx)
         tab1.sam_refine_all_chk.setChecked(True)
+        tab1.max_images_spin.setValue(5)
         tab1.classes_edit.setText("hero, boss")
         tab1.guideline_edit.setText("紧贴主体边缘")
         tab1.api_key_edit.setText("secret-key-should-not-persist")
@@ -1023,6 +1066,8 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         assert tab2.refine_mode_combo.currentData() == BoxRefineMode.SAM_LOCAL
         assert tab2.sam_refine_all_chk.isChecked() is True
         assert tab2.sam_row_widget.isHidden() is False
+        assert tab2.max_images_spin.value() == 5
+        assert tab2.trial_5_btn.isChecked() is True
         assert tab2.classes_edit.text() == "hero, boss"
         assert tab2.guideline_edit.text() == "紧贴主体边缘"
         assert tab2.api_key_edit.text() == ""  # 明文 API Key 绝不持久化
