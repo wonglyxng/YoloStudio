@@ -121,8 +121,7 @@ def test_embedded_workbench_keyboard_shortcuts_and_tab_isolation(
     win.activateWindow()
     qt_app.processEvents()
     try:
-        win.dataset_tab.set_frames_dir(str(frames_dir))
-        win.dataset_tab._on_open_in_workbench()
+        win._on_open_in_workbench(str(frames_dir))
         qt_app.processEvents()
 
         assert win.tabs.currentIndex() == 1

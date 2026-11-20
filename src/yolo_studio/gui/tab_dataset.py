@@ -1,15 +1,15 @@
 """标签页 4：标注统计检验与 YOLO26 数据集准备界面。
 
 职责：
-    与「2. 标注工作台」联动打开标注图片目录，扫描并展示标注分布与告警，
+    读取标注工作台或 MLLM 纠错产出的图片与标注，扫描并展示标注分布与告警，
     并按 train/val/test 比例生成 YOLO26 标准数据集与 `data.yaml`。
+    左侧按“数据来源 / 划分与输出”分组：前者决定读取哪些图片与标注（扫描只依赖它），后者只影响生成结果。
     界面负责参数输入、划分比例归一化预览、覆盖已有划分前的确认、
     类别分布（含各划分框数与验证集缺类提示）展示，以及参数修改后的结果过期标记。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程；扫描与构建任务委托给 `DatasetScanWorker` / `DatasetBuildWorker`，
     不支持中途取消，运行期间只显示不定长忙碌进度条。
-    通过 `open_in_workbench` 请求主窗口切换至内嵌标注工作台；
     生成结果通过 `send_data_yaml` 信号同步至 `MainWindow` 与训练标签页，
     `request_train_tab` 仅请求主窗口切换到训练页，本模块不直接操作其他标签页。
 """
@@ -135,7 +135,6 @@ class DatasetTab(QWidget):
     """
 
     send_data_yaml = Signal(str)
-    open_in_workbench = Signal(str, str)  # 信号参数：(图片目录, 可选 classes.txt 路径)
     request_train_tab = Signal()  # 请求主窗口切换到「5. YOLO26 训练」，不携带数据
 
     def __init__(self, workspace_root: Path, parent: QWidget | None = None) -> None:
@@ -201,19 +200,21 @@ class DatasetTab(QWidget):
         self._refresh_scope_counts()
 
     def _build_source_group(self) -> QGroupBox:
-        """分组 1：图片目录及其子目录开关（递归/排除 need_review）、打开工作台与扫描统计入口。
+        """分组 1“数据来源”：图片目录及子目录开关、标注目录、标注格式、classes.txt 与扫描统计入口。
 
-        设计原因：递归与排除开关决定从图片目录中取哪些图片，“扫描标注统计”与“生成数据集”都使用同一范围，
-        因此作为图片目录的从属选项紧贴输入框放置（不再单独设行标签），并实时显示图片数。
-        递归默认开启：内嵌 X-AnyLabeling 打开目录时同样递归列出子目录图片，按视频分建子目录的抽帧结果
-        与 MLLM 分流结果也都位于子目录；平铺目录开启递归结果不变，未复核的 need_review 默认排除。
+        分组原则：本组只放“从哪里读取图片与标注”的输入参数，「扫描标注统计」只依赖这些参数，
+        因此扫描按钮放在本组末尾；划分、输出等只影响生成结果的参数放在分组 2。
+        递归与排除开关决定从图片目录中取哪些图片，作为图片目录的从属选项紧贴输入框放置（不设行标签），
+        并实时显示图片数。递归默认开启：内嵌 X-AnyLabeling 打开目录时同样递归列出子目录图片，
+        按视频分建子目录的抽帧结果与 MLLM 分流结果也都位于子目录；平铺目录开启递归结果不变，
+        未复核的 need_review 默认排除。
         """
-        group = QGroupBox("1. 标注源目录与工作台联动")
+        group = QGroupBox("1. 数据来源")
         form = QFormLayout(group)
 
         default_frames = str((self.workspace_root / "data" / "raw_frames").resolve())
         self.images_picker = PathPickerRow(
-            placeholder="选择待标注或待转换的图片目录（与抽帧输出一致）",
+            placeholder="选择待转换的图片目录（与抽帧输出或标注工作台打开的目录一致）",
             mode="dir",
             default_path=default_frames,
         )
@@ -243,29 +244,6 @@ class DatasetTab(QWidget):
         scope_box.addWidget(self.scope_hint)
         form.addRow("", scope_box)
 
-        action_row = QHBoxLayout()
-        self.open_workbench_btn = QPushButton("在「2. 标注工作台」中打开 →")
-        self.scan_btn = QPushButton("扫描标注统计")
-        self.scan_btn.setToolTip("只读扫描图片与标注文件，统计类别分布并列出告警，不写入任何文件")
-        action_row.addWidget(self.open_workbench_btn)
-        action_row.addWidget(self.scan_btn)
-        action_row.addStretch(1)
-        form.addRow("", action_row)
-
-        tip = QLabel(
-            "支持 X-AnyLabeling 同目录保存的原生 .json 与导出的 YOLO .txt；"
-            "在工作台保存标注后点「扫描标注统计」即可刷新右侧分布。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color: #666666;")
-        form.addRow("", tip)
-        return group
-
-    def _build_split_group(self) -> QGroupBox:
-        """分组 2：标注格式、类别文件、输出目录、划分比例、随机种子与负样本选项。"""
-        group = QGroupBox("2. 标注转换与 Train/Val/Test 数据集划分")
-        form = QFormLayout(group)
-
         self.ann_picker = PathPickerRow(
             placeholder="留空则默认与「图片目录」相同（支持 .json 或导出的 .txt）",
             mode="dir",
@@ -285,6 +263,22 @@ class DatasetTab(QWidget):
             file_filter="文本文件 (*.txt);;所有文件 (*.*)",
         )
         form.addRow(self.classes_label, self.classes_picker)
+
+        scan_row = QHBoxLayout()
+        self.scan_btn = QPushButton("扫描标注统计")
+        self.scan_btn.setToolTip("只读扫描图片与标注文件，统计类别分布并列出告警，不写入任何文件")
+        scan_tip = QLabel("在工作台保存标注后，点此刷新右侧分布")
+        scan_tip.setStyleSheet("color: #666666;")
+        scan_row.addWidget(self.scan_btn)
+        scan_row.addWidget(scan_tip)
+        scan_row.addStretch(1)
+        form.addRow("", scan_row)
+        return group
+
+    def _build_split_group(self) -> QGroupBox:
+        """分组 2“划分与输出”：输出目录、Train/Val/Test 比例、随机种子与负样本选项，只影响生成结果。"""
+        group = QGroupBox("2. 划分与输出")
+        form = QFormLayout(group)
 
         default_ds_out = str((self.workspace_root / "datasets" / "custom_yolo26").resolve())
         self.output_ds_picker = PathPickerRow(
@@ -382,7 +376,6 @@ class DatasetTab(QWidget):
         return group
 
     def _connect_signals(self) -> None:
-        self.open_workbench_btn.clicked.connect(self._on_open_in_workbench)
         self.scan_btn.clicked.connect(self._on_scan)
         self.build_btn.clicked.connect(self._on_build)
         self.open_ds_btn.clicked.connect(lambda: open_local_path(self.output_ds_picker.path()))
@@ -577,15 +570,6 @@ class DatasetTab(QWidget):
                 (BUCKET_NEED_REVIEW,) if self.exclude_need_review_chk.isChecked() else ()
             ),
         )
-
-    def _on_open_in_workbench(self) -> None:
-        images_text = self.images_picker.text()
-        if not images_text or not Path(images_text).is_dir():
-            QMessageBox.warning(self, "提示", "请先选择有效的图片目录。")
-            return
-        cls_text = self.classes_picker.text()
-        self.open_in_workbench.emit(images_text, cls_text)
-        self.log_box.append(f"已在「2. 标注工作台」中打开目录: {images_text}")
 
     def _on_scan(self) -> None:
         """校验参数后进入忙碌状态并在后台线程执行只读扫描。"""

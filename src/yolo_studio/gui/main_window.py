@@ -154,7 +154,6 @@ class MainWindow(QMainWindow):
         self.labeling_tab.send_to_dataset.connect(self._on_labeling_to_dataset)
         self.labeling_tab.send_to_review.connect(self._on_labeling_to_review)
         self.labeling_tab.annotations_changed.connect(self._on_annotations_changed)
-        self.dataset_tab.open_in_workbench.connect(self._on_open_in_workbench)
         self.review_tab.open_in_workbench.connect(self._on_open_in_workbench)
         self.review_tab.send_cleaned_dataset.connect(self._on_cleaned_ready)
         self.dataset_tab.send_data_yaml.connect(self._on_yaml_ready)
