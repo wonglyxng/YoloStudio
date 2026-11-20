@@ -88,7 +88,7 @@ def test_ratio_hint_format_hint_and_exclude_option(qt_app: QApplication, tmp_pat
 
 
 def test_scope_hint_next_to_images_dir(qt_app: QApplication, tmp_path: Path) -> None:
-    """验证递归开关位于图片目录分组内，并按目录结构实时提示扫描范围（子目录有图未勾选递归时警示）。"""
+    """验证递归开关位于图片目录分组内，并按目录结构实时提示图片范围（子目录有图未勾选递归时警示）。"""
     root = tmp_path / "pilot"
     _make_labeled_dir(root / "video-001", count=3)
     _make_labeled_dir(root / "video-002", count=2)
@@ -105,9 +105,9 @@ def test_scope_hint_next_to_images_dir(qt_app: QApplication, tmp_path: Path) -> 
     assert "请勾选「递归扫描子目录」" in tab.scope_hint.text()
 
     tab.recursive_chk.setChecked(True)
-    assert "将扫描 5 张" in tab.scope_hint.text() and "排除 need_review 中的 1 张" in tab.scope_hint.text()
+    assert "共 5 张" in tab.scope_hint.text() and "排除 need_review 中的 1 张" in tab.scope_hint.text()
     tab.exclude_need_review_chk.setChecked(False)
-    assert "将扫描 6 张" in tab.scope_hint.text()
+    assert "共 6 张" in tab.scope_hint.text()
 
     tab.set_frames_dir(str(tmp_path / "missing"))
     tab._refresh_scope_counts()

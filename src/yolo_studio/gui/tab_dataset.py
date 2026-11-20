@@ -130,7 +130,7 @@ class DatasetTab(QWidget):
         `_last_yaml_path` / `_yaml_revision`：最近一次成功生成的 `data.yaml` 及其参数版本号；
             仅当版本号与当前参数一致时才允许“前往训练”，避免把与当前设置不符的数据集当作最新结果。
         `_busy`：是否有扫描或生成任务在运行；运行期间禁用扫描/生成/前往训练按钮。
-        `_scope_counts`：当前图片目录的图片计数预览（顶层/递归/need_review 内），仅用于扫描范围提示；
+        `_scope_counts`：当前图片目录的图片计数预览（顶层/递归/need_review 内），仅用于图片范围提示；
             目录为空或不存在时为 `None`，图片目录变化后经防抖定时器重新计算。
     """
 
@@ -201,9 +201,10 @@ class DatasetTab(QWidget):
         self._refresh_scope_counts()
 
     def _build_source_group(self) -> QGroupBox:
-        """分组 1：图片目录、扫描范围（递归/排除 need_review）、打开工作台与扫描统计入口。
+        """分组 1：图片目录、图片范围（递归/排除 need_review）、打开工作台与扫描统计入口。
 
-        设计原因：递归扫描决定从图片目录中取哪些图片，与图片目录强相关，因此紧贴目录输入框放置，
+        设计原因：递归与排除开关决定从图片目录中取哪些图片，“扫描标注统计”与“生成数据集”都使用同一范围，
+        与图片目录强相关，因此紧贴目录输入框放置，
         并实时显示顶层/子目录图片数，避免用户选了按子目录组织的数据却没注意到需要开启递归。
         """
         group = QGroupBox("1. 标注源目录与工作台联动")
@@ -235,7 +236,7 @@ class DatasetTab(QWidget):
         scope_box.setSpacing(2)
         scope_box.addLayout(scope_row)
         scope_box.addWidget(self.scope_hint)
-        form.addRow("扫描范围:", scope_box)
+        form.addRow("图片范围:", scope_box)
 
         action_row = QHBoxLayout()
         self.open_workbench_btn = QPushButton("在「2. 标注工作台」中打开 →")
@@ -482,7 +483,7 @@ class DatasetTab(QWidget):
         self._scope_timer.start()
 
     def _refresh_scope_counts(self) -> None:
-        """在主线程遍历图片目录统计顶层/递归图片数并缓存，随后刷新扫描范围提示。
+        """在主线程遍历图片目录统计顶层/递归图片数并缓存，随后刷新图片范围提示。
 
         `preview_image_counts` 只按扩展名计数并设有条目上限，正常目录耗时为毫秒级；
         目录为空或不存在时缓存置为 `None`，提示区显示对应状态。
@@ -495,7 +496,9 @@ class DatasetTab(QWidget):
         self._render_scope_hint()
 
     def _render_scope_hint(self, *_args: object) -> None:
-        """根据缓存计数与当前勾选状态，显示本次扫描实际会纳入的图片数量。
+        """根据缓存计数与当前勾选状态，显示扫描统计与生成数据集所用的候选图片数量。
+
+        候选图片按扩展名计数，生成时是否纳入还取决于标注情况与负样本选项，因此只表述为“共 N 张图片”。
 
         重点场景：顶层没有图片而子目录有图片且未勾选递归时，以醒目颜色提示勾选，
         这是“按视频/分流子目录组织的数据集”最常见的配置遗漏。
@@ -512,9 +515,9 @@ class DatasetTab(QWidget):
         nested = counts.total - counts.top_level
         if self.recursive_chk.isChecked():
             kept = counts.total - (counts.excluded if self.exclude_need_review_chk.isChecked() else 0)
-            msg = f"将扫描 {kept}{more} 张图片（含子目录）"
+            msg = f"共 {kept}{more} 张图片（含子目录）"
             if self.exclude_need_review_chk.isChecked() and counts.excluded:
-                msg += f"，已排除 {BUCKET_NEED_REVIEW} 中的 {counts.excluded} 张"
+                msg += f"；已排除 {BUCKET_NEED_REVIEW} 中的 {counts.excluded} 张"
             self._set_scope_hint(msg, "ok" if kept else "error")
         elif counts.top_level == 0 and nested > 0:
             self._set_scope_hint(
@@ -524,11 +527,11 @@ class DatasetTab(QWidget):
             self._set_scope_hint("该目录及子目录中没有图片。", "error")
         elif nested > 0:
             self._set_scope_hint(
-                f"将扫描顶层 {counts.top_level} 张图片；子目录另有 {nested}{more} 张未纳入（勾选递归可纳入）。",
+                f"共 {counts.top_level} 张图片（仅顶层）；子目录另有 {nested}{more} 张未包含，勾选递归可包含。",
                 "info",
             )
         else:
-            self._set_scope_hint(f"将扫描 {counts.top_level}{more} 张图片。", "ok")
+            self._set_scope_hint(f"共 {counts.top_level}{more} 张图片。", "ok")
 
     def _set_scope_hint(self, text: str, level: str) -> None:
         self.scope_hint.setText(text)
