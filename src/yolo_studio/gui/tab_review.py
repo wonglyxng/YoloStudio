@@ -3,8 +3,9 @@
 职责：
     配置候选框来源（基准 `.pt` 低阈值推理或已有 X-AnyLabeling `.json`）、MLLM 接口与预设、
     连通性测试、边框紧贴标准化修正（标记过松 / MLLM 局部图精修 / 本地 SAM 像素级收紧）与审核分流策略；
-    右侧提供带实时计数的分流状态筛选、语义配色结果表、自适应缩放的 Before/After 对比图、
-    历史报告加载与审核日志，并支持一键跳转「2. 标注工作台」精修或发送清洗结果至数据集准备页。
+    右侧提供带实时计数的分流状态筛选、语义配色结果表与运行日志（同区双页签）、自适应缩放的 Before/After 对比图、
+    历史报告加载，并支持一键跳转「2. 标注工作台」精修或发送清洗结果至数据集准备页；
+    左右两栏置于可拖拽的水平分割条中，用户可按屏幕宽度调整比例。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程；后台审核由 `MllmReviewWorker` 执行，接口连通性测试由
@@ -45,6 +46,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -189,28 +191,42 @@ class MllmReviewTab(QWidget):
         if path_str:
             self.weights_picker.setText(path_str)
 
+    @staticmethod
+    def _tune_form(form: QFormLayout) -> None:
+        """统一左侧三组表单的留白节奏：加大行距与组内边距，缓解控件堆叠带来的拥挤感。"""
+        form.setContentsMargins(12, 10, 12, 12)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
     def _init_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setSpacing(12)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # 左右两栏放入可拖拽的水平分割条，用户可按屏幕宽度自行调整参数区与结果区比例
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(10)
 
         # 左侧面板：滚动表单区 + 底部固定操作栏
-        left = QVBoxLayout()
-        left.setSpacing(6)
+        left_widget = QWidget()
+        left = QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 4, 0)
+        left.setSpacing(8)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll_content = QWidget()
         form_stack = QVBoxLayout(scroll_content)
-        form_stack.setContentsMargins(0, 0, 4, 0)
-        form_stack.setSpacing(5)
+        form_stack.setContentsMargins(0, 0, 6, 0)
+        form_stack.setSpacing(12)
 
         # 1. 待纠错数据来源与基准模型
         src_group = QGroupBox("1. 待纠错数据来源与基准模型")
         s_form = QFormLayout(src_group)
-        s_form.setContentsMargins(10, 6, 10, 8)
-        s_form.setHorizontalSpacing(8)
-        s_form.setVerticalSpacing(4)
+        self._tune_form(s_form)
         self._src_form = s_form
 
         self.source_mode_combo = QComboBox()
@@ -298,9 +314,7 @@ class MllmReviewTab(QWidget):
         # 2. MLLM 接口与模型配置
         llm_group = QGroupBox("2. 多模态大语言模型 (MLLM) 配置")
         l_form = QFormLayout(llm_group)
-        l_form.setContentsMargins(10, 6, 10, 8)
-        l_form.setHorizontalSpacing(8)
-        l_form.setVerticalSpacing(4)
+        self._tune_form(l_form)
         self._llm_form = l_form
 
         self.provider_combo = QComboBox()
@@ -356,9 +370,7 @@ class MllmReviewTab(QWidget):
         # 3. 纠错、补漏、边框紧贴修正与分流策略
         pol_group = QGroupBox("3. 纠错、补漏、边框修正与分流策略")
         p_form = QFormLayout(pol_group)
-        p_form.setContentsMargins(10, 6, 10, 8)
-        p_form.setHorizontalSpacing(8)
-        p_form.setVerticalSpacing(4)
+        self._tune_form(p_form)
         self._pol_form = p_form
 
         cls_row = QHBoxLayout()
@@ -431,6 +443,17 @@ class MllmReviewTab(QWidget):
         self.workers_spin.setRange(1, 16)
         self.workers_spin.setValue(2)
         self.workers_spin.setMinimumWidth(84)
+        triage_row.addWidget(self.high_conf_label)
+        triage_row.addWidget(self.high_conf_spin)
+        triage_row.addSpacing(18)
+        triage_row.addWidget(QLabel("并发数:"))
+        triage_row.addWidget(self.workers_spin)
+        triage_row.addStretch(1)
+        p_form.addRow("阈值与并发:", triage_row)
+
+        # 处理数量单独成行：试跑开关与上限分离于阈值行，避免一行塞入过多控件
+        limit_row = QHBoxLayout()
+        limit_row.setSpacing(6)
         self.max_images_spin = QSpinBox()
         self.max_images_spin.setRange(0, 100000)
         self.max_images_spin.setValue(0)
@@ -443,27 +466,18 @@ class MllmReviewTab(QWidget):
         self.trial_5_btn = QPushButton("试跑 5 张")
         self.trial_5_btn.setCheckable(True)
         self.trial_5_btn.setStyleSheet(
-            "QPushButton { padding: 3px 8px; font-size: 12px; }"
+            "QPushButton { padding: 3px 10px; font-size: 12px; }"
             "QPushButton:checked { background-color: #0969da; color: #ffffff; border-color: #085ec4; font-weight: 600; }"
         )
         self.trial_5_btn.setToolTip("一键切换仅审核前 5 张图用于快速试跑，再次点击恢复处理全部图片")
-        triage_row.addWidget(self.high_conf_label)
-        triage_row.addWidget(self.high_conf_spin)
-        triage_row.addSpacing(4)
-        triage_row.addWidget(QLabel("并发:"))
-        triage_row.addWidget(self.workers_spin)
-        triage_row.addSpacing(4)
-        triage_row.addWidget(QLabel("上限:"))
-        triage_row.addWidget(self.max_images_spin)
-        triage_row.addWidget(self.trial_5_btn)
-        triage_row.addStretch(1)
-        p_form.addRow("效率与试跑:", triage_row)
-
-        opts_widget = QWidget()
-        opts_grid = QGridLayout(opts_widget)
-        opts_grid.setContentsMargins(0, 0, 0, 0)
-        opts_grid.setHorizontalSpacing(10)
-        opts_grid.setVerticalSpacing(4)
+        limit_hint = QLabel("首次调整规则或收框模式时，建议先试跑验证效果")
+        limit_hint.setStyleSheet("color: #8c959f; font-size: 12px;")
+        limit_row.addWidget(self.max_images_spin)
+        limit_row.addWidget(self.trial_5_btn)
+        limit_row.addSpacing(8)
+        limit_row.addWidget(limit_hint)
+        limit_row.addStretch(1)
+        p_form.addRow("处理数量:", limit_row)
 
         self.check_missing_chk = QCheckBox("检查漏标目标")
         self.check_missing_chk.setChecked(True)
@@ -476,23 +490,39 @@ class MllmReviewTab(QWidget):
         self.triage_dirs_chk.setToolTip("在输出目录下自动分建 auto_passed / llm_fixed / need_review 三个子目录")
         self.recursive_chk = QCheckBox("递归扫描输入子目录")
 
-        opts_grid.addWidget(self.check_missing_chk, 0, 0)
-        opts_grid.addWidget(self.add_missing_chk, 0, 1)
-        opts_grid.addWidget(self.crops_chk, 0, 2)
-        opts_grid.addWidget(self.triage_dirs_chk, 1, 0)
-        opts_grid.addWidget(self.recursive_chk, 1, 1)
-        for col in range(3):
-            opts_grid.setColumnStretch(col, 1)
-        p_form.addRow("策略与目录:", opts_widget)
+        def _make_check_grid(boxes: list[QCheckBox]) -> QWidget:
+            """按统一的 3 列等宽网格排列复选框，保证“纠错选项”与“输出选项”两行纵向对齐。"""
+            holder = QWidget()
+            grid = QGridLayout(holder)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(12)
+            for col, box in enumerate(boxes):
+                grid.addWidget(box, 0, col)
+            for col in range(3):
+                grid.setColumnStretch(col, 1)
+            return holder
+
+        p_form.addRow(
+            "纠错选项:", _make_check_grid([self.check_missing_chk, self.add_missing_chk, self.crops_chk])
+        )
+        p_form.addRow("输出选项:", _make_check_grid([self.triage_dirs_chk, self.recursive_chk]))
         form_stack.addWidget(pol_group)
         form_stack.addStretch(1)
 
         scroll.setWidget(scroll_content)
         left.addWidget(scroll, 1)
 
+        # 底部操作栏：主操作（开始/停止）靠左，结果后续操作靠右，并用分隔线与表单区隔开
+        btn_sep = QFrame()
+        btn_sep.setFrameShape(QFrame.Shape.HLine)
+        btn_sep.setStyleSheet("color: #d0d7de;")
+        left.addWidget(btn_sep)
+
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self.start_btn = QPushButton("开始 MLLM 纠错清洗")
         self.start_btn.setObjectName("primaryBtn")
+        self.start_btn.setMinimumWidth(160)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.open_need_review_btn = QPushButton("在工作台打开待复核目录")
@@ -501,13 +531,16 @@ class MllmReviewTab(QWidget):
         self.send_ds_btn.setEnabled(False)
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(self.open_need_review_btn)
+        btn_row.addStretch(1)
         btn_row.addWidget(self.open_out_btn)
+        btn_row.addWidget(self.open_need_review_btn)
         btn_row.addWidget(self.send_ds_btn)
         left.addLayout(btn_row)
 
-        # 右侧面板：进度与汇总、分流筛选栏 + 历史报告加载、分组化的结果表 / 自适应对比预览 / 日志
-        right = QVBoxLayout()
+        # 右侧面板：进度与汇总、分流筛选栏 + 历史报告加载、结果列表/运行日志页签 + 自适应对比预览
+        right_widget = QWidget()
+        right = QVBoxLayout(right_widget)
+        right.setContentsMargins(4, 0, 0, 0)
         right.setSpacing(8)
 
         self.progress_bar = QProgressBar()
@@ -517,10 +550,11 @@ class MllmReviewTab(QWidget):
 
         self.summary_label = QLabel("就绪：配置基准模型与 MLLM 后点击「开始 MLLM 纠错清洗」，或加载历史审核报告继续复核。")
         self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("color: #424a53;")
         right.addWidget(self.summary_label)
 
         filter_row = QHBoxLayout()
-        filter_row.setSpacing(4)
+        filter_row.setSpacing(6)
         self.filter_buttons: dict[str, QPushButton] = {}
         filter_specs = (
             ("all", "全部"),
@@ -530,7 +564,7 @@ class MllmReviewTab(QWidget):
             ("error", "出错"),
         )
         filter_btn_qss = (
-            "QPushButton { padding: 3px 8px; font-size: 12px; }"
+            "QPushButton { padding: 3px 10px; font-size: 12px; }"
             "QPushButton:checked { background-color: #0969da; color: #ffffff; border-color: #085ec4; font-weight: 600; }"
         )
         for key, label in filter_specs:
@@ -543,16 +577,23 @@ class MllmReviewTab(QWidget):
             filter_row.addWidget(btn)
         filter_row.addStretch(1)
         self.load_report_btn = QPushButton("加载历史报告...")
-        self.load_report_btn.setStyleSheet("padding: 3px 8px; font-size: 12px;")
+        self.load_report_btn.setStyleSheet("padding: 3px 10px; font-size: 12px;")
         self.load_report_btn.setToolTip("读取历史清洗目录中的 review_report.json，直接还原结果表与对比预览继续复核")
         filter_row.addWidget(self.load_report_btn)
         right.addLayout(filter_row)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(10)
 
-        table_group = QGroupBox("4. 审核结果列表（单击看对比图，双击直达标注工作台精修）")
+        # 结果列表与运行日志合并为同一区域的两个页签，省出一整块纵向空间留给对比预览
+        table_group = QGroupBox("4. 审核结果与日志")
+        table_group.setToolTip("单击结果行查看对比图与判定理由，双击直达「2. 标注工作台」精修")
         table_layout = QVBoxLayout(table_group)
-        table_layout.setContentsMargins(6, 6, 6, 6)
+        table_layout.setContentsMargins(8, 8, 8, 8)
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setDocumentMode(True)
+
         self.result_table = QTableWidget(0, 8)
         self.result_table.setHorizontalHeaderLabels(
             ["图片", "分流结果", "保留", "改类", "删误检", "收框", "补漏", "说明"]
@@ -566,23 +607,32 @@ class MllmReviewTab(QWidget):
         for num_col in (2, 3, 4, 5, 6):
             header.setSectionResizeMode(num_col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.result_table.verticalHeader().setDefaultSectionSize(28)
+        self.result_table.setAlternatingRowColors(True)
         self.result_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.result_table.currentCellChanged.connect(self._on_row_selected)
         self.result_table.cellDoubleClicked.connect(self._on_row_double_clicked)
-        table_layout.addWidget(self.result_table)
+        self.result_tabs.addTab(self.result_table, "结果列表")
+
+        self.log_box = QPlainTextEdit()
+        self.log_box.setMaximumBlockCount(LOG_MAX_LINES)
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("MLLM 逐张审核日志将在此输出...")
+        self.result_tabs.addTab(self.log_box, "运行日志")
+        table_layout.addWidget(self.result_tabs)
         splitter.addWidget(table_group)
 
         preview_group = QGroupBox("5. 纠错前后对比预览")
         preview_layout = QVBoxLayout(preview_group)
-        preview_layout.setContentsMargins(6, 6, 6, 6)
-        preview_layout.setSpacing(4)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.setSpacing(6)
         self.legend_label = QLabel(
             "框色图例："
-            '<span style="color:#16a34a; font-weight:600;">■</span> 保留&nbsp;&nbsp;'
-            '<span style="color:#ea580c; font-weight:600;">■</span> 改类&nbsp;&nbsp;'
-            '<span style="color:#ca8a04; font-weight:600;">■</span> 补漏&nbsp;&nbsp;'
-            '<span style="color:#0284c7; font-weight:600;">■</span> 已收框(虚线为原框)&nbsp;&nbsp;'
+            '<span style="color:#16a34a; font-weight:600;">■</span> 保留&nbsp;&nbsp;&nbsp;'
+            '<span style="color:#ea580c; font-weight:600;">■</span> 改类&nbsp;&nbsp;&nbsp;'
+            '<span style="color:#ca8a04; font-weight:600;">■</span> 补漏&nbsp;&nbsp;&nbsp;'
+            '<span style="color:#0284c7; font-weight:600;">■</span> 已收框(虚线为原框)&nbsp;&nbsp;&nbsp;'
             '<span style="color:#c026d3; font-weight:600;">■</span> 过松/超门禁待修'
         )
         self.legend_label.setTextFormat(Qt.TextFormat.RichText)
@@ -590,18 +640,18 @@ class MllmReviewTab(QWidget):
         preview_layout.addWidget(self.legend_label)
 
         self.preview_label = _ScaledPreviewLabel(
-            "单击表格行对比「纠错前 vs 纠错后」标注框；双击行或点右下按钮可在「2. 标注工作台」精修"
+            "单击结果行对比「纠错前 vs 纠错后」标注框\n双击行或点击右下按钮可在「2. 标注工作台」精修"
         )
         preview_layout.addWidget(self.preview_label, 1)
 
         detail_row = QHBoxLayout()
         detail_row.setContentsMargins(0, 2, 0, 0)
-        detail_row.setSpacing(8)
+        detail_row.setSpacing(10)
         self.detail_label = QLabel("未选中图片：单击上方结果行可查看 MLLM 逐框判定理由与收框明细。")
         self.detail_label.setWordWrap(True)
         self.detail_label.setStyleSheet("color: #424a53; font-size: 12px;")
         self.open_selected_btn = QPushButton("在工作台精修此图 →")
-        self.open_selected_btn.setStyleSheet("padding: 4px 10px; font-size: 12px;")
+        self.open_selected_btn.setStyleSheet("padding: 4px 12px; font-size: 12px;")
         self.open_selected_btn.setEnabled(False)
         self.open_selected_btn.setToolTip("跳转到「2. 标注工作台」并精确打开当前选中的图片微调标注框")
         detail_row.addWidget(self.detail_label, 1)
@@ -609,21 +659,19 @@ class MllmReviewTab(QWidget):
         preview_layout.addLayout(detail_row)
         splitter.addWidget(preview_group)
 
-        log_group = QGroupBox("6. 审核日志")
-        log_layout = QVBoxLayout(log_group)
-        log_layout.setContentsMargins(6, 6, 6, 6)
-        self.log_box = QPlainTextEdit()
-        self.log_box.setMaximumBlockCount(LOG_MAX_LINES)
-        self.log_box.setReadOnly(True)
-        self.log_box.setPlaceholderText("MLLM 逐张审核日志将在此输出...")
-        log_layout.addWidget(self.log_box)
-        splitter.addWidget(log_group)
-
-        splitter.setSizes([215, 315, 110])
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([260, 400])
         right.addWidget(splitter, 1)
 
-        root.addLayout(left, 5)
-        root.addLayout(right, 4)
+        left_widget.setMinimumWidth(560)
+        right_widget.setMinimumWidth(440)
+        self.main_splitter.addWidget(left_widget)
+        self.main_splitter.addWidget(right_widget)
+        self.main_splitter.setStretchFactor(0, 5)
+        self.main_splitter.setStretchFactor(1, 4)
+        self.main_splitter.setSizes([5000, 4000])
+        root.addWidget(self.main_splitter)
 
         # 信号与槽连接
         self.images_picker.line_edit.textChanged.connect(self._schedule_images_count)
@@ -962,6 +1010,7 @@ class MllmReviewTab(QWidget):
         self.api_key_status_label.setText(message)
         self.log_box.appendPlainText(f"[连接测试] {message}")
         if not ok:
+            self.result_tabs.setCurrentWidget(self.log_box)
             QMessageBox.warning(self, "MLLM 连接测试失败", message)
 
     def save_settings(self, settings: QSettings, *, force: bool = False) -> None:
@@ -1127,6 +1176,7 @@ class MllmReviewTab(QWidget):
         self.detail_label.setToolTip("")
         self.open_selected_btn.setEnabled(False)
         self.result_table.setRowCount(0)
+        self.result_tabs.setCurrentWidget(self.result_table)
         self._refresh_filter_counts()
         self.log_box.clear()
         self.progress_bar.setValue(0)
@@ -1346,6 +1396,8 @@ class MllmReviewTab(QWidget):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.summary_label.setText(f"执行失败: {err}")
+        # 日志与结果列表共用页签区域，失败时自动切到“运行日志”便于直接查看出错上下文
+        self.result_tabs.setCurrentWidget(self.log_box)
         QMessageBox.critical(self, "MLLM 纠错失败", err)
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
