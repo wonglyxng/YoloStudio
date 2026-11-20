@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 from collections import Counter
@@ -178,6 +179,55 @@ def _count_excluded_images(images_dir: Path, exclude_subdirs: tuple[str, ...]) -
     total = len(find_images(images_dir, recursive=True))
     kept = len(find_images(images_dir, recursive=True, exclude_subdirs=exclude_subdirs))
     return total - kept
+
+
+@dataclass
+class ImageCountPreview:
+    """图片目录的轻量计数预览，供界面在选择目录后即时提示扫描范围（只读，不解析标注）。
+
+    字段说明：
+        `top_level`：目录顶层（不含子目录）的图片数。
+        `total`：含所有子目录的图片总数（含 `excluded`）。
+        `excluded`：位于 `exclude_subdirs` 命中目录中的图片数，口径与 `find_images` 一致。
+        `truncated`：累计文件数达到 `limit` 后提前停止，此时各计数为下限值。
+    """
+
+    top_level: int = 0
+    total: int = 0
+    excluded: int = 0
+    truncated: bool = False
+
+
+def preview_image_counts(
+    images_dir: Path, exclude_subdirs: tuple[str, ...] = (), limit: int = 200_000
+) -> ImageCountPreview:
+    """遍历目录统计顶层与递归图片数，供界面实时显示“勾选递归扫描后会多出多少张图片”。
+
+    只按扩展名计数，不打开图片或标注文件；遍历过的文件条目达到 `limit` 时停止并标记 `truncated`，
+    避免误选磁盘根目录等超大目录时长时间卡住主线程。目录不存在或无法读取时返回全零结果。
+    """
+    result = ImageCountPreview()
+    excluded = set(exclude_subdirs)
+    seen = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(images_dir):
+            rel_parts = Path(dirpath).relative_to(images_dir).parts
+            in_excluded = bool(excluded) and any(part in excluded for part in rel_parts)
+            for name in filenames:
+                seen += 1
+                if seen > limit:
+                    result.truncated = True
+                    return result
+                if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+                result.total += 1
+                if not rel_parts:
+                    result.top_level += 1
+                elif in_excluded:
+                    result.excluded += 1
+    except OSError:
+        return ImageCountPreview()
+    return result
 
 
 def _load_classes_file(classes_file: Path | None, search_dirs: list[Path]) -> list[str]:

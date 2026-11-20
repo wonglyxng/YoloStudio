@@ -24,6 +24,7 @@ from yolo_studio.core.dataset_converter import (
     DatasetBuildConfig,
     build_yolo_dataset,
     existing_split_dirs,
+    preview_image_counts,
     scan_dataset,
 )
 
@@ -260,3 +261,18 @@ def test_build_reports_split_class_counts_and_existing_split_dirs(tmp_path: Path
 
     found = {p.relative_to(out_dir).as_posix() for p in existing_split_dirs(out_dir)}
     assert found == {f"{k}/{s}" for k in ("images", "labels") for s in ("train", "val", "test")}
+
+
+def test_preview_image_counts_top_nested_and_excluded(tmp_path: Path) -> None:
+    """验证目录计数预览区分顶层、递归总数与排除子目录，并在达到条目上限时标记截断。"""
+    root = tmp_path / "root"
+    _write_dummy_image(root / "a.jpg")
+    _write_dummy_image(root / "v1" / "b.png")
+    _write_dummy_image(root / "v1" / "deep" / "c.png")
+    _write_dummy_image(root / "need_review" / "d.jpg")
+    (root / "notes.txt").write_text("x", encoding="utf-8")
+
+    res = preview_image_counts(root, ("need_review",))
+    assert (res.top_level, res.total, res.excluded, res.truncated) == (1, 4, 1, False)
+    assert preview_image_counts(tmp_path / "missing").total == 0
+    assert preview_image_counts(root, limit=2).truncated

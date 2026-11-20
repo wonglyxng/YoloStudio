@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal as Signal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -48,7 +48,9 @@ from yolo_studio.core.dataset_converter import (
     DatasetBuildConfig,
     DatasetBuildResult,
     DatasetScanSummary,
+    ImageCountPreview,
     existing_split_dirs,
+    preview_image_counts,
 )
 from yolo_studio.core.mllm_reviewer import BUCKET_NEED_REVIEW
 from yolo_studio.gui.common import PathPickerRow, open_local_path
@@ -128,6 +130,8 @@ class DatasetTab(QWidget):
         `_last_yaml_path` / `_yaml_revision`：最近一次成功生成的 `data.yaml` 及其参数版本号；
             仅当版本号与当前参数一致时才允许“前往训练”，避免把与当前设置不符的数据集当作最新结果。
         `_busy`：是否有扫描或生成任务在运行；运行期间禁用扫描/生成/前往训练按钮。
+        `_scope_counts`：当前图片目录的图片计数预览（顶层/递归/need_review 内），仅用于扫描范围提示；
+            目录为空或不存在时为 `None`，图片目录变化后经防抖定时器重新计算。
     """
 
     send_data_yaml = Signal(str)
@@ -145,6 +149,12 @@ class DatasetTab(QWidget):
         self._result_revision: int | None = None
         self._yaml_revision: int | None = None
         self._busy = False
+        self._scope_counts: ImageCountPreview | None = None
+        # 图片目录输入的防抖定时器：停止输入 300 ms 后才遍历目录计数
+        self._scope_timer = QTimer(self)
+        self._scope_timer.setSingleShot(True)
+        self._scope_timer.setInterval(300)
+        self._scope_timer.timeout.connect(self._refresh_scope_counts)
         self._init_ui()
 
     # ------------------------------------------------------------------ 界面构建
@@ -188,9 +198,14 @@ class DatasetTab(QWidget):
         self._update_ratio_hint()
         self._update_format_hint()
         self._update_exclude_option()
+        self._refresh_scope_counts()
 
     def _build_source_group(self) -> QGroupBox:
-        """分组 1：图片目录、打开工作台与扫描统计入口。"""
+        """分组 1：图片目录、扫描范围（递归/排除 need_review）、打开工作台与扫描统计入口。
+
+        设计原因：递归扫描决定从图片目录中取哪些图片，与图片目录强相关，因此紧贴目录输入框放置，
+        并实时显示顶层/子目录图片数，避免用户选了按子目录组织的数据却没注意到需要开启递归。
+        """
         group = QGroupBox("1. 标注源目录与工作台联动")
         form = QFormLayout(group)
 
@@ -201,6 +216,26 @@ class DatasetTab(QWidget):
             default_path=default_frames,
         )
         form.addRow("图片目录:", self.images_picker)
+
+        self.recursive_chk = QCheckBox("递归扫描子目录")
+        self.recursive_chk.setToolTip("图片按子目录（如 video-001/、auto_passed/）组织时需勾选")
+        self.exclude_need_review_chk = QCheckBox()
+        self.exclude_need_review_chk.setChecked(True)
+        self.exclude_need_review_chk.setToolTip(
+            "MLLM 清洗结果中的 need_review 含 LLM 补框与审核出错样本，人工复核完成前不应进入训练；"
+            "确认已在工作台复核后可取消勾选。仅在递归扫描时生效。"
+        )
+        self.scope_hint = QLabel()
+        self.scope_hint.setWordWrap(True)
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(self.recursive_chk)
+        scope_row.addWidget(self.exclude_need_review_chk)
+        scope_row.addStretch(1)
+        scope_box = QVBoxLayout()
+        scope_box.setSpacing(2)
+        scope_box.addLayout(scope_row)
+        scope_box.addWidget(self.scope_hint)
+        form.addRow("扫描范围:", scope_box)
 
         action_row = QHBoxLayout()
         self.open_workbench_btn = QPushButton("在「2. 标注工作台」中打开 →")
@@ -221,7 +256,7 @@ class DatasetTab(QWidget):
         return group
 
     def _build_split_group(self) -> QGroupBox:
-        """分组 2：标注格式、类别文件、输出目录、划分比例与附加选项。"""
+        """分组 2：标注格式、类别文件、输出目录、划分比例、随机种子与负样本选项。"""
         group = QGroupBox("2. 标注转换与 Train/Val/Test 数据集划分")
         form = QFormLayout(group)
 
@@ -294,22 +329,7 @@ class DatasetTab(QWidget):
         self.include_empty_chk.setToolTip(
             "仅影响完全没有 .json/.txt 的图片；已保存但无目标的标注文件视为人工确认的负样本，始终纳入"
         )
-        self.recursive_chk = QCheckBox("递归扫描子目录")
-        self.exclude_need_review_chk = QCheckBox()
-        self.exclude_need_review_chk.setChecked(True)
-        self.exclude_need_review_chk.setToolTip(
-            "MLLM 清洗结果中的 need_review 含 LLM 补框与审核出错样本，人工复核完成前不应进入训练；"
-            "确认已在工作台复核后可取消勾选。仅在递归扫描时生效。"
-        )
-        opt_box = QVBoxLayout()
-        opt_box.setSpacing(4)
-        opt_box.addWidget(self.include_empty_chk)
-        recursive_row = QHBoxLayout()
-        recursive_row.addWidget(self.recursive_chk)
-        recursive_row.addWidget(self.exclude_need_review_chk)
-        recursive_row.addStretch(1)
-        opt_box.addLayout(recursive_row)
-        form.addRow("附加选项:", opt_box)
+        form.addRow("附加选项:", self.include_empty_chk)
         return group
 
     @staticmethod
@@ -373,6 +393,9 @@ class DatasetTab(QWidget):
         for chk in (self.include_empty_chk, self.recursive_chk, self.exclude_need_review_chk):
             chk.toggled.connect(self._on_params_changed)
         self.recursive_chk.toggled.connect(self._update_exclude_option)
+        self.images_picker.textChanged.connect(self._schedule_scope_refresh)
+        self.recursive_chk.toggled.connect(self._render_scope_hint)
+        self.exclude_need_review_chk.toggled.connect(self._render_scope_hint)
 
     # ------------------------------------------------------------------ 跨页写入接口
 
@@ -450,11 +473,66 @@ class DatasetTab(QWidget):
             self.classes_picker.setPlaceholderText(_CLASSES_PLACEHOLDER_DEFAULT)
 
     def _update_exclude_option(self, *_args: object) -> None:
-        """排除 need_review 选项仅在递归扫描时生效：未开启递归时置灰并在文案中写明原因。"""
-        recursive = self.recursive_chk.isChecked()
-        self.exclude_need_review_chk.setEnabled(recursive)
-        suffix = "" if recursive else "（需开启递归扫描）"
-        self.exclude_need_review_chk.setText(f"排除未复核的 {BUCKET_NEED_REVIEW} 子目录{suffix}")
+        """排除 need_review 选项仅在递归扫描时生效：未开启递归时置灰（紧邻递归开关，无需额外说明）。"""
+        self.exclude_need_review_chk.setEnabled(self.recursive_chk.isChecked())
+        self.exclude_need_review_chk.setText(f"排除未复核的 {BUCKET_NEED_REVIEW} 子目录")
+
+    def _schedule_scope_refresh(self, *_args: object) -> None:
+        """图片目录变化时延迟重新计数，避免逐字输入路径时反复遍历磁盘。"""
+        self._scope_timer.start()
+
+    def _refresh_scope_counts(self) -> None:
+        """在主线程遍历图片目录统计顶层/递归图片数并缓存，随后刷新扫描范围提示。
+
+        `preview_image_counts` 只按扩展名计数并设有条目上限，正常目录耗时为毫秒级；
+        目录为空或不存在时缓存置为 `None`，提示区显示对应状态。
+        """
+        text = self.images_picker.text()
+        if not text or not Path(text).is_dir():
+            self._scope_counts = None
+        else:
+            self._scope_counts = preview_image_counts(Path(text), (BUCKET_NEED_REVIEW,))
+        self._render_scope_hint()
+
+    def _render_scope_hint(self, *_args: object) -> None:
+        """根据缓存计数与当前勾选状态，显示本次扫描实际会纳入的图片数量。
+
+        重点场景：顶层没有图片而子目录有图片且未勾选递归时，以醒目颜色提示勾选，
+        这是“按视频/分流子目录组织的数据集”最常见的配置遗漏。
+        """
+        text = self.images_picker.text()
+        counts = self._scope_counts
+        if not text:
+            self.scope_hint.setText("")
+            return
+        if counts is None:
+            self._set_scope_hint("目录不存在或无法访问。", "error")
+            return
+        more = "+" if counts.truncated else ""
+        nested = counts.total - counts.top_level
+        if self.recursive_chk.isChecked():
+            kept = counts.total - (counts.excluded if self.exclude_need_review_chk.isChecked() else 0)
+            msg = f"将扫描 {kept}{more} 张图片（含子目录）"
+            if self.exclude_need_review_chk.isChecked() and counts.excluded:
+                msg += f"，已排除 {BUCKET_NEED_REVIEW} 中的 {counts.excluded} 张"
+            self._set_scope_hint(msg, "ok" if kept else "error")
+        elif counts.top_level == 0 and nested > 0:
+            self._set_scope_hint(
+                f"顶层没有图片，子目录中有 {nested}{more} 张，请勾选「递归扫描子目录」。", "warn"
+            )
+        elif counts.top_level == 0:
+            self._set_scope_hint("该目录及子目录中没有图片。", "error")
+        elif nested > 0:
+            self._set_scope_hint(
+                f"将扫描顶层 {counts.top_level} 张图片；子目录另有 {nested}{more} 张未纳入（勾选递归可纳入）。",
+                "info",
+            )
+        else:
+            self._set_scope_hint(f"将扫描 {counts.top_level}{more} 张图片。", "ok")
+
+    def _set_scope_hint(self, text: str, level: str) -> None:
+        self.scope_hint.setText(text)
+        self.scope_hint.setStyleSheet(f"color: {_STATUS_COLORS[level]};")
 
     def _refresh_send_btn(self) -> None:
         fresh = bool(self._last_yaml_path) and self._yaml_revision == self._param_revision
