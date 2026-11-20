@@ -3,7 +3,7 @@
 职责：
     展示本机计算设备（CUDA GPU/CPU）状态，配置 `data.yaml`、预训练权重、场景超参数预设、
     优化器、数据增强与任意附加参数，支持配置持久化记忆、训练参数 JSON 一键导入/复制与防呆联动，
-    并在后台启动训练后实时刷新 Epoch 指标卡片与 Ultralytics 日志流（含提交配置与实际生效超参数明细）。
+    并在后台启动训练后实时刷新 Epoch 指标卡片、训练时长与 Ultralytics 日志流（含提交配置与实际生效超参数明细）。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程；训练任务委托给 `gui.workers.TrainWorker`，
@@ -14,9 +14,12 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal as Signal
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -118,6 +121,22 @@ def _as_bool(value: object, default: bool) -> bool:
     return default
 
 
+def format_elapsed_duration(seconds: float) -> str:
+    """将已用训练秒数格式化为固定宽度 `HH:MM:SS` 文本。
+
+    边界行为：
+        非有限值（`NaN`/`inf`）或非正数按 `0` 秒返回 `"00:00:00"`；
+        超过 99 小时后小时位继续自然递增（如 `"100:00:00"`），不回绕归零。
+    """
+    if not math.isfinite(seconds) or seconds <= 0:
+        total_sec = 0
+    else:
+        total_sec = int(seconds)
+    hours, rem = divmod(total_sec, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 class _ImportTrainArgsDialog(QDialog):
     """用于粘贴或加载外部训练参数 JSON / 日志片段并回填界面的轻量对话框。"""
 
@@ -208,7 +227,8 @@ class TrainTab(QWidget):
         持有硬件探测结果 `device_info`、统一设备控制组件 `device_ctrl`、跨页计算设备互斥协调器 `gpu_guard`、
         训练工作线程 `worker`、预设/持久化批量写入重入锁 `_applying_preset` / `_restoring_state`、
         用户修改脏标记 `_settings_dirty`、硬件自适应项覆盖标记（`_auto_batch_value`、`_amp_user_overridden`、
-        `_amp_saved_before_cpu`），以及最近实验目录 `_last_save_dir` 与最近最佳权重路径 `_last_best_pt`。
+        `_amp_saved_before_cpu`）、基于 `time.monotonic()` 单调时钟域的训练启动时间戳 `_train_started_at`
+        与实时刷新定时器 `_elapsed_timer`，以及最近实验目录 `_last_save_dir` 与最近最佳权重路径 `_last_best_pt`。
     """
 
     send_best_weights = Signal(str, str)  # 信号参数：(weights_path, data_yaml)
@@ -234,7 +254,12 @@ class TrainTab(QWidget):
         self._auto_batch_value: int = 16 if self.device_info.cuda_available else 4
         self._amp_user_overridden: bool = False
         self._amp_saved_before_cpu: bool | None = None
+        # 训练计时器状态：使用 `time.monotonic()` 单调时钟域，避免系统时间校时影响已用时长计算
+        self._train_started_at: float | None = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(500)
         self._init_ui()
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed_time)
 
     def _init_ui(self) -> None:
         root = QHBoxLayout(self)
@@ -660,6 +685,7 @@ class TrainTab(QWidget):
         metrics_grid.setSpacing(6)
 
         c1, self.val_epoch = make_metric_card("Epoch", "0 / 0")
+        c_time, self.val_elapsed = make_metric_card("训练时长", "-")
         c2, self.val_box_loss = make_metric_card("Box Loss", "-")
         c3, self.val_cls_loss = make_metric_card("Cls Loss", "-")
         c4, self.val_precision = make_metric_card("Precision", "-")
@@ -667,13 +693,16 @@ class TrainTab(QWidget):
         c6, self.val_map50 = make_metric_card("mAP50", "-")
         c7, self.val_map50_95 = make_metric_card("mAP50-95", "-")
 
-        metrics_grid.addWidget(c1, 0, 0, 1, 2)
+        metrics_grid.addWidget(c1, 0, 0)
+        metrics_grid.addWidget(c_time, 0, 1)
         metrics_grid.addWidget(c2, 1, 0)
         metrics_grid.addWidget(c3, 1, 1)
         metrics_grid.addWidget(c4, 2, 0)
         metrics_grid.addWidget(c5, 2, 1)
         metrics_grid.addWidget(c6, 3, 0)
         metrics_grid.addWidget(c7, 3, 1)
+        metrics_grid.setColumnStretch(0, 1)
+        metrics_grid.setColumnStretch(1, 1)
         right.addWidget(metrics_group)
 
         self.progress_bar = QProgressBar()
@@ -1496,8 +1525,76 @@ class TrainTab(QWidget):
         """校验当前界面表单并组装完整的 `TrainConfig`；输入非法时抛出带中文说明的 `ValueError`。"""
         return self._assemble_train_config(require_existing_yaml=True)
 
+    def _disconnect_worker(self, worker: TrainWorker | None) -> None:
+        """断开已完成训练线程的信号连接，防止历史实例的残留队列事件污染新一次训练的指标与日志。"""
+        if worker is None:
+            return
+        for sig in (worker.epoch_updated, worker.log_line, worker.finished_result, worker.failed):
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+
+    def _reset_live_metrics(self, *, total_epochs: int = 0, initial_elapsed: str = "-") -> None:
+        """立即重置右侧全部实时训练指标卡片与进度条，清除上一次训练残留数值。
+
+        参数说明：
+            `total_epochs`：本次训练计划总轮数；大于 0 时将 `Epoch` 重置为 `0 / <total_epochs>`，
+                为 0（如空闲初始态或断点续训尚待读取断点内总轮数）时重置为 `0 / 0`。
+            `initial_elapsed`：`训练时长` 卡片的重置显示文本（新训练启动时传入 `"00:00:00"`）。
+        """
+        self.progress_bar.setValue(0)
+        self.val_epoch.setText(f"0 / {total_epochs}" if total_epochs > 0 else "0 / 0")
+        self.val_elapsed.setText(initial_elapsed)
+        self.val_box_loss.setText("-")
+        self.val_cls_loss.setText("-")
+        self.val_precision.setText("-")
+        self.val_recall.setText("-")
+        self.val_map50.setText("-")
+        self.val_map50_95.setText("-")
+
+    def _start_elapsed_timer(self) -> None:
+        """以当前 `time.monotonic()` 单调时钟为起点启动训练时长刷新定时器，并立即归零显示 `00:00:00`。"""
+        self._train_started_at = time.monotonic()
+        self.val_elapsed.setText("00:00:00")
+        self._elapsed_timer.start()
+
+    def _refresh_elapsed_time(self) -> str:
+        """按单调时钟计算当前已用训练时长并刷新卡片文本；尚未启动计时时原样返回当前显示文本。"""
+        if self._train_started_at is None:
+            return self.val_elapsed.text()
+        elapsed_text = format_elapsed_duration(time.monotonic() - self._train_started_at)
+        if self.val_elapsed.text() != elapsed_text:
+            self.val_elapsed.setText(elapsed_text)
+        return elapsed_text
+
+    def _stop_elapsed_timer(self) -> str | None:
+        """停止训练时长定时器并在停表前完成末次刷新，返回定格的 `HH:MM:SS` 文案（未计时时返回 `None`）。"""
+        self._elapsed_timer.stop()
+        if self._train_started_at is None:
+            return None
+        return self._refresh_elapsed_time()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """关闭标签页时停止实时计时定时器，避免关闭后定时器继续触发。"""
+        self._elapsed_timer.stop()
+        super().closeEvent(event)
+
+    def _resolve_initial_total_epochs(self, cfg: TrainConfig) -> int:
+        """计算新训练启动瞬间的 `Epoch` 卡片分母；断点续训时由断点内配置决定，启动瞬间返回 `0`。"""
+        if cfg.resume:
+            return 0
+        raw_epochs = build_train_kwargs(cfg).get("epochs", cfg.epochs)
+        if isinstance(raw_epochs, bool):
+            return cfg.epochs if cfg.epochs > 0 else 0
+        try:
+            parsed = int(raw_epochs)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            parsed = cfg.epochs
+        return parsed if parsed > 0 else 0
+
     def _on_start(self) -> None:
-        """校验表单与附加超参数后锁定运行按钮、清空日志并启动 `TrainWorker`。"""
+        """校验表单与附加超参数后锁定运行按钮、立即重置全部实时指标与计时器、清空日志并启动 `TrainWorker`。"""
         if self.device_info.probing:
             self.apply_device_info(detect_compute_device())
 
@@ -1507,16 +1604,22 @@ class TrainTab(QWidget):
             QMessageBox.warning(self, "提示", str(exc))
             return
 
-        self._settings_dirty = True
-        self._last_save_dir = cfg.project_dir / cfg.run_name
-
         if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "YOLO26 模型训练"):
             return
+
+        self._settings_dirty = True
+        self._last_save_dir = cfg.project_dir / cfg.run_name
+        self._last_best_pt = ""
+        self._disconnect_worker(self.worker)
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.send_eval_btn.setEnabled(False)
-        self.progress_bar.setValue(0)
+        self._reset_live_metrics(
+            total_epochs=self._resolve_initial_total_epochs(cfg),
+            initial_elapsed="00:00:00",
+        )
+        self._start_elapsed_timer()
         self.log_box.clear()
         self.log_box.appendPlainText("正在启动 YOLO26 训练任务...")
 
@@ -1540,6 +1643,7 @@ class TrainTab(QWidget):
         pct = int(min(100, (m.epoch / max(1, m.total_epochs)) * 100))
         self.progress_bar.setValue(pct)
         self.val_epoch.setText(f"{m.epoch} / {m.total_epochs}")
+        self._refresh_elapsed_time()
         self.val_box_loss.setText(f"{m.box_loss:.4f}")
         self.val_cls_loss.setText(f"{m.cls_loss:.4f}")
         self.val_precision.setText(f"{m.precision:.4f}")
@@ -1551,7 +1655,8 @@ class TrainTab(QWidget):
         self.log_box.appendPlainText(line)
 
     def _on_finished(self, res: TrainResult) -> None:
-        """恢复界面状态并记录产物目录；若生成了 `best.pt` 则自动通知下游标签页。"""
+        """恢复界面状态、停表定格训练时长并记录产物目录；若生成了 `best.pt` 则自动通知下游标签页。"""
+        elapsed_text = self._stop_elapsed_timer()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._last_save_dir = res.save_dir
@@ -1560,6 +1665,8 @@ class TrainTab(QWidget):
 
         status_text = "训练已提前停止" if res.stopped_early else "训练完成"
         self.log_box.appendPlainText(f"\n=== {status_text} ===")
+        if elapsed_text is not None:
+            self.log_box.appendPlainText(f"训练时长: {elapsed_text}")
         self.log_box.appendPlainText(f"结果目录: {res.save_dir}")
         if res.best_weights:
             self._last_best_pt = str(res.best_weights)
@@ -1570,7 +1677,13 @@ class TrainTab(QWidget):
             self.log_box.appendPlainText(f"最新权重: {res.last_weights}")
 
     def _on_failed(self, err: str) -> None:
+        """训练异常退出时停表定格训练时长、恢复按钮状态并弹窗提示错误。"""
+        elapsed_text = self._stop_elapsed_timer()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.log_box.appendPlainText(f"\n[错误] {err}")
+        if elapsed_text is not None:
+            self.log_box.appendPlainText(f"\n训练时长: {elapsed_text}")
+            self.log_box.appendPlainText(f"[错误] {err}")
+        else:
+            self.log_box.appendPlainText(f"\n[错误] {err}")
         QMessageBox.critical(self, "训练错误", err)
