@@ -125,7 +125,14 @@ class DatasetBuildConfig:
 
 @dataclass
 class DatasetBuildResult:
-    """YOLO 数据集生成完成后的产物路径与分布统计摘要。"""
+    """YOLO 数据集生成完成后的产物路径与分布统计摘要。
+
+    关键字段说明：
+        `class_counts`：扫描阶段全部样本（含未被纳入划分的样本）中各类别的标注框数。
+        `split_class_counts`：实际写入各划分的标注框数，键为 `train` / `val` / `test`，
+            值为“类别名称 → 框数”；三个划分键始终存在，某类别在该划分中没有框时不出现在内层字典中。
+            用于检查验证集是否缺失某些类别。
+    """
 
     output_dir: Path
     data_yaml_path: Path
@@ -137,6 +144,7 @@ class DatasetBuildResult:
     total_boxes: int
     class_counts: dict[str, int]
     warnings: list[str] = field(default_factory=list)
+    split_class_counts: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def find_images(
@@ -586,6 +594,26 @@ def _clear_previous_splits(out_dir: Path, split_dirs: list[Path]) -> None:
             cache_file.unlink(missing_ok=True)
 
 
+def existing_split_dirs(output_dir: Path) -> list[Path]:
+    """只读列出 `output_dir` 下已存在且非空、会被 `build_yolo_dataset` 清理重建的划分子目录。
+
+    用途：
+        供界面在生成前提示用户确认覆盖；返回空列表表示本次构建不会删除任何已有划分文件。
+        与 `_clear_previous_splits` 的清理范围保持一致（`images|labels` × `train|val|test`），
+        不包含 `labels/*.cache` 这类可再生缓存。目录不存在或无法读取时视为无可覆盖内容。
+    """
+    found: list[Path] = []
+    for kind in ("images", "labels"):
+        for split in SPLIT_NAMES:
+            d = output_dir / kind / split
+            try:
+                if d.is_dir() and any(d.iterdir()):
+                    found.append(d)
+            except OSError:
+                continue
+    return found
+
+
 def build_yolo_dataset(config: DatasetBuildConfig) -> DatasetBuildResult:
     """转换标注、按比例划分为 train/val/test，并写出 Ultralytics `data.yaml`。
 
@@ -627,7 +655,10 @@ def build_yolo_dataset(config: DatasetBuildConfig) -> DatasetBuildResult:
     _validate_output_location(config, out_dir, split_dirs, summary.samples)
     _clear_previous_splits(out_dir, split_dirs)
 
+    split_class_counts: dict[str, dict[str, int]] = {}
     for split_name, split_items in (("train", train_set), ("val", val_set), ("test", test_set)):
+        split_counter: Counter[str] = Counter(b.class_name for s in split_items for b in s.boxes)
+        split_class_counts[split_name] = dict(split_counter)
         if not split_items and split_name == "test":
             continue
         img_out_dir = out_dir / "images" / split_name
@@ -684,4 +715,5 @@ def build_yolo_dataset(config: DatasetBuildConfig) -> DatasetBuildResult:
         total_boxes=summary.total_boxes,
         class_counts=summary.class_counts,
         warnings=summary.warnings,
+        split_class_counts=split_class_counts,
     )

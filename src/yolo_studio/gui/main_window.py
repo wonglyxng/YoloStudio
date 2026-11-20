@@ -155,6 +155,9 @@ class MainWindow(QMainWindow):
         self.review_tab.open_in_workbench.connect(self._on_open_in_workbench)
         self.review_tab.send_cleaned_dataset.connect(self._on_cleaned_ready)
         self.dataset_tab.send_data_yaml.connect(self._on_yaml_ready)
+        self.dataset_tab.request_train_tab.connect(
+            lambda: self.tabs.setCurrentWidget(self.train_tab)
+        )
         self.train_tab.send_best_weights.connect(self._on_weights_ready)
 
         self._restore_settings()
@@ -227,17 +230,8 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(3)
 
     def _on_annotations_changed(self, dir_path: str) -> None:
-        """工作台内保存或更新 `.json` 后，若数据集页当前指向同目录则更新状态提示。"""
-        cur_ds_dir = self.dataset_tab.images_picker.text()
-        if not cur_ds_dir:
-            return
-        try:
-            if Path(cur_ds_dir).resolve() == Path(dir_path).resolve():
-                self.dataset_tab.summary_label.setText(
-                    "检测到「2. 标注工作台」已更新标注文件，可点击「扫描标注统计」刷新分布。"
-                )
-        except OSError:
-            pass
+        """工作台内保存或更新 `.json` 后通知数据集页；由数据集页判断是否同目录并标记统计结果过期。"""
+        self.dataset_tab.mark_annotations_changed(dir_path)
 
     def _on_cleaned_ready(self, images_dir: str, classes_txt: str, recursive: bool) -> None:
         """将 MLLM 清洗输出目录与类别清单填入「3. 数据集准备」并切换至该页。"""

@@ -4,7 +4,7 @@
     验证 `scan_dataset` 与 `build_yolo_dataset` 对自动格式识别、归一化坐标换算、
     `classes.txt` 读取及 `train`/`val` 划分的正确性；并覆盖重复构建清理旧划分、
     显式负样本保留、损坏标注跳过、递归排除子目录、同名图片不跨目录误配标注
-    以及输出目录位置校验等回归场景。
+    以及输出目录位置校验等回归场景；同时覆盖按划分统计类别框数与已有划分目录探测。
 
 运行环境与协作边界：
     通过 `pytest` 在临时目录（`tmp_path`）中运行，依赖 `Pillow` 与 `PyYAML`，
@@ -23,6 +23,7 @@ from yolo_studio.core.dataset_converter import (
     AnnotationFormat,
     DatasetBuildConfig,
     build_yolo_dataset,
+    existing_split_dirs,
     scan_dataset,
 )
 
@@ -230,3 +231,32 @@ def test_build_rejects_output_inside_recursive_images_dir(tmp_path: Path) -> Non
         assert "内部" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("应拒绝位于图片目录内部的输出目录")
+
+
+def test_build_reports_split_class_counts_and_existing_split_dirs(tmp_path: Path) -> None:
+    """验证生成结果按划分统计类别框数（与写出的标签一致），以及 `existing_split_dirs` 只列出非空划分目录。"""
+    raw_dir = tmp_path / "raw"
+    for idx in range(10):
+        img = raw_dir / f"f_{idx:02d}.jpg"
+        _write_dummy_image(img)
+        _write_json_ann(img, [_rect("person"), _rect("car" if idx % 2 else "person")])
+
+    out_dir = tmp_path / "ds"
+    assert existing_split_dirs(out_dir) == []
+    (out_dir / "images" / "train").mkdir(parents=True)  # 空目录不算可覆盖内容
+    assert existing_split_dirs(out_dir) == []
+
+    res = build_yolo_dataset(
+        DatasetBuildConfig(images_dir=raw_dir, output_dir=out_dir, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2)
+    )
+    assert set(res.split_class_counts) == {"train", "val", "test"}
+    for name, total in res.class_counts.items():
+        assert sum(res.split_class_counts[s].get(name, 0) for s in ("train", "val", "test")) == total
+    val_boxes = sum(
+        len([ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()])
+        for p in (out_dir / "labels" / "val").glob("*.txt")
+    )
+    assert val_boxes == sum(res.split_class_counts["val"].values())
+
+    found = {p.relative_to(out_dir).as_posix() for p in existing_split_dirs(out_dir)}
+    assert found == {f"{k}/{s}" for k in ("images", "labels") for s in ("train", "val", "test")}

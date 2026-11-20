@@ -54,7 +54,14 @@ def load_pixmap_scaled(image_path: Path, max_w: int, max_h: int) -> QPixmap | No
 
 
 class PathPickerRow(QWidget):
-    """包含路径输入框与“浏览...”按钮的水平复合控件，支持 `dir` 目录模式与文件选择模式。"""
+    """包含路径输入框与“浏览...”按钮的水平复合控件，支持 `dir` 目录模式与文件选择模式。
+
+    长路径显示约定：
+        通过 `setText` 或“浏览...”写入路径后，光标统一回到开头，使各输入框都从盘符开始显示，
+        避免有的显示开头、有的被滚动到结尾；输入框 tooltip 始终同步为完整路径，便于查看被截断的部分。
+    """
+
+    textChanged = Signal(str)  # 输入框文本变化（含程序写入与用户编辑），参数为未去空白的原始文本
 
     def __init__(
         self,
@@ -74,6 +81,9 @@ class PathPickerRow(QWidget):
 
         self.line_edit = QLineEdit(default_path)
         self.line_edit.setPlaceholderText(placeholder)
+        self.line_edit.setCursorPosition(0)
+        self.line_edit.setToolTip(default_path)
+        self.line_edit.textChanged.connect(self._on_text_changed)
         self.browse_btn = QPushButton("浏览...")
         self.browse_btn.setFixedWidth(76)
         self.browse_btn.clicked.connect(self._on_browse)
@@ -85,10 +95,19 @@ class PathPickerRow(QWidget):
         return self.line_edit.text().strip()
 
     def setText(self, value: str) -> None:
+        """程序写入路径并把光标移回开头，使长路径从盘符开始显示。"""
         self.line_edit.setText(value)
+        self.line_edit.setCursorPosition(0)
+
+    def setPlaceholderText(self, value: str) -> None:
+        self.line_edit.setPlaceholderText(value)
 
     def path(self) -> Path:
         return Path(self.text())
+
+    def _on_text_changed(self, value: str) -> None:
+        self.line_edit.setToolTip(value.strip())
+        self.textChanged.emit(value)
 
     def _on_browse(self) -> None:
         start_dir = self.text() or str(Path.cwd())
@@ -97,7 +116,7 @@ class PathPickerRow(QWidget):
         else:
             chosen, _ = QFileDialog.getOpenFileName(self, "选择文件", start_dir, self.file_filter)
         if chosen:
-            self.line_edit.setText(chosen)
+            self.setText(chosen)
 
 
 def make_metric_card(title: str, initial_value: str = "-") -> tuple[QWidget, QLabel]:
