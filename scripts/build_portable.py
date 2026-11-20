@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -865,6 +866,157 @@ def ensure_cython_toolchain(
     return tools_dir
 
 
+# 纯 Python 通用 Qt 信号槽签名桥接源码（仅在 `--protect pyd` 模式下编译为无源码 `.pyc` 随包分发）。
+# 作用：解决 PyQt6-sip 无法对 Cython 编译后的 cyfunction 自动截断多余信号参数（如 QPushButton.clicked(bool)）的问题。
+_QT_SLOT_BRIDGE_SOURCE = """import inspect
+import types
+import weakref
+
+
+def adapt_slot(slot):
+    if not callable(slot):
+        return slot
+    if isinstance(slot, types.FunctionType):
+        return slot
+    if isinstance(slot, types.MethodType) and isinstance(slot.__func__, types.FunctionType):
+        return slot
+    try:
+        sig = inspect.signature(slot)
+    except (TypeError, ValueError):
+        return slot
+
+    max_pos = 0
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return slot
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            max_pos += 1
+
+    if isinstance(slot, types.MethodType):
+        owner = getattr(slot, "__self__", None)
+        use_weak = False
+        if owner is not None:
+            try:
+                from PyQt6.QtCore import QObject
+
+                use_weak = isinstance(owner, QObject)
+            except Exception:
+                use_weak = False
+        if use_weak:
+            try:
+                weak_m = weakref.WeakMethod(slot)
+
+                def _weak_bound_wrapper(*args):
+                    fn = weak_m()
+                    if fn is not None:
+                        return fn(*args[:max_pos])
+                    return None
+
+                return _weak_bound_wrapper
+            except TypeError:
+                pass
+
+    def _slot_wrapper(*args):
+        return slot(*args[:max_pos])
+
+    return _slot_wrapper
+"""
+
+
+def rewrite_connect_calls_for_cython(source_text: str) -> tuple[str, bool]:
+    """通过 AST 将源码中所有 `.connect(slot, ...)` 的首个位置参数改写为 `_ys_adapt_slot(slot)`。
+
+    设计原因：
+        Cython 编译后的类方法与匿名 `lambda` 均为 `cyfunction`，PyQt6-sip 无法按原生 `PyFunctionObject`
+        截断 `clicked(bool)`、`toggled(bool)`、`valueChanged(int)` 等信号附带参数，会抛出 `TypeError` 导致闪退。
+        本函数仅在临时构建副本上执行改写，不改动原仓库源码，且将自动注入的 `import` 严格放在模块文档字符串
+        与 `from __future__ import ...` 之后。非 Qt 的 `.connect(str/tuple)` 因参数不可调用会被运行期原样透传。
+    返回 `(改写后的源码文本, 是否发生了改写)`。
+    """
+    tree = ast.parse(source_text)
+    changed = False
+
+    class _ConnectTransformer(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            nonlocal changed
+            self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                and node.args
+                and not isinstance(node.args[0], ast.Starred)
+            ):
+                first_arg = node.args[0]
+                already_wrapped = (
+                    isinstance(first_arg, ast.Call)
+                    and isinstance(first_arg.func, ast.Name)
+                    and first_arg.func.id == "_ys_adapt_slot"
+                )
+                if not already_wrapped:
+                    node.args[0] = ast.Call(
+                        func=ast.Name(id="_ys_adapt_slot", ctx=ast.Load()),
+                        args=[first_arg],
+                        keywords=[],
+                    )
+                    changed = True
+            return node
+
+    tree = _ConnectTransformer().visit(tree)
+    if not changed:
+        return source_text, False
+
+    insert_idx = 0
+    if (
+        tree.body
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    ):
+        insert_idx = 1
+    while (
+        insert_idx < len(tree.body)
+        and isinstance(tree.body[insert_idx], ast.ImportFrom)
+        and tree.body[insert_idx].module == "__future__"
+    ):
+        insert_idx += 1
+
+    bridge_import = ast.ImportFrom(
+        module="yolo_studio._qt_slot_bridge",
+        names=[ast.alias(name="adapt_slot", asname="_ys_adapt_slot")],
+        level=0,
+    )
+    tree.body.insert(insert_idx, bridge_import)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n", True
+
+
+def write_qt_slot_bridge_pyc(bundle_root: Path, runtime_python: Path) -> Path:
+    """在 `app/src/yolo_studio/` 下生成纯字节码 `_qt_slot_bridge.pyc` 并移除对应 `.py`。
+
+    约束：
+        必须保留为纯 Python 字节码 `.pyc`（不得经 Cython 编译为 `.pyd`），确保其返回的闭包为
+        PyQt6-sip 可识别的原生 `PyFunctionObject`。
+    """
+    pkg_root = bundle_root / "app" / "src" / "yolo_studio"
+    bridge_py = pkg_root / "_qt_slot_bridge.py"
+    bridge_py.write_text(_QT_SLOT_BRIDGE_SOURCE, encoding="utf-8")
+
+    env = _isolated_subprocess_env(runtime_python.parent, bundle_root)
+    subprocess.run(
+        [str(runtime_python), "-m", "compileall", "-b", "-q", str(bridge_py)],
+        env=env,
+        check=True,
+    )
+    bridge_pyc = bridge_py.with_suffix(".pyc")
+    if not bridge_pyc.is_file() or bridge_pyc.stat().st_size == 0:
+        raise RuntimeError(f"未能生成 Qt 信号槽桥接字节码: {bridge_pyc}")
+    bridge_py.unlink(missing_ok=True)
+    return bridge_pyc
+
+
 def compile_yolo_studio_to_pyd(
     bundle_root: Path,
     cache_dir: Path,
@@ -873,9 +1025,11 @@ def compile_yolo_studio_to_pyd(
     """将 `app/src/yolo_studio/**/*.py`（不含包标识 `__init__.py`）编译为原生 x64 `.pyd` 机器码并删除明文源码。
 
     关键编译约束：
-        1. 使用 `annotation_typing=False` 保留完整 Python `__annotations__`，确保 Pydantic v2 模型与 dataclass 反射正常；
-        2. 使用 `binding=True` 保证 PyQt6 槽函数连接与签名绑定兼容，使用 `embedsignature=False` 避免在二进制内残留明文签名；
-        3. 通过 `vcvars64.bat` 配合 `DISTUTILS_USE_SDK=1` / `MSSdk=1` 兼容 Visual Studio 2019~2026 全系编译器。
+        1. 编译前在临时源码副本上执行 `rewrite_connect_calls_for_cython` 注入 Qt 信号槽签名桥接，
+           并产出纯字节码 `_qt_slot_bridge.pyc`，根治 Cython `cyfunction` 与 PyQt6 槽参数不截断闪退；
+        2. 使用 `annotation_typing=False` 保留完整 Python `__annotations__`，确保 Pydantic v2 模型与 dataclass 反射正常；
+        3. 使用 `binding=True` 保证 `inspect.signature` 可读取真实参数个数，使用 `embedsignature=False` 避免在二进制内残留明文签名；
+        4. 通过 `vcvars64.bat` 配合 `DISTUTILS_USE_SDK=1` / `MSSdk=1` 兼容 Visual Studio 2019~2026 全系编译器。
     """
     runtime_dir = bundle_root / "runtime"
     runtime_py = runtime_dir / "python.exe"
@@ -888,7 +1042,7 @@ def compile_yolo_studio_to_pyd(
     cython_tools = ensure_cython_toolchain(runtime_py, cache_dir, pip_index_url=pip_index_url)
 
     py_sources = sorted(
-        p for p in pkg_root.rglob("*.py") if p.name != "__init__.py"
+        p for p in pkg_root.rglob("*.py") if p.name not in {"__init__.py", "_qt_slot_bridge.py"}
     )
     if not py_sources:
         raise RuntimeError(f"未在 {pkg_root} 中找到可编译的业务模块 .py 文件")
@@ -896,15 +1050,34 @@ def compile_yolo_studio_to_pyd(
     print(f"[保护] 正在使用 Cython + MSVC 将 {len(py_sources)} 个核心业务模块编译为原生 .pyd 机器码...")
     with tempfile.TemporaryDirectory(prefix="ys_cython_build_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
+        staged_src_root = tmp_dir / "staged_src"
         build_temp = tmp_dir / "obj"
         setup_script = tmp_dir / "setup_cython.py"
         build_bat = tmp_dir / "run_cython_build.bat"
 
+        # 将全部源码复制到临时构建目录并应用 Qt 信号槽 AST 改写，不触碰原仓库文件
+        rewritten_modules = 0
         ext_specs: list[tuple[str, str]] = []
+        for init_py in pkg_root.rglob("__init__.py"):
+            rel = init_py.relative_to(src_root)
+            dst_init = staged_src_root / rel
+            dst_init.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(init_py, dst_init)
+
         for py_file in py_sources:
-            rel_no_ext = py_file.relative_to(src_root).with_suffix("")
-            mod_name = ".".join(rel_no_ext.parts)
-            ext_specs.append((mod_name, str(py_file.resolve())))
+            rel = py_file.relative_to(src_root)
+            staged_py = staged_src_root / rel
+            staged_py.parent.mkdir(parents=True, exist_ok=True)
+            raw_text = py_file.read_text(encoding="utf-8")
+            rewritten_text, was_changed = rewrite_connect_calls_for_cython(raw_text)
+            if was_changed:
+                rewritten_modules += 1
+            staged_py.write_text(rewritten_text, encoding="utf-8")
+            mod_name = ".".join(rel.with_suffix("").parts)
+            ext_specs.append((mod_name, str(staged_py.resolve())))
+
+        if rewritten_modules > 0:
+            print(f"[保护] 已对 {rewritten_modules} 个含 Qt 信号连接的模块自动注入 Cython 槽签名兼容桥接。")
 
         setup_code = f"""
 import multiprocessing
@@ -938,7 +1111,7 @@ if __name__ == "__main__":
         setup_script.write_text(setup_code, encoding="utf-8")
 
         jobs = max(1, os.cpu_count() or 1)
-        # 通过 cmd 批处理先初始化 Visual Studio x64 编译器环境，再由便携包自身 python.exe 匹配 ABI 编译
+        # 通过 cmd 批处理先初始化 Visual Studio x64 编译器环境，再按包路径直接输出 .pyd 至 src_root
         bat_lines = [
             "@echo off",
             "chcp 65001 >nul",
@@ -947,7 +1120,7 @@ if __name__ == "__main__":
             "set DISTUTILS_USE_SDK=1",
             "set MSSdk=1",
             f'set "PYTHONPATH={cython_tools}"',
-            f'"{runtime_py}" "{setup_script}" build_ext --inplace --parallel {jobs} --build-temp "{build_temp}" --build-lib "{src_root}"',
+            f'"{runtime_py}" "{setup_script}" build_ext --parallel {jobs} --build-temp "{build_temp}" --build-lib "{src_root}"',
             "exit /b %ERRORLEVEL%",
         ]
         build_bat.write_bytes(("\r\n".join(bat_lines) + "\r\n").encode("utf-8"))
@@ -955,7 +1128,7 @@ if __name__ == "__main__":
         env = _isolated_subprocess_env(runtime_dir, bundle_root)
         res = subprocess.run(
             ["cmd.exe", "/d", "/c", str(build_bat)],
-            cwd=str(src_root),
+            cwd=str(staged_src_root),
             env=env,
             capture_output=True,
             text=True,
@@ -985,6 +1158,9 @@ if __name__ == "__main__":
     for cache_dir_item in list(pkg_root.rglob("__pycache__")):
         if cache_dir_item.is_dir():
             shutil.rmtree(cache_dir_item, ignore_errors=True)
+
+    # 写出纯字节码 Qt 信号槽桥接模块（供已编译 .pyd 的 .connect() 运行期调用）
+    write_qt_slot_bridge_pyc(bundle_root, runtime_py)
 
     # 清空子包标记 __init__.py，顶层包仅保留单行版本导出以支持 `yolo_studio.__version__`
     top_init = (pkg_root / "__init__.py").resolve()
@@ -1459,13 +1635,26 @@ assert decision.box_id == 1 and decision.action == "keep"
 if sys.argv[2] == "1":
     import torch, onnxruntime, ultralytics
     from PyQt6.QtCore import QCoreApplication, Qt
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QFileDialog
     from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
 
     ensure_cuda_dll_search_paths()
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication([])
     win = main_window.MainWindow(bundle / "workspace", lazy_init=True)
+
+    # 实测 .pyd 编译模块下的 Qt 按钮 clicked(bool) 与表单信号不会抛出参数个数 TypeError
+    slot_errors = []
+    sys.excepthook = lambda t, v, tb: slot_errors.append(f"{t.__name__}: {v}")
+    dialog_calls = []
+    QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: (dialog_calls.append(a) or ""))
+    win.extract_tab.output_picker.browse_btn.click()
+    win.dataset_tab.images_picker.browse_btn.click()
+    win.dataset_tab.train_spin.setValue(75)
+    win.train_tab.toggle_aug_btn.click()
+    assert len(dialog_calls) == 2, f"浏览按钮未正常触发 QFileDialog: {dialog_calls}"
+    assert not slot_errors, f"Qt 信号槽在编译模块下发生异常: {slot_errors}"
+
     assert win.labeling_tab.ensure_mounted() is True, "内嵌 X-AnyLabeling 挂载失败"
     win.labeling_tab.prepare_for_close()
     win.close()

@@ -496,3 +496,94 @@ def test_create_patch_archive_overlays_cleanly_and_passes_integrity_check(tmp_pa
     assert "v0.3.1" in (old_bundle / "app" / "main.py").read_text(encoding="utf-8")
     verify_res = subprocess.run([str(old_bundle / "YoloStudio.exe"), "--verify-only"], capture_output=True)
     assert verify_res.returncode == 0
+
+
+def test_rewrite_connect_calls_for_cython_and_slot_bridge_behavior() -> None:
+    """验证 AST 重写严格保持 `__future__` 置顶并包裹 `.connect()`，且桥接器能截断多余信号参数。"""
+    bp = _load_build_portable_module()
+
+    # 1) 无 .connect() 调用的模块不做改动
+    plain_src = '"""doc"""\nfrom __future__ import annotations\nx = 1\n'
+    out_plain, changed_plain = bp.rewrite_connect_calls_for_cython(plain_src)
+    assert changed_plain is False
+    assert out_plain == plain_src
+
+    # 2) 含多种 .connect() 的模块应正确注入导入于 __future__ 之后并仅包裹首参
+    gui_src = (
+        '"""模块文档"""\n'
+        "from __future__ import annotations\n"
+        "def wire(btn, sig, conn_type):\n"
+        "    btn.clicked.connect(self._on_browse)\n"
+        "    btn.clicked.connect(lambda: 123)\n"
+        "    sig.connect(self._on_ready, conn_type)\n"
+    )
+    rewritten, changed = bp.rewrite_connect_calls_for_cython(gui_src)
+    assert changed is True
+    lines = [line.strip() for line in rewritten.splitlines() if line.strip()]
+    assert lines[1] == "from __future__ import annotations"
+    assert lines[2] == "from yolo_studio._qt_slot_bridge import adapt_slot as _ys_adapt_slot"
+    assert "_ys_adapt_slot(self._on_browse)" in rewritten
+    assert "_ys_adapt_slot(lambda: 123)" in rewritten
+    assert "sig.connect(_ys_adapt_slot(self._on_ready), conn_type)" in rewritten
+    compile(rewritten, "<rewritten_gui>", "exec")
+
+    # 3) 验证桥接模块 adapt_slot 对非 PyFunction 可调用对象（模拟 Cython cyfunction）的参数截断与透传
+    ns: dict[str, object] = {}
+    exec(bp._QT_SLOT_BRIDGE_SOURCE, ns)
+    adapt_slot = ns["adapt_slot"]
+    assert callable(adapt_slot)
+
+    # 非可调用对象（如 sqlite3.connect("a.db") 的字符串参数）原样透传
+    assert adapt_slot("demo.db") == "demo.db"
+
+    calls: list[tuple[object, ...]] = []
+
+    class _ZeroArgCallable:
+        def __call__(self) -> str:
+            calls.append(())
+            return "zero_ok"
+
+    class _TwoArgCallable:
+        def __call__(self, a: int, b: str = "def") -> tuple[int, str]:
+            calls.append((a, b))
+            return (a, b)
+
+    class _VarArgsCallable:
+        def __call__(self, *args: object) -> tuple[object, ...]:
+            calls.append(args)
+            return args
+
+    wrapped_zero = adapt_slot(_ZeroArgCallable())
+    assert wrapped_zero(False) == "zero_ok"
+    assert wrapped_zero(False, 99) == "zero_ok"
+
+    wrapped_two = adapt_slot(_TwoArgCallable())
+    assert wrapped_two(7, "hi", "extra") == (7, "hi")
+    assert wrapped_two(8) == (8, "def")
+
+    var_obj = _VarArgsCallable()
+    assert adapt_slot(var_obj) is var_obj
+
+
+def test_install_runtime_excepthook_logs_without_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证全局运行时异常钩子在禁用弹窗时将未捕获异常追加写入 `logs/runtime_error.log`。"""
+    from yolo_studio.app import install_runtime_excepthook
+
+    orig_hook = sys.excepthook
+    try:
+        install_runtime_excepthook(workspace_root=tmp_path, show_dialog=False)
+        try:
+            raise ValueError("模拟槽函数异常")
+        except ValueError:
+            exc_type, exc_val, exc_tb = sys.exc_info()
+            assert exc_type is not None
+            sys.excepthook(exc_type, exc_val, exc_tb)
+    finally:
+        sys.excepthook = orig_hook
+
+    log_file = tmp_path / "logs" / "runtime_error.log"
+    assert log_file.is_file()
+    content = log_file.read_text(encoding="utf-8")
+    assert "ValueError: 模拟槽函数异常" in content

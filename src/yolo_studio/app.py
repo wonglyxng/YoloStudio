@@ -26,12 +26,15 @@ import ctypes
 import os
 import sys
 import tempfile
+import threading
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 from yolo_studio._version import __version__
 
 WORKSPACE_ENV_VAR = "YOLO_STUDIO_WORKSPACE"
+_IN_RUNTIME_EXCEPTHOOK = False
 
 
 def _code_root_candidate() -> Path:
@@ -160,6 +163,74 @@ def report_startup_crash(
     return log_file
 
 
+def install_runtime_excepthook(
+    workspace_root: Path | None = None,
+    show_dialog: bool | None = None,
+) -> None:
+    """安装进程级未捕获异常钩子，防止 PyQt6 槽函数异常触发 C++ 层 `qFatal`/`abort` 导致应用无声闪退。
+
+    副作用与线程约束：
+        替换 `sys.excepthook`；放行 `KeyboardInterrupt` 与 `SystemExit`；
+        其余未捕获异常将带时间戳追加写入 `<workspace>/logs/runtime_error.log`，
+        并在非无头桌面会话的主线程中弹出中文错误对话框提示错误摘要与日志路径。
+        内部通过 `_IN_RUNTIME_EXCEPTHOOK` 防止异常弹窗重入递归。
+    """
+    prev_hook = sys.excepthook
+
+    def _runtime_hook(exc_type, exc_value, exc_tb) -> None:
+        global _IN_RUNTIME_EXCEPTHOOK
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            prev_hook(exc_type, exc_value, exc_tb)
+            return
+
+        formatted = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log_file: Path | None = None
+        try:
+            base = resolve_workspace_root(workspace_root)
+            log_dir = base / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "runtime_error.log"
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(f"\n===== {stamp} (YoloStudio v{__version__}) =====\n{formatted}\n")
+        except OSError:
+            log_file = None
+
+        raw_stderr = getattr(sys.stderr, "original", sys.stderr)
+        if raw_stderr is not None:
+            try:
+                raw_stderr.write(formatted)
+                raw_stderr.flush()
+            except Exception:
+                pass
+
+        if _IN_RUNTIME_EXCEPTHOOK:
+            return
+        _IN_RUNTIME_EXCEPTHOOK = True
+        try:
+            should_show = show_dialog
+            if should_show is None:
+                is_offscreen = os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen"
+                should_show = (not is_offscreen) and (threading.current_thread() is threading.main_thread())
+            if should_show:
+                from PyQt6.QtWidgets import QApplication, QMessageBox
+
+                qapp = QApplication.instance()
+                if isinstance(qapp, QApplication):
+                    hint = f"\n\n完整错误日志已保存至:\n{log_file}" if log_file else ""
+                    QMessageBox.critical(
+                        qapp.activeWindow(),
+                        "YoloStudio 运行时异常",
+                        f"操作执行时发生未预期错误，已拦截以防止程序闪退：\n\n{exc_type.__name__}: {exc_value}{hint}",
+                    )
+        except Exception:
+            pass
+        finally:
+            _IN_RUNTIME_EXCEPTHOOK = False
+
+    sys.excepthook = _runtime_hook
+
+
 def _find_app_icon_path(code_root: Path, workspace_root: Path) -> Path | None:
     """在应用代码目录或工作区中查找内置 `icon.ico` 路径，不存在时返回 `None`。"""
     rel = Path("third_party") / "X-AnyLabeling" / "anylabeling" / "resources" / "images" / "icon.ico"
@@ -273,6 +344,7 @@ def main(workspace_root: Path | None = None) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("YOLO26 Training Studio")
     app.setApplicationVersion(__version__)
+    install_runtime_excepthook(workspace_root=root)
     icon_path = _find_app_icon_path(code_root, root)
     if icon_path is not None:
         app.setWindowIcon(QIcon(str(icon_path)))
