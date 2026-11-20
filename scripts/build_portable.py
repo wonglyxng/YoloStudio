@@ -1261,7 +1261,7 @@ def write_cli_and_quickstart_files(bundle_root: Path, version: str, variant: str
             "",
             'if exist "%BUNDLE_ROOT%\\runtime\\python.exe" goto :runtime_ok',
             "echo [错误] 未找到内置运行环境 runtime\\python.exe，请先完整解压压缩包后再运行。",
-            "pause",
+            'if "%~1"=="" pause',
             "exit /b 1",
             "",
             ":runtime_ok",
