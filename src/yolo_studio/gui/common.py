@@ -39,8 +39,8 @@ if TYPE_CHECKING:
 # 避免长时间训练日志无限增长拖慢界面
 LOG_MAX_LINES = 5000
 
-# 表单标签与右侧字段控件（下拉框、输入框、微调框等）之间的默认水平间距（像素）
-FORM_LABEL_SPACING = 10
+# 表单最长标签与右侧字段控件（下拉框、输入框、微调框等）之间的默认水平间距（像素）
+FORM_LABEL_SPACING = 8
 
 
 def configure_form_layout(
@@ -50,14 +50,14 @@ def configure_form_layout(
     vertical_spacing: int | None = None,
     margins: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """统一表单标签对齐方式与列间距，使每行标签紧邻其右侧控件保持合适距离。
+    """统一表单标签左对齐与字段列间距，使右侧下拉框/输入框沿最长标签紧凑对齐。
 
     设计原因：
-        Windows 原生 `QFormLayout` 默认将标签左对齐；当同一分组存在较长标签（如 `最长边(0=原尺寸):`、
-        `classes.txt(可选):`）时，短标签与右侧下拉框/输入框之间会被拉出大片空白。
-        改为右对齐并设定固定 `horizontal_spacing` 后，所有标签右端均与字段左边缘保持恒定距离。
+        采用中文界面更易浏览的左对齐标签（`AlignLeft | AlignVCenter`），配合固定
+        `horizontal_spacing` 与 `align_form_labels` 的统一标签列宽，既保持左侧标签垂直齐平，
+        又保证右侧控件紧邻最长标签左边缘垂直对齐、无多余留白。
     """
-    form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     form.setHorizontalSpacing(horizontal_spacing)
     if vertical_spacing is not None:
         form.setVerticalSpacing(vertical_spacing)
@@ -80,7 +80,7 @@ class _FormLabelAligner(QObject):
         QEvent.Type.StyleChange,
     )
 
-    def __init__(self, forms: Sequence[QFormLayout], extra_padding: int = 2) -> None:
+    def __init__(self, forms: Sequence[QFormLayout], extra_padding: int = 0) -> None:
         super().__init__(forms[0])
         self._forms = tuple(forms)
         self._extra_padding = max(0, extra_padding)
@@ -122,7 +122,7 @@ class _FormLabelAligner(QObject):
 
             target_width = max_width + self._extra_padding
             for label in labels:
-                label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                 label.setMinimumWidth(target_width)
             self._last_width = target_width
             return target_width
@@ -135,13 +135,14 @@ class _FormLabelAligner(QObject):
         return super().eventFilter(watched, event)
 
 
-def align_form_labels(forms: Sequence[QFormLayout], *, extra_padding: int = 2) -> int:
-    """将同页多个 `QFormLayout` 的非空行标签统一为一致的右对齐列宽并返回当前最小宽度（像素）。
+def align_form_labels(forms: Sequence[QFormLayout], *, extra_padding: int = 0) -> int:
+    """将同页多个 `QFormLayout` 的非空行标签统一为左对齐且按最长标签定宽，返回最小宽度（像素）。
 
     调用时机与约束：
         应在相关 `QFormLayout` 的全部表单行添加完成后调用（支持包含当前处于隐藏状态的可切换行，
         如 `Base URL:`、`SAM 分割模型:`），避免用户切换模式显示/隐藏行时整个表单左右抖动；
-        内部会挂接 `_FormLabelAligner` 在样式表与字体继承生效后自动重算，确保跨分组控件左边缘精确对齐。
+        内部会挂接 `_FormLabelAligner` 在样式表与字体继承生效后自动重算，确保跨分组右侧控件
+        严格沿最长标签垂直对齐。
     """
     valid_forms = [f for f in forms if f is not None]
     if not valid_forms:

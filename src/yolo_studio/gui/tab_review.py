@@ -195,10 +195,9 @@ class MllmReviewTab(QWidget):
 
     @staticmethod
     def _tune_form(form: QFormLayout) -> None:
-        """统一左侧三组表单的标签右对齐与留白节奏，保证标签紧邻右侧控件并缓解拥挤感。"""
+        """统一左侧三组表单的标签左对齐与留白节奏，保证跨分组右侧控件沿最长标签整齐对齐。"""
         configure_form_layout(
             form,
-            horizontal_spacing=10,
             vertical_spacing=8,
             margins=(12, 10, 12, 12),
         )

@@ -3,8 +3,8 @@
 职责：
     在离线 `offscreen` Qt 环境下验证共享布局辅助函数 `configure_form_layout` / `align_form_labels`，
     以及五个配置标签页（视频抽帧、MLLM 标注纠错、数据集准备、YOLO26 训练、验证推理与导出）中：
-    1. 所有 `QFormLayout` 标签均采用右对齐并与右侧下拉框/输入框保持紧凑合适间距；
-    2. 同页多分组在挂载到 `MainWindow` 并继承样式表字号后，字段列左边缘仍能精确垂直对齐且切换动态行不抖动；
+    1. 所有 `QFormLayout` 标签均采用左对齐，且右侧下拉框/输入框紧邻最长标签紧凑对齐；
+    2. 同页多分组在挂载到 `MainWindow` 并继承样式表字号后，所有标签左边缘对齐、右侧字段列沿同页最长标签垂直对齐且切换动态行不抖动；
     3. 行内多控件组合（如「格式:」+ 下拉框、「起:/止:」、「低阈值Conf:/IoU:/ImgSz:」、「Conf:/IoU:」）
        中的标签不会被布局均分拉宽，与紧随其后的控件始终保持合适距离。
 
@@ -98,14 +98,16 @@ def test_align_form_labels_realigns_after_stylesheet_font_change(qt_app: QApplic
     lbl1 = f1.itemAt(0, QFormLayout.ItemRole.LabelRole).widget()
     lbl2 = f2.itemAt(0, QFormLayout.ItemRole.LabelRole).widget()
     assert isinstance(lbl1, QLabel) and isinstance(lbl2, QLabel)
+    assert bool(lbl1.alignment() & Qt.AlignmentFlag.AlignLeft)
+    assert bool(lbl2.alignment() & Qt.AlignmentFlag.AlignLeft)
     assert lbl1.minimumWidth() == lbl2.minimumWidth()
     assert lbl1.minimumWidth() > initial_w
-    assert lbl2.minimumWidth() >= lbl1.sizeHint().width()
+    assert lbl2.minimumWidth() == lbl1.sizeHint().width()
     host.close()
 
 
 def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp_path: Path) -> None:
-    """验证五个配置标签页的表单标签右对齐、紧邻下拉框/输入框、跨组对齐及行内标签不被拉伸。"""
+    """验证五个配置标签页的表单标签左对齐、右侧控件沿最长标签跨组对齐及行内标签不被拉伸。"""
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     win = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=settings)
     try:
@@ -126,7 +128,9 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
             qt_app.processEvents()
 
             for form in tab.findChildren(QFormLayout):
-                assert bool(form.labelAlignment() & Qt.AlignmentFlag.AlignRight)
+                assert bool(form.labelAlignment() & Qt.AlignmentFlag.AlignLeft)
+                label_xs: set[int] = set()
+                field_xs: set[int] = set()
                 for row in range(form.rowCount()):
                     lbl_item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
                     fld_item = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
@@ -135,33 +139,54 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
                     lbl = lbl_item.widget()
                     if not isinstance(lbl, QLabel) or not lbl.text() or not lbl.isVisible():
                         continue
-                    gap = _visual_label_to_field_gap(lbl, fld_item.geometry().x())
-                    assert 4 <= gap <= FORM_LABEL_SPACING + 4, (
-                        f"tab={tab_idx} label={lbl.text()!r} 距右侧控件间距异常: {gap}px"
-                    )
+                    assert bool(lbl.alignment() & Qt.AlignmentFlag.AlignLeft)
+                    label_xs.add(lbl.geometry().x())
+                    field_xs.add(fld_item.geometry().x())
+                    # 标签盒子右端到字段左端应恰好为 horizontalSpacing
+                    box_gap = fld_item.geometry().x() - (lbl.geometry().x() + lbl.geometry().width())
+                    assert box_gap == form.horizontalSpacing()
+                assert len(label_xs) == 1
+                assert len(field_xs) == 1
 
-        # 验证多分组页面的字段列左边缘精确垂直对齐（含样式表生效后的最终布局）
-        # 1) Tab 3（MLLM 纠错）：切出 OpenAI Base URL 与 SAM 隐藏行后三组依然对齐
+        # 验证多分组页面的字段列左边缘沿同页最长标签精确垂直对齐（含样式表生效后的最终布局）
+        # 1) Tab 3（MLLM 纠错）：切出 OpenAI Base URL 与 SAM 隐藏行后三组依然对齐，且最长标签紧邻控件
         win.tabs.setCurrentIndex(2)
         win.review_tab.provider_combo.setCurrentIndex(1)
         win.review_tab.refine_mode_combo.setCurrentIndex(win.review_tab.refine_mode_combo.count() - 1)
         qt_app.processEvents()
+        review_forms = (win.review_tab._src_form, win.review_tab._llm_form, win.review_tab._pol_form)
         review_field_xs = {
-            form.itemAt(0, QFormLayout.ItemRole.FieldRole).geometry().x()
-            for form in (win.review_tab._src_form, win.review_tab._llm_form, win.review_tab._pol_form)
+            form.itemAt(0, QFormLayout.ItemRole.FieldRole).geometry().x() for form in review_forms
         }
         assert len(review_field_xs) == 1
+        review_min_gap = min(
+            _visual_label_to_field_gap(
+                form.itemAt(r, QFormLayout.ItemRole.LabelRole).widget(),
+                form.itemAt(r, QFormLayout.ItemRole.FieldRole).geometry().x(),
+            )
+            for form in review_forms
+            for r in range(form.rowCount())
+            if form.itemAt(r, QFormLayout.ItemRole.LabelRole) is not None
+            and isinstance(form.itemAt(r, QFormLayout.ItemRole.LabelRole).widget(), QLabel)
+            and form.itemAt(r, QFormLayout.ItemRole.LabelRole).widget().isVisible()
+            and form.itemAt(r, QFormLayout.ItemRole.LabelRole).widget().text()
+        )
+        assert FORM_LABEL_SPACING - 2 <= review_min_gap <= FORM_LABEL_SPACING + 4
 
-        # 2) Tab 4（数据集准备）：来源分组与划分分组字段列精确对齐
+        # 2) Tab 4（数据集准备）：来源分组与划分分组字段列沿最长标签精确对齐
         win.tabs.setCurrentIndex(3)
         qt_app.processEvents()
+        ds_forms = (win.dataset_tab._source_form, win.dataset_tab._split_form)
         ds_field_xs = {
-            form.itemAt(0, QFormLayout.ItemRole.FieldRole).geometry().x()
-            for form in (win.dataset_tab._source_form, win.dataset_tab._split_form)
+            form.itemAt(0, QFormLayout.ItemRole.FieldRole).geometry().x() for form in ds_forms
         }
         assert len(ds_field_xs) == 1
+        assert FORM_LABEL_SPACING - 2 <= _visual_label_to_field_gap(
+            win.dataset_tab.classes_label,
+            win.dataset_tab.classes_picker.geometry().x(),
+        ) <= FORM_LABEL_SPACING + 4
 
-        # 3) Tab 6（验证、推理与导出）：三组字段列精确对齐
+        # 3) Tab 6（验证、推理与导出）：三组字段列沿最长标签精确对齐
         win.tabs.setCurrentIndex(5)
         qt_app.processEvents()
         eval_forms = win.eval_tab.findChildren(QFormLayout)
