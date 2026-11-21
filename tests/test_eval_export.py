@@ -666,14 +666,26 @@ def test_eval_tab_auto_reads_weights_syncs_imgsz_and_exports_independent_config(
         assert tab.export_w_spin.value() == 960
         assert "0: only_cls" in tab.weights_info_label.text()
 
-        # 5) TensorRT 在 CPU 模式下点击导出应弹出清晰提示拦截
+        # 5) TensorRT 在 CPU 模式下自动置灰「导出模型」按钮，直接触发导出防御逻辑也应弹出清晰提示拦截
         tab.format_combo.setCurrentIndex(2)  # engine
         tab.device_ctrl.gpu_chk.setChecked(False)
         qt_app.processEvents()
+        assert tab.export_btn.isEnabled() is False
+        assert "GPU" in tab.export_btn.toolTip()
+        # 忙碌态结束后仍应保持禁用，不会被误恢复
+        tab._set_busy(True)
+        tab._set_busy(False)
+        assert tab.export_btn.isEnabled() is False
+
         before_export_cnt = len(export_workers)
-        tab.export_btn.click()
+        tab._on_export()
         qt_app.processEvents()
         assert len(export_workers) == before_export_cnt
         assert any("TensorRT" in msg for msg in warnings_shown)
+
+        # 重新启用 GPU 后导出按钮恢复可用
+        tab.device_ctrl.gpu_chk.setChecked(True)
+        qt_app.processEvents()
+        assert tab.export_btn.isEnabled() is True
     finally:
         tab.close()

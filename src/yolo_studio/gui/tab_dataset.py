@@ -298,7 +298,7 @@ class DatasetTab(QWidget):
         )
         form.addRow("数据集输出目录:", self.output_ds_picker)
 
-        self.train_spin = self._make_ratio_spin(0.1, 0.99, 0.8)
+        self.train_spin = self._make_ratio_spin(0.1, 1.0, 0.8)
         self.val_spin = self._make_ratio_spin(0.0, 0.9, 0.2)
         self.test_spin = self._make_ratio_spin(0.0, 0.9, 0.0)
         self.seed_spin = QSpinBox()

@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import urlparse
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QColor, QFont, QPixmap, QResizeEvent
@@ -86,6 +88,24 @@ from yolo_studio.gui.workers import MllmConnectionTestWorker, MllmReviewWorker
 # 左右对比预览 JPEG 字节流的 LRU 缓存容量上限（按结果表行号索引，每次重新开始审核或加载报告时清空）
 _PREVIEW_CACHE_MAX = 64
 _REVIEW_SETTINGS_KEY = "review_tab/state_json"
+
+
+def _is_local_or_lan_url(base_url: str) -> bool:
+    """判断接口 Base URL 是否指向本机或局域网服务（如 Ollama / vLLM，通常免填 API Key）。"""
+    raw = base_url.strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        return False
 
 
 class _ScaledPreviewLabel(QLabel):
@@ -280,6 +300,7 @@ class MllmReviewTab(QWidget):
         yolo_row = QHBoxLayout(self.yolo_params_widget)
         yolo_row.setContentsMargins(0, 0, 0, 0)
         yolo_row.setSpacing(4)
+        self._yolo_row = yolo_row
         self.yolo_conf_spin = QDoubleSpinBox()
         self.yolo_conf_spin.setRange(0.01, 0.95)
         self.yolo_conf_spin.setSingleStep(0.02)
@@ -425,9 +446,13 @@ class MllmReviewTab(QWidget):
         refine_box.addWidget(self.refine_hint_label)
         p_form.addRow("边框紧贴修正:", refine_box)
 
-        # SAM 参数行：仅在选中 `SAM_LOCAL` 时展示，其余模式通过 setRowVisible 折叠保持界面清爽
+        # SAM 参数行：仅在选中 `SAM_LOCAL` 时展示，其余模式通过 setRowVisible 折叠保持界面清爽；
+        # 在「读取已有 .json」模式下因上方基准推理参数行隐藏，此处第二行会动态承载共享 GPU 加速开关
         self.sam_row_widget = QWidget()
-        sam_row = QHBoxLayout(self.sam_row_widget)
+        sam_vbox = QVBoxLayout(self.sam_row_widget)
+        sam_vbox.setContentsMargins(0, 0, 0, 0)
+        sam_vbox.setSpacing(4)
+        sam_row = QHBoxLayout()
         sam_row.setContentsMargins(0, 0, 0, 0)
         sam_row.setSpacing(6)
         self.sam_model_combo = QComboBox()
@@ -446,6 +471,17 @@ class MllmReviewTab(QWidget):
         sam_row.addWidget(self.sam_model_combo, 1)
         sam_row.addWidget(self.pick_sam_btn)
         sam_row.addWidget(self.sam_refine_all_chk)
+        sam_vbox.addLayout(sam_row)
+
+        self.sam_device_holder = QWidget()
+        self._sam_device_row = QHBoxLayout(self.sam_device_holder)
+        self._sam_device_row.setContentsMargins(0, 0, 0, 0)
+        self._sam_device_row.setSpacing(6)
+        self._sam_device_row.addWidget(QLabel("SAM 运行设备:"))
+        self._sam_device_row.addStretch(1)
+        self.sam_device_holder.setVisible(False)
+        sam_vbox.addWidget(self.sam_device_holder)
+
         p_form.addRow("SAM 分割模型:", self.sam_row_widget)
         self._sam_row_label = p_form.labelForField(self.sam_row_widget)
 
@@ -709,6 +745,7 @@ class MllmReviewTab(QWidget):
         self.sam_refine_all_chk.toggled.connect(self._sync_strategy_states)
         self.check_missing_chk.toggled.connect(self._sync_strategy_states)
         self.crops_chk.toggled.connect(self._sync_strategy_states)
+        self.triage_dirs_chk.toggled.connect(self._sync_strategy_states)
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.open_need_review_btn.clicked.connect(self._on_open_need_review_in_xal)
@@ -814,6 +851,33 @@ class MllmReviewTab(QWidget):
         self.trial_5_btn.blockSignals(False)
         self._refresh_images_count()
 
+    def _sync_local_device_ctrl(self) -> None:
+        """按数据来源与 SAM 收框模式动态安置并启停本地 GPU 加速开关。
+
+        规则：
+            - 基准模型推理模式下保留在「基准推理参数」行并启用（同时服务 YOLO 推理与 SAM 收框）；
+            - 读取已有 `.json` 且启用本地 SAM 收框时，迁移展示至 SAM 配置行下方并启用；
+            - 读取已有 `.json` 且未启用本地 SAM 时，收起并禁用，避免无效控件干扰。
+        """
+        is_yolo = self.source_mode_combo.currentData() == ReviewSourceMode.YOLO_PREDICT
+        refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
+        is_sam = refine_mode == BoxRefineMode.SAM_LOCAL
+        show_in_sam = (not is_yolo) and is_sam
+
+        if show_in_sam:
+            if self._sam_device_row.indexOf(self.yolo_device_ctrl) < 0:
+                self._yolo_row.removeWidget(self.yolo_device_ctrl)
+                self._sam_device_row.insertWidget(1, self.yolo_device_ctrl, 1)
+            self.sam_device_holder.setVisible(True)
+            self.yolo_device_ctrl.setVisible(True)
+            self.yolo_device_ctrl.setEnabled(True)
+        else:
+            if self._yolo_row.indexOf(self.yolo_device_ctrl) < 0:
+                self._sam_device_row.removeWidget(self.yolo_device_ctrl)
+                self._yolo_row.addWidget(self.yolo_device_ctrl, 1)
+            self.sam_device_holder.setVisible(False)
+            self.yolo_device_ctrl.setEnabled(is_yolo)
+
     def _on_source_mode_changed(self) -> None:
         """按候选框来源模式启用/禁用并动态折叠无关表单行，减少无效置灰项干扰。"""
         is_yolo = self.source_mode_combo.currentData() == ReviewSourceMode.YOLO_PREDICT
@@ -821,11 +885,11 @@ class MllmReviewTab(QWidget):
         self.yolo_conf_spin.setEnabled(is_yolo)
         self.yolo_iou_spin.setEnabled(is_yolo)
         self.yolo_imgsz_spin.setEnabled(is_yolo)
-        self.yolo_device_ctrl.setEnabled(is_yolo)
         self.ann_picker.setEnabled(not is_yolo)
         self._src_form.setRowVisible(self.weights_picker, is_yolo)
         self._src_form.setRowVisible(self.yolo_params_widget, is_yolo)
         self._src_form.setRowVisible(self.ann_picker, not is_yolo)
+        self._sync_local_device_ctrl()
 
     def _on_provider_changed(self) -> None:
         """切换 Gemini 与 OpenAI 兼容接口时更新常用预设并按需折叠 Base URL 行。"""
@@ -879,25 +943,26 @@ class MllmReviewTab(QWidget):
             return
 
         has_env = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-        base_url = self.base_url_edit.text().strip().lower()
-        is_local = any(host in base_url for host in ("localhost", "127.0.0.1"))
+        base_url = self.base_url_edit.text().strip()
+        is_local = _is_local_or_lan_url(base_url)
         if has_env:
             self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
             self.api_key_status_label.setText("已检测到环境变量 OPENAI_API_KEY，上方输入框可保持留空")
         elif is_local:
             self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 12px;")
-            self.api_key_status_label.setText("当前为本地服务地址（如 Ollama / vLLM），API Key 可留空直接连接")
+            self.api_key_status_label.setText("当前为本地/局域网服务地址（如 Ollama / vLLM），API Key 可留空直接连接")
         else:
             self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 12px;")
             self.api_key_status_label.setText("未检测到环境变量 OPENAI_API_KEY，请在上方填写或配置环境变量")
 
     def _sync_strategy_states(self, *_args: object) -> None:
-        """同步边框修正模式、漏标开关、局部裁剪与高置信度阈值之间的防呆联动状态。"""
+        """同步边框修正模式、漏标开关、局部裁剪、高置信度阈值与分流目录按钮之间的防呆联动状态。"""
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
         is_sam = refine_mode == BoxRefineMode.SAM_LOCAL
         is_mllm_crop = refine_mode == BoxRefineMode.MLLM_CROP
 
         self._pol_form.setRowVisible(self.sam_row_widget, is_sam)
+        self._sync_local_device_ctrl()
         if is_sam and self.sam_refine_all_chk.isChecked():
             self.refine_hint_label.setText(
                 "已开启全量收紧：本地 SAM 对所有保留/改类框统一贴边收框（零额外 API 费），超门禁自动回退原框转待复核。"
@@ -921,6 +986,17 @@ class MllmReviewTab(QWidget):
 
         check_missing = self.check_missing_chk.isChecked()
         self.add_missing_chk.setEnabled(check_missing)
+
+        if self.triage_dirs_chk.isChecked():
+            self.open_need_review_btn.setText("在工作台打开待复核目录")
+            self.open_need_review_btn.setToolTip(
+                "在「2. 标注工作台」中打开清洗输出下的 need_review/ 子目录重点复核"
+            )
+        else:
+            self.open_need_review_btn.setText("在工作台打开输出目录")
+            self.open_need_review_btn.setToolTip(
+                "当前未按结果分建子目录，将在「2. 标注工作台」中直接打开清洗输出根目录"
+            )
 
         # 精准反映 high_conf_skip 在当前策略组合下的真实生效角色，并用方向符号（≥ / <）消除理解歧义
         needs_mllm_for_refine = refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP} or (
@@ -1191,6 +1267,36 @@ class MllmReviewTab(QWidget):
             QMessageBox.warning(self, "提示", "请选择有效的基准模型 .pt 权重文件。")
             return
 
+        # 前置校验 LLM 必填参数与凭据，避免先跑完耗时的基准模型推理才因缺少 Key/模型名失败
+        if not cfg.model_name:
+            QMessageBox.warning(self, "提示", "请在「2. 大语言模型 (LLM) 配置」中填写模型名称。")
+            return
+        if cfg.provider == MllmProvider.GEMINI:
+            if not (cfg.api_key or os.environ.get("GEMINI_API_KEY", "").strip()):
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "未检测到 Gemini API Key：请在「2. 大语言模型 (LLM) 配置」中填写 API Key，"
+                    "或配置环境变量 GEMINI_API_KEY。",
+                )
+                return
+        else:
+            if not cfg.base_url:
+                QMessageBox.warning(self, "提示", "请填写 OpenAI 兼容接口的 Base URL。")
+                return
+            if (
+                not cfg.api_key
+                and not os.environ.get("OPENAI_API_KEY", "").strip()
+                and not _is_local_or_lan_url(cfg.base_url)
+            ):
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "未检测到 API Key 或环境变量 OPENAI_API_KEY。\n"
+                    "如使用云端接口请在上方填写 API Key；如使用本地服务请确认 Base URL 为本地或局域网地址。",
+                )
+                return
+
         if uses_local_gpu_model and self.gpu_guard is not None:
             task_label = (
                 "MLLM 基准模型推理 / SAM 收框审核"
@@ -1216,6 +1322,7 @@ class MllmReviewTab(QWidget):
         self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.load_report_btn.setEnabled(False)
         self.send_ds_btn.setEnabled(False)
         self.summary_label.setText("正在运行候选框提取与 MLLM 纠错清洗...")
 
@@ -1354,6 +1461,8 @@ class MllmReviewTab(QWidget):
         return res
 
     def _on_load_report_dialog(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
         start_dir = self.output_picker.text() or str(self.workspace_root)
         chosen, _ = QFileDialog.getOpenFileName(
             self,
@@ -1411,6 +1520,7 @@ class MllmReviewTab(QWidget):
         """恢复界面状态、记录产物路径、更新汇总栏并在存在结果时允许发送至数据集页。"""
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.load_report_btn.setEnabled(True)
         self._last_output_dir = res.output_dir
         self._last_classes_txt = str(res.classes_txt_path) if res.classes_txt_path else ""
         self.send_ds_btn.setEnabled(res.total_images > 0)
@@ -1429,6 +1539,7 @@ class MllmReviewTab(QWidget):
     def _on_failed(self, err: str) -> None:
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.load_report_btn.setEnabled(True)
         self.summary_label.setText(f"执行失败: {err}")
         # 日志与结果列表共用页签区域，失败时自动切到“运行日志”便于直接查看出错上下文
         self.result_tabs.setCurrentWidget(self.log_box)

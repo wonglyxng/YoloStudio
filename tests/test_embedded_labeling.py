@@ -33,6 +33,7 @@ from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QGroupBox, QMessageBox  # noqa: E402
 
+from yolo_studio._version import __version__  # noqa: E402
 from yolo_studio.gui.main_window import MainWindow  # noqa: E402
 from yolo_studio.gui.tab_labeling import (  # noqa: E402
     ensure_cuda_dll_search_paths,
@@ -75,6 +76,7 @@ def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
     win.show()
     qt_app.processEvents()
     try:
+        assert win.windowTitle() == f"YoloStudio v{__version__}"
         assert win.tabs.count() == 6
         assert win.tabs.tabText(1) == "2. 标注工作台"
         assert win.tabs.tabText(2) == "3. LLM 标注清洗"

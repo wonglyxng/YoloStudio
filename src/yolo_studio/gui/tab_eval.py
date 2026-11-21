@@ -170,6 +170,7 @@ class EvalTab(QWidget):
         self._inspected_file_sig: tuple[str, int, int] | None = None
         self._inspect_request_id: int = 0
         self._syncing_export_dims: bool = False
+        self._busy: bool = False
 
         # 用户在路径输入框手动键入时的短防抖定时器（180ms），程序写入路径时直接立即探测
         self._inspect_timer = QTimer(self)
@@ -490,7 +491,7 @@ class EvalTab(QWidget):
         self.export_square_chk.toggled.connect(self._on_export_square_toggled)
         self.sync_train_imgsz_btn.clicked.connect(self._on_sync_train_imgsz)
         self.export_batch_spin.valueChanged.connect(self._refresh_export_io_preview)
-        self.dynamic_chk.toggled.connect(self._refresh_export_io_preview)
+        self.dynamic_chk.toggled.connect(self._on_dynamic_toggled)
         self.export_opset_combo.currentIndexChanged.connect(self._refresh_export_io_preview)
         self.nms_mode_combo.currentIndexChanged.connect(self._on_export_format_changed)
         self.export_max_det_spin.valueChanged.connect(self._refresh_export_io_preview)
@@ -701,8 +702,40 @@ class EvalTab(QWidget):
                 self._syncing_export_dims = False
         self._refresh_export_io_preview()
 
+    def _on_dynamic_toggled(self, _checked: bool) -> None:
+        self._refresh_export_batch_tooltip()
+        self._refresh_export_io_preview()
+
+    def _refresh_export_batch_tooltip(self) -> None:
+        """按导出格式与动态输入开关刷新 `Batch` 微调框的语义提示。"""
+        fmt = str(self.format_combo.currentData() or "onnx")
+        is_dynamic = self.dynamic_chk.isChecked() and self.dynamic_chk.isEnabled()
+        if fmt == "engine" and is_dynamic:
+            self.export_batch_spin.setToolTip(
+                "TensorRT 开启动态输入时，Batch 表示推理期允许的最大批大小（建议设为 8 或 16）"
+            )
+        elif fmt == "onnx" and is_dynamic:
+            self.export_batch_spin.setToolTip(
+                "ONNX 开启动态输入后导出维度为动态 batch，此数值仅作导出追踪参考"
+            )
+        else:
+            self.export_batch_spin.setToolTip("静态批大小；TensorRT 开启动态输入时建议设为预期最大批大小")
+
+    def _refresh_export_btn_state(self) -> None:
+        """同步「导出模型」按钮可用态：忙碌期间或 TensorRT 处于 CPU 模式时置灰防误点。"""
+        fmt = str(self.format_combo.currentData() or "onnx")
+        using_gpu = self.device_ctrl.is_using_gpu() and not self.device_info.probing
+        blocked_engine_cpu = fmt == "engine" and not using_gpu
+        self.export_btn.setEnabled((not self._busy) and (not blocked_engine_cpu))
+        if blocked_engine_cpu:
+            self.export_btn.setToolTip(
+                "TensorRT (.engine) 导出需要可用的 CUDA GPU，请在上方运行设备中启用 GPU 加速后再导出"
+            )
+        else:
+            self.export_btn.setToolTip("按当前配置导出部署模型（产物生成在源权重同目录）")
+
     def _on_export_format_changed(self, *_args: object) -> None:
-        """同步导出面板各项防呆状态：FP16、ONNX 专属参数（opset/simplify）、dynamic 及 NMS 阈值显隐。"""
+        """同步导出面板各项防呆状态：FP16、ONNX 专属参数（opset/simplify）、dynamic、NMS 阈值及导出按钮。"""
         fmt = str(self.format_combo.currentData() or "onnx")
         is_onnx = fmt == "onnx"
         is_onnx_backed = fmt in ONNX_BACKED_EXPORT_FORMATS
@@ -754,6 +787,8 @@ class EvalTab(QWidget):
             self.export_max_det_spin.setToolTip("原始输出模式 (raw) 输出全部候选框，不使用 MaxDet")
         self._exp_form.setRowVisible(self.nms_thresh_row_widget, is_embedded)
 
+        self._refresh_export_batch_tooltip()
+        self._refresh_export_btn_state()
         self._refresh_export_io_preview()
 
     def build_export_config(self, *, allow_missing_weights: bool = False) -> ExportConfig:
@@ -844,9 +879,10 @@ class EvalTab(QWidget):
 
     def _set_busy(self, busy: bool) -> None:
         """互斥启用或禁用验证、推理与导出三个执行按钮，防止后台任务冲突。"""
+        self._busy = busy
         self.val_btn.setEnabled(not busy)
         self.predict_btn.setEnabled(not busy)
-        self.export_btn.setEnabled(not busy)
+        self._refresh_export_btn_state()
 
     def _on_validate(self) -> None:
         """校验权重与 `data.yaml` 后在后台启动 `ValidateWorker`。"""

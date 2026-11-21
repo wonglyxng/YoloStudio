@@ -100,9 +100,7 @@ class MainWindow(QMainWindow):
         self._lazy_init = lazy_init
         self._device_probe_worker: DeviceProbeWorker | None = None
         self.settings = settings or QSettings("YOLO26Studio", "VideoToYOLO26")
-        self.setWindowTitle(
-            f"YOLO26 视频抽帧与训练工具 v{__version__} (Video → 内嵌 X-AnyLabeling → MLLM纠错 → YOLO26)"
-        )
+        self.setWindowTitle(f"YoloStudio v{__version__}")
         self.resize(1380, 860)
         self.setStyleSheet(APP_STYLESHEET)
 

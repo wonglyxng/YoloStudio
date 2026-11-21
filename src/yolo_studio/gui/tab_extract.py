@@ -67,6 +67,8 @@ class ExtractTab(QWidget):
         self.worker: FrameExtractWorker | None = None
         self.probe_worker: VideoProbeWorker | None = None
         self._video_paths: list[Path] = []
+        self._controls_locked: bool = False
+        self._allow_clear_when_locked: bool = False
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -162,6 +164,7 @@ class ExtractTab(QWidget):
         self.dedup_spin.setRange(0.0, 50.0)
         self.dedup_spin.setSingleStep(0.5)
         self.dedup_spin.setValue(2.0)
+        self.dedup_spin.setSpecialValueText("0.00 (不去重)")
         self.dedup_spin.setMinimumWidth(160)
         self.dedup_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.dedup_spin.setToolTip("相邻保存帧灰度平均像素差低于该值时自动跳过，0 表示不去重")
@@ -178,6 +181,7 @@ class ExtractTab(QWidget):
         self.format_combo = QComboBox()
         self.format_combo.addItems(["jpg", "png"])
         self.format_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.quality_label = QLabel("JPG质量:")
         self.quality_spin = QSpinBox()
         self.quality_spin.setRange(10, 100)
         self.quality_spin.setValue(95)
@@ -187,7 +191,7 @@ class ExtractTab(QWidget):
         resize_row.addWidget(QLabel("格式:"))
         resize_row.addWidget(self.format_combo)
         resize_row.addSpacing(12)
-        resize_row.addWidget(QLabel("JPG质量:"))
+        resize_row.addWidget(self.quality_label)
         resize_row.addWidget(self.quality_spin)
         resize_row.addStretch(1)
         form.addRow("最长边(0=原尺寸):", resize_row)
@@ -251,11 +255,15 @@ class ExtractTab(QWidget):
         self.add_folder_btn.clicked.connect(self._on_add_folder)
         self.remove_btn.clicked.connect(self._on_remove_selected)
         self.clear_btn.clicked.connect(self._on_clear_videos)
+        self.video_list.itemSelectionChanged.connect(self._refresh_list_action_states)
+        self.format_combo.currentTextChanged.connect(self._on_format_changed)
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.open_dir_btn.clicked.connect(lambda: open_local_path(self.output_picker.path()))
         self.send_next_btn.clicked.connect(lambda: self.send_frames_dir.emit(self.output_picker.text()))
         self._on_mode_changed()
+        self._on_format_changed()
+        self._refresh_list_action_states()
 
     def _on_mode_changed(self) -> None:
         mode = self.mode_combo.currentData()
@@ -263,13 +271,39 @@ class ExtractTab(QWidget):
         self.frame_step_spin.setEnabled(mode == ExtractionMode.EVERY_N_FRAMES)
         self.target_count_spin.setEnabled(mode == ExtractionMode.TARGET_COUNT)
 
+    def _on_format_changed(self) -> None:
+        """按输出图片格式联动 JPG 质量微调框：PNG 为无损格式时置灰禁用以防误解。"""
+        is_jpg = self.format_combo.currentText().strip().lower() == "jpg"
+        self.quality_label.setEnabled(is_jpg)
+        self.quality_spin.setEnabled(is_jpg)
+        tip = (
+            "JPG 有损压缩质量（10~100，数值越大画质越好、体积越大）"
+            if is_jpg
+            else "PNG 为无损格式，不适用 JPG 压缩质量设置；切换为 jpg 格式后生效"
+        )
+        self.quality_label.setToolTip(tip)
+        self.quality_spin.setToolTip(tip)
+
+    def _refresh_list_action_states(self) -> None:
+        """按当前锁定状态、列表数量与选中态刷新增删与清空按钮的可用性。"""
+        if self._controls_locked:
+            self.add_files_btn.setEnabled(False)
+            self.add_folder_btn.setEnabled(False)
+            self.remove_btn.setEnabled(False)
+            self.clear_btn.setEnabled(self._allow_clear_when_locked)
+            self.start_btn.setEnabled(False)
+            return
+        self.add_files_btn.setEnabled(True)
+        self.add_folder_btn.setEnabled(True)
+        self.remove_btn.setEnabled(bool(self.video_list.selectedItems()))
+        self.clear_btn.setEnabled(bool(self._video_paths))
+        self.start_btn.setEnabled(True)
+
     def _set_list_controls_enabled(self, enabled: bool, allow_clear: bool = True) -> None:
         """同步视频列表增删按钮与开始抽帧按钮的可用性，防止探测或抽帧期间并发改动列表。"""
-        self.add_files_btn.setEnabled(enabled)
-        self.add_folder_btn.setEnabled(enabled)
-        self.remove_btn.setEnabled(enabled)
-        self.clear_btn.setEnabled(allow_clear)
-        self.start_btn.setEnabled(enabled)
+        self._controls_locked = not enabled
+        self._allow_clear_when_locked = allow_clear if not enabled else False
+        self._refresh_list_action_states()
 
     def _add_video_paths(self, raw_paths: list[Path]) -> None:
         """启动后台 `VideoProbeWorker` 扫描并探测视频元信息，避免大量视频阻塞界面。"""
@@ -333,6 +367,7 @@ class ExtractTab(QWidget):
             self.video_list.takeItem(row)
             if 0 <= row < len(self._video_paths):
                 self._video_paths.pop(row)
+        self._refresh_list_action_states()
 
     def _on_clear_videos(self) -> None:
         if self.probe_worker and self.probe_worker.isRunning():
@@ -342,7 +377,7 @@ class ExtractTab(QWidget):
         self._set_list_controls_enabled(True)
 
     def _on_start(self) -> None:
-        """校验视频列表与输出目录后切换按钮状态并启动后台 `FrameExtractWorker`。"""
+        """校验视频列表、输出目录与截取时间段后切换按钮状态并启动后台 `FrameExtractWorker`。"""
         if not self._video_paths:
             QMessageBox.warning(self, "提示", "请先添加至少一个视频文件。")
             return
@@ -351,14 +386,23 @@ class ExtractTab(QWidget):
             QMessageBox.warning(self, "提示", "请选择输出目录。")
             return
 
+        start_sec = self.start_sec_spin.value()
         end_sec = self.end_sec_spin.value()
+        if end_sec > 0 and end_sec <= start_sec:
+            QMessageBox.warning(
+                self,
+                "提示",
+                "截取结束时间必须大于开始时间（或将结束时间设为 0 表示抽到视频结尾）。",
+            )
+            return
+
         config = ExtractionConfig(
             output_dir=Path(out_text),
             mode=self.mode_combo.currentData(),
             interval_seconds=self.interval_spin.value(),
             every_n_frames=self.frame_step_spin.value(),
             target_count=self.target_count_spin.value(),
-            start_sec=self.start_sec_spin.value(),
+            start_sec=start_sec,
             end_sec=end_sec if end_sec > 0 else None,
             dedup_threshold=self.dedup_spin.value(),
             max_dimension=self.max_dim_spin.value(),

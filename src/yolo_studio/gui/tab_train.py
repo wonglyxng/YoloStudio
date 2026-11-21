@@ -120,6 +120,22 @@ def _make_grid_label(text: str) -> QLabel:
     return label
 
 
+class _BatchSpinBox(QSpinBox):
+    """支持 `-1`（GPU 自动探测 AutoBatch）与正整数（`>= 1`）的批大小微调框，自动跳过无效值 `0`。"""
+
+    def stepBy(self, steps: int) -> None:
+        cur = self.value()
+        if steps < 0 and cur == 1 and self.minimum() == -1:
+            self.setValue(-1)
+            return
+        if steps > 0 and cur == -1:
+            self.setValue(1)
+            return
+        super().stepBy(steps)
+        if self.value() == 0:
+            self.setValue(1 if steps >= 0 else (self.minimum() if self.minimum() < 0 else 1))
+
+
 def _as_bool(value: object, default: bool) -> bool:
     """将 JSON 导入或持久化中的布尔兼容值安全转换为 `bool`。"""
     if isinstance(value, bool):
@@ -269,6 +285,9 @@ class TrainTab(QWidget):
         self._auto_batch_value: int = 16 if self.device_info.cuda_available else 4
         self._amp_user_overridden: bool = False
         self._amp_saved_before_cpu: bool | None = None
+        self._amp_disabled_for_cpu: bool = False
+        self._batch_cpu_clamped: bool = False
+        self._batch_was_auto_before_cpu: bool = False
         # 训练计时器状态：使用 `time.monotonic()` 单调时钟域，避免系统时间校时影响已用时长计算
         self._train_started_at: float | None = None
         self._has_best_eval_metrics: bool = False
@@ -386,12 +405,13 @@ class TrainTab(QWidget):
         self.imgsz_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.imgsz_combo.setMinimumWidth(64)
 
-        self.batch_spin = QSpinBox()
+        self.batch_spin = _BatchSpinBox()
         self.batch_spin.setRange(-1, 512)
+        self.batch_spin.setSpecialValueText("自动")
         self.batch_spin.setValue(16 if self.device_info.cuda_available else 4)
         self.batch_spin.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.batch_spin.setMinimumWidth(64)
-        self.batch_spin.setToolTip("设为 -1 可让 Ultralytics 自动探测最大可用 Batch Size")
+        self.batch_spin.setToolTip("设为 -1（显示为“自动”）可让 Ultralytics 自动探测最大可用 Batch Size")
 
         self.nbs_spin = QSpinBox()
         self.nbs_spin.setRange(1, 1024)
@@ -505,9 +525,12 @@ class TrainTab(QWidget):
         opt_sched_row.addWidget(self.warmup_spin)
         form.addRow("优化器与学习率:", opt_sched_row)
 
-        # 训练与复现选项：统一 2 行 × 4 列网格对齐
+        # 训练与复现选项：统一 2 行 × 4 列网格对齐，下方按需展开断点续训生效范围提示
         opts_widget = QWidget()
-        opts_grid = QGridLayout(opts_widget)
+        opts_vbox = QVBoxLayout(opts_widget)
+        opts_vbox.setContentsMargins(0, 0, 0, 0)
+        opts_vbox.setSpacing(4)
+        opts_grid = QGridLayout()
         opts_grid.setContentsMargins(0, 0, 0, 0)
         opts_grid.setHorizontalSpacing(10)
         opts_grid.setVerticalSpacing(4)
@@ -537,6 +560,19 @@ class TrainTab(QWidget):
         opts_grid.addWidget(self.val_chk, 1, 2)
         for col in range(4):
             opts_grid.setColumnStretch(col, 1)
+        opts_vbox.addLayout(opts_grid)
+
+        self.resume_hint_label = QLabel(
+            "断点续训模式：优先加载「自定义权重路径」或「保存根目录/实验名称/weights/last.pt」，"
+            "已置灰的超参数与增强项将沿用断点原配置，仅运行与验证类参数可覆盖。"
+        )
+        self.resume_hint_label.setWordWrap(True)
+        self.resume_hint_label.setStyleSheet(
+            "color: #0969da; background: #eff6ff; border: 1px solid #bfdbfe; "
+            "border-radius: 4px; padding: 4px 8px; font-size: 12px;"
+        )
+        self.resume_hint_label.setVisible(False)
+        opts_vbox.addWidget(self.resume_hint_label)
         form.addRow("训练与复现:", opts_widget)
 
         default_proj = str((self.workspace_root / "runs" / "detect").resolve())
@@ -757,12 +793,45 @@ class TrainTab(QWidget):
         self.custom_model_edit.textChanged.connect(self._on_control_state_inputs_changed)
         self.optimizer_combo.currentIndexChanged.connect(self._on_control_state_inputs_changed)
         self.mosaic_spin.valueChanged.connect(self._on_control_state_inputs_changed)
-        self.batch_spin.valueChanged.connect(self._refresh_accum_hint)
+        self.resume_chk.toggled.connect(self._on_control_state_inputs_changed)
+        self.val_chk.toggled.connect(self._on_control_state_inputs_changed)
+        self.batch_spin.valueChanged.connect(self._on_batch_value_changed)
         self.nbs_spin.valueChanged.connect(self._refresh_accum_hint)
         self.extra_args_edit.textChanged.connect(self._on_extra_args_changed)
         self.amp_chk.toggled.connect(self._on_amp_toggled)
         self._bind_preset_dirty_watchers()
         self._bind_settings_dirty_watchers()
+
+        # 记录受断点续训 (resume=True) 忽略的控件及其默认提示文案，切回正常训练时完整恢复
+        self._resume_ignored_widgets: tuple[tuple[QWidget, str], ...] = tuple(
+            (w, w.toolTip())
+            for w in (
+                self.preset_combo,
+                self.import_json_btn,
+                self.epochs_spin,
+                self.nbs_spin,
+                self.optimizer_combo,
+                self.lrf_spin,
+                self.warmup_spin,
+                self.cos_lr_chk,
+                self.seed_spin,
+                self.deterministic_chk,
+                self.mosaic_spin,
+                self.mixup_spin,
+                self.cutmix_spin,
+                self.copy_paste_spin,
+                self.degrees_spin,
+                self.translate_spin,
+                self.scale_spin,
+                self.shear_spin,
+                self.perspective_spin,
+                self.flipud_spin,
+                self.fliplr_spin,
+                self.hsv_h_spin,
+                self.hsv_s_spin,
+                self.hsv_v_spin,
+            )
+        )
 
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
@@ -885,6 +954,13 @@ class TrainTab(QWidget):
     def _on_control_state_inputs_changed(self, *_args: object) -> None:
         self._sync_control_states()
 
+    def _on_batch_value_changed(self, value: int) -> None:
+        """禁止 `Batch` 停留在无效值 `0`，并实时刷新梯度累积换算提示。"""
+        if value == 0:
+            self.batch_spin.setValue(1)
+            return
+        self._refresh_accum_hint()
+
     def _refresh_accum_hint(self, *_args: object) -> None:
         """按当前 `Batch` 与 `NBS` 实时换算梯度累积步数并刷新只读提示标签。"""
         batch_val = self.batch_spin.value()
@@ -903,60 +979,144 @@ class TrainTab(QWidget):
         )
 
     def _sync_control_states(self) -> None:
-        """统一维护防呆联动禁用态：auto 置灰 LR0、自定义权重置灰官方模型、Mosaic=0 置灰 CloseMosaic、CPU 置灰 AMP。"""
+        """统一维护防呆联动禁用态：断点续训置灰忽略项、auto 置灰 LR0、自定义权重置灰官方模型、
+        Mosaic=0 置灰 CloseMosaic、关闭验证置灰 Patience、CPU 置灰 AMP 并禁用 Batch=-1 自动探测。
+        """
+        is_resume = self.resume_chk.isChecked()
+        probing = self.device_info.probing
+        using_gpu = self.device_ctrl.is_using_gpu()
+        resume_tip = (
+            "断点续训 (resume) 模式下该参数将沿用 last.pt 原配置，不会覆盖；取消勾选断点续训后可编辑"
+        )
+
+        self.resume_hint_label.setVisible(is_resume)
+
+        # 1) 受断点续训忽略的超参数与数据增强控件统一置灰，避免用户误改却不生效
+        for widget, default_tip in self._resume_ignored_widgets:
+            widget.setEnabled(not is_resume)
+            widget.setToolTip(resume_tip if is_resume else default_tip)
+
+        # 2) 优化器为 auto 或断点续训时置灰 LR0
         is_auto_opt = str(self.optimizer_combo.currentData() or "auto").lower() == "auto"
-        self.lr0_spin.setEnabled(not is_auto_opt)
+        self.lr0_spin.setEnabled((not is_auto_opt) and (not is_resume))
         self.lr0_label.setText("LR0(自动):" if is_auto_opt else "LR0:")
-        if is_auto_opt:
+        if is_resume:
+            self.lr0_spin.setToolTip(resume_tip)
+        elif is_auto_opt:
             self.lr0_spin.setToolTip(
                 "当前优化器为 auto，Ultralytics 将按类别数与步数自动计算并覆盖 LR0；切换到 AdamW / SGD 后可手动编辑"
             )
         else:
             self.lr0_spin.setToolTip("初始学习率：当前优化器已显式指定，训练时将严格按此值生效")
 
+        # 3) 指定自定义权重或开启断点续训时置灰官方预训练模型下拉框
         has_custom_model = bool(self.custom_model_edit.text().strip())
-        self.model_combo.setEnabled(not has_custom_model)
-        self.model_combo.setToolTip(
-            "已指定自定义权重路径，训练时将优先加载自定义 .pt；清空自定义路径后恢复选用官方模型"
-            if has_custom_model
-            else "选择官方 YOLO26 目标检测预训练模型"
-        )
-
-        mosaic_enabled = self.mosaic_spin.value() > 0.0
-        self.close_mosaic_spin.setEnabled(mosaic_enabled)
-        self.close_mosaic_spin.setToolTip(
-            "最后 N 轮关闭 Mosaic 增强 (close_mosaic)"
-            if mosaic_enabled
-            else "当前 Mosaic 概率为 0，已彻底关闭拼接增强，CloseMosaic 不再生效"
-        )
-
-        # CPU 模式或探测期间联动置灰混合精度 AMP，重新启用 GPU 时恢复用户原有偏好
-        if self.device_info.probing:
-            self.amp_chk.setEnabled(False)
-            self.amp_chk.setToolTip("正在检测计算设备，探测完成后自动更新混合精度 AMP 可用状态")
-        elif not self.device_ctrl.is_using_gpu():
-            if self.amp_chk.isEnabled():
-                self._amp_saved_before_cpu = self.amp_chk.isChecked()
-            prev_restoring = self._restoring_state
-            self._restoring_state = True
-            try:
-                self.amp_chk.setChecked(False)
-            finally:
-                self._restoring_state = prev_restoring
-            self.amp_chk.setEnabled(False)
-            self.amp_chk.setToolTip("当前为 CPU 模式，不支持 CUDA 混合精度 AMP；在顶部启用 GPU 加速后可开启")
+        self.model_combo.setEnabled((not has_custom_model) and (not is_resume))
+        if is_resume:
+            self.model_combo.setToolTip(
+                "已启用断点续训，将优先加载「自定义权重路径」或「保存根目录/实验名称/weights/last.pt」，不使用官方预训练模型"
+            )
+        elif has_custom_model:
+            self.model_combo.setToolTip(
+                "已指定自定义权重路径，训练时将优先加载自定义 .pt；清空自定义路径后恢复选用官方模型"
+            )
         else:
-            if not self.amp_chk.isEnabled() and self._amp_saved_before_cpu is not None:
+            self.model_combo.setToolTip("选择官方 YOLO26 目标检测预训练模型")
+
+        # 4) CloseMosaic：续训时 Ultralytics 允许覆盖，正常训练仅在 Mosaic > 0 时生效
+        if is_resume:
+            self.close_mosaic_spin.setEnabled(True)
+            self.close_mosaic_spin.setToolTip(
+                "最后 N 轮关闭 Mosaic 增强 (close_mosaic)；断点续训时允许覆盖此参数"
+            )
+        else:
+            mosaic_enabled = self.mosaic_spin.value() > 0.0
+            self.close_mosaic_spin.setEnabled(mosaic_enabled)
+            self.close_mosaic_spin.setToolTip(
+                "最后 N 轮关闭 Mosaic 增强 (close_mosaic)"
+                if mosaic_enabled
+                else "当前 Mosaic 概率为 0，已彻底关闭拼接增强，CloseMosaic 不再生效"
+            )
+
+        # 5) 关闭训练期验证 (val=False) 时早停 Patience 不会触发
+        val_enabled = self.val_chk.isChecked()
+        self.patience_spin.setEnabled(val_enabled)
+        self.patience_spin.setToolTip(
+            "早停容忍轮数：验证集指标连续 N 轮无提升则提前停训；设为 0 或等于 Epochs 可禁用早停"
+            if val_enabled
+            else "已关闭训练期验证 (val=False)，训练中途不评估验证集，早停 Patience 不会生效"
+        )
+
+        # 6) CPU 模式不支持 AutoBatch (-1)，限制 Batch >= 1；切回 GPU 时恢复 -1 可选及原偏好
+        if not probing and not using_gpu:
+            if not self._batch_cpu_clamped:
                 prev_restoring = self._restoring_state
                 self._restoring_state = True
                 try:
-                    self.amp_chk.setChecked(self._amp_saved_before_cpu)
+                    was_auto = self.batch_spin.value() <= 0
+                    self._batch_was_auto_before_cpu = was_auto
+                    self.batch_spin.setMinimum(1)
+                    self.batch_spin.setSpecialValueText("")
+                    if was_auto:
+                        self.batch_spin.setValue(4)
                 finally:
                     self._restoring_state = prev_restoring
-                self._amp_saved_before_cpu = None
-            self.amp_chk.setEnabled(True)
-            self.amp_chk.setToolTip("开启自动混合精度 (FP16 AMP) 可节省显存并提速；如需严格对标 FP32 数值可关闭")
+                self._batch_cpu_clamped = True
+            self.batch_spin.setToolTip(
+                "CPU 模式不支持 AutoBatch (-1)，请指定正整数批大小（建议 2~8）；启用 GPU 加速后恢复 -1 自动探测"
+            )
+        else:
+            if self._batch_cpu_clamped:
+                prev_restoring = self._restoring_state
+                self._restoring_state = True
+                try:
+                    self.batch_spin.setMinimum(-1)
+                    self.batch_spin.setSpecialValueText("自动")
+                    if self._batch_was_auto_before_cpu:
+                        self.batch_spin.setValue(-1)
+                        self._batch_was_auto_before_cpu = False
+                finally:
+                    self._restoring_state = prev_restoring
+                self._batch_cpu_clamped = False
+            self.batch_spin.setToolTip(
+                "设为 -1（显示为“自动”）可让 Ultralytics 自动探测最大可用 Batch Size"
+            )
 
+        # 7) CPU 模式或探测期间联动置灰混合精度 AMP，重新启用 GPU 时恢复用户原有偏好；续训时同样置灰
+        if probing:
+            self.amp_chk.setEnabled(False)
+            self.amp_chk.setToolTip("正在检测计算设备，探测完成后自动更新混合精度 AMP 可用状态")
+        elif not using_gpu:
+            if not self._amp_disabled_for_cpu:
+                self._amp_saved_before_cpu = self.amp_chk.isChecked()
+                self._amp_disabled_for_cpu = True
+                prev_restoring = self._restoring_state
+                self._restoring_state = True
+                try:
+                    self.amp_chk.setChecked(False)
+                finally:
+                    self._restoring_state = prev_restoring
+            self.amp_chk.setEnabled(False)
+            self.amp_chk.setToolTip("当前为 CPU 模式，不支持 CUDA 混合精度 AMP；在顶部启用 GPU 加速后可开启")
+        else:
+            if self._amp_disabled_for_cpu:
+                if self._amp_saved_before_cpu is not None:
+                    prev_restoring = self._restoring_state
+                    self._restoring_state = True
+                    try:
+                        self.amp_chk.setChecked(self._amp_saved_before_cpu)
+                    finally:
+                        self._restoring_state = prev_restoring
+                self._amp_saved_before_cpu = None
+                self._amp_disabled_for_cpu = False
+            self.amp_chk.setEnabled(not is_resume)
+            self.amp_chk.setToolTip(
+                resume_tip
+                if is_resume
+                else "开启自动混合精度 (FP16 AMP) 可节省显存并提速；如需严格对标 FP32 数值可关闭"
+            )
+
+        self._refresh_accum_hint()
         self._refresh_aug_summary()
 
     def _on_toggle_aug_panel(self) -> None:
@@ -1101,19 +1261,28 @@ class TrainTab(QWidget):
                 self.custom_model_edit.setText(model_val)
             applied.append("model")
 
+        if "device" in known and known["device"] is not None:
+            self.device_ctrl.set_device(str(known["device"]), user_action=not self._restoring_state)
+            applied.append("device")
+
         _set_int(self.epochs_spin, "epochs")
         if "imgsz" in known and known["imgsz"] is not None:
             self.imgsz_combo.setCurrentText(str(int(known["imgsz"])))  # type: ignore[call-overload]
             applied.append("imgsz")
-        _set_int(self.batch_spin, "batch")
+        if "batch" in known and known["batch"] is not None:
+            raw_batch = int(known["batch"])  # type: ignore[call-overload]
+            if raw_batch == 0:
+                raw_batch = 1
+            if raw_batch < 0 and self.batch_spin.minimum() > raw_batch:
+                self.batch_spin.setMinimum(-1)
+                self.batch_spin.setSpecialValueText("自动")
+                self._batch_cpu_clamped = False
+            self.batch_spin.setValue(raw_batch)
+            applied.append("batch")
         _set_int(self.nbs_spin, "nbs")
         _set_int(self.patience_spin, "patience")
         _set_int(self.workers_spin, "workers")
         _set_int(self.seed_spin, "seed")
-
-        if "device" in known and known["device"] is not None:
-            self.device_ctrl.set_device(str(known["device"]), user_action=not self._restoring_state)
-            applied.append("device")
 
         if "optimizer" in known and known["optimizer"] is not None:
             opt_text = str(known["optimizer"]).strip()
@@ -1261,6 +1430,10 @@ class TrainTab(QWidget):
             self.epochs_spin.setValue(100)
             self.imgsz_combo.setCurrentText("640")
             self._auto_batch_value = 16 if self.device_info.cuda_available else 4
+            self._batch_cpu_clamped = False
+            self._batch_was_auto_before_cpu = False
+            self.batch_spin.setMinimum(-1)
+            self.batch_spin.setSpecialValueText("自动")
             self.batch_spin.setValue(self._auto_batch_value)
             self.patience_spin.setValue(50)
             self.workers_spin.setValue(4)
@@ -1268,6 +1441,7 @@ class TrainTab(QWidget):
             self.device_ctrl.reset_to_recommended()
             self._amp_user_overridden = False
             self._amp_saved_before_cpu = None
+            self._amp_disabled_for_cpu = False
             self.amp_chk.setChecked(self.device_info.cuda_available)
             self.cache_chk.setChecked(False)
             self.resume_chk.setChecked(False)
@@ -1329,8 +1503,13 @@ class TrainTab(QWidget):
             return
         saved_amp = (
             self._amp_saved_before_cpu
-            if (not self.device_ctrl.is_using_gpu() and self._amp_saved_before_cpu is not None)
+            if (self._amp_disabled_for_cpu and self._amp_saved_before_cpu is not None)
             else self.amp_chk.isChecked()
+        )
+        saved_batch = (
+            -1
+            if (self._batch_cpu_clamped and self._batch_was_auto_before_cpu)
+            else self.batch_spin.value()
         )
         state: dict[str, object] = {
             "version": 1,
@@ -1339,8 +1518,8 @@ class TrainTab(QWidget):
             "custom_model": self.custom_model_edit.text().strip(),
             "epochs": self.epochs_spin.value(),
             "imgsz": self.imgsz_combo.currentText().strip() or "640",
-            "batch": self.batch_spin.value(),
-            "batch_is_auto": self.batch_spin.value() == self._auto_batch_value,
+            "batch": saved_batch,
+            "batch_is_auto": saved_batch == self._auto_batch_value,
             "nbs": self.nbs_spin.value(),
             "optimizer": str(self.optimizer_combo.currentData() or "auto"),
             "lr0": self.lr0_spin.value(),
@@ -1398,6 +1577,13 @@ class TrainTab(QWidget):
         self._restoring_state = True
         self._applying_preset = True
         try:
+            self._amp_disabled_for_cpu = False
+            self._amp_saved_before_cpu = None
+            self._batch_cpu_clamped = False
+            self._batch_was_auto_before_cpu = False
+            self.batch_spin.setMinimum(-1)
+            self.batch_spin.setSpecialValueText("自动")
+
             model_file = str(state.get("model_file", ""))
             model_idx = self.model_combo.findData(model_file)
             if model_idx >= 0:
@@ -1414,7 +1600,6 @@ class TrainTab(QWidget):
                 self._auto_batch_value = -999
 
             self._amp_user_overridden = bool(state.get("amp_user_overridden", False))
-            self._amp_saved_before_cpu = None
             if not self._amp_user_overridden:
                 self.amp_chk.setChecked(self.device_info.cuda_available)
 
@@ -1495,6 +1680,10 @@ class TrainTab(QWidget):
                 raise ValueError
         except ValueError as exc:
             raise ValueError("ImgSz 必须是正整数。") from exc
+
+        batch_val = self.batch_spin.value()
+        if batch_val == 0:
+            raise ValueError("Batch 不能为 0，请设为 -1（GPU 自动探测）或正整数。")
 
         extra_args = parse_extra_train_args(self.extra_args_edit.toPlainText())
 
