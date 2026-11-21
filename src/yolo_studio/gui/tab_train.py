@@ -75,6 +75,18 @@ from yolo_studio.gui.workers import TrainWorker
 
 _CUSTOM_PRESET_KEY = "custom"
 _SETTINGS_STATE_KEY = "train_tab/state_json"
+_BEST_EVAL_METRIC_KEYS = (
+    "metrics/precision(B)",
+    "metrics/recall(B)",
+    "metrics/mAP50(B)",
+    "metrics/mAP50-95(B)",
+)
+_BEST_EVAL_CARD_IDLE_QSS = (
+    "QWidget#bestEvalCard { border: 1px solid #d8dee4; border-radius: 6px; background-color: #f8fafc; }"
+)
+_BEST_EVAL_CARD_READY_QSS = (
+    "QWidget#bestEvalCard { border: 1px solid #86efac; border-radius: 6px; background-color: #f0fdf4; }"
+)
 
 
 def _make_double_spin(
@@ -230,7 +242,8 @@ class TrainTab(QWidget):
         训练工作线程 `worker`、预设/持久化批量写入重入锁 `_applying_preset` / `_restoring_state`、
         用户修改脏标记 `_settings_dirty`、硬件自适应项覆盖标记（`_auto_batch_value`、`_amp_user_overridden`、
         `_amp_saved_before_cpu`）、基于 `time.monotonic()` 单调时钟域的训练启动时间戳 `_train_started_at`
-        与实时刷新定时器 `_elapsed_timer`，以及最近实验目录 `_last_save_dir` 与最近最佳权重路径 `_last_best_pt`。
+        与实时刷新定时器 `_elapsed_timer`、`best.pt` 最终评估就绪标记 `_has_best_eval_metrics`，
+        以及最近实验目录 `_last_save_dir` 与最近最佳权重路径 `_last_best_pt`。
     """
 
     send_best_weights = Signal(str, str)  # 信号参数：(weights_path, data_yaml)
@@ -258,6 +271,7 @@ class TrainTab(QWidget):
         self._amp_saved_before_cpu: bool | None = None
         # 训练计时器状态：使用 `time.monotonic()` 单调时钟域，避免系统时间校时影响已用时长计算
         self._train_started_at: float | None = None
+        self._has_best_eval_metrics: bool = False
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(500)
         self._init_ui()
@@ -709,6 +723,8 @@ class TrainTab(QWidget):
         metrics_grid.addWidget(c5, 2, 1)
         metrics_grid.addWidget(c6, 3, 0)
         metrics_grid.addWidget(c7, 3, 1)
+        self.best_eval_card = self._build_best_eval_card()
+        metrics_grid.addWidget(self.best_eval_card, 4, 0, 1, 2)
         metrics_grid.setColumnStretch(0, 1)
         metrics_grid.setColumnStretch(1, 1)
         right.addWidget(metrics_group)
@@ -1543,8 +1559,90 @@ class TrainTab(QWidget):
             except TypeError:
                 pass
 
+    def _build_best_eval_card(self) -> QWidget:
+        """构建紧凑的 `best.pt` 最终评估摘要卡片，独立于上方最后一轮实时指标卡片展示。"""
+        card = QWidget()
+        card.setObjectName("bestEvalCard")
+        card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        card.setStyleSheet(_BEST_EVAL_CARD_IDLE_QSS)
+        card.setToolTip(
+            "训练结束后 Ultralytics 对最佳权重 best.pt 单独执行的完整验证指标；独立展示，不覆盖上方最后一轮指标"
+        )
+
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(10, 6, 10, 6)
+        outer.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+        self.best_eval_title_label = QLabel("best.pt 最终评估")
+        self.best_eval_title_label.setStyleSheet("color: #57606a; font-weight: 600; font-size: 12px;")
+        self.best_eval_status_label = QLabel("训练结束后更新（不覆盖上方最后一轮）")
+        self.best_eval_status_label.setStyleSheet("color: #8c959f; font-size: 11px;")
+        header.addWidget(self.best_eval_title_label)
+        header.addStretch(1)
+        header.addWidget(self.best_eval_status_label)
+        outer.addLayout(header)
+
+        values_row = QHBoxLayout()
+        values_row.setContentsMargins(0, 0, 0, 0)
+        values_row.setSpacing(10)
+
+        def _make_pair(caption: str, tip: str) -> QLabel:
+            pair = QHBoxLayout()
+            pair.setContentsMargins(0, 0, 0, 0)
+            pair.setSpacing(4)
+            cap_lbl = QLabel(f"{caption}:")
+            cap_lbl.setStyleSheet("color: #666666; font-weight: 500; font-size: 12px;")
+            cap_lbl.setToolTip(tip)
+            val_lbl = QLabel("-")
+            val_lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
+            val_lbl.setToolTip(tip)
+            pair.addWidget(cap_lbl)
+            pair.addWidget(val_lbl)
+            pair.addStretch(1)
+            values_row.addLayout(pair, 1)
+            return val_lbl
+
+        self.val_best_precision = _make_pair("P", "best.pt 最终评估精确率 (Precision)")
+        self.val_best_recall = _make_pair("R", "best.pt 最终评估召回率 (Recall)")
+        self.val_best_map50 = _make_pair("mAP50", "best.pt 最终评估 mAP@0.50")
+        self.val_best_map50_95 = _make_pair("mAP50-95", "best.pt 最终评估 mAP@0.50:0.95")
+        outer.addLayout(values_row)
+        return card
+
+    def _reset_best_eval_metrics(self) -> None:
+        """清空 `best.pt` 最终评估摘要卡片数值并恢复待评估状态样式。"""
+        self._has_best_eval_metrics = False
+        self.best_eval_card.setStyleSheet(_BEST_EVAL_CARD_IDLE_QSS)
+        self.best_eval_title_label.setStyleSheet("color: #57606a; font-weight: 600; font-size: 12px;")
+        self.best_eval_status_label.setText("训练结束后更新（不覆盖上方最后一轮）")
+        self.best_eval_status_label.setStyleSheet("color: #8c959f; font-size: 11px;")
+        for lbl in (
+            self.val_best_precision,
+            self.val_best_recall,
+            self.val_best_map50,
+            self.val_best_map50_95,
+        ):
+            lbl.setText("-")
+
+    def _set_best_eval_metrics(
+        self, *, precision: float, recall: float, map50: float, map50_95: float
+    ) -> None:
+        """写入 `best.pt` 最终评估四项验证指标并切换高亮完成样式，不影响上方最后一轮卡片。"""
+        self._has_best_eval_metrics = True
+        self.best_eval_card.setStyleSheet(_BEST_EVAL_CARD_READY_QSS)
+        self.best_eval_title_label.setStyleSheet("color: #15803d; font-weight: 700; font-size: 12px;")
+        self.best_eval_status_label.setText("独立于上方最后一轮指标")
+        self.best_eval_status_label.setStyleSheet("color: #166534; font-size: 11px;")
+        self.val_best_precision.setText(f"{precision:.4f}")
+        self.val_best_recall.setText(f"{recall:.4f}")
+        self.val_best_map50.setText(f"{map50:.4f}")
+        self.val_best_map50_95.setText(f"{map50_95:.4f}")
+
     def _reset_live_metrics(self, *, total_epochs: int = 0, initial_elapsed: str = "-") -> None:
-        """立即重置右侧全部实时训练指标卡片与进度条，清除上一次训练残留数值。
+        """立即重置右侧全部实时训练指标卡片、`best.pt` 最终评估摘要与进度条，清除上次训练残留。
 
         参数说明：
             `total_epochs`：本次训练计划总轮数；大于 0 时将 `Epoch` 重置为 `0 / <total_epochs>`，
@@ -1560,6 +1658,7 @@ class TrainTab(QWidget):
         self.val_recall.setText("-")
         self.val_map50.setText("-")
         self.val_map50_95.setText("-")
+        self._reset_best_eval_metrics()
 
     def _start_elapsed_timer(self) -> None:
         """以当前 `time.monotonic()` 单调时钟为起点启动训练时长刷新定时器，并立即归零显示 `00:00:00`。"""
@@ -1648,10 +1747,20 @@ class TrainTab(QWidget):
             self.log_box.appendPlainText("正在请求停止训练，请等待当前 Epoch 完成保存...")
 
     def _on_epoch_updated(self, m: EpochMetrics) -> None:
+        """更新右侧指标卡片：常规轮次更新实时/最后一轮卡片，`final_eval` 仅更新下方 `best.pt` 最终评估栏。"""
+        self._refresh_elapsed_time()
+        if m.is_final_eval:
+            self._set_best_eval_metrics(
+                precision=m.precision,
+                recall=m.recall,
+                map50=m.map50,
+                map50_95=m.map50_95,
+            )
+            return
+
         pct = int(min(100, (m.epoch / max(1, m.total_epochs)) * 100))
         self.progress_bar.setValue(pct)
         self.val_epoch.setText(f"{m.epoch} / {m.total_epochs}")
-        self._refresh_elapsed_time()
         self.val_box_loss.setText(f"{m.box_loss:.4f}")
         self.val_cls_loss.setText(f"{m.cls_loss:.4f}")
         self.val_precision.setText(f"{m.precision:.4f}")
@@ -1663,7 +1772,7 @@ class TrainTab(QWidget):
         self.log_box.appendPlainText(line)
 
     def _on_finished(self, res: TrainResult) -> None:
-        """恢复界面状态、停表定格训练时长并记录产物目录；若生成了 `best.pt` 则自动通知下游标签页。"""
+        """恢复界面状态、停表定格训练时长、兜底补齐 `best.pt` 评估指标并通知下游标签页。"""
         elapsed_text = self._stop_elapsed_timer()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -1671,10 +1780,31 @@ class TrainTab(QWidget):
         if not res.stopped_early:
             self.progress_bar.setValue(100)
 
+        # 多卡 DDP 或未走主进程 `final_eval` 回调时，兜底从 `TrainResult.metrics` 填充 `best.pt` 最终评估指标
+        if (
+            not self._has_best_eval_metrics
+            and res.best_weights is not None
+            and any(k in res.metrics for k in _BEST_EVAL_METRIC_KEYS)
+        ):
+            self._set_best_eval_metrics(
+                precision=float(res.metrics.get("metrics/precision(B)", 0.0)),
+                recall=float(res.metrics.get("metrics/recall(B)", 0.0)),
+                map50=float(res.metrics.get("metrics/mAP50(B)", 0.0)),
+                map50_95=float(res.metrics.get("metrics/mAP50-95(B)", 0.0)),
+            )
+
         status_text = "训练已提前停止" if res.stopped_early else "训练完成"
         self.log_box.appendPlainText(f"\n=== {status_text} ===")
         if elapsed_text is not None:
             self.log_box.appendPlainText(f"训练时长: {elapsed_text}")
+        if self._has_best_eval_metrics:
+            self.log_box.appendPlainText(
+                "best.pt 最终评估: "
+                f"P={self.val_best_precision.text()}, "
+                f"R={self.val_best_recall.text()}, "
+                f"mAP50={self.val_best_map50.text()}, "
+                f"mAP50-95={self.val_best_map50_95.text()}"
+            )
         self.log_box.appendPlainText(f"结果目录: {res.save_dir}")
         if res.best_weights:
             self._last_best_pt = str(res.best_weights)

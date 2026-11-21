@@ -415,3 +415,126 @@ def test_parse_train_arguments_text_and_split_known_extra() -> None:
 
     with pytest.raises(ValueError, match="请输入"):
         parse_train_arguments_text("   \n=== 仅标题 ===\n")
+
+
+def test_train_yolo26_final_eval_keeps_completed_epoch_and_marks_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证跑满与早停场景下，Ultralytics `final_eval()` 的临时 `epoch += 1` 不会导致完成轮次多加 1。"""
+    import threading
+
+    from yolo_studio.core.trainer import EpochMetrics
+
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text("names: [target]\n", encoding="utf-8")
+
+    class _FakeLossTensor:
+        def __init__(self, vals: list[float]) -> None:
+            self._vals = vals
+
+        def detach(self) -> "_FakeLossTensor":
+            return self
+
+        def cpu(self) -> "_FakeLossTensor":
+            return self
+
+        def tolist(self) -> list[float]:
+            return list(self._vals)
+
+    def _run_case(*, total_epochs: int, actual_epochs: int, cancel_during_final_eval: bool) -> tuple[list[EpochMetrics], bool]:
+        cancel_ev = threading.Event()
+
+        class _FakeYOLO:
+            def __init__(self, _model_source: str) -> None:
+                self.callbacks: dict[str, list] = {}
+                self.trainer: object | None = None
+
+            def add_callback(self, event: str, cb: object) -> None:
+                self.callbacks.setdefault(event, []).append(cb)
+
+            def train(self, **kwargs: object) -> object:
+                save_dir = Path(str(kwargs["project"])) / str(kwargs["name"])
+                (save_dir / "weights").mkdir(parents=True, exist_ok=True)
+                (save_dir / "weights" / "best.pt").write_bytes(b"pt")
+
+                trainer_ns = types.SimpleNamespace(
+                    args=types.SimpleNamespace(**kwargs),
+                    save_dir=save_dir,
+                    epoch=0,
+                    epochs=total_epochs,
+                    metrics={},
+                    tloss=None,
+                    stop=False,
+                )
+                self.trainer = trainer_ns
+                for cb in self.callbacks.get("on_train_start", []):
+                    cb(trainer_ns)
+
+                # 模拟正常训练轮次：每轮成对触发 on_train_epoch_end -> on_fit_epoch_end
+                for idx in range(actual_epochs):
+                    trainer_ns.epoch = idx
+                    trainer_ns.tloss = _FakeLossTensor([0.4 - idx * 0.05, 0.25 - idx * 0.02])
+                    trainer_ns.metrics = {
+                        "metrics/precision(B)": 0.80 + idx * 0.02,
+                        "metrics/recall(B)": 0.75 + idx * 0.02,
+                        "metrics/mAP50(B)": 0.82 + idx * 0.02,
+                        "metrics/mAP50-95(B)": 0.60 + idx * 0.02,
+                    }
+                    for cb in self.callbacks.get("on_train_epoch_end", []):
+                        cb(trainer_ns)
+                    for cb in self.callbacks.get("on_fit_epoch_end", []):
+                        cb(trainer_ns)
+
+                # 模拟 Ultralytics BaseTrainer.final_eval()：跳过 on_train_epoch_end，
+                # 将 epoch 临时加 1 后再次触发 on_fit_epoch_end 上报 best.pt 最终评估指标
+                if cancel_during_final_eval:
+                    cancel_ev.set()
+                best_metrics = {
+                    "metrics/precision(B)": 0.945,
+                    "metrics/recall(B)": 0.912,
+                    "metrics/mAP50(B)": 0.961,
+                    "metrics/mAP50-95(B)": 0.785,
+                }
+                trainer_ns.metrics = dict(best_metrics)
+                trainer_ns.epoch += 1
+                for cb in self.callbacks.get("on_fit_epoch_end", []):
+                    cb(trainer_ns)
+                trainer_ns.epoch -= 1
+                return types.SimpleNamespace(results_dict=best_metrics)
+
+        fake_ultralytics = types.ModuleType("ultralytics")
+        fake_ultralytics.YOLO = _FakeYOLO  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "ultralytics", fake_ultralytics)
+
+        received: list[EpochMetrics] = []
+        cfg = TrainConfig(
+            data_yaml=data_yaml,
+            epochs=total_epochs,
+            project_dir=tmp_path / "runs",
+            run_name=f"case_{total_epochs}_{actual_epochs}",
+        )
+        res = train_yolo26(cfg, epoch_callback=received.append, cancel_event=cancel_ev)
+        return received, res.stopped_early
+
+    # 1) 跑满全部 3 轮：常规回调为 1, 2, 3；final_eval 保持 epoch=3 且 is_final_eval=True，迟到取消不计为提前停训
+    full_events, full_stopped = _run_case(total_epochs=3, actual_epochs=3, cancel_during_final_eval=True)
+    assert [(e.epoch, e.total_epochs, e.is_final_eval) for e in full_events] == [
+        (1, 3, False),
+        (2, 3, False),
+        (3, 3, False),
+        (3, 3, True),
+    ]
+    assert full_events[-1].precision == pytest.approx(0.945)
+    assert full_events[-1].recall == pytest.approx(0.912)
+    assert full_events[-1].map50 == pytest.approx(0.961)
+    assert full_events[-1].map50_95 == pytest.approx(0.785)
+    assert full_events[-1].box_loss == 0.0 and full_events[-1].cls_loss == 0.0
+    assert full_stopped is False
+
+    # 2) 早停在第 2 / 10 轮：final_eval 同样保持实际完成轮次 epoch=2（不会变成 3 / 10）
+    early_events, _ = _run_case(total_epochs=10, actual_epochs=2, cancel_during_final_eval=False)
+    assert [(e.epoch, e.total_epochs, e.is_final_eval) for e in early_events] == [
+        (1, 10, False),
+        (2, 10, False),
+        (2, 10, True),
+    ]

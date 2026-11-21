@@ -220,7 +220,14 @@ class TrainConfig:
 
 @dataclass
 class EpochMetrics:
-    """单个训练轮次结束时提取的关键指标快照（`epoch` 为从 1 开始计数）。"""
+    """单个训练轮次或训练结束后 `best.pt` 最终评估提取的关键指标快照（`epoch` 从 1 开始计数）。
+
+    字段说明：
+        `is_final_eval`：为 `False` 时表示常规训练轮次结束快照；为 `True` 时表示来自 Ultralytics
+            `BaseTrainer.final_eval()` 对 `best.pt` 执行的最终验证，此时 `epoch` 保持为实际已完成的
+            最后一轮轮次（避免因 Ultralytics 临时 `epoch += 1` 记日志而多出 1 步），验证精度字段
+            对应 `best.pt` 最终评估结果，不应用于覆盖最后一轮训练指标。
+    """
 
     epoch: int
     total_epochs: int
@@ -230,6 +237,7 @@ class EpochMetrics:
     recall: float = 0.0
     map50: float = 0.0
     map50_95: float = 0.0
+    is_final_eval: bool = False
 
 
 @dataclass
@@ -916,6 +924,11 @@ def train_yolo26(
     ensure_torch_cpu_threads()
     model = YOLO(model_source)
     stop_requested = {"value": False}
+    # 追踪正常训练轮次与 `final_eval()` 额外回调的成对关系：
+    # 正常每轮必定先触发 `on_train_epoch_end` 再触发 `on_fit_epoch_end`；
+    # 训练结束后的 `final_eval()` 不经过 `on_train_epoch_end`，而是临时将 `trainer.epoch += 1`
+    # 后再次触发 `on_fit_epoch_end`，据此可精确识别并在早停/跑满两种场景下保持真实完成轮次
+    epoch_state = {"awaiting_fit_end": False, "last_completed_epoch": 0}
     extra_keys = tuple(config.extra_args.keys())
 
     def _on_train_start(trainer: object) -> None:
@@ -929,15 +942,36 @@ def train_yolo26(
             if log_callback:
                 log_callback("收到停止请求，将在当前轮次结束后安全停止训练...")
 
+    def _on_train_epoch_end(trainer: object) -> None:
+        epoch_state["awaiting_fit_end"] = True
+        _check_cancel(trainer)
+
     def _on_fit_epoch_end(trainer: object) -> None:
-        epoch = int(getattr(trainer, "epoch", 0)) + 1
+        raw_epoch = int(getattr(trainer, "epoch", 0))
         epochs = int(getattr(trainer, "epochs", config.epochs))
         metrics_dict = getattr(trainer, "metrics", {}) or {}
         tloss = getattr(trainer, "tloss", None)
 
+        if epoch_state["awaiting_fit_end"]:
+            epoch_state["awaiting_fit_end"] = False
+            is_final_eval = False
+            epoch = raw_epoch + 1
+            epoch_state["last_completed_epoch"] = epoch
+        elif epoch_state["last_completed_epoch"] > 0 or (epochs > 0 and raw_epoch >= epochs):
+            is_final_eval = True
+            epoch = (
+                epoch_state["last_completed_epoch"]
+                if epoch_state["last_completed_epoch"] > 0
+                else min(max(1, raw_epoch), epochs)
+            )
+        else:
+            is_final_eval = False
+            epoch = raw_epoch + 1
+            epoch_state["last_completed_epoch"] = epoch
+
         box_loss = 0.0
         cls_loss = 0.0
-        if tloss is not None:
+        if not is_final_eval and tloss is not None:
             try:
                 flat = tloss.detach().cpu().tolist()
                 if isinstance(flat, list) and len(flat) >= 2:
@@ -955,13 +989,16 @@ def train_yolo26(
             recall=_safe_float(metrics_dict.get("metrics/recall(B)", 0.0)),
             map50=_safe_float(metrics_dict.get("metrics/mAP50(B)", 0.0)),
             map50_95=_safe_float(metrics_dict.get("metrics/mAP50-95(B)", 0.0)),
+            is_final_eval=is_final_eval,
         )
         if epoch_callback:
             epoch_callback(em)
-        _check_cancel(trainer)
+        # 训练已自然进入 final_eval 阶段后，不再将迟到的取消信号计作提前停训
+        if not is_final_eval:
+            _check_cancel(trainer)
 
     model.add_callback("on_train_start", _on_train_start)
-    model.add_callback("on_train_epoch_end", _check_cancel)
+    model.add_callback("on_train_epoch_end", _on_train_epoch_end)
     model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
 
     train_kwargs = build_train_kwargs(config)
