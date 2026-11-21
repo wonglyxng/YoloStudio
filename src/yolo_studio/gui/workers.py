@@ -39,10 +39,12 @@ from yolo_studio.core.mllm_reviewer import (
 )
 from yolo_studio.core.trainer import (
     DeviceInfo,
+    ExportConfig,
     TrainConfig,
     TrainResult,
     detect_compute_device,
-    export_model,
+    export_model_with_config,
+    inspect_weights_metadata,
     predict_source,
     train_yolo26,
     validate_model,
@@ -299,32 +301,73 @@ class PredictWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class WeightsInspectWorker(QThread):
+    """在后台线程只读解析 `.pt` 权重的训练尺寸、类别顺序与检测头信息，避免阻塞主界面。
+
+    信号契约：
+        `finished_metadata(request_id, WeightsMetadata)`：读取成功时携带请求序号与元数据快照。
+        `failed(request_id, error_text)`：读取失败或权重格式非法时回传请求序号与中文错误信息。
+    """
+
+    finished_metadata = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, weights_path: Path, request_id: int = 0) -> None:
+        super().__init__()
+        self.weights_path = weights_path
+        self.request_id = request_id
+
+    def run(self) -> None:
+        """线程入口：执行只读 `inspect_weights_metadata` 并将结果或异常派发至主线程。"""
+        try:
+            meta = inspect_weights_metadata(self.weights_path)
+            self.finished_metadata.emit(self.request_id, meta)
+        except Exception as exc:
+            self.failed.emit(self.request_id, str(exc))
+
+
 class ExportWorker(QThread):
-    """在后台线程执行 YOLO26 权重导出（ONNX / TorchScript / TensorRT 等）。"""
+    """在后台线程执行 YOLO26 权重导出（ONNX / TorchScript / TensorRT 等）。
+
+    构造方式：
+        推荐直接传入 `ExportConfig`（`ExportWorker(config)`）；同时兼容旧版位置/关键字参数
+        `ExportWorker(weights_path, export_format=..., imgsz=..., half=..., device=...)`。
+    """
 
     log_line = Signal(str)
     finished_path = Signal(str)
     failed = Signal(str)
 
     def __init__(
-        self, weights_path: Path, export_format: str, imgsz: int, half: bool, device: str
+        self,
+        config_or_weights: ExportConfig | Path,
+        export_format: str = "onnx",
+        imgsz: int | tuple[int, int] | None = None,
+        half: bool = False,
+        device: str = "0",
     ) -> None:
         super().__init__()
-        self.weights_path = weights_path
-        self.export_format = export_format
-        self.imgsz = imgsz
-        self.half = half
-        self.device = device
+        if isinstance(config_or_weights, ExportConfig):
+            self.config = config_or_weights
+        else:
+            self.config = ExportConfig(
+                weights_path=Path(config_or_weights),
+                export_format=export_format,
+                imgsz=imgsz,
+                half=half,
+                device=device,
+            )
+        self.weights_path = self.config.weights_path
+        self.export_format = self.config.export_format
+        self.imgsz = self.config.imgsz
+        self.half = self.config.half
+        self.device = self.config.device
 
     def run(self) -> None:
-        """线程入口：执行 `export_model` 并派发导出文件路径字符串。"""
+        """线程入口：执行 `export_model_with_config` 并派发导出文件路径字符串。"""
         try:
-            exported = export_model(
-                self.weights_path,
-                export_format=self.export_format,
-                imgsz=self.imgsz,
-                half=self.half,
-                device=self.device,
+            exported = export_model_with_config(
+                self.config,
                 log_callback=lambda line: self.log_line.emit(line),
             )
             self.finished_path.emit(str(exported))

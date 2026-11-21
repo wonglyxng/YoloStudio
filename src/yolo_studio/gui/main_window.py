@@ -283,15 +283,27 @@ class MainWindow(QMainWindow):
         ]
         return [w for w in candidates if isinstance(w, QThread) and w.isRunning()]
 
+    def _running_readonly_probes(self) -> list[QThread]:
+        """收集仍在收尾的只读后台探测线程（硬件探测与 `.pt` 权重元数据读取）。"""
+        probes: list[QThread] = []
+        if self._device_probe_worker is not None and self._device_probe_worker.isRunning():
+            probes.append(self._device_probe_worker)
+        get_inspect = getattr(self.eval_tab, "running_inspect_workers", None)
+        if callable(get_inspect):
+            probes.extend(
+                w for w in get_inspect() if isinstance(w, QThread) and w.isRunning()
+            )
+        return probes
+
     def _poll_workers_then_close(self) -> None:
-        """等待后台任务及硬件探测线程全部结束后再次触发关闭；由 `_close_wait_timer` 周期调用。"""
+        """等待后台任务及只读探测线程全部结束后再次触发关闭；由 `_close_wait_timer` 周期调用。"""
         running = self._running_workers()
-        probing = self._device_probe_worker is not None and self._device_probe_worker.isRunning()
+        probes = self._running_readonly_probes()
         if running:
             self.statusBar().showMessage(f"正在等待 {len(running)} 个后台任务安全停止后退出...")
             return
-        if probing:
-            self.statusBar().showMessage("正在等待后台硬件检测收尾后退出...")
+        if probes:
+            self.statusBar().showMessage("正在等待后台只读探测收尾后退出...")
             return
         self._close_wait_timer.stop()
         self.close()
@@ -302,7 +314,8 @@ class MainWindow(QMainWindow):
         后台任务处理：
             存在运行中的业务 `QThread` 时询问用户；确认后对支持取消的任务调用 `cancel()`，
             禁用界面并忽略本次关闭事件，由定时器轮询到全部线程结束后再次调用 `close()`。
-            若仅有只读的后台硬件探测线程仍在收尾，则免打扰直接通过定时器等待其退出，避免析构运行中的 `QThread`。
+            若仅有只读的后台硬件/权重元数据探测线程仍在收尾，则免打扰直接通过定时器等待其退出，
+            避免析构运行中的 `QThread`。
         """
         if self._close_wait_timer.isActive():
             event.ignore()
@@ -334,10 +347,10 @@ class MainWindow(QMainWindow):
             self._close_wait_timer.start()
             return
 
-        if self._device_probe_worker is not None and self._device_probe_worker.isRunning():
+        if self._running_readonly_probes():
             event.ignore()
             self.tabs.setEnabled(False)
-            self.statusBar().showMessage("正在等待后台硬件检测收尾后退出...")
+            self.statusBar().showMessage("正在等待后台只读探测收尾后退出...")
             self._close_wait_timer.start()
             return
 

@@ -225,7 +225,23 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
 
         win.tabs.setCurrentIndex(5)
         qt_app.processEvents()
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "ImgSz:", win.eval_tab.imgsz_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "Conf:", win.eval_tab.conf_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "IoU:", win.eval_tab.iou_spin) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "高(H):", win.eval_tab.export_h_spin) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "宽(W):", win.eval_tab.export_w_spin) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "Batch:", win.eval_tab.export_batch_spin) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "Opset:", win.eval_tab.export_opset_combo) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "MaxDet:", win.eval_tab.export_max_det_spin) <= 12
+
+        # 切换至图内嵌入 NMS 模式展开阈值行后，三组表单字段列依旧严格对齐且行内标签紧凑
+        win.eval_tab.nms_mode_combo.setCurrentIndex(2)
+        qt_app.processEvents()
+        eval_forms_embedded = win.eval_tab.findChildren(QFormLayout)
+        assert len(
+            {form.itemAt(0, QFormLayout.ItemRole.FieldRole).geometry().x() for form in eval_forms_embedded}
+        ) == 1
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "NMS Conf:", win.eval_tab.export_nms_conf_spin) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "NMS IoU:", win.eval_tab.export_nms_iou_spin) <= 12
     finally:
         win.close()

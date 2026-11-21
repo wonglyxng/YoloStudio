@@ -1,4 +1,4 @@
-"""无头批处理命令行入口模块，覆盖视频抽帧、数据集构建、YOLO26 训练与 MLLM 标注纠错。
+"""无头批处理命令行入口模块，覆盖视频抽帧、数据集构建、YOLO26 训练、模型导出与 MLLM 标注纠错。
 
 职责与真实入口：
     提供 `build_parser()` 与 `main(argv)`，既作为已安装命令 `yolo-studio-cli` 的入口点，
@@ -13,9 +13,10 @@
     本模块按子命令延迟导入具体核心引擎，使 `--help` 与轻量命令免于加载无关重型依赖；不启动 PyQt6 GUI。
 
 输入输出与失败方式：
-    按子命令从本地视频、图片、标注或 `data.yaml` 读取输入，并在指定输出目录写出帧图、
-    YOLO 数据集（含 `data.yaml` 与 `classes.txt`）、训练权重或 MLLM 清洗分流结果与报告。
-    参数非法时由 `argparse` 直接终止；`extract` 出现视频错误或 `review` 存在审核异常时返回
+    按子命令从本地视频、图片、标注、`data.yaml` 或 `.pt` 权重读取输入，并在指定输出目录或权重同目录写出
+    帧图、YOLO 数据集（含 `data.yaml` 与 `classes.txt`）、训练权重、部署导出文件（`.onnx`/`.torchscript`/
+    `.engine` 等）或 MLLM 清洗分流结果与报告。
+    参数非法时由 `argparse` 直接终止或返回退出码 `2`；`extract` 出现视频错误或 `review` 存在审核异常时返回
     退出码 `1`；缺失必需文件、权重或凭据时核心引擎抛出异常并导致进程非零退出。
 """
 
@@ -188,6 +189,98 @@ def _cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_cli_export_config(args: argparse.Namespace) -> "object":
+    """解析并校验 `export` 子命令参数，构建对应的 `ExportConfig`。
+
+    失败方式：
+        `--imgsz`、`--nms`、`--batch`、`--opset`、`--conf`、`--iou`、`--workspace`
+        或 `--extra-arg` 参数非法时抛出中文 `ValueError`。
+    """
+    from yolo_studio.core.trainer import (
+        ExportConfig,
+        build_export_kwargs,
+        normalize_export_format,
+        normalize_export_imgsz,
+        parse_export_nms_mode,
+        parse_extra_train_args,
+    )
+
+    imgsz: int | tuple[int, int] | None = None
+    if getattr(args, "imgsz", None):
+        pair = normalize_export_imgsz(args.imgsz)
+        imgsz = pair[0] if pair[0] == pair[1] else pair
+
+    merged_extra: dict[str, object] = {}
+    for raw_item in getattr(args, "extra_arg", None) or []:
+        merged_extra.update(parse_extra_train_args(raw_item))
+
+    cfg = ExportConfig(
+        weights_path=Path(args.weights),
+        export_format=normalize_export_format(args.format),
+        imgsz=imgsz,
+        batch=int(args.batch),
+        dynamic=bool(args.dynamic),
+        nms=parse_export_nms_mode(args.nms),
+        max_det=int(args.max_det),
+        conf=args.conf,
+        iou=args.iou,
+        opset=args.opset,
+        simplify=bool(args.simplify),
+        half=bool(args.half),
+        device=str(args.device),
+        workspace=args.workspace,
+        extra_args=merged_extra,
+    )
+    # 提前执行纯参数校验，避免等到加载模型后才暴露非法选项
+    build_export_kwargs(cfg)
+    return cfg
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    """执行 `export` 子命令：读取 `.pt` 权重元数据并导出部署模型（或仅预览元数据与 IO 形状）。"""
+    from yolo_studio.core.trainer import (
+        ExportConfig,
+        build_export_kwargs,
+        describe_export_io,
+        export_model_with_config,
+        format_imgsz_text,
+        format_submitted_export_config,
+        format_weights_metadata_log,
+        inspect_weights_metadata,
+    )
+
+    try:
+        cfg = _build_cli_export_config(args)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    assert isinstance(cfg, ExportConfig)
+    if getattr(args, "inspect_only", False):
+        meta = inspect_weights_metadata(cfg.weights_path)
+        _cli_print_line(format_weights_metadata_log(meta))
+        export_kwargs, build_warnings = build_export_kwargs(cfg, metadata=meta)
+        io_summary, io_warnings = describe_export_io(cfg, metadata=meta)
+        all_warnings: list[str] = []
+        if cfg.imgsz is None and meta.train_imgsz is not None:
+            all_warnings.append(
+                f"未显式指定 --imgsz，将自动沿用权重训练尺寸: {format_imgsz_text(meta.train_imgsz)}。"
+            )
+        for item in [*build_warnings, *io_warnings]:
+            if item not in all_warnings:
+                all_warnings.append(item)
+        _cli_print_line(
+            format_submitted_export_config(
+                export_kwargs, io_summary=io_summary, warnings=all_warnings
+            )
+        )
+        return 0
+
+    exported = export_model_with_config(cfg, log_callback=_cli_print_line)
+    print(f"导出完成，输出文件: {exported}")
+    return 0
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     """执行 `review` 子命令运行 MLLM 纠错清洗与可选边框紧贴修正；无单图错误返回 0，否则返回 1。"""
     from yolo_studio.core.mllm_reviewer import (
@@ -238,7 +331,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """构建包含 `extract`、`dataset`、`train`、`review` 四个子命令的 CLI 解析器。"""
+    """构建包含 `extract`、`dataset`、`train`、`export`、`review` 五个子命令的 CLI 解析器。"""
     parser = argparse.ArgumentParser(description=f"YOLO26 视频抽帧与训练 CLI 工具 (v{__version__})")
     parser.add_argument(
         "-V",
@@ -387,6 +480,93 @@ def build_parser() -> argparse.ArgumentParser:
     p_rv.add_argument("--flat", action="store_true", help="不按状态分建子目录")
     p_rv.add_argument("-r", "--recursive", action="store_true", help="递归扫描输入子目录")
     p_rv.set_defaults(func=_cmd_review)
+
+    p_exp = sub.add_parser("export", help="查看权重元数据并导出部署模型 (ONNX / TorchScript / TensorRT 等)")
+    p_exp.add_argument("-w", "--weights", required=True, help="待导出的 .pt 权重文件路径")
+    p_exp.add_argument(
+        "-f",
+        "--format",
+        default="onnx",
+        help="目标导出格式：onnx / torchscript / engine (tensorrt) / openvino 等（默认 onnx）",
+    )
+    p_exp.add_argument(
+        "--imgsz",
+        default=None,
+        help="导出输入尺寸：单整数（如 960）或 高,宽（如 544,960 / 544x960）；不指定时自动沿用 .pt 权重训练尺寸",
+    )
+    p_exp.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="静态批大小（TensorRT 开启动态输入时建议设为最大批大小，默认 1）",
+    )
+    p_exp.add_argument(
+        "--dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="是否启用动态输入尺寸与动态批大小 (dynamic)",
+    )
+    p_exp.add_argument(
+        "--nms",
+        choices=("raw", "end2end", "embedded"),
+        default="raw",
+        help="输出头与 NMS 模式：raw(默认原始输出，外部NMS) / end2end(YOLO26原生无NMS) / embedded(图内嵌入NMS)",
+    )
+    p_exp.add_argument(
+        "--max-det",
+        type=int,
+        default=300,
+        help="end2end 或 embedded 模式下单图最大输出检测框数（默认 300）",
+    )
+    p_exp.add_argument(
+        "--conf",
+        type=float,
+        default=None,
+        help="仅 embedded 模式生效：图内嵌入 NMS 的置信度阈值（默认 0.25）",
+    )
+    p_exp.add_argument(
+        "--iou",
+        type=float,
+        default=None,
+        help="仅 embedded 模式生效：图内嵌入 NMS 的 IoU 阈值（默认 0.50）",
+    )
+    p_exp.add_argument(
+        "--opset",
+        type=int,
+        default=None,
+        help="ONNX opset 版本号（7~22；留空自动选择，非 ONNX 系列格式自动忽略）",
+    )
+    p_exp.add_argument(
+        "--simplify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否使用 onnxslim 简化 ONNX 计算图（默认开启，非 ONNX 系列格式自动忽略）",
+    )
+    p_exp.add_argument(
+        "--half",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="是否启用 FP16 半精度导出（需 GPU 模式且非 ONNX CPU 导出）",
+    )
+    p_exp.add_argument(
+        "--workspace",
+        type=float,
+        default=None,
+        help="仅 TensorRT (engine) 生效：工作空间显存上限 (GiB)",
+    )
+    p_exp.add_argument("--device", default="0", help="导出计算设备（如 0 或 cpu；ONNX 固定使用 cpu）")
+    p_exp.add_argument(
+        "--extra-arg",
+        action="append",
+        default=[],
+        help="透传任意其他 Ultralytics 导出参数（可多次指定，支持 JSON 或 key=value）",
+    )
+    p_exp.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="仅读取并打印 .pt 权重训练尺寸、类别顺序与预期导出输入/输出形状，不执行实际导出",
+    )
+    p_exp.set_defaults(func=_cmd_export)
 
     return parser
 

@@ -1,17 +1,19 @@
-"""Ultralytics YOLO26 模型训练、验证、推理预览与导出引擎。
+"""Ultralytics YOLO26 模型训练、验证、推理预览、权重元数据探测与导出引擎。
 
 职责：
-    封装本地硬件探测及 YOLO26 模型的训练、验证、图片/视频推理与部署格式导出，
-    并将训练引擎的标准输出和 Epoch 指标实时桥接至调用方回调。
+    封装本地硬件探测、`.pt` 权重元数据只读解析（训练尺寸、类别顺序与检测头能力），
+    以及 YOLO26 模型的训练、验证、图片/视频推理与部署格式导出，
+    并将训练与导出引擎的标准输出和 Epoch 指标实时桥接至调用方回调。
 
 运行环境：
     Python >= 3.11，依赖 `torch`、`ultralytics` 与 `opencv-python`；
     使用预训练名称（如 `yolo26s.pt`）且本地缺失权重时，Ultralytics 会触发模型下载。
 
 协作对象与职责边界：
-    为 `cli._cmd_train`、`gui.workers`（`TrainWorker`、`ValidateWorker`、`PredictWorker`、
-    `ExportWorker`）、`gui.tab_train.TrainTab`、`gui.tab_eval.EvalTab` 与
-    `gui.tab_review.MllmReviewTab` 提供底层能力。仅负责引擎调度，不管理线程或 UI 控件。
+    为 `cli._cmd_train`、`cli._cmd_export`、`gui.workers`（`TrainWorker`、`ValidateWorker`、
+    `PredictWorker`、`ExportWorker`、`WeightsInspectWorker`）、`gui.tab_train.TrainTab`、
+    `gui.tab_eval.EvalTab` 与 `gui.tab_review.MllmReviewTab` 提供底层能力。
+    仅负责引擎调度与纯数据转换，不管理线程或 UI 控件。
 """
 
 from __future__ import annotations
@@ -1148,36 +1150,744 @@ def predict_source(
     return saved_outputs
 
 
+# 模型导出 NMS 模式选项：(内部键名, 界面显示文案, 对应 Ultralytics `nms` 参数值)
+EXPORT_NMS_MODES: list[tuple[str, str, bool | None]] = [
+    ("raw", "原始输出 · 外部 NMS (默认，兼容 YOLOv8/11)", None),
+    ("end2end", "端到端无 NMS · YOLO26 原生 (输出 [B,N,6])", False),
+    ("embedded", "图内嵌入 NMS (输出 [B,N,6])", True),
+]
+EXPORT_NMS_KEY_TO_VALUE: dict[str, bool | None] = {
+    key: nms_val for key, _, nms_val in EXPORT_NMS_MODES
+}
+EXPORT_NMS_VALUE_TO_KEY: dict[bool | None, str] = {
+    nms_val: key for key, _, nms_val in EXPORT_NMS_MODES
+}
+
+# ONNX Opset 界面下拉选项：(显示文案, 传给 Ultralytics 的值；`None` 表示自动选择)
+EXPORT_OPSET_OPTIONS: list[tuple[str, int | None]] = [
+    ("自动 (推荐)", None),
+    *((str(ver), ver) for ver in range(11, 22)),
+]
+
+# 支持 ONNX 中间图专属参数（`opset`、`simplify`）的导出格式集合
+ONNX_BACKED_EXPORT_FORMATS: frozenset[str] = frozenset(
+    {"onnx", "engine", "ascend", "mnn", "rknn", "qnn", "deepx", "xilinx"}
+)
+# 支持动态输入尺寸与动态批大小（`dynamic=True`）的导出格式集合
+DYNAMIC_EXPORT_FORMATS: frozenset[str] = frozenset(
+    {"onnx", "torchscript", "engine", "openvino", "coreml", "mnn"}
+)
+
+
+@dataclass(frozen=True)
+class WeightsMetadata:
+    """从 `.pt` 权重文件中只读解析出的训练尺寸、类别顺序与检测头能力摘要。
+
+    字段说明：
+        `weights_path`：源 `.pt` 权重文件路径。
+        `task`：权重任务类型（如 `"detect"`、`"segment"`、`"pose"`、`"obb"`、`"classify"`），缺失时为空字符串。
+        `train_imgsz`：权重记录的训练输入尺寸 `(高, 宽)` 像素元组；单边整数（如 `960`）规范为 `(960, 960)`，
+            未记录有效尺寸时为 `None`。
+        `class_names`：按类别索引升序排列的 `(类别编号, 类别名称)` 元组，例如 `((0, "person"), (1, "car"))`。
+        `strides`：检测头步长元组（像素，默认 `(8, 16, 32)`），用于校验尺寸对齐与估算候选框数量。
+        `channels`：模型输入通道数（通常为 `3`）。
+        `supports_end2end`：检测头是否包含 YOLO26 `one2one` 原生无 NMS 端到端分支（`nms=False` 可用）。
+        `one2many_available`：检测头是否保留 `one2many` 原始分支（若已被融合移除，导出仅能使用 `one2one` 分支）。
+        `epoch`：权重保存时的训练轮次；预训练权重或缺失时为 `None`。
+    """
+
+    weights_path: Path
+    task: str = ""
+    train_imgsz: tuple[int, int] | None = None
+    class_names: tuple[tuple[int, str], ...] = ()
+    strides: tuple[int, ...] = (8, 16, 32)
+    channels: int = 3
+    supports_end2end: bool = False
+    one2many_available: bool = True
+    epoch: int | None = None
+
+    @property
+    def max_stride(self) -> int:
+        """返回检测头最大步长（像素，至少为 `32` 或实际最大步长）。"""
+        return max(self.strides) if self.strides else 32
+
+    @property
+    def num_classes(self) -> int:
+        """返回权重记录的类别总数；未记录类别时返回 `0`。"""
+        return len(self.class_names)
+
+
+@dataclass
+class ExportConfig:
+    """YOLO26 部署模型导出配置。
+
+    字段说明：
+        `weights_path`：待导出的源 `.pt` 权重文件路径。
+        `export_format`：目标格式（如 `"onnx"`、`"torchscript"`、`"engine"` 等，别名 `tensorrt`/`trt` 自动归一为 `"engine"`）。
+        `imgsz`：导出输入尺寸，支持单整数（方形，如 `960`）、`(高, 宽)` 二元组（如 `(544, 960)`）或 `None`；
+            为 `None` 时自动沿用 `.pt` 权重中记录的训练尺寸（若权重未记录则交给 Ultralytics 默认）。
+        `batch`：静态批大小（或 TensorRT 动态模式下的最大批大小），须 `>= 1`。
+        `dynamic`：是否启用动态输入尺寸与动态批大小。
+        `nms`：三态后处理开关：`None`=原始 `one2many` 输出（需外部 NMS），`False`=YOLO26 原生 `one2one`
+            NMS-free 端到端头，`True`=图内嵌入 NMS 层。
+        `max_det`：单图最大输出检测框数（仅 `nms=False` 或 `nms=True` 时生效），须 `>= 1`。
+        `conf` / `iou`：仅 `nms=True`（图内嵌入 NMS）时生效的置信度与 IoU 阈值；为 `None` 时沿用 Ultralytics 默认值。
+        `opset`：ONNX 算子集版本号（如 `12`、`17`）；`None` 表示由 Ultralytics 自动选择；非 ONNX 系列格式忽略。
+        `simplify`：是否使用 `onnxslim` 简化 ONNX 计算图；非 ONNX 系列格式忽略。
+        `half`：是否以 FP16 半精度导出（ONNX 在 CPU 上导出或设备为 CPU 时不支持并自动忽略）。
+        `device`：导出计算设备标识（如 `"0"` 或 `"cpu"`；ONNX 导出固定切至 `"cpu"` 规避图追踪设备冲突）。
+        `workspace`：TensorRT 工作空间大小（GiB，仅 `engine` 格式生效；为 `None` 时使用默认值）。
+        `extra_args`：透传给 `model.export()` 的附加参数字典，同名键优先级高于结构化字段。
+    """
+
+    weights_path: Path
+    export_format: str = "onnx"
+    imgsz: int | tuple[int, int] | None = None
+    batch: int = 1
+    dynamic: bool = False
+    nms: bool | None = None
+    max_det: int = 300
+    conf: float | None = None
+    iou: float | None = None
+    opset: int | None = None
+    simplify: bool = True
+    half: bool = False
+    device: str = "0"
+    workspace: float | None = None
+    extra_args: dict[str, object] = field(default_factory=dict)
+
+
+def normalize_export_format(export_format: str) -> str:
+    """将导出格式名称规范化为小写标准键名，并将 `tensorrt`/`trt` 映射为 `engine`。"""
+    fmt = str(export_format).strip().lower()
+    if not fmt:
+        raise ValueError("导出格式不能为空。")
+    if fmt in {"tensorrt", "trt"}:
+        return "engine"
+    return fmt
+
+
+def parse_export_nms_mode(raw: str | bool | None) -> bool | None:
+    """将界面键名、CLI 选项或布尔值解析为 Ultralytics 三态 `nms` 参数（`None` / `False` / `True`）。"""
+    if raw is None or isinstance(raw, bool):
+        return raw
+    token = str(raw).strip().lower()
+    if token in {"raw", "none", "external", "default", ""}:
+        return None
+    if token in {"end2end", "false", "nms_free", "nms-free", "yolo26"}:
+        return False
+    if token in {"embedded", "true", "nms", "builtin"}:
+        return True
+    raise ValueError(
+        f"无效的 NMS 模式 '{raw}'，可选值: raw(原始输出/外部NMS)、end2end(YOLO26端到端无NMS)、embedded(图内嵌入NMS)"
+    )
+
+
+def _extract_positive_int(value: object) -> int | None:
+    """将非布尔整数或整数型浮点数安全转换为正整数，非法时返回 `None`。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        iv = int(value)
+        return iv if iv > 0 else None
+    return None
+
+
+def _extract_imgsz_pair(raw: object) -> tuple[int, int] | None:
+    """从权重配置字段中提取 `(高, 宽)` 正整数像素元组；无法解析时返回 `None`。"""
+    single = _extract_positive_int(raw)
+    if single is not None:
+        return (single, single)
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        items = list(raw)
+        if len(items) == 1:
+            one = _extract_positive_int(items[0])
+            return (one, one) if one is not None else None
+        if len(items) >= 2:
+            h = _extract_positive_int(items[0])
+            w = _extract_positive_int(items[1])
+            if h is not None and w is not None:
+                return (h, w)
+    return None
+
+
+def normalize_export_imgsz(raw: int | Sequence[int] | str) -> tuple[int, int]:
+    """将单整数、二元组或字符串（如 `'960'`、`'544,960'`、`'544x960'`）规范为 `(高, 宽)` 像素元组。
+
+    校验规则：
+        高和宽均须为 `32 ~ 8192` 范围内的整数；格式或数值越界时抛出中文 `ValueError`。
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            raise ValueError("导出尺寸不能为空。")
+        parts = [p.strip() for p in re.split(r"[,xX×*:\s]+", text) if p.strip()]
+        if len(parts) == 1:
+            if not re.fullmatch(r"\d+", parts[0]):
+                raise ValueError(f"非法的导出尺寸 '{raw}'，请输入正整数（如 960）或 高,宽（如 544,960）。")
+            h = w = int(parts[0])
+        elif len(parts) == 2:
+            if not (re.fullmatch(r"\d+", parts[0]) and re.fullmatch(r"\d+", parts[1])):
+                raise ValueError(f"非法的导出尺寸 '{raw}'，高与宽必须为正整数（如 544,960 或 544x960）。")
+            h, w = int(parts[0]), int(parts[1])
+        else:
+            raise ValueError(f"非法的导出尺寸 '{raw}'，仅支持单个尺寸（如 960）或 高,宽 两个维度（如 544,960）。")
+    else:
+        pair = _extract_imgsz_pair(raw)
+        if pair is None:
+            raise ValueError(f"非法的导出尺寸 {raw!r}，请输入正整数或 (高, 宽) 正整数二元组。")
+        h, w = pair
+
+    if not (32 <= h <= 8192 and 32 <= w <= 8192):
+        raise ValueError(f"导出尺寸 ({h}×{w}) 超出有效范围，高与宽须在 32 ~ 8192 像素之间。")
+    return (h, w)
+
+
+def align_imgsz_to_stride(imgsz: tuple[int, int], max_stride: int = 32) -> tuple[int, int]:
+    """将 `(高, 宽)` 按检测头最大步长向上取整对齐（与 Ultralytics `check_imgsz` 规则一致）。"""
+    stride = max(1, int(max_stride))
+    h, w = imgsz
+    aligned_h = max(stride, int(math.ceil(h / stride)) * stride)
+    aligned_w = max(stride, int(math.ceil(w / stride)) * stride)
+    return (aligned_h, aligned_w)
+
+
+def format_imgsz_text(imgsz: tuple[int, int] | None) -> str:
+    """将 `(高, 宽)` 像素元组格式化为简洁中文展示文本。"""
+    if imgsz is None:
+        return "未记录"
+    h, w = imgsz
+    return f"{h}×{w}" if h == w else f"{h}×{w} (高×宽)"
+
+
+def _extract_class_names(raw: object) -> tuple[tuple[int, str], ...]:
+    """将模型中的 `names`（字典或列表）提取为按类别索引升序排列的 `(id, name)` 元组。"""
+    if isinstance(raw, Mapping):
+        pairs: list[tuple[int, str]] = []
+        for k, v in raw.items():
+            try:
+                idx = int(k)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            pairs.append((idx, str(v)))
+        pairs.sort(key=lambda item: item[0])
+        return tuple(pairs)
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        return tuple((idx, str(v)) for idx, v in enumerate(raw))
+    return ()
+
+
+def _extract_strides(raw: object) -> tuple[int, ...]:
+    """提取模型检测头步长序列（像素），缺失或非法时回退标准三尺度 `(8, 16, 32)`。"""
+    values: object = raw
+    if hasattr(values, "tolist"):
+        try:
+            values = values.tolist()  # type: ignore[union-attr]
+        except Exception:
+            values = None
+    if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+        parsed = [iv for item in values if (iv := _extract_positive_int(item)) is not None]
+        if parsed:
+            return tuple(parsed)
+    single = _extract_positive_int(values)
+    if single is not None:
+        return (single,)
+    return (8, 16, 32)
+
+
+def format_class_order(class_names: Sequence[tuple[int, str]], *, max_items: int = 0) -> str:
+    """将有序 `(id, name)` 类别序列格式化为单行摘要，超限时按 `max_items` 截断并附总数。"""
+    if not class_names:
+        return "未记录"
+    if max_items > 0 and len(class_names) > max_items:
+        head = ", ".join(f"{idx}: {name}" for idx, name in class_names[:max_items])
+        return f"{head}, ...（共 {len(class_names)} 类）"
+    return ", ".join(f"{idx}: {name}" for idx, name in class_names)
+
+
+def format_class_order_lines(class_names: Sequence[tuple[int, str]]) -> str:
+    """将有序 `(id, name)` 类别序列格式化为逐行清单，便于弹窗展示或直接复制部署。"""
+    if not class_names:
+        return "（权重未记录类别名称）"
+    return "\n".join(f"{idx}: {name}" for idx, name in class_names)
+
+
+def inspect_weights_metadata(weights_path: Path) -> WeightsMetadata:
+    """只读解析本地 `.pt` 权重中的训练尺寸、类别顺序与检测头结构摘要。
+
+    调用条件与失败方式：
+        - 要求 `weights_path` 为存在的本地文件，缺失时抛出 `FileNotFoundError`；
+        - 内部按需导入 `torch` / `ultralytics` 在 CPU 上反序列化，不会占用 GPU 显存，也不会修改权重文件；
+        - 若文件损坏或不是有效的 PyTorch/Ultralytics 权重，抛出中文 `ValueError`。
+    """
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"权重文件不存在: {weights_path}")
+
+    ckpt: object
+    try:
+        from ultralytics.nn.tasks import torch_safe_load
+
+        ckpt, _ = torch_safe_load(str(weights_path))
+    except Exception:
+        try:
+            import torch
+
+            ckpt = torch.load(str(weights_path), map_location="cpu", weights_only=False)
+        except Exception as exc:
+            raise ValueError(f"无法读取 .pt 权重元数据: {exc}") from exc
+
+    model_obj: object | None = None
+    train_args: Mapping[str, object] = {}
+    ckpt_names: object = None
+    epoch_val: int | None = None
+
+    if isinstance(ckpt, Mapping):
+        model_obj = ckpt.get("ema") or ckpt.get("model")
+        raw_train_args = ckpt.get("train_args")
+        if isinstance(raw_train_args, Mapping):
+            train_args = raw_train_args
+        elif raw_train_args is not None and hasattr(raw_train_args, "__dict__"):
+            train_args = vars(raw_train_args)
+        ckpt_names = ckpt.get("names")
+        raw_epoch = ckpt.get("epoch")
+        if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool) and raw_epoch >= 0:
+            epoch_val = raw_epoch
+    elif hasattr(ckpt, "names") or hasattr(ckpt, "args") or hasattr(ckpt, "model"):
+        model_obj = ckpt
+    else:
+        raise ValueError(f"文件不是有效的 Ultralytics .pt 权重格式: {weights_path.name}")
+
+    model_args: Mapping[str, object] = {}
+    if model_obj is not None:
+        raw_model_args = getattr(model_obj, "args", None)
+        if isinstance(raw_model_args, Mapping):
+            model_args = raw_model_args
+        elif raw_model_args is not None and hasattr(raw_model_args, "__dict__"):
+            model_args = vars(raw_model_args)
+
+    train_imgsz = _extract_imgsz_pair(train_args.get("imgsz")) or _extract_imgsz_pair(
+        model_args.get("imgsz")
+    )
+    task = str(
+        train_args.get("task")
+        or model_args.get("task")
+        or (getattr(model_obj, "task", "") if model_obj is not None else "")
+        or ""
+    ).strip()
+
+    class_names = _extract_class_names(
+        getattr(model_obj, "names", None) if model_obj is not None else None
+    )
+    if not class_names:
+        class_names = _extract_class_names(ckpt_names)
+
+    strides = _extract_strides(
+        getattr(model_obj, "stride", None) if model_obj is not None else None
+    )
+
+    channels = 3
+    if model_obj is not None:
+        model_yaml = getattr(model_obj, "yaml", None)
+        if isinstance(model_yaml, Mapping):
+            parsed_ch = _extract_positive_int(model_yaml.get("channels"))
+            if parsed_ch is not None:
+                channels = parsed_ch
+
+    supports_end2end = False
+    one2many_available = True
+    if model_obj is not None:
+        layers = getattr(model_obj, "model", None)
+        head = None
+        if layers is not None:
+            try:
+                head = layers[-1]
+            except Exception:
+                head = None
+        if head is not None:
+            supports_end2end = getattr(head, "one2one_cv2", None) is not None
+            if hasattr(head, "cv2"):
+                one2many_available = getattr(head, "cv2", None) is not None
+        elif hasattr(model_obj, "end2end"):
+            supports_end2end = bool(getattr(model_obj, "end2end", False))
+
+    return WeightsMetadata(
+        weights_path=weights_path,
+        task=task,
+        train_imgsz=train_imgsz,
+        class_names=class_names,
+        strides=strides,
+        channels=channels,
+        supports_end2end=supports_end2end,
+        one2many_available=one2many_available,
+        epoch=epoch_val,
+    )
+
+
+def format_weights_metadata_log(meta: WeightsMetadata) -> str:
+    """将权重元数据格式化为面向 GUI/CLI 日志区的多行中文摘要。"""
+    task_text = meta.task or "未记录"
+    imgsz_text = format_imgsz_text(meta.train_imgsz)
+    if meta.supports_end2end and meta.one2many_available:
+        head_text = "双分支检测头（支持 raw 外部NMS / end2end YOLO26无NMS / embedded 图内NMS）"
+    elif meta.supports_end2end:
+        head_text = "仅保留 one2one 端到端无 NMS 分支"
+    else:
+        head_text = "标准 one2many 检测头（支持 raw 外部NMS / embedded 图内NMS）"
+
+    lines = [
+        f"=== 权重元数据 ({meta.weights_path.name}) ===",
+        f"  任务类型: {task_text}",
+        f"  训练输入尺寸: {imgsz_text}",
+        f"  检测头能力: {head_text}",
+        f"  类别顺序 ({meta.num_classes} 类): {format_class_order(meta.class_names)}",
+    ]
+    return "\n".join(lines)
+
+
+def _ultralytics_supports_quantize_arg() -> bool:
+    """探测当前已安装的 Ultralytics 配置是否支持新版 `quantize` 精度参数。"""
+    try:
+        from ultralytics.utils import DEFAULT_CFG
+
+        return hasattr(DEFAULT_CFG, "quantize")
+    except Exception:
+        return False
+
+
+def resolve_export_imgsz(
+    config: ExportConfig, metadata: WeightsMetadata | None = None
+) -> tuple[int, int] | None:
+    """解析本次导出应使用的 `(高, 宽)` 像素尺寸；未显式指定时回退为权重训练尺寸。"""
+    if config.imgsz is not None:
+        return normalize_export_imgsz(config.imgsz)
+    if metadata is not None and metadata.train_imgsz is not None:
+        return metadata.train_imgsz
+    return None
+
+
+def describe_export_io(
+    config: ExportConfig, metadata: WeightsMetadata | None = None
+) -> tuple[str, list[str]]:
+    """根据导出配置与可选权重元数据，生成预期输入/输出张量说明及风险提示列表。
+
+    返回值为 `(io_summary_text, warnings_list)`，供桌面界面实时预览与 CLI/导出日志复用。
+    """
+    fmt = normalize_export_format(config.export_format)
+    warnings: list[str] = []
+
+    raw_imgsz = resolve_export_imgsz(config, metadata)
+    strides = metadata.strides if metadata is not None else (8, 16, 32)
+    max_stride = metadata.max_stride if metadata is not None else 32
+    channels = metadata.channels if metadata is not None else 3
+    nc = metadata.num_classes if metadata is not None else 0
+
+    if raw_imgsz is not None:
+        aligned = align_imgsz_to_stride(raw_imgsz, max_stride=max_stride)
+        if aligned != raw_imgsz:
+            warnings.append(
+                f"导出尺寸 {raw_imgsz[0]}×{raw_imgsz[1]} 不是步长 {max_stride} 的倍数，"
+                f"Ultralytics 将自动向上对齐为 {aligned[0]}×{aligned[1]}。"
+            )
+        h, w = aligned
+    else:
+        h, w = (640, 640)
+
+    if (
+        metadata is not None
+        and metadata.train_imgsz is not None
+        and raw_imgsz is not None
+        and raw_imgsz != metadata.train_imgsz
+    ):
+        warnings.append(
+            f"当前导出尺寸 {format_imgsz_text(raw_imgsz)} 与权重训练尺寸 "
+            f"{format_imgsz_text(metadata.train_imgsz)} 不一致，可能影响目标检测精度。"
+        )
+
+    export_device = "cpu" if fmt == "onnx" else str(config.device).strip() or "0"
+    effective_fp16 = bool(config.half) and export_device.lower() != "cpu"
+    dtype_label = "FP16" if effective_fp16 else "FP32"
+
+    if fmt == "engine" and export_device.lower() == "cpu":
+        warnings.append("TensorRT (.engine) 仅支持 CUDA GPU 导出，请在运行设备中启用 GPU 加速。")
+    if config.dynamic and fmt == "engine" and int(config.batch) == 1:
+        warnings.append("TensorRT 开启动态输入时，建议将 Batch 调大为推理期预期最大批大小（如 8 或 16）。")
+    if config.dynamic and fmt not in DYNAMIC_EXPORT_FORMATS:
+        warnings.append(f"导出格式 {fmt} 不支持 dynamic 动态输入，该选项将被忽略。")
+
+    batch_dim = "batch" if config.dynamic and fmt in DYNAMIC_EXPORT_FORMATS else str(int(config.batch))
+    if config.dynamic and fmt in DYNAMIC_EXPORT_FORMATS:
+        in_desc = f"输入 images: ({batch_dim}, {channels}, height, width) [动态, 参考 {h}×{w}, {dtype_label}]"
+    else:
+        in_desc = f"输入 images: ({batch_dim}, {channels}, {h}, {w}) [{dtype_label}, NCHW]"
+
+    nms_val = parse_export_nms_mode(config.nms)
+    effective_end2end = False
+    if nms_val is False:
+        if metadata is not None and not metadata.supports_end2end:
+            warnings.append(
+                "当前权重检测头未检测到 YOLO26 one2one 端到端分支，选择 end2end 时将自动回退为原始 one2many 输出。"
+            )
+        else:
+            effective_end2end = True
+    elif metadata is not None and not metadata.one2many_available and metadata.supports_end2end:
+        effective_end2end = True
+        if nms_val is None or nms_val is True:
+            warnings.append(
+                "当前权重仅保留 one2one 端到端分支（one2many 已被融合移除），导出将直接输出端到端 [B,N,6] 结果。"
+            )
+
+    if effective_end2end:
+        out_desc = (
+            f"输出 output0: ({batch_dim}, {int(config.max_det)}, 6) "
+            "[x1,y1,x2,y2,score,cls_id，YOLO26 无NMS直出]"
+        )
+    elif nms_val is True:
+        conf_txt = f"{config.conf:.2f}" if config.conf is not None else "0.25"
+        iou_txt = f"{config.iou:.2f}" if config.iou is not None else "0.50"
+        out_desc = (
+            f"输出 output0: ({batch_dim}, {int(config.max_det)}, 6) "
+            f"[图内嵌入NMS, conf={conf_txt}, iou={iou_txt}]"
+        )
+    else:
+        if config.dynamic and fmt in DYNAMIC_EXPORT_FORMATS:
+            anchors_text = "anchors"
+        else:
+            anchors = sum(int(h // s) * int(w // s) for s in strides if s > 0)
+            anchors_text = str(anchors)
+        if nc > 0:
+            ch_text = f"{4 + nc}"
+            cls_hint = f"4+{nc}类"
+        else:
+            ch_text = "4+nc"
+            cls_hint = "cx,cy,w,h+各类分数"
+        out_desc = f"输出 output0: ({batch_dim}, {ch_text}, {anchors_text}) [{cls_hint}，需外部NMS]"
+
+    return f"{in_desc}  |  {out_desc}", warnings
+
+
+def build_export_kwargs(
+    config: ExportConfig,
+    *,
+    metadata: WeightsMetadata | None = None,
+    use_quantize_arg: bool | None = None,
+) -> tuple[dict[str, object], list[str]]:
+    """校验 `ExportConfig` 并生成可直接传给 `model.export(**kwargs)` 的参数字典与提示列表。
+
+    格式兼容性保护：
+        - `onnx` 固定使用 `device="cpu"` 以规避部分环境下的图追踪设备冲突；
+        - `opset` 与 `simplify` 仅在 ONNX 系列后端格式中传入，避免 `torchscript` 触发 Ultralytics 参数校验异常；
+        - 启用 FP16 且非 CPU 时，在支持 `quantize` 的 Ultralytics 8.4+ 环境中传 `quantize=16` 以消除 `half` 废弃告警；
+        - 未显式传入 `imgsz` 时优先使用权重记录的 `train_imgsz`，两者均缺失时交由 Ultralytics 默认推导。
+    """
+    fmt = normalize_export_format(config.export_format)
+    warnings: list[str] = []
+
+    batch = int(config.batch)
+    if batch < 1:
+        raise ValueError(f"导出批大小 batch 必须 >= 1，当前值: {batch}")
+
+    max_det = int(config.max_det)
+    if max_det < 1:
+        raise ValueError(f"最大检测框数 max_det 必须 >= 1，当前值: {max_det}")
+
+    nms_val = parse_export_nms_mode(config.nms)
+
+    opset: int | None = None
+    if config.opset is not None:
+        opset = int(config.opset)
+        if not (7 <= opset <= 22):
+            raise ValueError(f"ONNX opset 必须在 7 ~ 22 之间，当前值: {opset}")
+        if nms_val is True and opset < 11:
+            raise ValueError(f"图内嵌入 NMS (nms=True) 要求 ONNX opset >= 11，当前值: {opset}")
+
+    if config.conf is not None:
+        conf_val = float(config.conf)
+        if not (0.0 < conf_val < 1.0):
+            raise ValueError(f"嵌入 NMS 置信度阈值 conf 必须在 (0, 1) 之间，当前值: {conf_val}")
+    if config.iou is not None:
+        iou_val = float(config.iou)
+        if not (0.0 < iou_val <= 1.0):
+            raise ValueError(f"嵌入 NMS IoU 阈值 iou 必须在 (0, 1] 之间，当前值: {iou_val}")
+    if config.workspace is not None:
+        ws_val = float(config.workspace)
+        if not math.isfinite(ws_val) or ws_val <= 0:
+            raise ValueError(f"TensorRT workspace (GiB) 必须为正数，当前值: {config.workspace}")
+
+    resolved_imgsz = resolve_export_imgsz(config, metadata)
+    export_device = "cpu" if fmt == "onnx" else (str(config.device).strip() or "0")
+
+    export_kwargs: dict[str, object] = {
+        "format": fmt,
+        "batch": batch,
+        "device": export_device,
+    }
+
+    if resolved_imgsz is not None:
+        h, w = resolved_imgsz
+        export_kwargs["imgsz"] = h if h == w else [h, w]
+
+    if fmt in DYNAMIC_EXPORT_FORMATS:
+        export_kwargs["dynamic"] = bool(config.dynamic)
+    elif config.dynamic:
+        warnings.append(f"导出格式 '{fmt}' 不支持 dynamic=True，已忽略该选项。")
+
+    if nms_val is not None:
+        export_kwargs["nms"] = nms_val
+        export_kwargs["max_det"] = max_det
+        if nms_val is True:
+            if config.conf is not None:
+                export_kwargs["conf"] = float(config.conf)
+            if config.iou is not None:
+                export_kwargs["iou"] = float(config.iou)
+
+    if fmt in ONNX_BACKED_EXPORT_FORMATS:
+        export_kwargs["simplify"] = bool(config.simplify)
+        if opset is not None:
+            export_kwargs["opset"] = opset
+    else:
+        if opset is not None:
+            warnings.append(f"导出格式 '{fmt}' 不支持 opset 参数，已忽略 opset={opset}。")
+        if config.simplify is False:
+            warnings.append(f"导出格式 '{fmt}' 不使用 simplify 参数，已忽略。")
+
+    if fmt == "engine" and config.workspace is not None:
+        export_kwargs["workspace"] = float(config.workspace)
+    elif fmt != "engine" and config.workspace is not None:
+        warnings.append(f"workspace 仅对 TensorRT (.engine) 生效，当前格式 '{fmt}' 已忽略。")
+
+    if config.half:
+        if export_device.lower() == "cpu":
+            if fmt == "onnx":
+                warnings.append("ONNX 固定在 CPU 上导出，不支持 FP16，半精度选项已忽略。")
+            else:
+                warnings.append("当前为 CPU 设备模式，不支持 FP16 半精度导出，已忽略。")
+        else:
+            use_q = _ultralytics_supports_quantize_arg() if use_quantize_arg is None else use_quantize_arg
+            if use_q:
+                export_kwargs["quantize"] = 16
+            else:
+                export_kwargs["half"] = True
+
+    if config.extra_args:
+        export_kwargs.update(config.extra_args)
+
+    return export_kwargs, warnings
+
+
+def format_submitted_export_config(
+    export_kwargs: Mapping[str, object],
+    *,
+    io_summary: str = "",
+    warnings: Sequence[str] = (),
+) -> str:
+    """将提交给 Ultralytics 的导出参数、预期输入/输出与告警格式化为可读日志文本。"""
+    json_lines = json.dumps(dict(export_kwargs), ensure_ascii=False, indent=2, default=str).splitlines()
+    if json_lines:
+        json_lines[0] = f'"export_arguments": {json_lines[0]}'
+    lines = [
+        "=== 模型导出配置 (提交至 Ultralytics) ===",
+        *json_lines,
+    ]
+    if io_summary:
+        lines.append(f"[预期张量] {io_summary}")
+    for warn in warnings:
+        lines.append(f"[提示] {warn}")
+    return "\n".join(lines)
+
+
+def export_model_with_config(
+    config: ExportConfig,
+    log_callback: Callable[[str], None] | None = None,
+) -> Path:
+    """按 `ExportConfig` 执行 YOLO26 模型导出，并在导出前输出权重元数据与完整参数日志。
+
+    行为说明：
+        - 导出前先只读探测权重元数据（训练尺寸、类别顺序、检测头能力）并输出至 `log_callback`；
+        - 若 `config.imgsz` 为 `None` 且权重记录了训练尺寸，则自动沿用训练尺寸；
+        - 产物生成在源权重同目录并返回其路径；权重缺失时抛出 `FileNotFoundError`，参数非法时抛出 `ValueError`。
+    """
+    from ultralytics import YOLO
+
+    if not config.weights_path.is_file():
+        raise FileNotFoundError(f"权重文件不存在: {config.weights_path}")
+
+    meta: WeightsMetadata | None = None
+    try:
+        meta = inspect_weights_metadata(config.weights_path)
+        _emit_multiline_log(log_callback, format_weights_metadata_log(meta))
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[提示] 预读取权重元数据失败（将继续执行导出）: {exc}")
+
+    export_kwargs, build_warnings = build_export_kwargs(config, metadata=meta)
+    io_summary, io_warnings = describe_export_io(config, metadata=meta)
+
+    all_warnings: list[str] = []
+    for item in [*build_warnings, *io_warnings]:
+        if item not in all_warnings:
+            all_warnings.append(item)
+
+    if config.imgsz is None and meta is not None and meta.train_imgsz is not None:
+        all_warnings.insert(
+            0, f"未显式指定导出尺寸，已自动沿用权重训练尺寸: {format_imgsz_text(meta.train_imgsz)}。"
+        )
+
+    _emit_multiline_log(
+        log_callback,
+        format_submitted_export_config(
+            export_kwargs, io_summary=io_summary, warnings=all_warnings
+        ),
+    )
+
+    ensure_torch_cpu_threads()
+    model = YOLO(str(config.weights_path))
+    with capture_thread_output(log_callback):
+        exported = model.export(**export_kwargs)
+    return Path(str(exported))
+
+
 def export_model(
     weights_path: Path,
     export_format: str = "onnx",
-    imgsz: int = 640,
+    imgsz: int | tuple[int, int] | None = None,
     half: bool = False,
     device: str = "0",
+    *,
+    batch: int = 1,
+    dynamic: bool = False,
+    nms: bool | None = None,
+    max_det: int = 300,
+    conf: float | None = None,
+    iou: float | None = None,
+    opset: int | None = None,
+    simplify: bool = True,
+    workspace: float | None = None,
+    extra_args: Mapping[str, object] | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> Path:
     """将已训练的 YOLO26 `.pt` 权重导出为指定部署格式（`onnx`、`torchscript`、`engine` 等）。
 
-    当 `export_format == "onnx"` 时强制使用 `"cpu"` 设备导出，避免部分环境下 ONNX 图追踪设备冲突；
-    CPU 导出不支持 FP16，此时会通过 `log_callback` 提示 `half` 被忽略。
-    产物生成在源权重同目录并返回其路径，权重缺失时抛出 `FileNotFoundError`。
+    当 `imgsz` 为 `None` 时自动沿用权重中记录的训练尺寸；当 `export_format == "onnx"` 时固定使用
+    `"cpu"` 设备导出以规避图追踪设备冲突（此时忽略 FP16）。产物生成在源权重同目录并返回其路径，
+    权重缺失时抛出 `FileNotFoundError`，参数非法时抛出 `ValueError`。
     """
-    from ultralytics import YOLO
-
-    if not weights_path.is_file():
-        raise FileNotFoundError(f"权重文件不存在: {weights_path}")
-
-    export_device = device if export_format != "onnx" else "cpu"
-    if half and export_device == "cpu" and log_callback:
-        log_callback("提示：ONNX 在 CPU 上导出，不支持 FP16，半精度选项将被忽略。")
-
-    ensure_torch_cpu_threads()
-    model = YOLO(str(weights_path))
-    with capture_thread_output(log_callback):
-        exported = model.export(
-            format=export_format,
-            imgsz=imgsz,
-            half=half and export_device != "cpu",
-            device=export_device,
-        )
-    return Path(str(exported))
+    cfg = ExportConfig(
+        weights_path=weights_path,
+        export_format=export_format,
+        imgsz=imgsz,
+        batch=batch,
+        dynamic=dynamic,
+        nms=nms,
+        max_det=max_det,
+        conf=conf,
+        iou=iou,
+        opset=opset,
+        simplify=simplify,
+        half=half,
+        device=device,
+        workspace=workspace,
+        extra_args=dict(extra_args or {}),
+    )
+    return export_model_with_config(cfg, log_callback=log_callback)
