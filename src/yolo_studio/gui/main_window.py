@@ -1,7 +1,7 @@
 """PyQt6 桌面主窗口模块，统筹六步工作流标签页及跨页数据流转。
 
 职责：
-    组装“1. 视频抽帧 → 2. 标注工作台 (X-AnyLabeling) → 3. MLLM 标注纠错 → 4. 数据集准备 →
+    组装“1. 视频抽帧 → 2. 标注工作台 → 3. LLM 标注清洗 → 4. 数据集准备 →
     5. YOLO26 训练 → 6. 验证、推理与导出”六个标签页，协调内嵌工作台联动与跨页路径同步。
 
 运行环境与协作边界：
@@ -138,10 +138,10 @@ class MainWindow(QMainWindow):
         )
 
         self.tabs.addTab(self.extract_tab, "1. 视频抽帧")
-        self.tabs.addTab(self.labeling_tab, "2. 标注工作台 (X-AnyLabeling)")
+        self.tabs.addTab(self.labeling_tab, "2. 标注工作台")
         # 标签页按“采集 → 标注 → 质检 → 组装 → 训练 → 评估”排列；页面跳转一律按控件对象切换，
         # 不依赖序号，调整顺序时只需修改此处与界面文案中的编号
-        self.tabs.addTab(self.review_tab, "3. MLLM 标注纠错")
+        self.tabs.addTab(self.review_tab, "3. LLM 标注清洗")
         self.tabs.addTab(self.dataset_tab, "4. 数据集准备")
         self.tabs.addTab(self.train_tab, "5. YOLO26 训练")
         self.tabs.addTab(self.eval_tab, "6. 验证、推理与导出")
@@ -231,7 +231,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.dataset_tab)
 
     def _on_labeling_to_review(self, images_dir: str) -> None:
-        """将工作台当前图片目录同步至「3. MLLM 标注纠错」并切换过去。"""
+        """将工作台当前图片目录同步至「3. LLM 标注清洗」并切换过去。"""
         self.review_tab.set_images_dir(images_dir)
         self.tabs.setCurrentWidget(self.review_tab)
 
@@ -249,7 +249,7 @@ class MainWindow(QMainWindow):
         self.train_tab.set_data_yaml(yaml_path)
 
     def _on_weights_ready(self, weights_path: str, yaml_path: str) -> None:
-        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「3. MLLM 标注纠错」。"""
+        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「3. LLM 标注清洗」。"""
         self.eval_tab.set_weights_and_yaml(weights_path, yaml_path)
         self.review_tab.set_weights_path(weights_path)
 

@@ -31,7 +31,7 @@ if XAL_ROOT.is_dir() and str(XAL_ROOT) not in sys.path:
 from PyQt6.QtCore import QCoreApplication, QSettings, Qt, QThread  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QGroupBox, QMessageBox  # noqa: E402
 
 from yolo_studio.gui.main_window import MainWindow  # noqa: E402
 from yolo_studio.gui.tab_labeling import (  # noqa: E402
@@ -76,7 +76,13 @@ def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
     qt_app.processEvents()
     try:
         assert win.tabs.count() == 6
-        assert win.tabs.tabText(1) == "2. 标注工作台 (X-AnyLabeling)"
+        assert win.tabs.tabText(1) == "2. 标注工作台"
+        assert win.tabs.tabText(2) == "3. LLM 标注清洗"
+        assert win.labeling_tab.to_review_btn.text() == "发送到「3. LLM 标注清洗」→"
+        review_group_titles = [
+            box.title() for box in win.review_tab.findChildren(QGroupBox)
+        ]
+        assert "2. 大语言模型 (LLM) 配置" in review_group_titles
         assert win.labeling_tab._xal_window is not None
 
         # 初始位于第 1 页（视频抽帧），工作台不可见，快捷键处于收起隔离态
@@ -223,7 +229,7 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
 
     win = _make_window(tmp_path)
     try:
-        # 从「3. MLLM 标注纠错」触发跳转至「2. 标注工作台」并定位第二张图
+        # 从「3. LLM 标注清洗」触发跳转至「2. 标注工作台」并定位第二张图
         win.tabs.setCurrentWidget(win.review_tab)
         win.review_tab.open_in_workbench.emit(
             str(frames_dir), str(classes_file), str(img_b)
@@ -237,7 +243,7 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
         assert lw.unique_label_list.count() == 2
         assert Path(str(lw.filename)).resolve() == img_b.resolve()
 
-        # 从「2. 标注工作台」发回「4. 数据集准备」与「3. MLLM 标注纠错」
+        # 从「2. 标注工作台」发回「4. 数据集准备」与「3. LLM 标注清洗」
         win.labeling_tab.send_to_dataset.emit(str(frames_dir), str(classes_file))
         assert win.tabs.currentWidget() is win.dataset_tab
         assert win.tabs.tabText(win.tabs.currentIndex()) == "4. 数据集准备"
@@ -246,7 +252,7 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
 
         win.labeling_tab.send_to_review.emit(str(frames_dir))
         assert win.tabs.currentWidget() is win.review_tab
-        assert win.tabs.tabText(win.tabs.currentIndex()) == "3. MLLM 标注纠错"
+        assert win.tabs.tabText(win.tabs.currentIndex()) == "3. LLM 标注清洗"
         assert Path(win.review_tab.images_picker.text()).resolve() == frames_dir.resolve()
     finally:
         assert win.labeling_tab.prepare_for_close() is True

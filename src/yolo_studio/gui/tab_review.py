@@ -330,8 +330,8 @@ class MllmReviewTab(QWidget):
         s_form.addRow("清洗输出目录:", self.output_picker)
         form_stack.addWidget(src_group)
 
-        # 2. MLLM 接口与模型配置
-        llm_group = QGroupBox("2. 多模态大语言模型 (MLLM) 配置")
+        # 2. 大语言模型 (LLM) 配置
+        llm_group = QGroupBox("2. 大语言模型 (LLM) 配置")
         l_form = QFormLayout(llm_group)
         self._tune_form(l_form)
         self._llm_form = l_form
