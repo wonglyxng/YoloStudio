@@ -7,4 +7,4 @@
     发布新版本时仅需修改本文件的 `__version__`（或通过 `build_portable.ps1 --bump` 自动递增）。
 """
 
-__version__ = "0.3.6"
+__version__ = "0.3.7"
