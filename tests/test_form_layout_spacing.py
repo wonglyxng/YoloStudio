@@ -247,3 +247,57 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "NMS IoU:", win.eval_tab.export_nms_iou_spin) <= 12
     finally:
         win.close()
+
+
+def test_eval_tab_multiline_labels_unclipped_and_log_below_preview(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证第 6 页多行摘要标签不裁切、默认宽度无横向滚动条，且运行日志位于右侧预览区下方。"""
+    settings = QSettings(str(tmp_path / "settings_eval.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=settings)
+    try:
+        win._on_device_probed(_make_device_info(gpu_count=1))
+        win.resize(1380, 860)
+        win.show()
+        win.tabs.setCurrentIndex(5)
+
+        et = win.eval_tab
+        # 触发第 2 组差异提示（多行）与第 3 组长张量/预处理说明（多行）
+        et.imgsz_spin.setValue(960)
+        et.export_h_spin.setValue(96)
+        et.eval_head_combo.setCurrentIndex(1)
+        et.pred_pad_combo.setCurrentIndex(1)
+        et.nms_mode_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+        qt_app.processEvents()
+
+        # 左侧配置区在默认窗口宽度下不应撑出横向滚动条
+        assert et.left_scroll.horizontalScrollBar().isVisible() is False
+
+        # 三组多行标签高度均须完整容纳折行内容，且底边不超出各自所属分组框内部区域
+        for lbl in (et.weights_info_label, et.pred_summary_label, et.export_io_label):
+            needed = lbl.heightForWidth(lbl.width())
+            assert lbl.height() >= needed
+            parent_group = lbl.parentWidget()
+            assert parent_group is not None
+            assert lbl.geometry().bottom() <= parent_group.contentsRect().bottom()
+
+        # 消除第 2 组差异提示后，标签高度应随文案变短自动回缩
+        tall_h = et.pred_summary_label.height()
+        et.sync_export_pred_btn.click()
+        qt_app.processEvents()
+        qt_app.processEvents()
+        assert et.pred_summary_label.height() < tall_h
+        assert et.pred_summary_label.height() >= et.pred_summary_label.heightForWidth(
+            et.pred_summary_label.width()
+        )
+
+        # 运行日志位于右侧面板底部（处于预览框正下方且在左侧配置区右侧）
+        left_right_edge = et.left_scroll.mapTo(win, et.left_scroll.rect().topRight()).x()
+        preview_bottom = et.preview_label.mapTo(win, et.preview_label.rect().bottomLeft()).y()
+        log_top_left = et.log_box.mapTo(win, et.log_box.rect().topLeft())
+        assert log_top_left.x() >= left_right_edge
+        assert log_top_left.y() > preview_bottom
+        assert et.log_box.height() >= 140
+    finally:
+        win.close()

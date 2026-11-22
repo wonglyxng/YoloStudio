@@ -20,8 +20,8 @@ from __future__ import annotations
 import html
 from pathlib import Path
 
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtCore import QSize, QTimer, Qt
+from PyQt6.QtGui import QCloseEvent, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -37,8 +38,10 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -76,7 +79,6 @@ from yolo_studio.gui.common import (
     PathPickerRow,
     align_form_labels,
     configure_form_layout,
-    load_pixmap_scaled,
     open_local_path,
 )
 from yolo_studio.gui.workers import (
@@ -177,6 +179,118 @@ def _show_class_order_dialog(parent: QWidget, meta: WeightsMetadata) -> None:
     dlg.exec()
 
 
+class _WrappingLabel(QLabel):
+    """在嵌套水平/表单布局中按实际宽度精确撑开高度的自动换行标签。
+
+    设计原因：
+        普通 `QLabel(wordWrap=True)` 放入 `QFormLayout` 内部的 `QHBoxLayout`（与按钮同行）时，
+        Qt 往往按单行高度或按钮高度估算行高，导致 2~3 行文本在分组框底部被裁切，同时未折行的
+        长文案 `minimumSizeHint` 会把窗口横向撑宽。本控件收紧水平最小宽度并在 `setText` /
+        `resizeEvent` / `showEvent` 中按当前实际宽度重算 `heightForWidth` 更新 `minimumHeight`，
+        确保多行说明完整显示且随文案变短自动回缩。
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        *,
+        rich_text: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__("", parent)
+        self._last_height_hint = 0
+        self._syncing_height = False
+        self.setWordWrap(True)
+        if rich_text:
+            self.setTextFormat(Qt.TextFormat.RichText)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        if text:
+            self.setText(text)
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(80, max(self._last_height_hint, 20))
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(240, max(self._last_height_hint, 20))
+
+    def setText(self, text: str) -> None:  # type: ignore[override]
+        super().setText(text)
+        self._sync_wrapped_height()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._sync_wrapped_height()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._sync_wrapped_height()
+
+    def _sync_wrapped_height(self) -> None:
+        if self._syncing_height:
+            return
+        avail_w = self.width()
+        if avail_w < 80:
+            return
+        self._syncing_height = True
+        try:
+            # 不可通过 setMinimumHeight 锁死高度，否则 QLabel.heightForWidth 会被旧最小高度钳制导致无法回缩
+            needed = super().heightForWidth(avail_w)
+            if needed <= 0:
+                needed = super().sizeHint().height()
+            # 额外留 4px 缓冲，避免高 DPI 缩放下末行基线或下伸部被分组框底边裁切
+            target_h = max(20, needed + 4)
+            if target_h != self._last_height_hint:
+                self._last_height_hint = target_h
+                self.updateGeometry()
+        finally:
+            self._syncing_height = False
+
+
+class _ScaledPreviewLabel(QLabel):
+    """支持随窗口或分割条拖拽自动等比缩放的推理结果预览标签。"""
+
+    def __init__(self, placeholder: str, parent: QWidget | None = None) -> None:
+        super().__init__(placeholder, parent)
+        self._placeholder = placeholder
+        self._source_pixmap: QPixmap | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(320, 220)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.setStyleSheet(
+            "border: 1px dashed #999999; border-radius: 6px; background: #1e1e1e; color: #cccccc;"
+        )
+
+    def set_preview_image(self, image_path: Path) -> bool:
+        """从本地文件路径加载原始推理结果图并按当前控件尺寸缩放展示；加载失败返回 `False`。"""
+        if not image_path.is_file():
+            return False
+        pix = QPixmap(str(image_path))
+        if pix.isNull():
+            return False
+        self._source_pixmap = pix
+        self._apply_scaled()
+        return True
+
+    def _apply_scaled(self) -> None:
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            return
+        target_w = max(160, self.width() - 12)
+        target_h = max(120, self.height() - 12)
+        scaled = self._source_pixmap.scaled(
+            target_w,
+            target_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._source_pixmap is not None:
+            self._apply_scaled()
+
+
 class EvalTab(QWidget):
     """模型验证、推理测试与部署导出标签页（标签页 6）。
 
@@ -225,9 +339,21 @@ class EvalTab(QWidget):
 
     def _init_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setSpacing(12)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(0)
 
-        left = QVBoxLayout()
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
+
+        # 左侧面板：配置分组放入可滚动容器，避免小屏或展开隐藏行时挤压裁切底部说明文字
+        self.left_scroll = QScrollArea()
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.left_scroll.setMinimumWidth(560)
+        left_content = QWidget()
+        left = QVBoxLayout(left_content)
+        left.setContentsMargins(0, 0, 4, 0)
         left.setSpacing(10)
 
         # 分组 1：模型文件（支持 .pt 与已导出模型）、自动元数据提示、运行设备与验证/推理共享设置
@@ -251,15 +377,17 @@ class EvalTab(QWidget):
 
         meta_row = QHBoxLayout()
         meta_row.setSpacing(6)
-        self.weights_info_label = QLabel("选择 .pt 权重或已导出模型后将自动读取尺寸、检测头与类别顺序")
-        self.weights_info_label.setWordWrap(True)
+        self.weights_info_label = _WrappingLabel(
+            "选择 .pt 权重或已导出模型后将自动读取尺寸、检测头与类别顺序",
+            rich_text=False,
+        )
         self.weights_info_label.setStyleSheet("color: #666666;")
         self.view_classes_btn = QPushButton("类别清单")
         self.view_classes_btn.setEnabled(False)
         self.view_classes_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.view_classes_btn.setToolTip("查看并复制模型文件记录的完整类别索引顺序")
         meta_row.addWidget(self.weights_info_label, 1)
-        meta_row.addWidget(self.view_classes_btn)
+        meta_row.addWidget(self.view_classes_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._model_form.addRow("权重信息:", meta_row)
 
         self.yaml_picker = PathPickerRow(
@@ -291,6 +419,10 @@ class EvalTab(QWidget):
         self.eval_head_label = QLabel("检测头:")
         self.eval_head_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.eval_head_combo = QComboBox()
+        self.eval_head_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.eval_head_combo.setMinimumContentsLength(12)
         for key, label, _nms_val in PREDICT_HEAD_MODES:
             self.eval_head_combo.addItem(label, key)
         self.eval_head_combo.setToolTip(
@@ -336,6 +468,10 @@ class EvalTab(QWidget):
         pad_row = QHBoxLayout()
         pad_row.setSpacing(6)
         self.pred_pad_combo = QComboBox()
+        self.pred_pad_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.pred_pad_combo.setMinimumContentsLength(12)
         for key, label in PREDICT_PAD_MODES:
             self.pred_pad_combo.addItem(label, key)
         self.pred_pad_combo.setToolTip(
@@ -380,14 +516,12 @@ class EvalTab(QWidget):
 
         pred_info_row = QHBoxLayout()
         pred_info_row.setSpacing(8)
-        self.pred_summary_label = QLabel()
-        self.pred_summary_label.setWordWrap(True)
-        self.pred_summary_label.setTextFormat(Qt.TextFormat.RichText)
+        self.pred_summary_label = _WrappingLabel(rich_text=True)
         self.switch_model_btn = QPushButton()
         self.switch_model_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.switch_model_btn.setVisible(False)
         pred_info_row.addWidget(self.pred_summary_label, 1)
-        pred_info_row.addWidget(self.switch_model_btn)
+        pred_info_row.addWidget(self.switch_model_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._pred_form.addRow("实际参数:", pred_info_row)
         left.addWidget(pred_group)
 
@@ -400,6 +534,10 @@ class EvalTab(QWidget):
         fmt_row = QHBoxLayout()
         fmt_row.setSpacing(8)
         self.format_combo = QComboBox()
+        self.format_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.format_combo.setMinimumContentsLength(10)
         self.format_combo.addItem("ONNX (通用推理推荐)", "onnx")
         self.format_combo.addItem("TorchScript (.torchscript)", "torchscript")
         self.format_combo.addItem("TensorRT Engine (.engine, 需本机 TensorRT)", "engine")
@@ -483,6 +621,10 @@ class EvalTab(QWidget):
         nms_row = QHBoxLayout()
         nms_row.setSpacing(6)
         self.nms_mode_combo = QComboBox()
+        self.nms_mode_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.nms_mode_combo.setMinimumContentsLength(12)
         for key, label, _nms_val in EXPORT_NMS_MODES:
             self.nms_mode_combo.addItem(label, key)
         self.nms_mode_combo.setToolTip(
@@ -535,6 +677,10 @@ class EvalTab(QWidget):
         pre_row = QHBoxLayout()
         pre_row.setSpacing(6)
         self.export_preprocess_combo = QComboBox()
+        self.export_preprocess_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.export_preprocess_combo.setMinimumContentsLength(12)
         for key, label, _rm, _pa in EXPORT_PREPROCESS_MODES:
             self.export_preprocess_combo.addItem(label, key)
         self.export_preprocess_combo.setToolTip(
@@ -561,40 +707,63 @@ class EvalTab(QWidget):
         # 行 3.6：实时预期输入/输出张量说明与「导出模型」执行按钮
         io_row = QHBoxLayout()
         io_row.setSpacing(8)
-        self.export_io_label = QLabel()
-        self.export_io_label.setWordWrap(True)
-        self.export_io_label.setTextFormat(Qt.TextFormat.RichText)
+        self.export_io_label = _WrappingLabel(rich_text=True)
         self.export_btn = QPushButton("导出模型")
         self.export_btn.setObjectName("primaryBtn")
         self.export_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         io_row.addWidget(self.export_io_label, 1)
-        io_row.addWidget(self.export_btn)
+        io_row.addWidget(self.export_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._exp_form.addRow("输入/输出:", io_row)
+
+        # 限制下拉框最小宽度避免小屏撑出横向滚动条，同时保证展开弹出列表时可完整阅读长选项文案
+        for combo in (
+            self.eval_head_combo,
+            self.pred_pad_combo,
+            self.format_combo,
+            self.nms_mode_combo,
+            self.export_preprocess_combo,
+        ):
+            combo.view().setMinimumWidth(320)
 
         align_form_labels([self._model_form, self._pred_form, self._exp_form])
         left.addWidget(exp_group)
+        left.addStretch(1)
+        self.left_scroll.setWidget(left_content)
 
+        # 右侧面板：垂直可拖拽分割条，上方为推理结果预览，下方为运行日志
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.setChildrenCollapsible(False)
+        self.right_splitter.setHandleWidth(8)
+        self.right_splitter.setMinimumWidth(360)
+
+        preview_group = QGroupBox("4. 推理结果预览")
+        preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview_label = _ScaledPreviewLabel("运行图片推理后，将在此显示带检测框的结果图")
+        preview_layout.addWidget(self.preview_label, 1)
+        self.right_splitter.addWidget(preview_group)
+
+        log_group = QGroupBox("5. 运行日志")
+        log_layout = QVBoxLayout(log_group)
+        log_layout.setContentsMargins(8, 8, 8, 8)
         self.log_box = QPlainTextEdit()
         self.log_box.setMaximumBlockCount(LOG_MAX_LINES)
         self.log_box.setReadOnly(True)
+        self.log_box.setMinimumHeight(140)
         self.log_box.setPlaceholderText("权重元数据摘要、验证指标、推理结果路径与导出日志将在此显示...")
-        left.addWidget(self.log_box, 1)
+        log_layout.addWidget(self.log_box, 1)
+        self.right_splitter.addWidget(log_group)
 
-        # 右侧面板：推理结果图像预览
-        right = QVBoxLayout()
-        preview_group = QGroupBox("4. 推理结果预览")
-        preview_layout = QVBoxLayout(preview_group)
-        self.preview_label = QLabel("运行图片推理后，将在此显示带检测框的结果图")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(400, 360)
-        self.preview_label.setStyleSheet(
-            "border: 1px dashed #999999; border-radius: 6px; background: #1e1e1e; color: #cccccc;"
-        )
-        preview_layout.addWidget(self.preview_label, 1)
-        right.addWidget(preview_group)
+        self.right_splitter.setStretchFactor(0, 3)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.setSizes([460, 300])
 
-        root.addLayout(left, 3)
-        root.addLayout(right, 2)
+        self.main_splitter.addWidget(self.left_scroll)
+        self.main_splitter.addWidget(self.right_splitter)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setSizes([830, 520])
+        root.addWidget(self.main_splitter)
 
         # 信号与槽连接
         self.weights_picker.textChanged.connect(self._on_weights_text_changed)
@@ -1743,14 +1912,8 @@ class EvalTab(QWidget):
             self.log_box.appendPlainText(f"- {p}")
         for p in outputs:
             if p.suffix.lower() in IMAGE_EXTENSIONS:
-                pix = load_pixmap_scaled(
-                    p,
-                    max(360, self.preview_label.width() - 12),
-                    max(300, self.preview_label.height() - 12),
-                )
-                if pix:
-                    self.preview_label.setPixmap(pix)
-                break
+                if self.preview_label.set_preview_image(p):
+                    break
 
     def _on_export(self) -> None:
         """校验 `.pt` 权重与独立导出参数后在后台启动 `ExportWorker`。"""
