@@ -26,7 +26,7 @@ using System.Text;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("YoloStudio Launcher")]
-[assembly: AssemblyDescription("YOLO26 视频抽帧、内嵌标注、MLLM 纠错与训练一体化便携启动器")]
+[assembly: AssemblyDescription("一站式 YOLO26 抽帧、标注清洗与训练导出工作台便携启动器")]
 [assembly: AssemblyProduct("YoloStudio")]
 // AssemblyVersion / AssemblyFileVersion / AssemblyInformationalVersion 由构建脚本根据单一版本源自动注入
 

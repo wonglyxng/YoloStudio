@@ -935,6 +935,7 @@ def test_app_logo_assets_resolution_and_splash_render(tmp_path: Path) -> None:
     from PyQt6.QtWidgets import QApplication
 
     from yolo_studio.app import (
+        APP_SPLASH_SUBTITLE,
         _build_app_icon,
         _find_app_icon_path,
         _find_app_logo_path,
@@ -1000,6 +1001,7 @@ def test_app_logo_assets_resolution_and_splash_render(tmp_path: Path) -> None:
     avail = {(s.width(), s.height()) for s in qicon.availableSizes()}
     assert (16, 16) in avail and (256, 256) in avail and (512, 512) in avail
 
+    assert APP_SPLASH_SUBTITLE == "一站式 YOLO26 抽帧、标注清洗与训练导出工作台"
     pm_1x = _render_startup_splash_pixmap(1.0, own_ico, logo_path=own_png)
     pm_2x = _render_startup_splash_pixmap(2.0, own_ico, logo_path=own_png)
     assert not pm_1x.isNull() and pm_1x.width() == 508 and pm_1x.height() == 210

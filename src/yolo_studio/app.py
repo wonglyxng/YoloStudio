@@ -234,6 +234,7 @@ def install_runtime_excepthook(
 APP_USER_MODEL_ID = "YoloStudio.Desktop"
 APP_ICON_FILENAME = "logo.ico"
 APP_LOGO_FILENAME = "logo.png"
+APP_SPLASH_SUBTITLE = "一站式 YOLO26 抽帧、标注清洗与训练导出工作台"
 
 
 def _configure_windows_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> None:
@@ -383,7 +384,7 @@ def _render_startup_splash_pixmap(
     painter.setPen(QColor("#8b949e"))
     painter.drawText(
         QRectF(text_x, 66, width - text_x - 24, 28),
-        "视频抽帧 → 内嵌 X-AnyLabeling → MLLM 纠错 → YOLO26 训练",
+        APP_SPLASH_SUBTITLE,
     )
 
     painter.setPen(QColor("#0969da"))
