@@ -45,10 +45,13 @@ from PyQt6.QtWidgets import (
 
 from yolo_studio.core.dataset_converter import IMAGE_EXTENSIONS
 from yolo_studio.core.trainer import (
+    DEFAULT_EXPORT_PADDING_VALUE,
+    DEFAULT_EXPORT_PREPROCESS_MODE,
     DYNAMIC_EXPORT_FORMATS,
     EXPORT_NMS_KEY_TO_VALUE,
     EXPORT_NMS_MODES,
     EXPORT_OPSET_OPTIONS,
+    EXPORT_PREPROCESS_MODES,
     ONNX_BACKED_EXPORT_FORMATS,
     PREDICT_HEAD_KEY_TO_NMS,
     PREDICT_HEAD_MODES,
@@ -62,6 +65,7 @@ from yolo_studio.core.trainer import (
     format_class_order,
     format_class_order_lines,
     format_imgsz_text,
+    format_preprocess_summary,
     format_weights_metadata_log,
     is_exported_model_path,
 )
@@ -104,12 +108,17 @@ def _show_class_order_dialog(parent: QWidget, meta: WeightsMetadata) -> None:
             if meta.export_dynamic is True
             else ("静态" if meta.export_dynamic is False else "动态性未知")
         )
+        pre_line = (
+            f"\n预处理契约：{format_preprocess_summary(meta.preprocess_mode, meta.preprocess_padding_value, auto_rect=meta.preprocess_auto_rect)} (RGB, 0~1)"
+            if meta.preprocess_mode
+            else ""
+        )
         summary_text = (
             f"模型文件：{meta.weights_path.name} ({meta.model_format.upper()} 导出模型)\n"
             f"任务类型：{meta.task or '未记录'}  |  "
             f"导出输入尺寸：{format_imgsz_text(meta.train_imgsz)} ({dyn_desc})  |  "
             f"类别总数：{meta.num_classes}\n"
-            f"固化输出头：{head_desc}"
+            f"固化输出头：{head_desc}{pre_line}"
         )
     else:
         head_desc = (
@@ -522,6 +531,33 @@ class EvalTab(QWidget):
         nms_thr_layout.addStretch(1)
         self._exp_form.addRow("嵌入阈值:", self.nms_thresh_row_widget)
 
+        # 行 3.5b：写入 ONNX 部署元数据的预处理策略（居中填充 / 左上靠边 / 直接拉伸 与补边灰度）
+        pre_row = QHBoxLayout()
+        pre_row.setSpacing(6)
+        self.export_preprocess_combo = QComboBox()
+        for key, label, _rm, _pa in EXPORT_PREPROCESS_MODES:
+            self.export_preprocess_combo.addItem(label, key)
+        self.export_preprocess_combo.setToolTip(
+            "写入 ONNX 自身元数据 (metadata_props) 的预处理契约，供下游推理端自动读取（不改动计算图）：\n"
+            "• 居中填充 (letterbox_center，推荐): YOLO 标准等比缩放 + 四周居中补边；\n"
+            "• 左上靠边填充 (letterbox_top_left): 等比缩放贴左上角，仅在右下补边；\n"
+            "• 直接拉伸填充 (stretch): 不保持宽高比，直接拉伸至导出高×宽（无补边）。"
+        )
+        self.export_pad_value_label = QLabel("补边值:")
+        self.export_pad_value_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.export_pad_value_spin = QSpinBox()
+        self.export_pad_value_spin.setRange(0, 255)
+        self.export_pad_value_spin.setValue(DEFAULT_EXPORT_PADDING_VALUE)
+        self.export_pad_value_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.export_pad_value_spin.setToolTip(
+            "LetterBox 补边像素灰度值（0=纯黑，114=YOLO 标准灰边，255=纯白；直接拉伸模式不生效）"
+        )
+        pre_row.addWidget(self.export_preprocess_combo, 1)
+        pre_row.addSpacing(8)
+        pre_row.addWidget(self.export_pad_value_label)
+        pre_row.addWidget(self.export_pad_value_spin)
+        self._exp_form.addRow("预处理:", pre_row)
+
         # 行 3.6：实时预期输入/输出张量说明与「导出模型」执行按钮
         io_row = QHBoxLayout()
         io_row.setSpacing(8)
@@ -593,6 +629,8 @@ class EvalTab(QWidget):
         self.export_max_det_spin.valueChanged.connect(self._refresh_export_io_preview)
         self.export_nms_conf_spin.valueChanged.connect(self._refresh_export_io_preview)
         self.export_nms_iou_spin.valueChanged.connect(self._refresh_export_io_preview)
+        self.export_preprocess_combo.currentIndexChanged.connect(self._on_export_format_changed)
+        self.export_pad_value_spin.valueChanged.connect(self._refresh_export_io_preview)
 
         self._on_export_square_toggled(self.export_square_chk.isChecked())
         self._on_export_format_changed()
@@ -752,9 +790,14 @@ class EvalTab(QWidget):
                 "embedded": "图内嵌入NMS",
                 "raw": "one2many 外部NMS",
             }.get(meta.export_nms_mode, "固化输出头")
+            pre_brief = (
+                f" | 预处理: {format_preprocess_summary(meta.preprocess_mode, meta.preprocess_padding_value)}"
+                if meta.preprocess_mode
+                else ""
+            )
             self.weights_info_label.setText(
                 f"[{meta.model_format.upper()} 导出模型] 输入: {size_text} ({dyn_text}) | "
-                f"输出: {mode_brief} | 类别({meta.num_classes}): {cls_brief}"
+                f"输出: {mode_brief}{pre_brief} | 类别({meta.num_classes}): {cls_brief}"
             )
             self.weights_info_label.setStyleSheet("color: #0969da; font-weight: 500;")
             tooltip_lines = [
@@ -762,10 +805,18 @@ class EvalTab(QWidget):
                 f"任务类型: {meta.task or '未记录'}",
                 f"导出输入尺寸: {size_text} ({dyn_text})",
                 f"固化输出头: {mode_brief}",
-                f"类别总数: {meta.num_classes}",
-                "完整类别顺序:",
-                format_class_order_lines(meta.class_names),
             ]
+            if meta.preprocess_mode:
+                tooltip_lines.append(
+                    f"预处理契约: {format_preprocess_summary(meta.preprocess_mode, meta.preprocess_padding_value, auto_rect=meta.preprocess_auto_rect)} (RGB, 0~1)"
+                )
+            tooltip_lines.extend(
+                [
+                    f"类别总数: {meta.num_classes}",
+                    "完整类别顺序:",
+                    format_class_order_lines(meta.class_names),
+                ]
+            )
             self.weights_info_label.setToolTip("\n".join(tooltip_lines))
 
             self.log_box.appendPlainText(format_weights_metadata_log(meta))
@@ -880,15 +931,45 @@ class EvalTab(QWidget):
         return PREDICT_HEAD_KEY_TO_NMS.get(head_key, None)
 
     def build_predict_params(self) -> dict[str, object]:
-        """汇总当前「2. 推理效果测试」实际将提交的参数字典（含检测头、输入尺寸、填充与阈值）。"""
+        """汇总当前「2. 推理效果测试」实际将提交的参数字典（含检测头、输入尺寸、预处理与阈值）。"""
         meta = self._weights_metadata
         is_exported = self._current_model_is_exported()
         static_exported = is_exported and meta is not None and meta.export_dynamic is False
 
-        if static_exported and meta is not None and meta.train_imgsz is not None:
-            mh, mw = meta.train_imgsz
-            imgsz: int | tuple[int, int] = mh if mh == mw else (mh, mw)
-            rect = False
+        preprocess_mode = DEFAULT_EXPORT_PREPROCESS_MODE
+        padding_value: int | None = DEFAULT_EXPORT_PADDING_VALUE
+
+        if is_exported:
+            if meta is not None and meta.preprocess_mode:
+                preprocess_mode = meta.preprocess_mode
+                padding_value = (
+                    None
+                    if preprocess_mode == "stretch"
+                    else (
+                        meta.preprocess_padding_value
+                        if meta.preprocess_padding_value is not None
+                        else DEFAULT_EXPORT_PADDING_VALUE
+                    )
+                )
+            if static_exported and meta is not None and meta.train_imgsz is not None:
+                mh, mw = meta.train_imgsz
+                imgsz: int | tuple[int, int] = mh if mh == mw else (mh, mw)
+                rect = False
+            else:
+                pad_mode = str(self.pred_pad_combo.currentData() or "rect")
+                if pad_mode == "export":
+                    eh = self.export_h_spin.value()
+                    ew = eh if self.export_square_chk.isChecked() else self.export_w_spin.value()
+                    imgsz = eh if eh == ew else (eh, ew)
+                    rect = False
+                elif pad_mode == "square":
+                    imgsz = self.imgsz_spin.value()
+                    rect = False
+                else:
+                    imgsz = self.imgsz_spin.value()
+                    rect = True
+            if preprocess_mode == "stretch":
+                rect = False
         else:
             pad_mode = str(self.pred_pad_combo.currentData() or "rect")
             if pad_mode == "export":
@@ -896,6 +977,13 @@ class EvalTab(QWidget):
                 ew = eh if self.export_square_chk.isChecked() else self.export_w_spin.value()
                 imgsz = eh if eh == ew else (eh, ew)
                 rect = False
+                if str(self.format_combo.currentData() or "onnx") == "onnx":
+                    preprocess_mode = str(
+                        self.export_preprocess_combo.currentData() or DEFAULT_EXPORT_PREPROCESS_MODE
+                    )
+                    padding_value = (
+                        None if preprocess_mode == "stretch" else self.export_pad_value_spin.value()
+                    )
             elif pad_mode == "square":
                 imgsz = self.imgsz_spin.value()
                 rect = False
@@ -920,6 +1008,8 @@ class EvalTab(QWidget):
             "conf": self.conf_spin.value(),
             "iou": self.iou_spin.value(),
             "uses_external_iou": uses_external_iou,
+            "preprocess_mode": preprocess_mode,
+            "padding_value": padding_value,
         }
 
     def _refresh_eval_controls_state(self) -> None:
@@ -978,7 +1068,8 @@ class EvalTab(QWidget):
                     "end2end (nms=False): YOLO26 原生 one2one 无 NMS 端到端头（可复现 end2end 导出效果）。"
                 )
 
-            # 2) 静态导出模型锁定 ImgSz 与输入填充下拉框
+            # 2) 静态导出模型或 Stretch 拉伸导出模型锁定 ImgSz / 输入填充下拉框
+            exported_stretch = is_exported and meta is not None and meta.preprocess_mode == "stretch"
             if static_exported:
                 self.imgsz_spin.setEnabled(False)
                 self.imgsz_spin.setToolTip(
@@ -986,21 +1077,32 @@ class EvalTab(QWidget):
                     f"{format_imgsz_text(meta.train_imgsz if meta else None)}，推理/验证将自动沿用该固定尺寸"
                 )
                 self.pred_pad_combo.setEnabled(False)
-                self.pred_pad_combo.setToolTip(
-                    "静态导出模型固定使用导出尺寸进行等比灰边填充 (rect=False)，无需手动选择填充模式"
-                )
+                if exported_stretch:
+                    self.pred_pad_combo.setToolTip(
+                        "该导出模型元数据声明采用直接拉伸 (Stretch) 预处理，推理时将直接拉伸至导出尺寸"
+                    )
+                else:
+                    self.pred_pad_combo.setToolTip(
+                        "静态导出模型固定使用导出尺寸进行预处理 (rect=False)，无需手动选择填充模式"
+                    )
             else:
                 self.imgsz_spin.setEnabled(True)
                 self.imgsz_spin.setToolTip(
                     "用于『运行验证 (Val)』与『推理效果测试』的输入尺寸；模型导出尺寸请在下方第 3 组独立设置"
                 )
-                self.pred_pad_combo.setEnabled(True)
-                self.pred_pad_combo.setToolTip(
-                    "控制推理测试的图像缩放与补边方式：\n"
-                    "• 最小矩形填充 (rect=True): PT 默认，等比缩放后短边仅补齐至 32 倍数（如 576×960）；\n"
-                    "• 固定方形填充 (rect=False): 补灰边凑满 ImgSz×ImgSz，模拟静态方形导出；\n"
-                    "• 按导出尺寸固定填充 (H×W，rect=False): 按下方第 3 组导出尺寸（支持矩形）补灰边，精确模拟静态导出。"
-                )
+                if exported_stretch:
+                    self.pred_pad_combo.setEnabled(False)
+                    self.pred_pad_combo.setToolTip(
+                        "该导出模型元数据声明采用直接拉伸 (Stretch) 预处理，不进行 LetterBox 补边"
+                    )
+                else:
+                    self.pred_pad_combo.setEnabled(True)
+                    self.pred_pad_combo.setToolTip(
+                        "控制推理测试的图像缩放与补边方式：\n"
+                        "• 最小矩形填充 (rect=True): PT 默认，等比缩放后短边仅补齐至 32 倍数（如 576×960）；\n"
+                        "• 固定方形填充 (rect=False): 补灰边凑满 ImgSz×ImgSz，模拟静态方形导出；\n"
+                        "• 按导出尺寸固定填充 (H×W，rect=False): 按下方第 3 组导出尺寸（含预处理策略）固定处理，精确模拟静态导出。"
+                    )
         finally:
             self._syncing_eval_controls = False
 
@@ -1072,6 +1174,9 @@ class EvalTab(QWidget):
         conf_val = float(params["conf"])  # type: ignore[arg-type]
         iou_val = float(params["iou"])  # type: ignore[arg-type]
         max_det_val = int(params["max_det"])  # type: ignore[arg-type]
+        pre_mode = str(params.get("preprocess_mode") or DEFAULT_EXPORT_PREPROCESS_MODE)
+        pre_pad = params.get("padding_value")
+        pre_pad_int = int(pre_pad) if isinstance(pre_pad, int) else None
 
         if is_exported:
             mode_map = {
@@ -1080,18 +1185,30 @@ class EvalTab(QWidget):
                 "raw": "one2many 外部 NMS (已固化)",
             }
             head_txt = mode_map.get(meta.export_nms_mode if meta else None, "导出模型固化头")
-            pad_txt = (
-                "固定尺寸填充 (静态)"
-                if (meta is not None and meta.export_dynamic is False)
-                else ("最小矩形填充 (rect=True)" if rect_flag else "固定尺寸填充 (rect=False)")
-            )
+            if pre_mode == "stretch":
+                pad_txt = "直接拉伸 Stretch"
+            elif meta is not None and meta.export_dynamic is False:
+                pad_txt = (
+                    f"{format_preprocess_summary(pre_mode, pre_pad_int)} (静态)"
+                    if (pre_mode != DEFAULT_EXPORT_PREPROCESS_MODE or pre_pad_int != DEFAULT_EXPORT_PADDING_VALUE)
+                    else "固定尺寸填充 (静态)"
+                )
+            else:
+                pad_txt = "最小矩形填充 (rect=True)" if rect_flag else "固定尺寸填充 (rect=False)"
+                if pre_mode != DEFAULT_EXPORT_PREPROCESS_MODE or pre_pad_int != DEFAULT_EXPORT_PADDING_VALUE:
+                    pad_txt = f"{format_preprocess_summary(pre_mode, pre_pad_int)}, {pad_txt}"
             model_tag = f"{fmt_upper} 导出模型"
         else:
             if params["nms"] is False:
                 head_txt = f"one2one 端到端无 NMS (MaxDet={max_det_val})"
             else:
                 head_txt = "one2many + 外部 NMS"
-            pad_txt = "最小矩形填充 (rect=True)" if rect_flag else "固定尺寸填充 (rect=False)"
+            if pre_mode == "stretch":
+                pad_txt = "直接拉伸 Stretch (rect=False)"
+            else:
+                pad_txt = "最小矩形填充 (rect=True)" if rect_flag else "固定尺寸填充 (rect=False)"
+                if pre_mode != DEFAULT_EXPORT_PREPROCESS_MODE or pre_pad_int != DEFAULT_EXPORT_PADDING_VALUE:
+                    pad_txt = f"{format_preprocess_summary(pre_mode, pre_pad_int)}, {pad_txt}"
             model_tag = "PT 权重"
 
         thr_txt = (
@@ -1125,6 +1242,10 @@ class EvalTab(QWidget):
                     diffs.append("填充方式")
                 if size_pair != exp_pair:
                     diffs.append("输入尺寸")
+            if exp_cfg.export_format == "onnx":
+                exp_pad = None if exp_cfg.preprocess_mode == "stretch" else exp_cfg.padding_value
+                if exp_cfg.preprocess_mode != pre_mode or exp_pad != pre_pad_int:
+                    diffs.append("预处理")
             if diffs:
                 diff_str = "/".join(diffs)
                 hints.append(
@@ -1161,7 +1282,7 @@ class EvalTab(QWidget):
                     if idx >= 0:
                         self.eval_head_combo.setCurrentIndex(idx)
 
-            # 2) 对齐输入尺寸与填充模式
+            # 2) 对齐输入尺寸与填充模式（含自定义预处理策略模拟）
             if isinstance(exp_cfg.imgsz, tuple):
                 ref_dim = max(exp_cfg.imgsz)
             elif isinstance(exp_cfg.imgsz, int):
@@ -1171,7 +1292,11 @@ class EvalTab(QWidget):
             clamped = max(self.imgsz_spin.minimum(), min(self.imgsz_spin.maximum(), ref_dim))
             self.imgsz_spin.setValue(clamped)
 
-            target_pad = "rect" if exp_cfg.dynamic else "export"
+            has_custom_onnx_pre = exp_cfg.export_format == "onnx" and (
+                exp_cfg.preprocess_mode != DEFAULT_EXPORT_PREPROCESS_MODE
+                or exp_cfg.padding_value != DEFAULT_EXPORT_PADDING_VALUE
+            )
+            target_pad = "rect" if (exp_cfg.dynamic and not has_custom_onnx_pre) else "export"
             pad_idx = self.pred_pad_combo.findData(target_pad)
             if pad_idx >= 0:
                 self.pred_pad_combo.setCurrentIndex(pad_idx)
@@ -1347,6 +1472,30 @@ class EvalTab(QWidget):
             self.export_max_det_spin.setToolTip("原始输出模式 (raw) 输出全部候选框，不使用 MaxDet")
         self._exp_form.setRowVisible(self.nms_thresh_row_widget, is_embedded)
 
+        # 5) ONNX 部署预处理元数据控件联动（仅 ONNX 启用；stretch 无补边值）
+        pre_key = str(self.export_preprocess_combo.currentData() or DEFAULT_EXPORT_PREPROCESS_MODE)
+        self.export_preprocess_combo.setEnabled(is_onnx)
+        uses_pad_val = is_onnx and pre_key != "stretch"
+        self.export_pad_value_label.setEnabled(uses_pad_val)
+        self.export_pad_value_spin.setEnabled(uses_pad_val)
+        if not is_onnx:
+            tip = f"自定义预处理元数据写入仅对 ONNX 格式生效，当前格式 ({fmt}) 不适用"
+            self.export_preprocess_combo.setToolTip(tip)
+            self.export_pad_value_spin.setToolTip(tip)
+        else:
+            self.export_preprocess_combo.setToolTip(
+                "写入 ONNX 自身元数据 (metadata_props) 的预处理契约，供下游推理端自动读取（不改动计算图）：\n"
+                "• 居中填充 (letterbox_center，推荐): YOLO 标准等比缩放 + 四周居中补边；\n"
+                "• 左上靠边填充 (letterbox_top_left): 等比缩放贴左上角，仅在右下补边；\n"
+                "• 直接拉伸填充 (stretch): 不保持宽高比，直接拉伸至导出高×宽（无补边）。"
+            )
+            if pre_key == "stretch":
+                self.export_pad_value_spin.setToolTip("直接拉伸 (Stretch) 模式不进行补边，不使用补边灰度值")
+            else:
+                self.export_pad_value_spin.setToolTip(
+                    "LetterBox 补边像素灰度值（0=纯黑，114=YOLO 标准灰边，255=纯白）"
+                )
+
         self._refresh_export_batch_tooltip()
         self._refresh_action_btn_states()
         self._refresh_export_io_preview()
@@ -1374,6 +1523,17 @@ class EvalTab(QWidget):
         conf_val = self.export_nms_conf_spin.value() if nms_val is True else None
         iou_val = self.export_nms_iou_spin.value() if nms_val is True else None
 
+        preprocess_mode = (
+            str(self.export_preprocess_combo.currentData() or DEFAULT_EXPORT_PREPROCESS_MODE)
+            if self.export_preprocess_combo.isEnabled()
+            else DEFAULT_EXPORT_PREPROCESS_MODE
+        )
+        padding_value = (
+            self.export_pad_value_spin.value()
+            if self.export_pad_value_spin.isEnabled()
+            else DEFAULT_EXPORT_PADDING_VALUE
+        )
+
         return ExportConfig(
             weights_path=Path(w_text) if w_text else Path("model.pt"),
             export_format=fmt,
@@ -1388,6 +1548,8 @@ class EvalTab(QWidget):
             simplify=self.simplify_chk.isChecked() if self.simplify_chk.isEnabled() else True,
             half=self.half_chk.isChecked() and self.half_chk.isEnabled() and self.device_ctrl.is_using_gpu(),
             device=self.device_ctrl.device(),
+            preprocess_mode=preprocess_mode,
+            padding_value=padding_value,
         )
 
     def _refresh_export_io_preview(self, *_args: object) -> None:
@@ -1560,6 +1722,12 @@ class EvalTab(QWidget):
             nms=params["nms"],  # type: ignore[arg-type]
             rect=bool(params["rect"]),
             max_det=int(params["max_det"]),  # type: ignore[arg-type]
+            preprocess_mode=str(params.get("preprocess_mode") or DEFAULT_EXPORT_PREPROCESS_MODE),
+            padding_value=(
+                int(params["padding_value"])
+                if isinstance(params.get("padding_value"), int)
+                else None
+            ),
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.pred_worker, "模型推理预览")

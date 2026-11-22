@@ -193,15 +193,17 @@ def _build_cli_export_config(args: argparse.Namespace) -> "object":
     """解析并校验 `export` 子命令参数，构建对应的 `ExportConfig`。
 
     失败方式：
-        `--imgsz`、`--nms`、`--batch`、`--opset`、`--conf`、`--iou`、`--workspace`
-        或 `--extra-arg` 参数非法时抛出中文 `ValueError`。
+        `--imgsz`、`--nms`、`--batch`、`--opset`、`--conf`、`--iou`、`--workspace`、
+        `--preprocess`、`--pad-value` 或 `--extra-arg` 参数非法时抛出中文 `ValueError`。
     """
     from yolo_studio.core.trainer import (
         ExportConfig,
         build_export_kwargs,
         normalize_export_format,
         normalize_export_imgsz,
+        normalize_padding_value,
         parse_export_nms_mode,
+        parse_export_preprocess_mode,
         parse_extra_train_args,
     )
 
@@ -229,6 +231,9 @@ def _build_cli_export_config(args: argparse.Namespace) -> "object":
         half=bool(args.half),
         device=str(args.device),
         workspace=args.workspace,
+        preprocess_mode=parse_export_preprocess_mode(getattr(args, "preprocess", None)),
+        padding_value=normalize_padding_value(getattr(args, "pad_value", None)),
+        preprocess_auto_rect=getattr(args, "preprocess_auto_rect", None),
         extra_args=merged_extra,
     )
     # 提前执行纯参数校验，避免等到加载模型后才暴露非法选项
@@ -555,6 +560,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="仅 TensorRT (engine) 生效：工作空间显存上限 (GiB)",
     )
     p_exp.add_argument("--device", default="0", help="导出计算设备（如 0 或 cpu；ONNX 固定使用 cpu）")
+    p_exp.add_argument(
+        "--preprocess",
+        choices=("letterbox_center", "letterbox_top_left", "stretch"),
+        default="letterbox_center",
+        help="写入 ONNX 部署元数据的预处理策略：letterbox_center(居中填充，默认) / letterbox_top_left(左上靠边) / stretch(直接拉伸)",
+    )
+    p_exp.add_argument(
+        "--pad-value",
+        type=int,
+        default=114,
+        help="写入 ONNX 部署元数据的 LetterBox 补边灰度值（0~255，默认 114；stretch 模式忽略）",
+    )
+    p_exp.add_argument(
+        "--preprocess-auto-rect",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="显式指定写入 ONNX 部署元数据的 auto_rect 标志（留空按 dynamic 与预处理策略自动推导）",
+    )
     p_exp.add_argument(
         "--extra-arg",
         action="append",

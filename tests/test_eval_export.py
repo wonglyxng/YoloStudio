@@ -31,11 +31,14 @@ import yolo_studio.core.trainer as trainer_module
 import yolo_studio.gui.tab_eval as tab_eval_module
 from yolo_studio.cli import _build_cli_export_config, build_parser, main as cli_main
 from yolo_studio.core.trainer import (
+    ONNX_DEPLOY_META_JSON_KEY,
+    ONNX_DEPLOY_SCHEMA_VERSION,
     DeviceInfo,
     ExportConfig,
     WeightsMetadata,
     align_imgsz_to_stride,
     build_export_kwargs,
+    build_onnx_deploy_metadata,
     build_predict_kwargs,
     build_val_kwargs,
     describe_export_io,
@@ -45,7 +48,9 @@ from yolo_studio.core.trainer import (
     format_weights_metadata_log,
     inspect_weights_metadata,
     normalize_export_imgsz,
+    normalize_padding_value,
     parse_export_nms_mode,
+    parse_export_preprocess_mode,
     predict_source,
     validate_model,
 )
@@ -1263,5 +1268,357 @@ def test_eval_tab_predict_head_padding_sync_export_and_onnx_switching(
         tab._on_predict()
         assert len(pred_workers) == before_pred
         assert any("TensorRT" in msg for msg in warnings_shown)
+    finally:
+        tab.close()
+
+
+def test_onnx_deploy_metadata_builder_cli_and_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 ONNX 部署预处理元数据构造、参数校验、CLI 选项解析与只读元数据还原。"""
+    import json
+
+    pt_file = tmp_path / "best.pt"
+    onnx_file = tmp_path / "best.onnx"
+    pt_file.write_bytes(b"pt")
+    onnx_file.write_bytes(b"onnx")
+
+    # 1) 预处理模式与补边灰度校验
+    assert parse_export_preprocess_mode(None) == "letterbox_center"
+    assert parse_export_preprocess_mode("top_left") == "letterbox_top_left"
+    assert parse_export_preprocess_mode("scale_fill") == "stretch"
+    with pytest.raises(ValueError, match="无效的预处理策略"):
+        parse_export_preprocess_mode("invalid_mode")
+
+    assert normalize_padding_value(0) == 0
+    assert normalize_padding_value(255) == 255
+    with pytest.raises(ValueError, match="0 ~ 255"):
+        normalize_padding_value(256)
+    with pytest.raises(ValueError, match="整数"):
+        normalize_padding_value(True)  # type: ignore[arg-type]
+
+    meta_pt = WeightsMetadata(
+        weights_path=pt_file,
+        task="detect",
+        train_imgsz=(960, 960),
+        class_names=((0, "stump"), (1, "boss")),
+        strides=(8, 16, 32),
+        channels=3,
+        supports_end2end=True,
+        one2many_available=True,
+    )
+
+    # 2) 左上靠边 + 黑边 0 + 矩形 576x960 + end2end
+    cfg_tl = ExportConfig(
+        weights_path=pt_file,
+        export_format="onnx",
+        imgsz=(576, 960),
+        batch=1,
+        dynamic=False,
+        nms=False,
+        max_det=200,
+        preprocess_mode="letterbox_top_left",
+        padding_value=0,
+    )
+    payload_tl, props_tl = build_onnx_deploy_metadata(cfg_tl, metadata=meta_pt)
+    assert payload_tl["schema"] == ONNX_DEPLOY_SCHEMA_VERSION
+    assert payload_tl["classes"] == ["stump", "boss"]
+    assert payload_tl["input"]["height"] == 576 and payload_tl["input"]["width"] == 960  # type: ignore[index]
+    assert payload_tl["preprocess"]["resize_mode"] == "letterbox"  # type: ignore[index]
+    assert payload_tl["preprocess"]["padding_align"] == "top_left"  # type: ignore[index]
+    assert payload_tl["preprocess"]["padding_value"] == 0  # type: ignore[index]
+    assert payload_tl["preprocess"]["auto_rect"] is False  # type: ignore[index]
+    assert payload_tl["postprocess"]["output_mode"] == "end2end"  # type: ignore[index]
+    assert payload_tl["postprocess"]["nms_required"] is False  # type: ignore[index]
+    assert payload_tl["postprocess"]["box_format"] == "xyxy"  # type: ignore[index]
+    assert props_tl["preprocess_padding_align"] == "top_left"
+    assert props_tl["preprocess_padding_value"] == "0"
+    assert json.loads(props_tl[ONNX_DEPLOY_META_JSON_KEY]) == payload_tl
+
+    io_tl, warns_tl = describe_export_io(cfg_tl, metadata=meta_pt)
+    assert "左上靠边 LetterBox (补边=0)" in io_tl
+    assert any("偏离 YOLO 默认" in w for w in warns_tl)
+
+    # 3) 直接拉伸 + 动态 + embedded NMS
+    cfg_st = ExportConfig(
+        weights_path=pt_file,
+        export_format="onnx",
+        imgsz=640,
+        dynamic=True,
+        nms=True,
+        conf=0.30,
+        iou=0.50,
+        preprocess_mode="stretch",
+        padding_value=114,
+    )
+    payload_st, props_st = build_onnx_deploy_metadata(cfg_st, metadata=meta_pt)
+    assert payload_st["preprocess"]["resize_mode"] == "stretch"  # type: ignore[index]
+    assert payload_st["preprocess"]["padding_align"] == "none"  # type: ignore[index]
+    assert payload_st["preprocess"]["padding_value"] is None  # type: ignore[index]
+    assert payload_st["preprocess"]["auto_rect"] is False  # type: ignore[index]
+    assert payload_st["postprocess"]["output_mode"] == "embedded"  # type: ignore[index]
+    assert payload_st["postprocess"]["embedded_conf"] == pytest.approx(0.30)  # type: ignore[index]
+    assert props_st["preprocess_padding_value"] == ""
+
+    # 4) 非 ONNX 格式设自定义预处理时给出忽略提醒，不传进 export_kwargs
+    cfg_ts = ExportConfig(
+        weights_path=pt_file,
+        export_format="torchscript",
+        preprocess_mode="stretch",
+    )
+    ts_kw, ts_warns = build_export_kwargs(cfg_ts, metadata=meta_pt)
+    assert "preprocess_mode" not in ts_kw
+    assert any("仅对 ONNX 格式生效" in w for w in ts_warns)
+
+    # 5) CLI export 解析 --preprocess / --pad-value / --no-preprocess-auto-rect 及非法值拦截
+    parser = build_parser()
+    parsed = parser.parse_args(
+        [
+            "export",
+            "-w",
+            str(pt_file),
+            "-f",
+            "onnx",
+            "--dynamic",
+            "--preprocess",
+            "letterbox_top_left",
+            "--pad-value",
+            "0",
+            "--no-preprocess-auto-rect",
+        ]
+    )
+    cli_cfg = _build_cli_export_config(parsed)
+    assert isinstance(cli_cfg, ExportConfig)
+    assert cli_cfg.preprocess_mode == "letterbox_top_left"
+    assert cli_cfg.padding_value == 0
+    assert cli_cfg.preprocess_auto_rect is False
+    assert cli_main(["export", "-w", str(pt_file), "--pad-value", "300"]) == 2
+
+    # 6) inspect_weights_metadata 既支持从 JSON 总包解析，也支持仅扁平键回退解析
+    fake_base_mod = types.ModuleType("ultralytics.nn.backends.base")
+    fake_backends_mod = types.ModuleType("ultralytics.nn.backends")
+    fake_backends_mod.base = fake_base_mod  # type: ignore[attr-defined]
+    fake_nn_mod = types.ModuleType("ultralytics.nn")
+    fake_nn_mod.backends = fake_backends_mod  # type: ignore[attr-defined]
+    fake_ultra = types.ModuleType("ultralytics")
+    fake_ultra.nn = fake_nn_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ultralytics", fake_ultra)
+    monkeypatch.setitem(sys.modules, "ultralytics.nn", fake_nn_mod)
+    monkeypatch.setitem(sys.modules, "ultralytics.nn.backends", fake_backends_mod)
+    monkeypatch.setitem(sys.modules, "ultralytics.nn.backends.base", fake_base_mod)
+
+    fake_base_mod.BaseBackend = types.SimpleNamespace(  # type: ignore[attr-defined]
+        read_metadata=staticmethod(lambda _p: {"imgsz": "[576, 960]", **props_tl})
+    )
+    meta_from_json = inspect_weights_metadata(onnx_file)
+    assert meta_from_json.deploy_schema == ONNX_DEPLOY_SCHEMA_VERSION
+    assert meta_from_json.preprocess_mode == "letterbox_top_left"
+    assert meta_from_json.preprocess_padding_value == 0
+    assert meta_from_json.preprocess_auto_rect is False
+    assert meta_from_json.class_names == ((0, "stump"), (1, "boss"))
+    assert "预处理契约: 左上靠边 LetterBox (补边=0)" in format_weights_metadata_log(meta_from_json)
+
+    flat_only = {k: v for k, v in props_st.items() if k != ONNX_DEPLOY_META_JSON_KEY}
+    fake_base_mod.BaseBackend = types.SimpleNamespace(  # type: ignore[attr-defined]
+        read_metadata=staticmethod(lambda _p: {"imgsz": "[640, 640]", **flat_only})
+    )
+    meta_from_flat = inspect_weights_metadata(onnx_file)
+    assert meta_from_flat.preprocess_mode == "stretch"
+    assert meta_from_flat.preprocess_padding_value is None
+
+
+def test_real_exported_onnx_deploy_metadata_roundtrip_with_ort_if_present(tmp_path: Path) -> None:
+    """若本地存在 `yolo26n.pt`，真实导出带自定义预处理元数据的 ONNX 并用 ONNX Runtime 与推理引擎端到端校验。"""
+    import json
+    import subprocess
+
+    candidate = Path("build/portable_cache/weights/yolo26n.pt")
+    if not candidate.is_file():
+        pytest.skip("本地未找到预置 yolo26n.pt 权重，跳过真实 ONNX 元数据与推理闭环测试")
+
+    src_dir = str((Path(__file__).resolve().parents[1] / "src").resolve())
+    script = (
+        f"import json, shutil, sys; from pathlib import Path; import cv2, numpy as np, onnxruntime as ort; "
+        f"sys.path.insert(0, {src_dir!r}); "
+        "from yolo_studio.core.trainer import export_model, inspect_weights_metadata, predict_source, ONNX_DEPLOY_META_JSON_KEY; "
+        f"work = Path({str(tmp_path.resolve())!r}); "
+        f"pt = work / 'yolo26n.pt'; shutil.copy({str(candidate.resolve())!r}, pt); "
+        "img_p = work / 'blank.jpg'; cv2.imwrite(str(img_p), np.full((180, 320, 3), 120, dtype=np.uint8)); "
+        # 1) 左上靠边 + 补边 0 导出 + ORT 读取 + 推理
+        "onnx_tl = export_model(pt, export_format='onnx', imgsz=(192, 320), nms=False, simplify=False, "
+        "preprocess_mode='letterbox_top_left', padding_value=0, device='cpu'); "
+        "sess_tl = ort.InferenceSession(str(onnx_tl), providers=['CPUExecutionProvider']); "
+        "ort_map_tl = sess_tl.get_modelmeta().custom_metadata_map; "
+        "deploy_tl = json.loads(ort_map_tl[ONNX_DEPLOY_META_JSON_KEY]); "
+        "meta_tl = inspect_weights_metadata(onnx_tl); "
+        "outs_tl = predict_source(onnx_tl, img_p, work / 'out_tl', conf=0.25, device='cpu'); "
+        # 2) 直接拉伸 stretch 导出 + ORT 读取 + 推理
+        "pt2 = work / 'yolo26n_st.pt'; shutil.copy(pt, pt2); "
+        "onnx_st = export_model(pt2, export_format='onnx', imgsz=320, nms=None, simplify=False, "
+        "preprocess_mode='stretch', device='cpu'); "
+        "sess_st = ort.InferenceSession(str(onnx_st), providers=['CPUExecutionProvider']); "
+        "deploy_st = json.loads(sess_st.get_modelmeta().custom_metadata_map[ONNX_DEPLOY_META_JSON_KEY]); "
+        "outs_st = predict_source(onnx_st, img_p, work / 'out_st', conf=0.25, device='cpu'); "
+        "print(json.dumps({"
+        "'tl_schema': deploy_tl['schema'], 'tl_align': deploy_tl['preprocess']['padding_align'], "
+        "'tl_pad': deploy_tl['preprocess']['padding_value'], 'tl_hw': [deploy_tl['input']['height'], deploy_tl['input']['width']], "
+        "'tl_out_mode': deploy_tl['postprocess']['output_mode'], 'tl_cls_len': len(deploy_tl['classes']), "
+        "'tl_has_ultra_names': 'names' in ort_map_tl, 'tl_meta_mode': meta_tl.preprocess_mode, 'tl_meta_pad': meta_tl.preprocess_padding_value, "
+        "'tl_outs': len(outs_tl), 'st_resize': deploy_st['preprocess']['resize_mode'], 'st_pad': deploy_st['preprocess']['padding_value'], "
+        "'st_nms_req': deploy_st['postprocess']['nms_required'], 'st_outs': len(outs_st)}))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        timeout=90,
+    )
+    res = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert res["tl_schema"] == ONNX_DEPLOY_SCHEMA_VERSION
+    assert res["tl_align"] == "top_left"
+    assert res["tl_pad"] == 0
+    assert res["tl_hw"] == [192, 320]
+    assert res["tl_out_mode"] == "end2end"
+    assert res["tl_cls_len"] == 80
+    assert res["tl_has_ultra_names"] is True
+    assert res["tl_meta_mode"] == "letterbox_top_left"
+    assert res["tl_meta_pad"] == 0
+    assert res["tl_outs"] == 1
+    assert res["st_resize"] == "stretch"
+    assert res["st_pad"] is None
+    assert res["st_nms_req"] is True
+    assert res["st_outs"] == 1
+
+
+def test_eval_tab_export_preprocess_controls_and_predict_alignment(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证第 6 页导出预处理策略防呆、与推理对齐及加载带 `stretch` 元数据 ONNX 的自动锁定。"""
+    pt_file = tmp_path / "best.pt"
+    onnx_file = tmp_path / "best_stretch.onnx"
+    img_file = tmp_path / "demo.jpg"
+    for p in (pt_file, onnx_file, img_file):
+        p.write_bytes(b"stub")
+
+    inspect_workers: list[_StubWeightsInspectWorker] = []
+    pred_workers: list[object] = []
+
+    class _StubPredictWorker(QObject):
+        log_line = Signal(str)
+        finished_outputs = Signal(object)
+        failed = Signal(str)
+
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__()
+            self.kwargs = dict(kwargs)
+            self.running = False
+
+        def start(self) -> None:
+            self.running = True
+
+        def isRunning(self) -> bool:
+            return self.running
+
+    monkeypatch.setattr(
+        tab_eval_module,
+        "WeightsInspectWorker",
+        lambda path, request_id=0: (
+            inspect_workers.append(_StubWeightsInspectWorker(path, request_id=request_id))
+            or inspect_workers[-1]
+        ),
+    )
+    monkeypatch.setattr(
+        tab_eval_module,
+        "PredictWorker",
+        lambda **kwargs: (pred_workers.append(_StubPredictWorker(**kwargs)) or pred_workers[-1]),
+    )
+
+    tab = EvalTab(workspace_root=tmp_path, device_info=_make_device_info(has_gpu=True))
+    try:
+        tab.set_weights_and_yaml(str(pt_file), "")
+        tab.source_edit.setText(str(img_file))
+        qt_app.processEvents()
+        inspect_workers[-1].complete_with(
+            WeightsMetadata(
+                weights_path=pt_file,
+                task="detect",
+                train_imgsz=(960, 960),
+                class_names=((0, "stump"),),
+                supports_end2end=True,
+                one2many_available=True,
+            )
+        )
+        qt_app.processEvents()
+
+        # 1) ONNX 默认启用预处理与补边值；切 stretch 置灰补边值；切 TorchScript 置灰两者
+        assert tab.export_preprocess_combo.isEnabled() is True
+        assert tab.export_pad_value_spin.isEnabled() is True
+
+        tab.export_preprocess_combo.setCurrentIndex(2)  # stretch
+        qt_app.processEvents()
+        assert tab.export_pad_value_spin.isEnabled() is False
+        assert "偏离 YOLO 默认" in tab.export_io_label.text()
+
+        tab.format_combo.setCurrentIndex(1)  # torchscript
+        qt_app.processEvents()
+        assert tab.export_preprocess_combo.isEnabled() is False
+        assert tab.export_pad_value_spin.isEnabled() is False
+
+        tab.format_combo.setCurrentIndex(0)  # onnx
+        tab.export_preprocess_combo.setCurrentIndex(1)  # letterbox_top_left
+        tab.export_pad_value_spin.setValue(0)
+        qt_app.processEvents()
+        assert tab.export_preprocess_combo.isEnabled() is True
+        assert tab.export_pad_value_spin.isEnabled() is True
+
+        exp_cfg = tab.build_export_config(allow_missing_weights=False)
+        assert exp_cfg.preprocess_mode == "letterbox_top_left"
+        assert exp_cfg.padding_value == 0
+
+        # 2) 点击「对齐导出参数」后，推理参数摘要不再提示预处理差异，且 PredictWorker 收到 top_left + pad=0
+        assert "预处理" in tab.pred_summary_label.text()
+        tab.sync_export_pred_btn.click()
+        qt_app.processEvents()
+        assert "存在差异" not in tab.pred_summary_label.text()
+
+        tab.predict_btn.click()
+        qt_app.processEvents()
+        sent_pt = pred_workers[-1].kwargs  # type: ignore[attr-defined]
+        assert sent_pt["preprocess_mode"] == "letterbox_top_left"
+        assert sent_pt["padding_value"] == 0
+        pred_workers[-1].running = False  # type: ignore[attr-defined]
+        tab._set_busy(False)
+
+        # 3) 加载带 stretch 预处理契约的动态 ONNX：锁定 pred_pad_combo，PredictWorker 自动按 stretch 执行
+        tab.set_weights_and_yaml(str(onnx_file), "")
+        qt_app.processEvents()
+        inspect_workers[-1].complete_with(
+            WeightsMetadata(
+                weights_path=onnx_file,
+                task="detect",
+                train_imgsz=(960, 960),
+                class_names=((0, "stump"),),
+                model_format="onnx",
+                is_exported=True,
+                export_nms_mode="end2end",
+                export_dynamic=True,
+                deploy_schema=ONNX_DEPLOY_SCHEMA_VERSION,
+                preprocess_mode="stretch",
+                preprocess_padding_value=None,
+                preprocess_auto_rect=False,
+            )
+        )
+        qt_app.processEvents()
+        assert "直接拉伸 Stretch" in tab.weights_info_label.text()
+        assert tab.pred_pad_combo.isEnabled() is False
+
+        tab.predict_btn.click()
+        qt_app.processEvents()
+        sent_onnx = pred_workers[-1].kwargs  # type: ignore[attr-defined]
+        assert sent_onnx["preprocess_mode"] == "stretch"
+        assert sent_onnx["padding_value"] is None
+        assert sent_onnx["rect"] is False
     finally:
         tab.close()

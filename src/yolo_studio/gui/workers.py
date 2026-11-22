@@ -290,6 +290,8 @@ class PredictWorker(QThread):
         nms: bool | None = None,
         rect: bool = True,
         max_det: int = 300,
+        preprocess_mode: str | None = None,
+        padding_value: int | None = None,
     ) -> None:
         super().__init__()
         self.weights_path = weights_path
@@ -302,6 +304,8 @@ class PredictWorker(QThread):
         self.nms = nms
         self.rect = rect
         self.max_det = max_det
+        self.preprocess_mode = preprocess_mode
+        self.padding_value = padding_value
 
     def run(self) -> None:
         """线程入口：执行 `predict_source` 并派发生成的输出文件路径列表。"""
@@ -317,6 +321,8 @@ class PredictWorker(QThread):
                 nms=self.nms,
                 rect=self.rect,
                 max_det=self.max_det,
+                preprocess_mode=self.preprocess_mode,
+                padding_value=self.padding_value,
                 log_callback=lambda line: self.log_line.emit(line),
             )
             self.finished_outputs.emit(outputs)

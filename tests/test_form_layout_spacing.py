@@ -234,6 +234,7 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "Batch:", win.eval_tab.export_batch_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "Opset:", win.eval_tab.export_opset_combo) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "MaxDet:", win.eval_tab.export_max_det_spin) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "补边值:", win.eval_tab.export_pad_value_spin) <= 12
 
         # 切换至图内嵌入 NMS 模式展开阈值行后，三组表单字段列依旧严格对齐且行内标签紧凑
         win.eval_tab.nms_mode_combo.setCurrentIndex(2)

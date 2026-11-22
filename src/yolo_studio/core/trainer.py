@@ -1255,6 +1255,191 @@ def _unique_pred_path(output_dir: Path, src: Path, used: set[str]) -> Path:
     return output_dir / f"{candidate}.jpg"
 
 
+# ONNX 部署元数据契约版本与结构化 JSON 主键
+ONNX_DEPLOY_SCHEMA_VERSION = "yolostudio.deploy.v1"
+ONNX_DEPLOY_META_JSON_KEY = "yolostudio_deploy_meta"
+
+# 导出预处理策略选项：(内部键名, 界面显示文案, resize_mode, padding_align)
+EXPORT_PREPROCESS_MODES: list[tuple[str, str, str, str]] = [
+    ("letterbox_center", "等比缩放 · 居中填充 (LetterBox，推荐)", "letterbox", "center"),
+    ("letterbox_top_left", "等比缩放 · 左上靠边填充 (LetterBox)", "letterbox", "top_left"),
+    ("stretch", "直接拉伸填充 (Stretch，不保持宽高比)", "stretch", "none"),
+]
+EXPORT_PREPROCESS_KEY_TO_SPEC: dict[str, tuple[str, str]] = {
+    key: (resize_mode, padding_align)
+    for key, _, resize_mode, padding_align in EXPORT_PREPROCESS_MODES
+}
+DEFAULT_EXPORT_PREPROCESS_MODE = "letterbox_center"
+DEFAULT_EXPORT_PADDING_VALUE = 114
+
+
+def parse_export_preprocess_mode(raw: str | None) -> str:
+    """将界面键名、CLI 选项或别名规范化为导出预处理策略键名。
+
+    可选规范值：
+        - `"letterbox_center"`：保持宽高比缩放 + 居中填充（YOLO 标准默认）；
+        - `"letterbox_top_left"`：保持宽高比缩放 + 左上角靠边填充；
+        - `"stretch"`：直接拉伸至目标高×宽（不保持宽高比、不补边）。
+    """
+    if raw is None:
+        return DEFAULT_EXPORT_PREPROCESS_MODE
+    token = str(raw).strip().lower()
+    if token in {"", "default", "letterbox", "center", "letterbox_center", "letterbox-center"}:
+        return "letterbox_center"
+    if token in {
+        "top_left",
+        "top-left",
+        "topleft",
+        "edge",
+        "letterbox_top_left",
+        "letterbox-top-left",
+    }:
+        return "letterbox_top_left"
+    if token in {"stretch", "scale_fill", "scale-fill", "resize"}:
+        return "stretch"
+    raise ValueError(
+        f"无效的预处理策略 '{raw}'，可选值: letterbox_center(居中填充)、"
+        "letterbox_top_left(左上靠边填充)、stretch(直接拉伸)"
+    )
+
+
+def normalize_padding_value(raw: int | None) -> int:
+    """校验并规范化 LetterBox 补边灰度值（`0 ~ 255` 整数，默认 `114`）。"""
+    if raw is None:
+        return DEFAULT_EXPORT_PADDING_VALUE
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        try:
+            if isinstance(raw, bool):
+                raise ValueError
+            val = int(raw)
+        except Exception as exc:
+            raise ValueError(f"补边灰度值必须为 0 ~ 255 的整数，当前值: {raw!r}") from exc
+    else:
+        val = raw
+    if not (0 <= val <= 255):
+        raise ValueError(f"补边灰度值必须在 0 ~ 255 之间，当前值: {val}")
+    return val
+
+
+def resolve_preprocess_spec(
+    preprocess_mode: str | None,
+    padding_value: int | None = DEFAULT_EXPORT_PADDING_VALUE,
+) -> tuple[str, str, str, int | None]:
+    """返回规范化四元组 `(mode_key, resize_mode, padding_align, effective_padding_value)`。"""
+    mode_key = parse_export_preprocess_mode(preprocess_mode)
+    resize_mode, padding_align = EXPORT_PREPROCESS_KEY_TO_SPEC[mode_key]
+    pad_val = None if resize_mode == "stretch" else normalize_padding_value(padding_value)
+    return mode_key, resize_mode, padding_align, pad_val
+
+
+def format_preprocess_summary(
+    preprocess_mode: str | None,
+    padding_value: int | None = DEFAULT_EXPORT_PADDING_VALUE,
+    *,
+    auto_rect: bool | None = None,
+) -> str:
+    """将预处理策略格式化为简洁中文展示文本，用于预览、日志与元数据展示。"""
+    mode_key, resize_mode, _align, pad_val = resolve_preprocess_spec(preprocess_mode, padding_value)
+    if resize_mode == "stretch":
+        base = "直接拉伸 Stretch (无补边)"
+    elif mode_key == "letterbox_top_left":
+        base = f"左上靠边 LetterBox (补边={pad_val})"
+    else:
+        base = f"居中 LetterBox (补边={pad_val})"
+    if auto_rect is True and resize_mode == "letterbox":
+        return f"{base}, auto_rect=True"
+    if auto_rect is False and resize_mode == "letterbox":
+        return f"{base}, auto_rect=False"
+    return base
+
+
+def _build_custom_preprocess_predictor(
+    resize_mode: str,
+    padding_align: str,
+    padding_value: int,
+) -> type:
+    """动态构造按指定预处理策略（靠边填充/直接拉伸/自定义补边值）执行前处理与坐标还原的 `DetectionPredictor` 子类。"""
+    from ultralytics.data.augment import LetterBox
+    from ultralytics.engine.results import Results
+    from ultralytics.models.yolo.detect.predict import DetectionPredictor
+    from ultralytics.utils import ops
+
+    is_stretch = resize_mode == "stretch"
+    is_center = padding_align == "center"
+    pad_val = int(padding_value)
+
+    class _CustomPreprocessDetectionPredictor(DetectionPredictor):
+        def pre_transform(self, im):
+            same_shapes = len({x.shape for x in im}) == 1
+            auto = (
+                (not is_stretch)
+                and same_shapes
+                and self.args.rect
+                and (
+                    self.model.format == "pt"
+                    or (getattr(self.model, "dynamic", False) and self.model.format != "imx")
+                )
+            )
+            letterbox = LetterBox(
+                self.imgsz,
+                auto=auto,
+                scale_fill=is_stretch,
+                center=is_center,
+                stride=self.model.stride,
+                padding_value=pad_val,
+            )
+            return [letterbox(image=x) for x in im]
+
+        def construct_result(self, pred, img, orig_img, img_path):
+            if is_stretch:
+                gain_y = img.shape[2] / orig_img.shape[0]
+                gain_x = img.shape[3] / orig_img.shape[1]
+                pred[:, :4] = ops.scale_boxes(
+                    img.shape[2:],
+                    pred[:, :4],
+                    orig_img.shape,
+                    ratio_pad=((gain_y, gain_x), (0.0, 0.0)),
+                    padding=False,
+                )
+            elif not is_center:
+                gain = min(img.shape[2] / orig_img.shape[0], img.shape[3] / orig_img.shape[1])
+                new_h = max(round(orig_img.shape[0] * gain), 1)
+                new_w = max(round(orig_img.shape[1] * gain), 1)
+                gain_y = new_h / orig_img.shape[0]
+                gain_x = new_w / orig_img.shape[1]
+                pred[:, :4] = ops.scale_boxes(
+                    img.shape[2:],
+                    pred[:, :4],
+                    orig_img.shape,
+                    ratio_pad=((gain_y, gain_x), (0.0, 0.0)),
+                    padding=True,
+                )
+            else:
+                pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+            return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])
+
+    return _CustomPreprocessDetectionPredictor
+
+
+def resolve_effective_predict_preprocess(
+    *,
+    is_exported: bool,
+    preprocess_mode: str | None = None,
+    padding_value: int | None = None,
+    metadata: WeightsMetadata | None = None,
+) -> tuple[str, str, str, int | None]:
+    """解析推理阶段应执行的预处理策略；已导出模型未显式覆盖时优先沿用其内嵌元数据契约。"""
+    raw_mode = preprocess_mode
+    if raw_mode is None and is_exported and metadata is not None and metadata.preprocess_mode:
+        raw_mode = metadata.preprocess_mode
+
+    raw_pad = padding_value
+    if raw_pad is None and is_exported and metadata is not None and metadata.preprocess_padding_value is not None:
+        raw_pad = metadata.preprocess_padding_value
+
+    return resolve_preprocess_spec(raw_mode, raw_pad)
+
+
 def build_predict_kwargs(
     weights_path: Path,
     source_path: Path,
@@ -1266,6 +1451,8 @@ def build_predict_kwargs(
     nms: bool | None = None,
     rect: bool = True,
     max_det: int = 300,
+    preprocess_mode: str | None = None,
+    padding_value: int | None = None,
     is_video: bool = False,
     output_dir: Path | None = None,
     metadata: WeightsMetadata | None = None,
@@ -1277,7 +1464,8 @@ def build_predict_kwargs(
         - `.pt` 权重传入 `nms=False` 时启用 YOLO26 `one2one` 端到端无 NMS 头，`nms=None` 走 `one2many` + 外部 NMS；
         - `rect=True` 对 `.pt` 与动态导出模型启用最小矩形 LetterBox 填充，`rect=False` 强制按设定尺寸固定填充；
         - 已导出模型（`.onnx` / `.torchscript` / `.engine`）已固化检测头，不传 `nms` 覆盖；
-          静态导出模型（`export_dynamic=False`）自动对齐导出尺寸并固定 `rect=False`。
+          静态导出模型（`export_dynamic=False`）自动对齐导出尺寸并固定 `rect=False`；
+        - 当预处理为 `stretch`（直接拉伸）时，强制 `rect=False`。
     """
     fmt = detect_model_format(weights_path)
     is_exported = is_exported_model_path(weights_path)
@@ -1289,8 +1477,15 @@ def build_predict_kwargs(
     if max_det_int < 1:
         raise ValueError(f"最大检测框数 max_det 必须 >= 1，当前值: {max_det_int}")
 
+    _mode_key, resize_mode, _pad_align, _pad_val = resolve_effective_predict_preprocess(
+        is_exported=is_exported,
+        preprocess_mode=preprocess_mode,
+        padding_value=padding_value,
+        metadata=metadata,
+    )
+
     imgsz_arg, pair = _format_imgsz_arg(imgsz)
-    effective_rect = bool(rect)
+    effective_rect = False if resize_mode == "stretch" else bool(rect)
     warnings: list[str] = []
 
     pred_kwargs: dict[str, object] = {
@@ -1346,6 +1541,8 @@ def format_submitted_predict_config(
     pred_kwargs: Mapping[str, object],
     *,
     metadata: WeightsMetadata | None = None,
+    preprocess_mode: str | None = None,
+    padding_value: int | None = None,
     warnings: Sequence[str] = (),
 ) -> str:
     """将提交给 Ultralytics `model.predict()` 的推理参数与提示格式化为可读多行日志。"""
@@ -1363,11 +1560,24 @@ def format_submitted_predict_config(
     else:
         head_desc = "one2many (外部 NMS，PT 默认)"
 
-    pad_desc = "最小矩形填充 (rect=True)" if pred_kwargs.get("rect") else "固定尺寸填充 (rect=False)"
+    mode_key, resize_mode, pad_align, pad_val = resolve_effective_predict_preprocess(
+        is_exported=is_exported,
+        preprocess_mode=preprocess_mode,
+        padding_value=padding_value,
+        metadata=metadata,
+    )
+    if resize_mode == "stretch":
+        pad_desc = "直接拉伸 Stretch (rect=False)"
+    else:
+        pad_desc = "最小矩形填充 (rect=True)" if pred_kwargs.get("rect") else "固定尺寸填充 (rect=False)"
+
     summary_dict: dict[str, object] = {
         "model": weights_path.name,
         "model_format": fmt,
         "head_mode": head_desc,
+        "preprocess_mode": mode_key,
+        "padding_align": pad_align,
+        "padding_value": pad_val,
         "pad_mode": pad_desc,
         "imgsz": pred_kwargs.get("imgsz"),
         "rect": pred_kwargs.get("rect"),
@@ -1400,6 +1610,8 @@ def predict_source(
     nms: bool | None = None,
     rect: bool = True,
     max_det: int = 300,
+    preprocess_mode: str | None = None,
+    padding_value: int | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """对单张图片、图片目录或视频运行推理并将带框结果写入 `output_dir`。
@@ -1408,7 +1620,9 @@ def predict_source(
         - 同时支持 `.pt` 源权重与已导出部署模型（`.onnx` / `.torchscript` / `.engine`）；
         - `imgsz` 支持正整数（方形）或 `(高, 宽)` 矩形二元组；
         - `nms` 仅对 `.pt` 权重生效（`None`=默认 `one2many` + 外部 NMS，`False`=YOLO26 `one2one` 无 NMS）；
-        - `rect=True` 为最小矩形填充（PT 默认），`rect=False` 为严格按 `imgsz` 补灰边固定尺寸填充。
+        - `rect=True` 为最小矩形填充（PT 默认），`rect=False` 为严格按 `imgsz` 补灰边固定尺寸填充；
+        - `preprocess_mode` / `padding_value` 支持复现 `letterbox_center` / `letterbox_top_left` / `stretch`
+          预处理契约；已导出模型未显式传入时自动沿用其内嵌元数据中的预处理设置。
 
     输出与内存约束：
         视频输入交由 Ultralytics 写出至 `output_dir / "predict"`；
@@ -1427,6 +1641,14 @@ def predict_source(
     except Exception:
         meta = None
 
+    is_exported = is_exported_model_path(weights_path)
+    mode_key, resize_mode, pad_align, pad_val = resolve_effective_predict_preprocess(
+        is_exported=is_exported,
+        preprocess_mode=preprocess_mode,
+        padding_value=padding_value,
+        metadata=meta,
+    )
+
     is_video = source_path.is_file() and source_path.suffix.lower() in VIDEO_EXTENSIONS
     pred_kwargs, warnings = build_predict_kwargs(
         weights_path,
@@ -1438,13 +1660,22 @@ def predict_source(
         nms=nms,
         rect=rect,
         max_det=max_det,
+        preprocess_mode=mode_key,
+        padding_value=pad_val,
         is_video=is_video,
         output_dir=output_dir,
         metadata=meta,
     )
     _emit_multiline_log(
         log_callback,
-        format_submitted_predict_config(weights_path, pred_kwargs, metadata=meta, warnings=warnings),
+        format_submitted_predict_config(
+            weights_path,
+            pred_kwargs,
+            metadata=meta,
+            preprocess_mode=mode_key,
+            padding_value=pad_val,
+            warnings=warnings,
+        ),
     )
 
     from ultralytics import YOLO
@@ -1453,18 +1684,38 @@ def predict_source(
     ensure_torch_cpu_threads()
     model = YOLO(str(weights_path))
 
+    # 仅当预处理偏离 Ultralytics 默认居中灰边 114 LetterBox 且为目标检测任务时，启用自定义预处理预测器
+    call_kwargs = dict(pred_kwargs)
+    needs_custom_pre = mode_key != DEFAULT_EXPORT_PREPROCESS_MODE or (
+        pad_val is not None and pad_val != DEFAULT_EXPORT_PADDING_VALUE
+    )
+    if needs_custom_pre:
+        model_task = str(getattr(model, "task", "") or (meta.task if meta else "") or "detect").lower()
+        if model_task == "detect":
+            try:
+                call_kwargs["predictor"] = _build_custom_preprocess_predictor(
+                    resize_mode=resize_mode,
+                    padding_align=pad_align,
+                    padding_value=pad_val if pad_val is not None else DEFAULT_EXPORT_PADDING_VALUE,
+                )
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[提示] 自定义预处理预测器加载失败，已回退默认预处理: {exc}")
+        elif log_callback:
+            log_callback(f"[提示] 当前任务 ({model_task}) 暂不支持自定义预处理预览，已使用 Ultralytics 默认预处理。")
+
     saved_outputs: list[Path] = []
     with capture_thread_output(log_callback):
         if is_video:
             save_dir: Path | None = None
-            for r in model.predict(**pred_kwargs):
+            for r in model.predict(**call_kwargs):
                 if save_dir is None and getattr(r, "save_dir", None):
                     save_dir = Path(r.save_dir)
             if save_dir is not None:
                 saved_outputs = sorted(save_dir.glob("*"))
         else:
             used_names: set[str] = set()
-            for idx, r in enumerate(model.predict(**pred_kwargs), start=1):
+            for idx, r in enumerate(model.predict(**call_kwargs), start=1):
                 plotted = r.plot()
                 src = Path(r.path) if getattr(r, "path", None) else Path(f"pred_{idx}.jpg")
                 out_file = _unique_pred_path(output_dir, src, used_names)
@@ -1524,6 +1775,10 @@ class WeightsMetadata:
         `export_nms_mode`：已导出模型固化的后处理模式（`"raw"` / `"end2end"` / `"embedded"`），未知或 `.pt` 时为 `None`。
         `export_dynamic`：已导出模型是否支持动态输入维度；未知或 `.pt` 时为 `None`。
         `export_batch`：已导出模型记录的批大小；未知或 `.pt` 时为 `None`。
+        `deploy_schema`：已导出 ONNX 模型写入的 YoloStudio 部署元数据协议版本（如 `"yolostudio.deploy.v1"`）。
+        `preprocess_mode`：已导出 ONNX 模型元数据记录的预处理策略键名（`"letterbox_center"` / `"letterbox_top_left"` / `"stretch"`）。
+        `preprocess_padding_value`：已导出 ONNX 模型元数据记录的 LetterBox 补边灰度（`0 ~ 255`；`stretch` 或未知为 `None`）。
+        `preprocess_auto_rect`：已导出 ONNX 模型元数据记录的是否允许动态最小矩形缩放（`True` / `False` / `None`）。
     """
 
     weights_path: Path
@@ -1540,6 +1795,10 @@ class WeightsMetadata:
     export_nms_mode: str | None = None
     export_dynamic: bool | None = None
     export_batch: int | None = None
+    deploy_schema: str | None = None
+    preprocess_mode: str | None = None
+    preprocess_padding_value: int | None = None
+    preprocess_auto_rect: bool | None = None
 
     @property
     def max_stride(self) -> int:
@@ -1572,6 +1831,11 @@ class ExportConfig:
         `half`：是否以 FP16 半精度导出（ONNX 在 CPU 上导出或设备为 CPU 时不支持并自动忽略）。
         `device`：导出计算设备标识（如 `"0"` 或 `"cpu"`；ONNX 导出固定切至 `"cpu"` 规避图追踪设备冲突）。
         `workspace`：TensorRT 工作空间大小（GiB，仅 `engine` 格式生效；为 `None` 时使用默认值）。
+        `preprocess_mode`：写入 ONNX 部署元数据的预处理策略（`"letterbox_center"` / `"letterbox_top_left"` / `"stretch"`），
+            仅作用于 ONNX 元数据，供下游推理端读取以统一前处理，不改动 Ultralytics 导出计算图。
+        `padding_value`：写入 ONNX 部署元数据的 LetterBox 补边灰度值（`0 ~ 255`，默认 `114`；`stretch` 时忽略）。
+        `preprocess_auto_rect`：写入 ONNX 部署元数据的 `auto_rect` 标志；为 `None` 时自动按
+            `dynamic and preprocess_mode != "stretch"` 推导。
         `extra_args`：透传给 `model.export()` 的附加参数字典，同名键优先级高于结构化字段。
     """
 
@@ -1589,6 +1853,9 @@ class ExportConfig:
     half: bool = False
     device: str = "0"
     workspace: float | None = None
+    preprocess_mode: str = DEFAULT_EXPORT_PREPROCESS_MODE
+    padding_value: int = DEFAULT_EXPORT_PADDING_VALUE
+    preprocess_auto_rect: bool | None = None
     extra_args: dict[str, object] = field(default_factory=dict)
 
 
@@ -1869,6 +2136,83 @@ def _inspect_exported_model_metadata(model_path: Path) -> WeightsMetadata:
         if export_dynamic is None and onnx_dyn is not None:
             export_dynamic = onnx_dyn
 
+    # 解析 YoloStudio 写入的 ONNX 部署预处理契约（优先 JSON 总包，缺失时回退扁平键）
+    deploy_schema: str | None = None
+    preprocess_mode: str | None = None
+    preprocess_padding_value: int | None = None
+    preprocess_auto_rect: bool | None = None
+
+    deploy_json_raw = raw_meta.get(ONNX_DEPLOY_META_JSON_KEY)
+    deploy_obj: Mapping[str, object] = {}
+    if isinstance(deploy_json_raw, str) and deploy_json_raw.strip():
+        try:
+            loaded_json = json.loads(deploy_json_raw)
+            if isinstance(loaded_json, Mapping):
+                deploy_obj = loaded_json
+        except Exception:
+            deploy_obj = {}
+
+    if deploy_obj:
+        schema_val = deploy_obj.get("schema")
+        if isinstance(schema_val, str) and schema_val.strip():
+            deploy_schema = schema_val.strip()
+
+        pre_obj = deploy_obj.get("preprocess")
+        if isinstance(pre_obj, Mapping):
+            rm = str(pre_obj.get("resize_mode") or "").strip().lower()
+            pa = str(pre_obj.get("padding_align") or "").strip().lower()
+            if rm == "stretch":
+                preprocess_mode = "stretch"
+            elif rm == "letterbox":
+                preprocess_mode = "letterbox_top_left" if pa == "top_left" else "letterbox_center"
+            raw_pv = pre_obj.get("padding_value")
+            if raw_pv is not None and not isinstance(raw_pv, bool):
+                try:
+                    preprocess_padding_value = normalize_padding_value(int(raw_pv))  # type: ignore[arg-type]
+                except Exception:
+                    preprocess_padding_value = None
+            raw_ar = pre_obj.get("auto_rect")
+            if isinstance(raw_ar, bool):
+                preprocess_auto_rect = raw_ar
+
+        # 若基础字段缺失，从 JSON 总包补全类别与后处理模式
+        if not class_names:
+            class_names = _extract_class_names(deploy_obj.get("classes"))
+        if export_nms_mode is None:
+            post_obj = deploy_obj.get("postprocess")
+            if isinstance(post_obj, Mapping):
+                om = str(post_obj.get("output_mode") or "").strip().lower()
+                if om in {"raw", "end2end", "embedded"}:
+                    export_nms_mode = om
+                    supports_end2end = om == "end2end"
+                    one2many_available = om != "end2end"
+
+    if deploy_schema is None:
+        raw_schema = raw_meta.get("deploy_schema")
+        if isinstance(raw_schema, str) and raw_schema.strip():
+            deploy_schema = raw_schema.strip()
+
+    if preprocess_mode is None:
+        flat_rm = str(raw_meta.get("preprocess_resize_mode") or "").strip().lower()
+        flat_pa = str(raw_meta.get("preprocess_padding_align") or "").strip().lower()
+        if flat_rm == "stretch":
+            preprocess_mode = "stretch"
+        elif flat_rm == "letterbox":
+            preprocess_mode = "letterbox_top_left" if flat_pa == "top_left" else "letterbox_center"
+
+    if preprocess_padding_value is None and preprocess_mode != "stretch":
+        flat_pv = _parse_metadata_literal(raw_meta.get("preprocess_padding_value"))
+        if isinstance(flat_pv, int) and not isinstance(flat_pv, bool):
+            try:
+                preprocess_padding_value = normalize_padding_value(flat_pv)
+            except Exception:
+                preprocess_padding_value = None
+
+    if preprocess_auto_rect is None and "preprocess_auto_rect" in raw_meta:
+        flat_ar = _parse_metadata_literal(raw_meta.get("preprocess_auto_rect"))
+        if isinstance(flat_ar, bool):
+            preprocess_auto_rect = flat_ar
+
     return WeightsMetadata(
         weights_path=model_path,
         task=task,
@@ -1884,6 +2228,10 @@ def _inspect_exported_model_metadata(model_path: Path) -> WeightsMetadata:
         export_nms_mode=export_nms_mode,
         export_dynamic=export_dynamic,
         export_batch=export_batch,
+        deploy_schema=deploy_schema,
+        preprocess_mode=preprocess_mode,
+        preprocess_padding_value=preprocess_padding_value,
+        preprocess_auto_rect=preprocess_auto_rect,
     )
 
 
@@ -2028,8 +2376,16 @@ def format_weights_metadata_log(meta: WeightsMetadata) -> str:
             f"  任务类型: {task_text}",
             f"  导出输入尺寸: {imgsz_text}（{dyn_desc}{batch_suffix}）",
             f"  固化输出头: {head_text}",
-            f"  类别顺序 ({meta.num_classes} 类): {format_class_order(meta.class_names)}",
         ]
+        if meta.preprocess_mode:
+            pre_desc = format_preprocess_summary(
+                meta.preprocess_mode,
+                meta.preprocess_padding_value,
+                auto_rect=meta.preprocess_auto_rect,
+            )
+            schema_suffix = f" [{meta.deploy_schema}]" if meta.deploy_schema else ""
+            lines.append(f"  预处理契约: {pre_desc}, RGB, 0~1{schema_suffix}")
+        lines.append(f"  类别顺序 ({meta.num_classes} 类): {format_class_order(meta.class_names)}")
         return "\n".join(lines)
 
     if meta.supports_end2end and meta.one2many_available:
@@ -2167,6 +2523,31 @@ def describe_export_io(
             cls_hint = "cx,cy,w,h+各类分数"
         out_desc = f"输出 output0: ({batch_dim}, {ch_text}, {anchors_text}) [{cls_hint}，需外部NMS]"
 
+    mode_key, resize_mode, _pad_align, pad_val = resolve_preprocess_spec(
+        config.preprocess_mode, config.padding_value
+    )
+    is_non_default_pre = mode_key != DEFAULT_EXPORT_PREPROCESS_MODE or (
+        pad_val is not None and pad_val != DEFAULT_EXPORT_PADDING_VALUE
+    )
+    if fmt == "onnx":
+        effective_auto_rect = (
+            bool(config.preprocess_auto_rect)
+            if config.preprocess_auto_rect is not None
+            else (bool(config.dynamic) and resize_mode == "letterbox")
+        )
+        if resize_mode == "stretch":
+            effective_auto_rect = False
+        pre_desc = format_preprocess_summary(mode_key, pad_val, auto_rect=effective_auto_rect)
+        if is_non_default_pre:
+            warnings.append(
+                "当前预处理策略偏离 YOLO 默认训练设置（居中 LetterBox + 灰边 114），"
+                "将写入 ONNX 元数据供推理端按此执行，请注意评估检测精度变化。"
+            )
+        return f"{in_desc}  |  {out_desc}  |  预处理元数据: {pre_desc}", warnings
+
+    if is_non_default_pre or config.preprocess_auto_rect is not None:
+        warnings.append(f"自定义预处理元数据写入仅对 ONNX 格式生效，当前格式 '{fmt}' 已忽略。")
+
     return f"{in_desc}  |  {out_desc}", warnings
 
 
@@ -2182,7 +2563,8 @@ def build_export_kwargs(
         - `onnx` 固定使用 `device="cpu"` 以规避部分环境下的图追踪设备冲突；
         - `opset` 与 `simplify` 仅在 ONNX 系列后端格式中传入，避免 `torchscript` 触发 Ultralytics 参数校验异常；
         - 启用 FP16 且非 CPU 时，在支持 `quantize` 的 Ultralytics 8.4+ 环境中传 `quantize=16` 以消除 `half` 废弃告警；
-        - 未显式传入 `imgsz` 时优先使用权重记录的 `train_imgsz`，两者均缺失时交由 Ultralytics 默认推导。
+        - 未显式传入 `imgsz` 时优先使用权重记录的 `train_imgsz`，两者均缺失时交由 Ultralytics 默认推导；
+        - 同步校验 `preprocess_mode` 与 `padding_value` 合法性（不透传给 Ultralytics `model.export`，而在 ONNX 导出后写入元数据）。
     """
     fmt = normalize_export_format(config.export_format)
     warnings: list[str] = []
@@ -2196,6 +2578,11 @@ def build_export_kwargs(
         raise ValueError(f"最大检测框数 max_det 必须 >= 1，当前值: {max_det}")
 
     nms_val = parse_export_nms_mode(config.nms)
+    mode_key, _resize_mode, _pad_align, pad_val = resolve_preprocess_spec(
+        config.preprocess_mode, config.padding_value
+    )
+    if mode_key != "stretch":
+        normalize_padding_value(config.padding_value)
 
     opset: int | None = None
     if config.opset is not None:
@@ -2273,10 +2660,219 @@ def build_export_kwargs(
             else:
                 export_kwargs["half"] = True
 
+    if fmt != "onnx" and (
+        mode_key != DEFAULT_EXPORT_PREPROCESS_MODE
+        or (pad_val is not None and pad_val != DEFAULT_EXPORT_PADDING_VALUE)
+        or config.preprocess_auto_rect is not None
+    ):
+        warnings.append(f"自定义预处理元数据写入仅对 ONNX 格式生效，当前格式 '{fmt}' 已忽略。")
+
     if config.extra_args:
         export_kwargs.update(config.extra_args)
 
     return export_kwargs, warnings
+
+
+def build_onnx_deploy_metadata(
+    config: ExportConfig,
+    *,
+    metadata: WeightsMetadata | None = None,
+    input_name: str = "images",
+    output_name: str = "output0",
+    input_dtype: str = "float32",
+    actual_imgsz: tuple[int, int] | None = None,
+) -> tuple[dict[str, object], dict[str, str]]:
+    """根据 `ExportConfig` 与权重元数据生成写入 ONNX `metadata_props` 的部署契约字典与扁平键值表。
+
+    协议版本：
+        `yolostudio.deploy.v1`（详见 `docs/004_ONNX部署元数据契约说明.md`）。
+        返回 `(deploy_payload, flat_props)`：
+        - `deploy_payload` 为标准结构化字典（序列化后写入 `yolostudio_deploy_meta`）；
+        - `flat_props` 为不与 Ultralytics / `BaseBackend` 冲突的 `map<str, str>` 键值表，
+          可直接写入 ONNX `metadata_props` 供下游推理端读取。
+    """
+    max_stride = metadata.max_stride if metadata is not None else 32
+    channels = metadata.channels if metadata is not None else 3
+    task = (metadata.task if metadata is not None and metadata.task else "") or "detect"
+    classes = [name for _, name in metadata.class_names] if metadata is not None else []
+
+    if actual_imgsz is not None:
+        h, w = actual_imgsz
+    else:
+        raw_imgsz = resolve_export_imgsz(config, metadata)
+        h, w = align_imgsz_to_stride(raw_imgsz, max_stride=max_stride) if raw_imgsz is not None else (640, 640)
+
+    mode_key, resize_mode, padding_align, pad_val = resolve_preprocess_spec(
+        config.preprocess_mode, config.padding_value
+    )
+    is_dynamic = bool(config.dynamic)
+    if resize_mode == "stretch":
+        auto_rect = False
+    elif config.preprocess_auto_rect is not None:
+        auto_rect = bool(config.preprocess_auto_rect) and is_dynamic
+    else:
+        auto_rect = is_dynamic
+
+    nms_val = parse_export_nms_mode(config.nms)
+    effective_end2end = False
+    if nms_val is False:
+        effective_end2end = metadata is None or metadata.supports_end2end
+    elif metadata is not None and not metadata.one2many_available and metadata.supports_end2end:
+        effective_end2end = True
+
+    if effective_end2end:
+        output_mode = "end2end"
+        nms_required = False
+        box_format = "xyxy"
+        max_det_out: int | None = int(config.max_det)
+        embedded_conf: float | None = None
+        embedded_iou: float | None = None
+    elif nms_val is True:
+        output_mode = "embedded"
+        nms_required = False
+        box_format = "xyxy"
+        max_det_out = int(config.max_det)
+        embedded_conf = float(config.conf) if config.conf is not None else 0.25
+        embedded_iou = float(config.iou) if config.iou is not None else 0.50
+    else:
+        output_mode = "raw"
+        nms_required = True
+        box_format = "xywh"
+        max_det_out = None
+        embedded_conf = None
+        embedded_iou = None
+
+    deploy_payload: dict[str, object] = {
+        "schema": ONNX_DEPLOY_SCHEMA_VERSION,
+        "task": task,
+        "input": {
+            "name": input_name,
+            "layout": "NCHW",
+            "dtype": input_dtype,
+            "batch": int(config.batch),
+            "channels": int(channels),
+            "height": int(h),
+            "width": int(w),
+            "dynamic": is_dynamic,
+            "stride": int(max_stride),
+            "color_format": "RGB",
+            "value_range": [0.0, 1.0],
+            "mean": [0.0, 0.0, 0.0],
+            "std": [255.0, 255.0, 255.0],
+        },
+        "preprocess": {
+            "mode": mode_key,
+            "resize_mode": resize_mode,
+            "padding_align": padding_align,
+            "padding_value": pad_val,
+            "auto_rect": auto_rect,
+            "interpolation": "linear",
+            "scale_up": True,
+        },
+        "postprocess": {
+            "output_name": output_name,
+            "output_mode": output_mode,
+            "nms_required": nms_required,
+            "box_format": box_format,
+            "box_coord_space": "input_pixels",
+            "max_det": max_det_out,
+            "embedded_conf": embedded_conf,
+            "embedded_iou": embedded_iou,
+        },
+        "classes": classes,
+    }
+
+    flat_props: dict[str, str] = {
+        "deploy_schema": ONNX_DEPLOY_SCHEMA_VERSION,
+        "preprocess_mode": mode_key,
+        "preprocess_resize_mode": resize_mode,
+        "preprocess_padding_align": padding_align,
+        "preprocess_padding_value": "" if pad_val is None else str(pad_val),
+        "preprocess_auto_rect": "true" if auto_rect else "false",
+        "preprocess_color_format": "RGB",
+        "preprocess_input_layout": "NCHW",
+        "preprocess_normalize": "0_1",
+        "preprocess_interpolation": "linear",
+        "postprocess_output_mode": output_mode,
+        "postprocess_nms_required": "true" if nms_required else "false",
+        "postprocess_box_format": box_format,
+        "postprocess_box_coord_space": "input_pixels",
+        ONNX_DEPLOY_META_JSON_KEY: json.dumps(deploy_payload, ensure_ascii=False, separators=(",", ":")),
+    }
+    return deploy_payload, flat_props
+
+
+def write_onnx_deploy_metadata(
+    onnx_path: Path,
+    config: ExportConfig,
+    *,
+    metadata: WeightsMetadata | None = None,
+) -> dict[str, object]:
+    """将预处理与后处理部署契约写入已导出的 `.onnx` 文件 `metadata_props` 中（保留 Ultralytics 原有字段）。
+
+    调用条件与失败方式：
+        - 要求 `onnx_path` 为有效的本地 ONNX 文件且已安装 `onnx` 库；
+        - 自动从 ONNX 真实输入/输出节点提取张量名称、数据类型与静态分辨率，避免元数据与计算图不一致；
+        - 文件缺失抛出 `FileNotFoundError`，ONNX 文件损坏或无法解析/保存时抛出中文 `ValueError`。
+    """
+    if not onnx_path.is_file():
+        raise FileNotFoundError(f"ONNX 模型文件不存在: {onnx_path}")
+
+    try:
+        import onnx
+    except Exception as exc:
+        raise ValueError(f"未安装 onnx 依赖，无法写入 ONNX 部署元数据: {exc}") from exc
+
+    try:
+        proto = onnx.load(str(onnx_path))
+    except Exception as exc:
+        raise ValueError(f"无法读取 ONNX 模型文件以写入元数据 ({onnx_path.name}): {exc}") from exc
+
+    input_name = "images"
+    output_name = "output0"
+    input_dtype = "float32"
+    actual_imgsz: tuple[int, int] | None = None
+
+    elem_type_map = {1: "float32", 10: "float16", 2: "uint8", 11: "float64"}
+    if proto.graph.input:
+        in0 = proto.graph.input[0]
+        if in0.name:
+            input_name = in0.name
+        tt = in0.type.tensor_type
+        input_dtype = elem_type_map.get(int(tt.elem_type), "float32")
+        dims = tt.shape.dim
+        if len(dims) >= 4:
+            h_dim = int(dims[2].dim_value or 0)
+            w_dim = int(dims[3].dim_value or 0)
+            if h_dim > 0 and w_dim > 0 and not dims[2].dim_param and not dims[3].dim_param:
+                actual_imgsz = (h_dim, w_dim)
+    if proto.graph.output and proto.graph.output[0].name:
+        output_name = proto.graph.output[0].name
+
+    deploy_payload, flat_props = build_onnx_deploy_metadata(
+        config,
+        metadata=metadata,
+        input_name=input_name,
+        output_name=output_name,
+        input_dtype=input_dtype,
+        actual_imgsz=actual_imgsz,
+    )
+
+    existing_props = {entry.key: entry for entry in proto.metadata_props}
+    for key, val in flat_props.items():
+        if key in existing_props:
+            existing_props[key].value = val
+        else:
+            item = proto.metadata_props.add()
+            item.key = key
+            item.value = val
+
+    try:
+        onnx.save(proto, str(onnx_path))
+    except Exception as exc:
+        raise ValueError(f"写回 ONNX 部署元数据失败 ({onnx_path.name}): {exc}") from exc
+
+    return deploy_payload
 
 
 def format_submitted_export_config(
@@ -2309,6 +2905,7 @@ def export_model_with_config(
     行为说明：
         - 导出前先只读探测权重元数据（训练尺寸、类别顺序、检测头能力）并输出至 `log_callback`；
         - 若 `config.imgsz` 为 `None` 且权重记录了训练尺寸，则自动沿用训练尺寸；
+        - 导出为 `.onnx` 时，自动向 ONNX `metadata_props` 追加写入预处理与后处理部署契约（保留 Ultralytics 原有字段）；
         - 产物生成在源权重同目录并返回其路径；权重缺失时抛出 `FileNotFoundError`，参数非法时抛出 `ValueError`。
     """
     if not config.weights_path.is_file():
@@ -2352,7 +2949,25 @@ def export_model_with_config(
     model = YOLO(str(config.weights_path))
     with capture_thread_output(log_callback):
         exported = model.export(**export_kwargs)
-    return Path(str(exported))
+    exported_path = Path(str(exported))
+
+    if exported_path.suffix.lower() == ".onnx" and exported_path.is_file():
+        try:
+            payload = write_onnx_deploy_metadata(exported_path, config, metadata=meta)
+            pre_map = payload.get("preprocess", {})
+            post_map = payload.get("postprocess", {})
+            if log_callback and isinstance(pre_map, Mapping) and isinstance(post_map, Mapping):
+                log_callback(
+                    f"[部署元数据] 已写入 ONNX ({ONNX_DEPLOY_SCHEMA_VERSION}): "
+                    f"preprocess={pre_map.get('resize_mode')}/{pre_map.get('padding_align')}"
+                    f"(pad={pre_map.get('padding_value')}, auto_rect={pre_map.get('auto_rect')}), "
+                    f"postprocess={post_map.get('output_mode')}/{post_map.get('box_format')}"
+                )
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[警告] 写入 ONNX 部署元数据失败（模型文件已保留）: {exc}")
+
+    return exported_path
 
 
 def export_model(
@@ -2371,13 +2986,17 @@ def export_model(
     opset: int | None = None,
     simplify: bool = True,
     workspace: float | None = None,
+    preprocess_mode: str = DEFAULT_EXPORT_PREPROCESS_MODE,
+    padding_value: int = DEFAULT_EXPORT_PADDING_VALUE,
+    preprocess_auto_rect: bool | None = None,
     extra_args: Mapping[str, object] | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> Path:
     """将已训练的 YOLO26 `.pt` 权重导出为指定部署格式（`onnx`、`torchscript`、`engine` 等）。
 
     当 `imgsz` 为 `None` 时自动沿用权重中记录的训练尺寸；当 `export_format == "onnx"` 时固定使用
-    `"cpu"` 设备导出以规避图追踪设备冲突（此时忽略 FP16）。产物生成在源权重同目录并返回其路径，
+    `"cpu"` 设备导出以规避图追踪设备冲突（此时忽略 FP16），并自动将 `preprocess_mode`、`padding_value`
+    等预处理与后处理契约写入 ONNX `metadata_props`。产物生成在源权重同目录并返回其路径，
     权重缺失时抛出 `FileNotFoundError`，参数非法时抛出 `ValueError`。
     """
     cfg = ExportConfig(
@@ -2395,6 +3014,9 @@ def export_model(
         half=half,
         device=device,
         workspace=workspace,
+        preprocess_mode=preprocess_mode,
+        padding_value=padding_value,
+        preprocess_auto_rect=preprocess_auto_rect,
         extra_args=dict(extra_args or {}),
     )
     return export_model_with_config(cfg, log_callback=log_callback)
