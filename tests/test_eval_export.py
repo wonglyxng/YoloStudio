@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -417,7 +418,10 @@ def test_export_model_with_config_and_cli_export(
         def export(self, **kwargs: object) -> str:
             captured_calls.append(dict(kwargs))
             out = pt_file.with_suffix(".onnx")
-            out.write_bytes(b"onnx")
+            # 提供真实可读的 ONNX 容器，覆盖提交参数到部署元数据的写回。
+            import onnx
+
+            onnx.save(onnx.ModelProto(), str(out))
             return str(out)
 
     fake_ultra = types.ModuleType("ultralytics")
@@ -518,6 +522,15 @@ def test_export_model_with_config_and_cli_export(
     assert captured_calls[-1]["imgsz"] == [544, 960]
     assert captured_calls[-1]["nms"] is False
     assert captured_calls[-1]["opset"] == 17
+
+    with pytest.raises(ValueError, match="写入失败"):
+        with monkeypatch.context() as scoped:
+
+            def reject_write(*args, **kwargs):
+                raise ValueError("写入失败")
+
+            scoped.setattr(trainer_module, "write_onnx_deploy_metadata", reject_write)
+            export_model(pt_file, export_format="onnx")
 
     # 4) CLI 非法参数返回退出码 2；export_model_with_config 对缺失权重抛出 FileNotFoundError
     assert cli_main(["export", "-w", str(pt_file), "--imgsz", "not_a_size"]) == 2
@@ -789,13 +802,19 @@ def test_build_predict_and_val_kwargs_pt_and_exported_models(tmp_path: Path) -> 
     assert any("固定使用导出尺寸" in w for w in w_onnx_st)
     assert any("忽略额外指定" in w for w in w_onnx_st)
 
-    # 3) 动态 embedded ONNX 保留传入尺寸与 rect，并提示图内 NMS 阈值约束
+    # 3) 旧动态 ONNX 保留传入尺寸与 rect，新部署声明则决定参考画布和步长填充。
     kw_onnx_dyn, w_onnx_dyn = build_predict_kwargs(
         onnx_file, src_img, imgsz=800, rect=True, metadata=onnx_dyn_emb
     )
     assert kw_onnx_dyn["imgsz"] == 800
     assert kw_onnx_dyn["rect"] is True
     assert any("图内嵌入 NMS" in w for w in w_onnx_dyn)
+    declared = replace(
+        onnx_dyn_emb, deploy_schema=ONNX_DEPLOY_SCHEMA_VERSION, train_imgsz=(576, 960), preprocess_auto_rect=True
+    )
+    declared_kwargs, _ = build_predict_kwargs(onnx_file, src_img, imgsz=640, rect=False, metadata=declared)
+    assert declared_kwargs["imgsz"] == [576, 960]
+    assert declared_kwargs["rect"] is True
 
     # 4) 验证参数：矩形尺寸自动关闭 rect=False；TensorRT CPU 下推理/验证均拦截
     kw_val_rect, w_val_rect = build_val_kwargs(
@@ -1412,6 +1431,7 @@ def test_onnx_deploy_metadata_builder_cli_and_inspection(
     )
     meta_from_json = inspect_weights_metadata(onnx_file)
     assert meta_from_json.deploy_schema == ONNX_DEPLOY_SCHEMA_VERSION
+    assert meta_from_json.export_nms_mode == payload_tl["postprocess"]["output_mode"]
     assert meta_from_json.preprocess_mode == "letterbox_top_left"
     assert meta_from_json.preprocess_padding_value == 0
     assert meta_from_json.preprocess_auto_rect is False

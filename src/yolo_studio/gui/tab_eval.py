@@ -56,6 +56,7 @@ from yolo_studio.core.trainer import (
     EXPORT_OPSET_OPTIONS,
     EXPORT_PREPROCESS_MODES,
     ONNX_BACKED_EXPORT_FORMATS,
+    ONNX_DEPLOY_SCHEMA_VERSION,
     PREDICT_HEAD_KEY_TO_NMS,
     PREDICT_HEAD_MODES,
     PREDICT_PAD_MODES,
@@ -1120,10 +1121,12 @@ class EvalTab(QWidget):
                         else DEFAULT_EXPORT_PADDING_VALUE
                     )
                 )
-            if static_exported and meta is not None and meta.train_imgsz is not None:
+            if meta is not None and meta.train_imgsz is not None and (
+                static_exported or meta.deploy_schema == ONNX_DEPLOY_SCHEMA_VERSION
+            ):
                 mh, mw = meta.train_imgsz
                 imgsz: int | tuple[int, int] = mh if mh == mw else (mh, mw)
-                rect = False
+                rect = bool(meta.export_dynamic and meta.preprocess_auto_rect)
             else:
                 pad_mode = str(self.pred_pad_combo.currentData() or "rect")
                 if pad_mode == "export":
@@ -1239,7 +1242,17 @@ class EvalTab(QWidget):
 
             # 2) 静态导出模型或 Stretch 拉伸导出模型锁定 ImgSz / 输入填充下拉框
             exported_stretch = is_exported and meta is not None and meta.preprocess_mode == "stretch"
-            if static_exported:
+            if (
+                is_exported
+                and meta is not None
+                and meta.export_dynamic
+                and meta.deploy_schema == ONNX_DEPLOY_SCHEMA_VERSION
+            ):
+                self.imgsz_spin.setEnabled(False)
+                self.pred_pad_combo.setEnabled(False)
+                self.imgsz_spin.setToolTip("动态 ONNX 推理采用模型记录的参考尺寸")
+                self.pred_pad_combo.setToolTip("按 ONNX 中的预处理策略和步长计算每帧填充")
+            elif static_exported:
                 self.imgsz_spin.setEnabled(False)
                 self.imgsz_spin.setToolTip(
                     f"当前静态 {meta.model_format.upper() if meta else ''} 模型固定使用导出尺寸 "

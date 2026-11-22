@@ -26,8 +26,9 @@ import math
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from threading import Event
 
 import cv2
@@ -1521,6 +1522,12 @@ def build_predict_kwargs(
                         "推理时将自动按该固定尺寸填充。"
                     )
                 pred_kwargs["imgsz"] = mh if mh == mw else [mh, mw]
+        if metadata is not None and metadata.deploy_schema == ONNX_DEPLOY_SCHEMA_VERSION and metadata.export_dynamic:
+            if metadata.train_imgsz is not None:
+                height, width = metadata.train_imgsz
+                pred_kwargs["imgsz"] = height if height == width else [height, width]
+            if metadata.preprocess_auto_rect is not None:
+                pred_kwargs["rect"] = resize_mode != "stretch" and metadata.preprocess_auto_rect
         if metadata is not None and metadata.export_nms_mode == "embedded":
             warnings.append(
                 "当前导出模型已在计算图内嵌入 NMS；若导出时图内 NMS Conf 高于当前 Conf，无法召回已被图内滤除的目标。"
@@ -2175,17 +2182,23 @@ def _inspect_exported_model_metadata(model_path: Path) -> WeightsMetadata:
             if isinstance(raw_ar, bool):
                 preprocess_auto_rect = raw_ar
 
-        # 若基础字段缺失，从 JSON 总包补全类别与后处理模式
+        # 部署声明记录实际导出输入和输出；原生字段继续服务于没有该声明的旧模型。
+        inp = deploy_obj.get("input")
+        if isinstance(inp, Mapping):
+            reference = _extract_imgsz_pair([inp.get("height"), inp.get("width")])
+            if reference is not None:
+                imgsz = reference
+            if isinstance(inp.get("dynamic"), bool):
+                export_dynamic = inp["dynamic"]
         if not class_names:
             class_names = _extract_class_names(deploy_obj.get("classes"))
-        if export_nms_mode is None:
-            post_obj = deploy_obj.get("postprocess")
-            if isinstance(post_obj, Mapping):
-                om = str(post_obj.get("output_mode") or "").strip().lower()
-                if om in {"raw", "end2end", "embedded"}:
-                    export_nms_mode = om
-                    supports_end2end = om == "end2end"
-                    one2many_available = om != "end2end"
+        post_obj = deploy_obj.get("postprocess")
+        if isinstance(post_obj, Mapping):
+            om = str(post_obj.get("output_mode") or "").strip().lower()
+            if om in {"raw", "end2end", "embedded"}:
+                export_nms_mode = om
+                supports_end2end = om == "end2end"
+                one2many_available = om != "end2end"
 
     if deploy_schema is None:
         raw_schema = raw_meta.get("deploy_schema")
@@ -2867,10 +2880,16 @@ def write_onnx_deploy_metadata(
             item.key = key
             item.value = val
 
+    # 在同目录完成序列化后再替换，写入失败时保留导出器生成的原文件以便诊断。
+    with NamedTemporaryFile(dir=onnx_path.parent, suffix=".onnx", delete=False) as handle:
+        staged = Path(handle.name)
     try:
-        onnx.save(proto, str(onnx_path))
+        onnx.save(proto, str(staged))
+        staged.replace(onnx_path)
     except Exception as exc:
         raise ValueError(f"写回 ONNX 部署元数据失败 ({onnx_path.name}): {exc}") from exc
+    finally:
+        staged.unlink(missing_ok=True)
 
     return deploy_payload
 
@@ -2951,21 +2970,20 @@ def export_model_with_config(
         exported = model.export(**export_kwargs)
     exported_path = Path(str(exported))
 
-    if exported_path.suffix.lower() == ".onnx" and exported_path.is_file():
-        try:
-            payload = write_onnx_deploy_metadata(exported_path, config, metadata=meta)
-            pre_map = payload.get("preprocess", {})
-            post_map = payload.get("postprocess", {})
-            if log_callback and isinstance(pre_map, Mapping) and isinstance(post_map, Mapping):
-                log_callback(
-                    f"[部署元数据] 已写入 ONNX ({ONNX_DEPLOY_SCHEMA_VERSION}): "
-                    f"preprocess={pre_map.get('resize_mode')}/{pre_map.get('padding_align')}"
-                    f"(pad={pre_map.get('padding_value')}, auto_rect={pre_map.get('auto_rect')}), "
-                    f"postprocess={post_map.get('output_mode')}/{post_map.get('box_format')}"
-                )
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[警告] 写入 ONNX 部署元数据失败（模型文件已保留）: {exc}")
+    if exported_path.suffix.lower() == ".onnx":
+        # 附加参数可以覆盖表单选项，元数据必须描述真正提交给导出器的设置。
+        fields = ("imgsz", "batch", "dynamic", "nms", "max_det", "conf", "iou")
+        effective = replace(config, **{key: export_kwargs[key] for key in fields if key in export_kwargs})
+        payload = write_onnx_deploy_metadata(exported_path, effective, metadata=meta)
+        pre_map = payload.get("preprocess", {})
+        post_map = payload.get("postprocess", {})
+        if log_callback and isinstance(pre_map, Mapping) and isinstance(post_map, Mapping):
+            log_callback(
+                f"[部署元数据] 已写入 ONNX ({ONNX_DEPLOY_SCHEMA_VERSION}): "
+                f"preprocess={pre_map.get('resize_mode')}/{pre_map.get('padding_align')}"
+                f"(pad={pre_map.get('padding_value')}, auto_rect={pre_map.get('auto_rect')}), "
+                f"postprocess={post_map.get('output_mode')}/{post_map.get('box_format')}"
+            )
 
     return exported_path
 
