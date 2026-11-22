@@ -4,12 +4,12 @@
     1. 验证 `.pt` 权重与已导出部署模型（`.onnx` / `.torchscript` / `.engine`）元数据只读解析
        （训练/导出尺寸方形/矩形、有序类别清单、动态属性、检测头分支/固化模式及异常兜底）；
     2. 验证 `build_predict_kwargs` / `build_val_kwargs`、`predict_source` / `validate_model`
-       对检测头（`one2many` / `end2end`）、输入填充（`rect=True/False`）及已导出模型的传参与日志输出；
+       对检测头（`one2many` / `end2end`）、输入填充（`rect=True/False`）、紧凑防重叠半透明绘制及已导出模型的传参与日志输出；
     3. 验证 `ExportConfig` 参数规范化、`build_export_kwargs` 按格式过滤（ONNX / TorchScript / TensorRT）、
        `describe_export_io` 输入输出张量估算与风险告警，以及 `export_model_with_config` 端到端行为；
     4. 验证 CLI `export` 子命令默认沿用权重训练尺寸、`--inspect-only`、全量导出选项与非法参数退出码 `2`；
     5. 在离线 `offscreen` Qt 环境下验证 `EvalTab` 自动探测元数据并同步尺寸、推理检测头/填充与导出对齐、
-       直接加载 `.onnx` 实测联动、一键切回 `.pt` 保留自定义导出尺寸、过期异步请求隔离及 Worker 传参。
+       预览样式控件与原图放大查看、直接加载 `.onnx` 实测联动、一键切回 `.pt` 保留自定义导出尺寸、过期异步请求隔离及 Worker 传参。
 
 运行环境与协作边界：
     通过 `pytest` 离线运行，依赖 `PyQt6`；主要测试使用模拟 checkpoint/元数据、模拟 `YOLO` 及轻量假 Worker，
@@ -36,7 +36,10 @@ from yolo_studio.core.trainer import (
     ONNX_DEPLOY_SCHEMA_VERSION,
     DeviceInfo,
     ExportConfig,
+    PredictRenderConfig,
     WeightsMetadata,
+    _layout_non_overlapping_labels,
+    _rect_intersect_area,
     align_imgsz_to_stride,
     build_export_kwargs,
     build_onnx_deploy_metadata,
@@ -46,13 +49,18 @@ from yolo_studio.core.trainer import (
     export_model,
     export_model_with_config,
     format_class_order,
+    format_predict_render_summary,
     format_weights_metadata_log,
     inspect_weights_metadata,
     normalize_export_imgsz,
     normalize_padding_value,
+    normalize_predict_render_config,
     parse_export_nms_mode,
     parse_export_preprocess_mode,
+    parse_predict_line_width_mode,
+    parse_predict_render_style,
     predict_source,
+    render_predict_result,
     validate_model,
 )
 from yolo_studio.gui.tab_eval import EvalTab
@@ -1640,5 +1648,289 @@ def test_eval_tab_export_preprocess_controls_and_predict_alignment(
         assert sent_onnx["preprocess_mode"] == "stretch"
         assert sent_onnx["padding_value"] is None
         assert sent_onnx["rect"] is False
+    finally:
+        tab.close()
+
+
+def test_predict_render_compact_non_overlapping_translucent_and_modes(tmp_path: Path) -> None:
+    """验证紧凑防重叠半透明推理绘制引擎、置信度小数格式、样式切换与视频参数透传。"""
+    import numpy as np
+
+    # 1) 配置校验与摘要格式化
+    assert parse_predict_render_style(None) == "compact"
+    assert parse_predict_render_style("ultralytics") == "ultralytics"
+    assert parse_predict_line_width_mode("thin") == "thin"
+    assert parse_predict_line_width_mode("bold") == "bold"
+    with pytest.raises(ValueError, match="无效的推理绘制样式"):
+        parse_predict_render_style("unknown")
+    with pytest.raises(ValueError, match="无效的框线挡位"):
+        parse_predict_line_width_mode("huge")
+    with pytest.raises(ValueError, match="label_alpha"):
+        normalize_predict_render_config(PredictRenderConfig(label_alpha=1.5))
+
+    assert "紧凑防重叠" in format_predict_render_summary(PredictRenderConfig())
+    assert "仅画框" in format_predict_render_summary(
+        PredictRenderConfig(show_labels=False, show_conf=False)
+    )
+
+    # 2) 二维防重叠排版：12 个水平紧邻小框（标签宽远大于框宽）开启避让后应 0 重叠且不越界
+    img_w, img_h = 1024, 598
+    dense_boxes = [(120 + i * 52, 260, 120 + i * 52 + 40, 320) for i in range(12)]
+    dense_sizes = [(86, 18) for _ in dense_boxes]
+    dense_scores = [0.95 - i * 0.01 for i in range(12)]
+
+    placed_no_avoid = _layout_non_overlapping_labels(
+        dense_boxes, dense_sizes, dense_scores, img_w=img_w, img_h=img_h, avoid_overlap=False
+    )
+    overlap_before = sum(
+        _rect_intersect_area(placed_no_avoid[i], placed_no_avoid[j])
+        for i in range(len(placed_no_avoid))
+        for j in range(i + 1, len(placed_no_avoid))
+    )
+    assert overlap_before > 0
+
+    placed_avoid = _layout_non_overlapping_labels(
+        dense_boxes, dense_sizes, dense_scores, img_w=img_w, img_h=img_h, avoid_overlap=True
+    )
+    assert len(placed_avoid) == len(dense_boxes)
+    for rx1, ry1, rx2, ry2 in placed_avoid:
+        assert 0 <= rx1 < rx2 <= img_w
+        assert 0 <= ry1 < ry2 <= img_h
+    overlap_after = sum(
+        _rect_intersect_area(placed_avoid[i], placed_avoid[j])
+        for i in range(len(placed_avoid))
+        for j in range(i + 1, len(placed_avoid))
+    )
+    assert overlap_after == 0
+
+    # 3) 半透明验证：在亮底图上画单个检测框，确认标签区域像素介于纯底色与原图背景之间而非纯色覆盖
+    canvas_bg = np.full((360, 640, 3), 220, dtype=np.uint8)
+    one_box = types.SimpleNamespace(
+        xyxy=np.array([[180.0, 140.0, 230.0, 210.0]], dtype=np.float32),
+        cls=np.array([0.0], dtype=np.float32),
+        conf=np.array([0.94], dtype=np.float32),
+        is_track=False,
+    )
+    res_one = types.SimpleNamespace(orig_img=canvas_bg, boxes=one_box, names={0: "player"})
+    img_semi = render_predict_result(
+        res_one, PredictRenderConfig(style="compact", label_alpha=0.55)
+    )
+    img_opaque = render_predict_result(
+        res_one, PredictRenderConfig(style="compact", label_alpha=1.0)
+    )
+    img_box_only = render_predict_result(
+        res_one, PredictRenderConfig(style="compact", show_labels=False, show_conf=False)
+    )
+    assert img_semi.shape == canvas_bg.shape
+    assert not np.array_equal(img_semi, img_opaque)
+    # 仅画框模式不应在框上方标签带写入背景色块
+    top_strip_box_only = img_box_only[110:136, 180:270]
+    assert np.all(top_strip_box_only == 220)
+    # 有标签模式在框上方标签带应已绘制像素，且半透明比不透明更接近底图 220
+    top_strip_semi = img_semi[110:136, 180:270].astype(np.float32)
+    top_strip_opaque = img_opaque[110:136, 180:270].astype(np.float32)
+    assert float(np.abs(top_strip_semi - 220.0).mean()) > 0.5
+    assert float(np.abs(top_strip_semi - 220.0).mean()) < float(
+        np.abs(top_strip_opaque - 220.0).mean()
+    )
+
+    # 4) 覆盖中文类别名、4 种挡位及仅置信度/仅类别模式，确保不乱码不抛异常
+    cn_boxes = types.SimpleNamespace(
+        xyxy=np.array([[b[0], b[1], b[2], b[3]] for b in dense_boxes[:6]], dtype=np.float32),
+        cls=np.array([i % 2 for i in range(6)], dtype=np.float32),
+        conf=np.array([0.94, 0.87, 0.91, 0.76, 0.88, 0.95], dtype=np.float32),
+        is_track=False,
+    )
+    res_cn = types.SimpleNamespace(
+        orig_img=np.full((img_h, img_w, 3), 100, dtype=np.uint8),
+        boxes=cn_boxes,
+        names={0: "怪物", 1: "玩家"},
+    )
+    for lw_mode in ("auto", "thin", "medium", "bold"):
+        for show_l, show_c in ((True, True), (True, False), (False, True), (False, False)):
+            out_img = render_predict_result(
+                res_cn,
+                PredictRenderConfig(
+                    style="compact",
+                    line_width_mode=lw_mode,
+                    show_labels=show_l,
+                    show_conf=show_c,
+                ),
+            )
+            assert out_img.shape == (img_h, img_w, 3)
+
+    # 5) Ultralytics 默认模式与带 masks 非纯检测模式均正确透传 plot 参数；无 orig_img 桩对象兼容无参 plot
+    plot_calls: list[dict[str, object]] = []
+
+    class _RecordingResult:
+        def __init__(self, *, with_masks: bool = False) -> None:
+            self.orig_img = np.zeros((320, 480, 3), dtype=np.uint8)
+            self.boxes = one_box
+            self.names = {0: "player"}
+            self.masks = object() if with_masks else None
+
+        def plot(self, **kwargs: object) -> np.ndarray:
+            plot_calls.append(dict(kwargs))
+            return np.zeros((320, 480, 3), dtype=np.uint8)
+
+    render_predict_result(
+        _RecordingResult(),
+        PredictRenderConfig(style="ultralytics", line_width_mode="thin", show_labels=False, show_conf=True),
+    )
+    assert plot_calls[-1] == {"labels": False, "conf": True, "line_width": 1}
+
+    render_predict_result(
+        _RecordingResult(with_masks=True),
+        PredictRenderConfig(style="compact", line_width_mode="medium", show_labels=True, show_conf=False),
+    )
+    assert plot_calls[-1] == {"labels": True, "conf": False, "line_width": 2}
+
+    stub_no_args = types.SimpleNamespace(plot=lambda: np.zeros((24, 24, 3), dtype=np.uint8))
+    assert render_predict_result(stub_no_args).shape == (24, 24, 3)
+
+    # 6) 视频推理参数：compact 由引擎逐帧写出 (save=False)，ultralytics 透传 save=True 与样式参数
+    pt_file = tmp_path / "m.pt"
+    vid_file = tmp_path / "demo.mp4"
+    pt_file.write_bytes(b"pt")
+    vid_file.write_bytes(b"mp4")
+    kw_vid_compact, _ = build_predict_kwargs(
+        pt_file,
+        vid_file,
+        is_video=True,
+        output_dir=tmp_path / "out",
+        render_config=PredictRenderConfig(style="compact"),
+    )
+    assert kw_vid_compact["save"] is False
+
+    kw_vid_ultra, _ = build_predict_kwargs(
+        pt_file,
+        vid_file,
+        is_video=True,
+        output_dir=tmp_path / "out",
+        render_config=PredictRenderConfig(
+            style="ultralytics", line_width_mode="thin", show_labels=True, show_conf=False
+        ),
+    )
+    assert kw_vid_ultra["save"] is True
+    assert kw_vid_ultra["show_labels"] is True
+    assert kw_vid_ultra["show_conf"] is False
+    assert kw_vid_ultra["line_width"] == 1
+
+
+def test_eval_tab_predict_render_controls_and_zoom_preview(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证第 6 页推理预览样式控件、Worker `render_config` 透传与原图放大查看按钮联动。"""
+    import cv2
+    import numpy as np
+
+    pt_file = tmp_path / "best.pt"
+    img_file = tmp_path / "demo.jpg"
+    pred_img = tmp_path / "demo_pred.jpg"
+    pt_file.write_bytes(b"pt")
+    cv2.imwrite(str(img_file), np.full((240, 320, 3), 120, dtype=np.uint8))
+    cv2.imwrite(str(pred_img), np.full((240, 320, 3), 150, dtype=np.uint8))
+
+    pred_workers: list[object] = []
+
+    class _StubPredictWorker(QObject):
+        log_line = Signal(str)
+        finished_outputs = Signal(object)
+        failed = Signal(str)
+
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__()
+            self.kwargs = dict(kwargs)
+            self.running = False
+
+        def start(self) -> None:
+            self.running = True
+
+        def isRunning(self) -> bool:
+            return self.running
+
+    monkeypatch.setattr(
+        tab_eval_module,
+        "WeightsInspectWorker",
+        lambda path, request_id=0: _StubWeightsInspectWorker(path, request_id=request_id),
+    )
+    monkeypatch.setattr(
+        tab_eval_module,
+        "PredictWorker",
+        lambda **kwargs: (pred_workers.append(_StubPredictWorker(**kwargs)) or pred_workers[-1]),
+    )
+
+    tab = EvalTab(workspace_root=tmp_path, device_info=_make_device_info(has_gpu=True))
+    try:
+        # 1) 默认样式：紧凑防重叠 + 自动 + 类别 + 置信度，尚未生成预览图时放大按钮置灰
+        cfg_default = tab.build_predict_render_config()
+        assert cfg_default.style == "compact"
+        assert cfg_default.line_width_mode == "auto"
+        assert cfg_default.show_labels is True
+        assert cfg_default.show_conf is True
+        assert cfg_default.avoid_overlap is True
+        assert 0.0 < cfg_default.label_alpha < 1.0
+        assert "紧凑防重叠" in tab.pred_summary_label.text()
+        assert tab.zoom_preview_btn.isEnabled() is False
+
+        # 2) 修改预览样式控件并点击推理预览，确认 PredictWorker 准确拿到最新 render_config
+        tab.set_weights_and_yaml(str(pt_file), "")
+        tab.source_edit.setText(str(img_file))
+        tab.pred_render_style_combo.setCurrentIndex(1)  # 切换至 Ultralytics 默认
+        tab.pred_line_width_combo.setCurrentIndex(1)  # 切换至极细挡位
+        tab.pred_show_labels_chk.setChecked(True)
+        tab.pred_show_conf_chk.setChecked(False)
+        qt_app.processEvents()
+
+        assert "Ultralytics 默认" in tab.pred_summary_label.text()
+        assert "仅类别" in tab.pred_summary_label.text()
+
+        tab.predict_btn.click()
+        qt_app.processEvents()
+        assert len(pred_workers) == 1
+        sent_render = pred_workers[-1].kwargs["render_config"]  # type: ignore[attr-defined]
+        assert isinstance(sent_render, PredictRenderConfig)
+        assert sent_render.style == "ultralytics"
+        assert sent_render.line_width_mode == "thin"
+        assert sent_render.show_labels is True
+        assert sent_render.show_conf is False
+
+        # 3) 模拟推理完成加载结果图：放大按钮启用，信息栏展示文件名与尺寸，真实缩放弹窗可正常适应与缩放
+        tab._on_predict_done([pred_img])
+        qt_app.processEvents()
+        assert tab.zoom_preview_btn.isEnabled() is True
+        assert "demo_pred.jpg" in tab.preview_info_label.text()
+        assert "320×240" in tab.preview_info_label.text()
+
+        pix = tab.preview_label.source_pixmap()
+        assert pix is not None and not pix.isNull()
+        real_zoom_dlg = tab_eval_module._PreviewZoomDialog(pix, image_path=pred_img, parent=tab)
+        try:
+            real_zoom_dlg._set_zoom(2.0)
+            assert real_zoom_dlg.scale_label.text() == "200%"
+            real_zoom_dlg._set_zoom(1.0)
+            assert real_zoom_dlg.scale_label.text() == "100%"
+            real_zoom_dlg._fit_to_window()
+            assert real_zoom_dlg.scale_label.text().endswith("%")
+        finally:
+            real_zoom_dlg.close()
+
+        opened_dialogs: list[object] = []
+
+        class _StubZoomDialog:
+            def __init__(self, pix, image_path=None, parent=None) -> None:
+                self.pix = pix
+                self.image_path = image_path
+                opened_dialogs.append(self)
+
+            def exec(self) -> int:
+                return 0
+
+        monkeypatch.setattr(tab_eval_module, "_PreviewZoomDialog", _StubZoomDialog)
+        tab.zoom_preview_btn.click()
+        tab.preview_label.double_clicked.emit()
+        qt_app.processEvents()
+        assert len(opened_dialogs) == 2
+        assert opened_dialogs[0].image_path == pred_img  # type: ignore[attr-defined]
     finally:
         tab.close()

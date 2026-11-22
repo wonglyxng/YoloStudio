@@ -4,8 +4,9 @@
     对训练好的 YOLO26 `.pt` 权重或已导出部署模型（`.onnx` / `.torchscript` / `.engine`）
     执行验证集指标评估（Val）与图片/目录/视频推理可视化预览，并在选择模型后自动后台只读解析
     尺寸、类别顺序、动态维度与检测头能力以提示用户和自动联动；
-    支持在推理测试中选择检测头模式（`one2many` / `end2end`）与输入填充方式（最小矩形 / 固定方形 /
-    按导出尺寸固定填充），并提供「对齐导出参数」与「测刚导出模型 / 切回 .pt 权重」快捷联动；
+    支持在推理测试中选择检测头模式（`one2many` / `end2end`）、输入填充方式（最小矩形 / 固定方形 /
+    按导出尺寸固定填充）及预览绘制样式（紧凑防重叠半透明 / Ultralytics 默认、框线挡位、类别与置信度开关），
+    提供「对齐导出参数」、「测刚导出模型 / 切回 .pt 权重」快捷联动及结果图放大查看能力；
     同时在独立导出面板中支持导出尺寸（方形/矩形）、`batch`、`dynamic`、`nms` 模式、`opset`、
     `simplify` 与 `FP16` 等完整部署导出参数配置与输入/输出张量实时预览。
 
@@ -20,8 +21,8 @@ from __future__ import annotations
 import html
 from pathlib import Path
 
-from PyQt6.QtCore import QSize, QTimer, Qt
-from PyQt6.QtGui import QCloseEvent, QPixmap, QResizeEvent
+from PyQt6.QtCore import QSize, QTimer, Qt, pyqtSignal as Signal
+from PyQt6.QtGui import QCloseEvent, QMouseEvent, QPixmap, QResizeEvent, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -50,6 +51,8 @@ from yolo_studio.core.dataset_converter import IMAGE_EXTENSIONS
 from yolo_studio.core.trainer import (
     DEFAULT_EXPORT_PADDING_VALUE,
     DEFAULT_EXPORT_PREPROCESS_MODE,
+    DEFAULT_PREDICT_LINE_WIDTH_MODE,
+    DEFAULT_PREDICT_RENDER_STYLE,
     DYNAMIC_EXPORT_FORMATS,
     EXPORT_NMS_KEY_TO_VALUE,
     EXPORT_NMS_MODES,
@@ -59,9 +62,12 @@ from yolo_studio.core.trainer import (
     ONNX_DEPLOY_SCHEMA_VERSION,
     PREDICT_HEAD_KEY_TO_NMS,
     PREDICT_HEAD_MODES,
+    PREDICT_LINE_WIDTH_MODES,
     PREDICT_PAD_MODES,
+    PREDICT_RENDER_STYLES,
     DeviceInfo,
     ExportConfig,
+    PredictRenderConfig,
     WeightsMetadata,
     describe_export_io,
     detect_compute_device,
@@ -69,6 +75,7 @@ from yolo_studio.core.trainer import (
     format_class_order,
     format_class_order_lines,
     format_imgsz_text,
+    format_predict_render_summary,
     format_preprocess_summary,
     format_weights_metadata_log,
     is_exported_model_path,
@@ -249,12 +256,15 @@ class _WrappingLabel(QLabel):
 
 
 class _ScaledPreviewLabel(QLabel):
-    """支持随窗口或分割条拖拽自动等比缩放的推理结果预览标签。"""
+    """支持随窗口或分割条拖拽自动等比缩放，并可双击触发放大查看原图的推理结果预览标签。"""
+
+    double_clicked = Signal()
 
     def __init__(self, placeholder: str, parent: QWidget | None = None) -> None:
         super().__init__(placeholder, parent)
         self._placeholder = placeholder
         self._source_pixmap: QPixmap | None = None
+        self._image_path: Path | None = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(320, 220)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
@@ -270,8 +280,19 @@ class _ScaledPreviewLabel(QLabel):
         if pix.isNull():
             return False
         self._source_pixmap = pix
+        self._image_path = image_path
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"{image_path.name} ({pix.width()}×{pix.height()})\n双击可放大查看原图")
         self._apply_scaled()
         return True
+
+    def image_path(self) -> Path | None:
+        """返回当前展示的结果图路径；尚未加载图片时返回 `None`。"""
+        return self._image_path
+
+    def source_pixmap(self) -> QPixmap | None:
+        """返回当前缓存的原始分辨率 `QPixmap`；尚未加载图片时返回 `None`。"""
+        return self._source_pixmap
 
     def _apply_scaled(self) -> None:
         if self._source_pixmap is None or self._source_pixmap.isNull():
@@ -290,6 +311,135 @@ class _ScaledPreviewLabel(QLabel):
         super().resizeEvent(event)
         if self._source_pixmap is not None:
             self._apply_scaled()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._source_pixmap is not None
+            and not self._source_pixmap.isNull()
+        ):
+            self.double_clicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class _PreviewZoomDialog(QDialog):
+    """推理结果图全分辨率缩放查看对话框，便于细检密集小目标框与置信度。"""
+
+    def __init__(
+        self,
+        pixmap: QPixmap,
+        image_path: Path | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._source_pixmap = pixmap
+        self._image_path = image_path
+        self._zoom: float = 1.0
+        self._fit_mode: bool = True
+
+        title = f"推理结果放大查看 - {image_path.name}" if image_path else "推理结果放大查看"
+        self.setWindowTitle(f"{title} ({pixmap.width()}×{pixmap.height()})")
+        self.resize(1120, 740)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.fit_btn = QPushButton("适应窗口")
+        self.actual_btn = QPushButton("1:1 原尺寸")
+        self.zoom_out_btn = QPushButton("缩小 (-)")
+        self.zoom_in_btn = QPushButton("放大 (+)")
+        self.scale_label = QLabel("100%")
+        self.scale_label.setStyleSheet("color: #444444; font-weight: 500;")
+        self.open_ext_btn = QPushButton("系统打开")
+        self.open_ext_btn.setEnabled(image_path is not None and image_path.is_file())
+        close_btn = QPushButton("关闭")
+
+        bar.addWidget(self.fit_btn)
+        bar.addWidget(self.actual_btn)
+        bar.addWidget(self.zoom_out_btn)
+        bar.addWidget(self.zoom_in_btn)
+        bar.addSpacing(8)
+        bar.addWidget(self.scale_label)
+        bar.addStretch(1)
+        bar.addWidget(QLabel("提示: Ctrl+滚轮缩放"))
+        bar.addSpacing(8)
+        bar.addWidget(self.open_ext_btn)
+        bar.addWidget(close_btn)
+        root.addLayout(bar)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll.setStyleSheet("background: #1e1e1e; border: 1px solid #444444;")
+        self.img_label = QLabel()
+        self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll.setWidget(self.img_label)
+        root.addWidget(self.scroll, 1)
+
+        self.fit_btn.clicked.connect(self._fit_to_window)
+        self.actual_btn.clicked.connect(lambda: self._set_zoom(1.0))
+        self.zoom_out_btn.clicked.connect(lambda: self._set_zoom(self._zoom / 1.25))
+        self.zoom_in_btn.clicked.connect(lambda: self._set_zoom(self._zoom * 1.25))
+        self.open_ext_btn.clicked.connect(self._on_open_external)
+        close_btn.clicked.connect(self.accept)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if self._fit_mode:
+            QTimer.singleShot(0, self._fit_to_window)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._fit_mode:
+            self._fit_to_window()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self._set_zoom(self._zoom * 1.15)
+            elif delta < 0:
+                self._set_zoom(self._zoom / 1.15)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def _fit_to_window(self) -> None:
+        self._fit_mode = True
+        vp = self.scroll.viewport()
+        avail_w = max(200, vp.width() - 16)
+        avail_h = max(160, vp.height() - 16)
+        pw = max(1, self._source_pixmap.width())
+        ph = max(1, self._source_pixmap.height())
+        ratio = min(avail_w / pw, avail_h / ph)
+        self._apply_zoom(max(0.15, min(6.0, ratio)))
+
+    def _set_zoom(self, scale: float) -> None:
+        self._fit_mode = False
+        self._apply_zoom(max(0.15, min(6.0, float(scale))))
+
+    def _apply_zoom(self, scale: float) -> None:
+        self._zoom = scale
+        target_w = max(1, round(self._source_pixmap.width() * scale))
+        target_h = max(1, round(self._source_pixmap.height() * scale))
+        scaled = self._source_pixmap.scaled(
+            target_w,
+            target_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.img_label.setPixmap(scaled)
+        self.img_label.resize(scaled.size())
+        self.scale_label.setText(f"{round(scale * 100)}%")
+
+    def _on_open_external(self) -> None:
+        if self._image_path is not None and self._image_path.is_file():
+            open_local_path(self._image_path)
 
 
 class EvalTab(QWidget):
@@ -489,6 +639,45 @@ class EvalTab(QWidget):
         pad_row.addWidget(self.pred_pad_combo, 1)
         pad_row.addWidget(self.sync_export_pred_btn)
         self._pred_form.addRow("输入填充:", pad_row)
+
+        style_row = QHBoxLayout()
+        style_row.setSpacing(6)
+        self.pred_render_style_combo = QComboBox()
+        self.pred_render_style_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.pred_render_style_combo.setMinimumContentsLength(10)
+        for key, label in PREDICT_RENDER_STYLES:
+            self.pred_render_style_combo.addItem(label, key)
+        self.pred_render_style_combo.setToolTip(
+            "控制推理预览结果图的框线与标签绘制方式：\n"
+            "• 紧凑防重叠 (半透明，推荐): 按目标密度自适应细框与小字号，半透明标签底色并自动防重叠错开，置信度保持 0.94 格式；\n"
+            "• Ultralytics 默认: 使用 Ultralytics 原生 r.plot() 风格绘制。"
+        )
+        self.pred_lw_label = QLabel("线宽:")
+        self.pred_lw_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.pred_line_width_combo = QComboBox()
+        for key, label in PREDICT_LINE_WIDTH_MODES:
+            self.pred_line_width_combo.addItem(label, key)
+        self.pred_line_width_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.pred_line_width_combo.setToolTip(
+            "控制推理框线粗细与紧凑模式字号大小：\n"
+            "自动：随分辨率与目标密集度自适应；极细/适中/较粗：按固定挡位渲染。"
+        )
+        self.pred_show_labels_chk = QCheckBox("类别")
+        self.pred_show_labels_chk.setChecked(True)
+        self.pred_show_labels_chk.setToolTip("在检测框标签中显示类别名称（取消且同时取消置信度时仅画框）")
+        self.pred_show_conf_chk = QCheckBox("置信度")
+        self.pred_show_conf_chk.setChecked(True)
+        self.pred_show_conf_chk.setToolTip("在检测框标签中显示置信度小数（如 0.94）")
+        style_row.addWidget(self.pred_render_style_combo, 1)
+        style_row.addSpacing(6)
+        style_row.addWidget(self.pred_lw_label)
+        style_row.addWidget(self.pred_line_width_combo)
+        style_row.addSpacing(8)
+        style_row.addWidget(self.pred_show_labels_chk)
+        style_row.addWidget(self.pred_show_conf_chk)
+        self._pred_form.addRow("预览样式:", style_row)
 
         thr_row = QHBoxLayout()
         thr_row.setSpacing(6)
@@ -720,6 +909,7 @@ class EvalTab(QWidget):
         for combo in (
             self.eval_head_combo,
             self.pred_pad_combo,
+            self.pred_render_style_combo,
             self.format_combo,
             self.nms_mode_combo,
             self.export_preprocess_combo,
@@ -739,7 +929,21 @@ class EvalTab(QWidget):
 
         preview_group = QGroupBox("4. 推理结果预览")
         preview_layout = QVBoxLayout(preview_group)
-        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.setContentsMargins(8, 6, 8, 8)
+        preview_layout.setSpacing(6)
+        preview_bar = QHBoxLayout()
+        preview_bar.setContentsMargins(0, 0, 0, 0)
+        preview_bar.setSpacing(6)
+        self.preview_info_label = QLabel("双击结果图或点击「放大查看」可按原图分辨率缩放检视")
+        self.preview_info_label.setStyleSheet("color: #666666; font-size: 12px;")
+        self.preview_info_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.zoom_preview_btn = QPushButton("放大查看")
+        self.zoom_preview_btn.setEnabled(False)
+        self.zoom_preview_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.zoom_preview_btn.setToolTip("在独立缩放窗口中查看当前推理结果原图（支持 1:1 与 Ctrl+滚轮缩放）")
+        preview_bar.addWidget(self.preview_info_label, 1)
+        preview_bar.addWidget(self.zoom_preview_btn)
+        preview_layout.addLayout(preview_bar)
         self.preview_label = _ScaledPreviewLabel("运行图片推理后，将在此显示带检测框的结果图")
         preview_layout.addWidget(self.preview_label, 1)
         self.right_splitter.addWidget(preview_group)
@@ -772,10 +976,16 @@ class EvalTab(QWidget):
         self.imgsz_spin.valueChanged.connect(self._on_eval_param_changed)
         self.eval_head_combo.currentIndexChanged.connect(self._on_eval_param_changed)
         self.pred_pad_combo.currentIndexChanged.connect(self._on_eval_param_changed)
+        self.pred_render_style_combo.currentIndexChanged.connect(self._on_eval_param_changed)
+        self.pred_line_width_combo.currentIndexChanged.connect(self._on_eval_param_changed)
+        self.pred_show_labels_chk.toggled.connect(self._on_eval_param_changed)
+        self.pred_show_conf_chk.toggled.connect(self._on_eval_param_changed)
         self.sync_export_pred_btn.clicked.connect(self._on_sync_export_to_predict)
         self.switch_model_btn.clicked.connect(self._on_switch_model)
         self.conf_spin.valueChanged.connect(self._on_eval_param_changed)
         self.iou_spin.valueChanged.connect(self._on_eval_param_changed)
+        self.zoom_preview_btn.clicked.connect(self._on_zoom_preview)
+        self.preview_label.double_clicked.connect(self._on_zoom_preview)
 
         self.pick_file_btn.clicked.connect(self._on_pick_file)
         self.pick_dir_btn.clicked.connect(self._on_pick_dir)
@@ -1100,8 +1310,23 @@ class EvalTab(QWidget):
         head_key = str(self.eval_head_combo.currentData() or "one2many")
         return PREDICT_HEAD_KEY_TO_NMS.get(head_key, None)
 
+    def build_predict_render_config(self) -> PredictRenderConfig:
+        """从界面「预览样式」行组装 `PredictRenderConfig` 配置对象。"""
+        style = str(self.pred_render_style_combo.currentData() or DEFAULT_PREDICT_RENDER_STYLE)
+        line_width_mode = str(
+            self.pred_line_width_combo.currentData() or DEFAULT_PREDICT_LINE_WIDTH_MODE
+        )
+        return PredictRenderConfig(
+            style=style,
+            line_width_mode=line_width_mode,
+            show_labels=self.pred_show_labels_chk.isChecked(),
+            show_conf=self.pred_show_conf_chk.isChecked(),
+            label_alpha=0.68,
+            avoid_overlap=True,
+        )
+
     def build_predict_params(self) -> dict[str, object]:
-        """汇总当前「2. 推理效果测试」实际将提交的参数字典（含检测头、输入尺寸、预处理与阈值）。"""
+        """汇总当前「2. 推理效果测试」实际将提交的参数字典（含检测头、输入尺寸、预处理、样式与阈值）。"""
         meta = self._weights_metadata
         is_exported = self._current_model_is_exported()
         static_exported = is_exported and meta is not None and meta.export_dynamic is False
@@ -1182,6 +1407,7 @@ class EvalTab(QWidget):
             "uses_external_iou": uses_external_iou,
             "preprocess_mode": preprocess_mode,
             "padding_value": padding_value,
+            "render_config": self.build_predict_render_config(),
         }
 
     def _refresh_eval_controls_state(self) -> None:
@@ -1398,7 +1624,16 @@ class EvalTab(QWidget):
             if bool(params["uses_external_iou"])
             else f"Conf={conf_val:.2f} (无外部 IoU)"
         )
-        summary_line = f"{model_tag}  |  {head_txt}  |  输入: {size_text} {pad_txt}  |  {thr_txt}"
+        raw_render_cfg = params.get("render_config")
+        render_cfg = (
+            raw_render_cfg
+            if isinstance(raw_render_cfg, PredictRenderConfig)
+            else self.build_predict_render_config()
+        )
+        render_txt = format_predict_render_summary(render_cfg)
+        summary_line = (
+            f"{model_tag}  |  {head_txt}  |  输入: {size_text} {pad_txt}  |  {thr_txt}  |  样式: {render_txt}"
+        )
 
         hints: list[str] = []
         if is_exported:
@@ -1910,6 +2145,11 @@ class EvalTab(QWidget):
                 if isinstance(params.get("padding_value"), int)
                 else None
             ),
+            render_config=(
+                params["render_config"]
+                if isinstance(params.get("render_config"), PredictRenderConfig)
+                else self.build_predict_render_config()
+            ),
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.pred_worker, "模型推理预览")
@@ -1926,7 +2166,20 @@ class EvalTab(QWidget):
         for p in outputs:
             if p.suffix.lower() in IMAGE_EXTENSIONS:
                 if self.preview_label.set_preview_image(p):
+                    pix = self.preview_label.source_pixmap()
+                    dims = f" ({pix.width()}×{pix.height()})" if pix is not None else ""
+                    self.preview_info_label.setText(f"{p.name}{dims} · 双击图片可放大查看")
+                    self.preview_info_label.setToolTip(str(p))
+                    self.zoom_preview_btn.setEnabled(True)
                     break
+
+    def _on_zoom_preview(self) -> None:
+        """打开独立缩放对话框，全分辨率查看当前推理预览结果图。"""
+        pix = self.preview_label.source_pixmap()
+        if pix is None or pix.isNull():
+            return
+        dlg = _PreviewZoomDialog(pix, image_path=self.preview_label.image_path(), parent=self)
+        dlg.exec()
 
     def _on_export(self) -> None:
         """校验 `.pt` 权重与独立导出参数后在后台启动 `ExportWorker`。"""

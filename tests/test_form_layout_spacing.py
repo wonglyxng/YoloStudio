@@ -227,6 +227,7 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
         qt_app.processEvents()
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "ImgSz:", win.eval_tab.imgsz_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "检测头:", win.eval_tab.eval_head_combo) <= 12
+        assert 2 <= _find_inline_pair_gap(win.eval_tab, "线宽:", win.eval_tab.pred_line_width_combo) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "Conf:", win.eval_tab.conf_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "IoU:", win.eval_tab.iou_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.eval_tab, "高(H):", win.eval_tab.export_h_spin) <= 12

@@ -3,11 +3,11 @@
 职责：
     封装本地硬件探测、`.pt` 权重及已导出模型（`.onnx` / `.torchscript` / `.engine`）元数据只读解析
     （训练/导出尺寸、类别顺序、动态维度与检测头能力），以及 YOLO26 模型的训练、验证、
-    图片/视频推理（支持检测头模式与填充方式配置）和部署格式导出，
+    图片/视频推理（支持检测头模式、填充方式及紧凑防重叠半透明绘制配置）和部署格式导出，
     并将训练、验证、推理与导出引擎的标准输出和 Epoch 指标实时桥接至调用方回调。
 
 运行环境：
-    Python >= 3.11，依赖 `torch`、`ultralytics` 与 `opencv-python`；
+    Python >= 3.11，依赖 `torch`、`ultralytics`、`numpy`、`opencv-python`（可选 `Pillow` 用于紧凑 TrueType 标签渲染）；
     推理已导出 `.onnx` 模型时依赖 `onnxruntime`（或 `onnxruntime-gpu`）；
     使用预训练名称（如 `yolo26s.pt`）且本地缺失权重时，Ultralytics 会触发模型下载。
 
@@ -25,13 +25,17 @@ import json
 import math
 import os
 import re
+import shutil
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Event
 
 import cv2
+import numpy as np
 
 from yolo_studio.core.frame_extractor import VIDEO_EXTENSIONS
 from yolo_studio.core.log_capture import capture_thread_output
@@ -1441,6 +1445,700 @@ def resolve_effective_predict_preprocess(
     return resolve_preprocess_spec(raw_mode, raw_pad)
 
 
+# 推理预览绘制样式选项：(内部键名, 界面显示文案)
+PREDICT_RENDER_STYLES: list[tuple[str, str]] = [
+    ("compact", "紧凑防重叠 (半透明，推荐)"),
+    ("ultralytics", "Ultralytics 默认"),
+]
+DEFAULT_PREDICT_RENDER_STYLE = "compact"
+
+# 推理预览框线与字号挡位：(内部键名, 界面显示文案)
+PREDICT_LINE_WIDTH_MODES: list[tuple[str, str]] = [
+    ("auto", "自动"),
+    ("thin", "极细"),
+    ("medium", "适中"),
+    ("bold", "较粗"),
+]
+DEFAULT_PREDICT_LINE_WIDTH_MODE = "auto"
+
+# 与 Ultralytics 默认调色板一致的 20 色高区分度 BGR 类别色表（零依赖，避免触发 `ultralytics` 顶层导入副作用）
+_CLASS_PALETTE_BGR: tuple[tuple[int, int, int], ...] = (
+    (255, 42, 4),
+    (235, 219, 11),
+    (243, 243, 243),
+    (183, 223, 0),
+    (104, 31, 17),
+    (221, 111, 255),
+    (79, 68, 255),
+    (0, 237, 204),
+    (68, 243, 0),
+    (255, 0, 189),
+    (255, 180, 0),
+    (186, 0, 221),
+    (255, 255, 0),
+    (0, 192, 38),
+    (179, 255, 1),
+    (255, 36, 125),
+    (104, 0, 123),
+    (108, 27, 255),
+    (47, 109, 252),
+    (11, 255, 162),
+)
+
+
+@dataclass(frozen=True)
+class PredictRenderConfig:
+    """推理预览检测框与标签绘制样式配置。
+
+    字段说明：
+        `style`：绘制模式键名，`"compact"`（紧凑半透明 + 标签防重叠，默认）或 `"ultralytics"`（原版 `r.plot()`）。
+        `line_width_mode`：框线与字号挡位，`"auto"`（按分辨率与目标密度自适应）、`"thin"`（极细）、
+            `"medium"`（适中）或 `"bold"`（较粗）。
+        `show_labels`：是否显示类别名称（如 `player`）。
+        `show_conf`：是否显示置信度小数（固定保留两位小数，如 `0.94`）。
+        `label_alpha`：紧凑模式下标签背景不透明度，范围 `[0.0, 1.0]`，默认 `0.68`（半透明兼顾可读与不遮挡）。
+        `avoid_overlap`：紧凑模式下是否启用二维防重叠避让排版（默认开启）。
+    """
+
+    style: str = DEFAULT_PREDICT_RENDER_STYLE
+    line_width_mode: str = DEFAULT_PREDICT_LINE_WIDTH_MODE
+    show_labels: bool = True
+    show_conf: bool = True
+    label_alpha: float = 0.68
+    avoid_overlap: bool = True
+
+
+def parse_predict_render_style(raw: str | None) -> str:
+    """将界面键名或别名规范化为推理绘制样式键名（`"compact"` 或 `"ultralytics"`）。"""
+    if raw is None:
+        return DEFAULT_PREDICT_RENDER_STYLE
+    token = str(raw).strip().lower()
+    if token in {"", "default", "compact", "dense", "smart"}:
+        return "compact"
+    if token in {"ultralytics", "native", "raw", "yolo"}:
+        return "ultralytics"
+    raise ValueError(f"无效的推理绘制样式 '{raw}'，可选值: compact(紧凑防重叠)、ultralytics(Ultralytics 默认)")
+
+
+def parse_predict_line_width_mode(raw: str | None) -> str:
+    """将界面键名或别名规范化为推理框线/字号挡位（`"auto"` / `"thin"` / `"medium"` / `"bold"`）。"""
+    if raw is None:
+        return DEFAULT_PREDICT_LINE_WIDTH_MODE
+    token = str(raw).strip().lower()
+    if token in {"", "auto", "default"}:
+        return "auto"
+    if token in {"thin", "fine", "small", "1"}:
+        return "thin"
+    if token in {"medium", "normal", "mid", "2"}:
+        return "medium"
+    if token in {"bold", "thick", "large", "3"}:
+        return "bold"
+    raise ValueError(f"无效的框线挡位 '{raw}'，可选值: auto(自动)、thin(极细)、medium(适中)、bold(较粗)")
+
+
+def normalize_predict_render_config(config: PredictRenderConfig | None) -> PredictRenderConfig:
+    """校验并规范化 `PredictRenderConfig`，返回字段合法的新配置实例。"""
+    if config is None:
+        return PredictRenderConfig()
+    style = parse_predict_render_style(config.style)
+    lw_mode = parse_predict_line_width_mode(config.line_width_mode)
+    alpha = float(config.label_alpha)
+    if not math.isfinite(alpha) or not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"标签透明度 label_alpha 必须在 0.0 ~ 1.0 之间，当前值: {config.label_alpha!r}")
+    return PredictRenderConfig(
+        style=style,
+        line_width_mode=lw_mode,
+        show_labels=bool(config.show_labels),
+        show_conf=bool(config.show_conf),
+        label_alpha=alpha,
+        avoid_overlap=bool(config.avoid_overlap),
+    )
+
+
+def format_predict_render_summary(config: PredictRenderConfig | None) -> str:
+    """将 `PredictRenderConfig` 格式化为简洁中文展示文案，用于界面摘要与运行日志。"""
+    cfg = normalize_predict_render_config(config)
+    style_txt = "紧凑防重叠" if cfg.style == "compact" else "Ultralytics 默认"
+    lw_map = {"auto": "自动", "thin": "极细", "medium": "适中", "bold": "较粗"}
+    lw_txt = lw_map.get(cfg.line_width_mode, cfg.line_width_mode)
+    if cfg.show_labels and cfg.show_conf:
+        content_txt = "类别+置信度"
+    elif cfg.show_labels:
+        content_txt = "仅类别"
+    elif cfg.show_conf:
+        content_txt = "仅置信度"
+    else:
+        content_txt = "仅画框"
+    return f"{style_txt} ({lw_txt}, {content_txt})"
+
+
+def _get_class_color_bgr(cls_id: int) -> tuple[int, int, int]:
+    """按类别编号返回稳定的 BGR 颜色三元组（与 Ultralytics 调色板保持一致，且不触发额外模块导入）。"""
+    return _CLASS_PALETTE_BGR[int(cls_id) % len(_CLASS_PALETTE_BGR)]
+
+
+def _to_numpy_2d_or_1d(value: object) -> np.ndarray | None:
+    """将 Tensor / ndarray / 序列安全转换为 NumPy 数组；缺失或无法转换时返回 `None`。"""
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "detach"):
+            return value.detach().cpu().numpy()  # type: ignore[union-attr]
+        if hasattr(value, "cpu") and hasattr(value, "numpy"):
+            return value.cpu().numpy()  # type: ignore[union-attr]
+        return np.asarray(value)
+    except Exception:
+        return None
+
+
+def _resolve_render_scale(
+    img_h: int,
+    img_w: int,
+    *,
+    num_boxes: int,
+    median_box_dim: float,
+    line_width_mode: str,
+) -> tuple[int, int, float, int | None]:
+    """根据画布分辨率、目标密度/中位尺寸与挡位计算 `(box_lw, font_px, cv_font_scale, ultra_lw)`。
+
+    参数与单位：
+        `img_h` / `img_w`：原图高与宽（像素）；`median_box_dim`：检测框宽高中位特征尺度（像素）。
+    返回值说明：
+        - `box_lw`：紧凑模式检测框线宽（像素，至少 `1`）；
+        - `font_px`：紧凑模式 TrueType 字体像素高度（`10 ~ 28`）；
+        - `cv_font_scale`：无 TrueType 字体回退 OpenCV `putText` 时的缩放系数；
+        - `ultra_lw`：透传给 Ultralytics `plot(line_width=...)` / `predict(line_width=...)` 的线宽
+          （`"auto"` 返回 `None` 沿用 Ultralytics 自身默认，其余挡位返回明确整数）。
+    """
+    avg_dim = max(1.0, (img_h + img_w) / 2.0)
+    dense_or_small = num_boxes >= 12 or (0.0 < median_box_dim < 72.0)
+
+    if line_width_mode == "thin":
+        box_lw = 1
+        font_px = max(10, min(18, round(avg_dim * 0.0115)))
+        ultra_lw: int | None = 1
+    elif line_width_mode == "medium":
+        box_lw = max(2, min(4, round(avg_dim / 520.0)))
+        font_px = max(12, min(24, round(avg_dim * 0.0155)))
+        ultra_lw = 2
+    elif line_width_mode == "bold":
+        box_lw = max(3, min(5, round(avg_dim / 360.0)))
+        font_px = max(14, min(28, round(avg_dim * 0.0195)))
+        ultra_lw = 3
+    else:
+        # 自动挡：常规场景克制缩减，检测到密集/小目标画面时进一步收紧字号与线宽避免遮挡
+        if dense_or_small:
+            box_lw = 1 if avg_dim < 760 else (2 if avg_dim < 1800 else 3)
+            font_px = max(11, min(20, round(avg_dim * 0.013)))
+        else:
+            box_lw = 1 if avg_dim < 600 else (2 if avg_dim < 1500 else 3)
+            font_px = max(12, min(22, round(avg_dim * 0.015)))
+        ultra_lw = None
+
+    cv_font_scale = max(0.36, min(0.85, font_px / 28.0))
+    return box_lw, font_px, cv_font_scale, ultra_lw
+
+
+@lru_cache(maxsize=64)
+def _load_compact_truetype_font(font_px: int, need_unicode: bool) -> object | None:
+    """按字号与字符集需求加载清晰紧凑的本地 TrueType 字体并缓存；不可用时返回 `None` 交由 OpenCV 回退。"""
+    try:
+        from PIL import ImageFont
+    except Exception:
+        return None
+
+    win_fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    candidates: list[Path] = []
+    if need_unicode:
+        candidates.extend(
+            [
+                win_fonts / "msyhbd.ttc",
+                win_fonts / "msyh.ttc",
+                win_fonts / "simhei.ttf",
+                win_fonts / "simsun.ttc",
+                Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc"),
+                Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+                Path("/System/Library/Fonts/PingFang.ttc"),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                win_fonts / "segoeuib.ttf",
+                win_fonts / "segoeui.ttf",
+                win_fonts / "arialbd.ttf",
+                win_fonts / "arial.ttf",
+                win_fonts / "msyhbd.ttc",
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                Path("/System/Library/Fonts/Helvetica.ttc"),
+            ]
+        )
+
+    # 仅在当前进程已加载 `ultralytics.utils` 时才顺带检索其字体缓存目录，避免触发 `ultralytics` 顶层日志副作用
+    ultra_utils = sys.modules.get("ultralytics.utils")
+    user_cfg_dir = getattr(ultra_utils, "USER_CONFIG_DIR", None) if ultra_utils is not None else None
+    if user_cfg_dir is not None:
+        cfg_dir = Path(user_cfg_dir)
+        if need_unicode:
+            candidates.append(cfg_dir / "Arial.Unicode.ttf")
+        candidates.append(cfg_dir / "Arial.ttf")
+
+    for path in candidates:
+        if path.is_file():
+            try:
+                return ImageFont.truetype(str(path), size=int(font_px))
+            except Exception:
+                continue
+
+    for bare_name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf", "arial.ttf"):
+        try:
+            return ImageFont.truetype(bare_name, size=int(font_px))
+        except Exception:
+            continue
+    return None
+
+
+def _rect_intersect_area(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+    *,
+    pad: int = 0,
+) -> int:
+    """计算两个轴对齐像素矩形 `(x1, y1, x2, y2)` 外扩 `pad` 像素后的交集面积。"""
+    ix1 = max(a[0] - pad, b[0] - pad)
+    iy1 = max(a[1] - pad, b[1] - pad)
+    ix2 = min(a[2] + pad, b[2] + pad)
+    iy2 = min(a[3] + pad, b[3] + pad)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0
+    return (ix2 - ix1) * (iy2 - iy1)
+
+
+def _layout_non_overlapping_labels(
+    boxes: Sequence[tuple[int, int, int, int]],
+    label_sizes: Sequence[tuple[int, int]],
+    scores: Sequence[float],
+    *,
+    img_w: int,
+    img_h: int,
+    avoid_overlap: bool = True,
+) -> list[tuple[int, int, int, int]]:
+    """为一组检测框计算紧贴目标且尽量互不重叠的标签像素矩形 `(rx1, ry1, rx2, ry2)`。
+
+    排版策略与坐标系：
+        - 输入/输出均为原图像素坐标系 `(x1, y1, x2, y2)`，所有结果均钳制在 `[0, img_w] × [0, img_h]` 内；
+        - 按行带从上到下、同行从左到右（同列高置信度优先）依次放置，使同排密集小目标自然形成
+          “正上方 / 正下方”交替错落排布；
+        - 候选优先级：框正上方（左/中/右）→ 框正下方（左/中/右）→ 框内顶/底（仅大框）→ 上下错层堆叠；
+        - 综合惩罚已放置标签重叠（最高权重）、其他目标框遮挡、自身目标遮挡与偏移距离；
+        - 当 `avoid_overlap=False` 时，仅按框正上方（顶部不足时退回框内顶部）并做画布边界钳制。
+        - 返回列表顺序与输入 `boxes` 一一对应。
+    """
+    count = len(boxes)
+    if count == 0:
+        return []
+
+    placements: list[tuple[int, int, int, int]] = [(0, 0, 0, 0)] * count
+    if not avoid_overlap:
+        for i, ((x1, y1, _x2, _y2), (lw_px, lh_px)) in enumerate(zip(boxes, label_sizes)):
+            eff_w = min(max(1, lw_px), max(1, img_w))
+            eff_h = min(max(1, lh_px), max(1, img_h))
+            raw_y = y1 - eff_h - 1 if y1 >= eff_h + 1 else y1 + 1
+            cx = max(0, min(max(0, img_w - eff_w), x1))
+            cy = max(0, min(max(0, img_h - eff_h), raw_y))
+            placements[i] = (cx, cy, cx + eff_w, cy + eff_h)
+        return placements
+
+    median_h = int(np.median([max(1, sz[1]) for sz in label_sizes]))
+    row_band = max(14, int(median_h * 1.4))
+    order = sorted(
+        range(count),
+        key=lambda idx: (boxes[idx][1] // row_band, boxes[idx][0], -float(scores[idx])),
+    )
+
+    placed_rects: list[tuple[int, int, int, int]] = []
+    gap = 2
+    # 超高目标数时限制多层搜索预算，避免极端 max_det=300 拖慢批量或视频推理
+    max_deep_search = 160
+
+    for step, orig_idx in enumerate(order):
+        x1, y1, x2, y2 = boxes[orig_idx]
+        raw_lw, raw_lh = label_sizes[orig_idx]
+        lw_px = min(max(1, raw_lw), max(1, img_w))
+        lh_px = min(max(1, raw_lh), max(1, img_h))
+        cx_mid = (x1 + x2 - lw_px) // 2
+
+        candidates: list[tuple[float, int, int]] = [
+            (0.0, x1, y1 - lh_px - 1),
+            (0.3, cx_mid, y1 - lh_px - 1),
+            (0.5, x2 - lw_px, y1 - lh_px - 1),
+            (1.0, x1, y2 + 1),
+            (1.3, cx_mid, y2 + 1),
+            (1.5, x2 - lw_px, y2 + 1),
+        ]
+        if step < max_deep_search:
+            if (y2 - y1) >= lh_px + 8 and (x2 - x1) >= max(24, int(lw_px * 0.55)):
+                candidates.append((2.2, x1 + 2, y1 + 2))
+                candidates.append((2.4, x1 + 2, y2 - lh_px - 2))
+            for layer in range(1, 5):
+                y_up = y1 - lh_px - 1 - layer * (lh_px + gap)
+                y_dn = y2 + 1 + layer * (lh_px + gap)
+                for align_idx, cx in enumerate((x1, cx_mid, x2 - lw_px)):
+                    candidates.append((2.5 + layer * 1.2 + align_idx * 0.2, cx, y_up))
+                    candidates.append((2.8 + layer * 1.2 + align_idx * 0.2, cx, y_dn))
+
+        anchor_x = x1 + lw_px / 2.0
+        anchor_y = y1 - lh_px / 2.0
+        best_rect: tuple[int, int, int, int] = (0, 0, lw_px, lh_px)
+        best_cost = float("inf")
+        seen_xy: set[tuple[int, int]] = set()
+
+        for tier_pen, raw_x, raw_y in candidates:
+            cx = max(0, min(max(0, img_w - lw_px), int(raw_x)))
+            cy = max(0, min(max(0, img_h - lh_px), int(raw_y)))
+            if (cx, cy) in seen_xy:
+                continue
+            seen_xy.add((cx, cy))
+            cand = (cx, cy, cx + lw_px, cy + lh_px)
+
+            lbl_ov = 0
+            for pr in placed_rects:
+                if cand[0] - 1 < pr[2] + 1 and cand[2] + 1 > pr[0] - 1 and cand[1] - 1 < pr[3] + 1 and cand[3] + 1 > pr[1] - 1:
+                    lbl_ov += _rect_intersect_area(cand, pr, pad=1)
+
+            other_ov = 0
+            if step < max_deep_search:
+                for b_idx, ob in enumerate(boxes):
+                    if b_idx == orig_idx:
+                        continue
+                    if cand[0] < ob[2] and cand[2] > ob[0] and cand[1] < ob[3] and cand[3] > ob[1]:
+                        other_ov += _rect_intersect_area(cand, ob)
+
+            self_ov = _rect_intersect_area(cand, (x1, y1, x2, y2))
+            dist = math.hypot((cx + lw_px / 2.0) - anchor_x, (cy + lh_px / 2.0) - anchor_y)
+            cost = (
+                lbl_ov * 2000.0
+                + other_ov * 0.8
+                + self_ov * 1.2
+                + tier_pen * 35.0
+                + dist * 0.12
+            )
+            if cost < best_cost:
+                best_cost = cost
+                best_rect = cand
+                if lbl_ov == 0 and other_ov == 0 and self_ov == 0 and tier_pen == 0.0:
+                    break
+
+        placed_rects.append(best_rect)
+        placements[orig_idx] = best_rect
+
+    return placements
+
+
+def _call_result_plot_compat(
+    result: object,
+    *,
+    show_labels: bool,
+    show_conf: bool,
+    line_width: int | None,
+) -> np.ndarray:
+    """兼容调用 Ultralytics `Results.plot(...)`；若遇到测试桩仅支持无参 `plot()` 时自动降级。"""
+    plot_fn = getattr(result, "plot")
+    plot_kwargs: dict[str, object] = {
+        "labels": bool(show_labels),
+        "conf": bool(show_conf),
+    }
+    if line_width is not None:
+        plot_kwargs["line_width"] = int(line_width)
+    try:
+        return np.asarray(plot_fn(**plot_kwargs))
+    except TypeError:
+        return np.asarray(plot_fn())
+
+
+def _normalize_bgr_canvas(raw_img: object) -> np.ndarray | None:
+    """将 `Results.orig_img`（ndarray 或 Tensor）规范化为可写连续 3 通道 BGR uint8 副本。"""
+    arr = _to_numpy_2d_or_1d(raw_img)
+    if arr is None or arr.ndim < 2:
+        return None
+    if arr.ndim == 4 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[0] in {1, 3} and arr.shape[2] not in {1, 3, 4}:
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.dtype != np.uint8:
+        scale = 255.0 if np.issubdtype(arr.dtype, np.floating) and float(np.nanmax(arr)) <= 1.0 else 1.0
+        arr = np.clip(arr * scale, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    if arr.shape[2] == 1:
+        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    if arr.shape[2] > 3:
+        arr = arr[:, :, :3]
+    return np.ascontiguousarray(arr.copy())
+
+
+def _lookup_class_name(names: object, cls_id: int) -> str:
+    """从 Ultralytics `names` 字典或序列解析类别名称，缺失时回退为编号字符串。"""
+    if isinstance(names, Mapping):
+        if cls_id in names:
+            return str(names[cls_id])
+        if str(cls_id) in names:
+            return str(names[str(cls_id)])
+    elif isinstance(names, Sequence) and not isinstance(names, (str, bytes)):
+        if 0 <= cls_id < len(names):
+            return str(names[cls_id])
+    return str(cls_id)
+
+
+def render_predict_result(
+    result: object,
+    render_config: PredictRenderConfig | None = None,
+) -> np.ndarray:
+    """将单帧 Ultralytics 推理结果渲染为 BGR `uint8` 图像。
+
+    模式说明与回退行为：
+        - `style="ultralytics"`：直接透传 `labels`、`conf`、`line_width` 调用 `result.plot(...)`；
+        - `style="compact"`：针对目标检测框执行两阶段紧凑绘制：
+          1. 按画布尺寸与目标密集度自适应细线宽与紧凑字号，统一先绘制全部检测框避免框线切穿文字；
+          2. 置信度严格保留两位小数（如 `player 0.94`），按 `show_labels` / `show_conf` 组合文案；
+          3. 使用 `_layout_non_overlapping_labels` 进行二维防重叠排版，以 `label_alpha` 半透明底色与
+             1px 细描边绘制标签（错层远离原框时附带 1px 细引导线），并依据混合后局部亮度自动切换黑白高对比文字；
+        - 若输入为缺少 `orig_img` 的轻量测试桩，或包含分割掩码/关键点/旋转框/分类概率等非纯检测结果，
+          自动安全回退调用 `result.plot(...)`，不丢失额外视觉元素。
+    """
+    cfg = normalize_predict_render_config(render_config)
+
+    # 先读取原图用于估算 Ultralytics 挡位线宽及判断是否可执行紧凑纯检测渲染
+    canvas = _normalize_bgr_canvas(getattr(result, "orig_img", None))
+    has_non_box_extras = any(
+        getattr(result, attr, None) is not None for attr in ("masks", "keypoints", "obb", "probs")
+    )
+    if canvas is None:
+        _, _, _, ultra_lw = _resolve_render_scale(
+            720, 1280, num_boxes=0, median_box_dim=0.0, line_width_mode=cfg.line_width_mode
+        )
+        return _call_result_plot_compat(
+            result,
+            show_labels=cfg.show_labels,
+            show_conf=cfg.show_conf,
+            line_width=ultra_lw,
+        )
+
+    img_h, img_w = canvas.shape[:2]
+    if cfg.style == "ultralytics" or has_non_box_extras:
+        _, _, _, ultra_lw = _resolve_render_scale(
+            img_h, img_w, num_boxes=0, median_box_dim=0.0, line_width_mode=cfg.line_width_mode
+        )
+        return _call_result_plot_compat(
+            result,
+            show_labels=cfg.show_labels,
+            show_conf=cfg.show_conf,
+            line_width=ultra_lw,
+        )
+
+    boxes_obj = getattr(result, "boxes", None)
+    xyxy_arr = _to_numpy_2d_or_1d(getattr(boxes_obj, "xyxy", None)) if boxes_obj is not None else None
+    if xyxy_arr is None or xyxy_arr.size == 0:
+        return canvas
+    if xyxy_arr.ndim == 1 and xyxy_arr.size == 4:
+        xyxy_arr = xyxy_arr.reshape(1, 4)
+    if xyxy_arr.ndim != 2 or xyxy_arr.shape[1] < 4:
+        return canvas
+
+    cls_arr = _to_numpy_2d_or_1d(getattr(boxes_obj, "cls", None))
+    conf_arr = _to_numpy_2d_or_1d(getattr(boxes_obj, "conf", None))
+    id_arr = (
+        _to_numpy_2d_or_1d(getattr(boxes_obj, "id", None))
+        if getattr(boxes_obj, "is_track", False)
+        else None
+    )
+    names = getattr(result, "names", None)
+
+    valid_boxes: list[tuple[int, int, int, int]] = []
+    valid_cls: list[int] = []
+    valid_scores: list[float] = []
+    valid_labels: list[str] = []
+
+    for i in range(xyxy_arr.shape[0]):
+        rx1, ry1, rx2, ry2 = (float(xyxy_arr[i, 0]), float(xyxy_arr[i, 1]), float(xyxy_arr[i, 2]), float(xyxy_arr[i, 3]))
+        x1 = max(0, min(img_w - 1, int(round(rx1))))
+        y1 = max(0, min(img_h - 1, int(round(ry1))))
+        x2 = max(0, min(img_w - 1, int(round(rx2))))
+        y2 = max(0, min(img_h - 1, int(round(ry2))))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        c_id = int(round(float(cls_arr[i]))) if (cls_arr is not None and i < len(cls_arr)) else 0
+        score = float(conf_arr[i]) if (conf_arr is not None and i < len(conf_arr)) else 1.0
+        track_prefix = (
+            f"id:{int(round(float(id_arr[i])))} "
+            if (id_arr is not None and i < len(id_arr) and math.isfinite(float(id_arr[i])))
+            else ""
+        )
+        cls_name = f"{track_prefix}{_lookup_class_name(names, c_id)}"
+
+        if cfg.show_labels and cfg.show_conf:
+            label_text = f"{cls_name} {score:.2f}"
+        elif cfg.show_labels:
+            label_text = cls_name
+        elif cfg.show_conf:
+            label_text = f"{score:.2f}"
+        else:
+            label_text = ""
+
+        valid_boxes.append((x1, y1, x2, y2))
+        valid_cls.append(c_id)
+        valid_scores.append(score)
+        valid_labels.append(label_text)
+
+    if not valid_boxes:
+        return canvas
+
+    box_dims = [min(b[2] - b[0], b[3] - b[1]) for b in valid_boxes]
+    median_dim = float(np.median(box_dims)) if box_dims else 0.0
+    box_lw, font_px, cv_font_scale, _ = _resolve_render_scale(
+        img_h,
+        img_w,
+        num_boxes=len(valid_boxes),
+        median_box_dim=median_dim,
+        line_width_mode=cfg.line_width_mode,
+    )
+
+    # 阶段 1：统一绘制全部检测框（按置信度从低到高，高置信度框边压在上方）
+    draw_box_order = sorted(range(len(valid_boxes)), key=lambda idx: valid_scores[idx])
+    for idx in draw_box_order:
+        x1, y1, x2, y2 = valid_boxes[idx]
+        color = _get_class_color_bgr(valid_cls[idx])
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness=box_lw, lineType=cv2.LINE_AA)
+
+    if not any(valid_labels):
+        return canvas
+
+    # 阶段 2：测量标签文本尺寸并执行二维防重叠排版
+    need_unicode = any(not text.isascii() for text in valid_labels if text)
+    pil_font = _load_compact_truetype_font(font_px, need_unicode)
+    pad_x = max(3, round(font_px * 0.28))
+    pad_y = max(2, round(font_px * 0.16))
+
+    label_indices: list[int] = []
+    label_boxes: list[tuple[int, int, int, int]] = []
+    label_sizes: list[tuple[int, int]] = []
+    label_scores: list[float] = []
+    text_metrics: list[tuple[int, int]] = []  # PIL 记录 (offset_x, offset_y)；OpenCV 记录 (text_h, baseline)
+
+    for idx, text in enumerate(valid_labels):
+        if not text:
+            continue
+        if pil_font is not None:
+            bbox = pil_font.getbbox(text)  # type: ignore[union-attr]
+            tw = max(1, int(bbox[2] - bbox[0]))
+            th = max(1, int(bbox[3] - bbox[1]))
+            text_metrics.append((int(bbox[0]), int(bbox[1])))
+        else:
+            (tw, th), baseline = cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX, cv_font_scale, 1
+            )
+            tw = max(1, int(tw))
+            th = max(1, int(th))
+            text_metrics.append((th, int(baseline)))
+        label_indices.append(idx)
+        label_boxes.append(valid_boxes[idx])
+        label_sizes.append((tw + pad_x * 2, th + pad_y * 2))
+        label_scores.append(valid_scores[idx])
+
+    placed_rects = _layout_non_overlapping_labels(
+        label_boxes,
+        label_sizes,
+        label_scores,
+        img_w=img_w,
+        img_h=img_h,
+        avoid_overlap=cfg.avoid_overlap,
+    )
+
+    # 阶段 3：在叠加层绘制半透明标签底色与错层细引导线，随后按 `label_alpha` 融合到画布
+    alpha = cfg.label_alpha
+    if alpha < 0.999:
+        overlay = canvas.copy()
+    else:
+        overlay = canvas
+
+    for item_i, orig_idx in enumerate(label_indices):
+        x1, y1, x2, y2 = valid_boxes[orig_idx]
+        rx1, ry1, rx2, ry2 = placed_rects[item_i]
+        color = _get_class_color_bgr(valid_cls[orig_idx])
+        # 标签因防重叠被推离原框超过 4 像素时，画一条 1px 细引导线明确归属关系
+        if ry2 < y1 - 4:
+            gx = max(x1 + 1, min(x2 - 1, (rx1 + rx2) // 2))
+            cv2.line(overlay, (gx, ry2), (gx, y1), color, 1, cv2.LINE_AA)
+        elif ry1 > y2 + 4:
+            gx = max(x1 + 1, min(x2 - 1, (rx1 + rx2) // 2))
+            cv2.line(overlay, (gx, y2), (gx, ry1), color, 1, cv2.LINE_AA)
+        cv2.rectangle(overlay, (rx1, ry1), (rx2, ry2), color, -1)
+
+    if alpha < 0.999:
+        cv2.addWeighted(overlay, alpha, canvas, 1.0 - alpha, 0.0, dst=canvas)
+
+    # 极细同色描边勾勒标签边界，兼顾半透明通透感与分组辨识度
+    for item_i, orig_idx in enumerate(label_indices):
+        rx1, ry1, rx2, ry2 = placed_rects[item_i]
+        color = _get_class_color_bgr(valid_cls[orig_idx])
+        cv2.rectangle(canvas, (rx1, ry1), (rx2, ry2), color, 1)
+
+    # 依据融合后标签区域的 WCAG 相对亮度自动选高对比黑白文字（临界点约 0.22，保证亮青/黄底配深字锐利清晰）
+    def _srgb_rel_luma(r_val: float, g_val: float, b_val: float) -> float:
+        def _lin(ch: float) -> float:
+            c = max(0.0, min(1.0, ch / 255.0))
+            return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+        return 0.2126 * _lin(r_val) + 0.7152 * _lin(g_val) + 0.0722 * _lin(b_val)
+
+    txt_colors_rgb: list[tuple[int, int, int]] = []
+    for item_i, orig_idx in enumerate(label_indices):
+        rx1, ry1, rx2, ry2 = placed_rects[item_i]
+        roi = canvas[ry1 : max(ry1 + 1, ry2), rx1 : max(rx1 + 1, rx2)]
+        if roi.size > 0:
+            mean_bgr = roi.mean(axis=(0, 1))
+            rel_luma = _srgb_rel_luma(float(mean_bgr[2]), float(mean_bgr[1]), float(mean_bgr[0]))
+        else:
+            b_c, g_c, r_c = _get_class_color_bgr(valid_cls[orig_idx])
+            rel_luma = _srgb_rel_luma(float(r_c), float(g_c), float(b_c))
+        txt_colors_rgb.append((16, 22, 32) if rel_luma >= 0.22 else (255, 255, 255))
+
+    # 阶段 4：绘制不透明锐利文字（优先 Pillow TrueType，回退 OpenCV）
+    if pil_font is not None:
+        from PIL import Image, ImageDraw
+
+        pil_img = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        for item_i, orig_idx in enumerate(label_indices):
+            rx1, ry1, _rx2, _ry2 = placed_rects[item_i]
+            ox, oy = text_metrics[item_i]
+            draw.text(
+                (rx1 + pad_x - ox, ry1 + pad_y - oy),
+                valid_labels[orig_idx],
+                font=pil_font,
+                fill=txt_colors_rgb[item_i],
+            )
+        return cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+
+    for item_i, orig_idx in enumerate(label_indices):
+        rx1, ry1, _rx2, _ry2 = placed_rects[item_i]
+        th, _baseline = text_metrics[item_i]
+        r_t, g_t, b_t = txt_colors_rgb[item_i]
+        cv2.putText(
+            canvas,
+            valid_labels[orig_idx],
+            (rx1 + pad_x, ry1 + pad_y + th),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            cv_font_scale,
+            (b_t, g_t, r_t),
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+    return canvas
+
+
 def build_predict_kwargs(
     weights_path: Path,
     source_path: Path,
@@ -1454,6 +2152,7 @@ def build_predict_kwargs(
     max_det: int = 300,
     preprocess_mode: str | None = None,
     padding_value: int | None = None,
+    render_config: PredictRenderConfig | None = None,
     is_video: bool = False,
     output_dir: Path | None = None,
     metadata: WeightsMetadata | None = None,
@@ -1466,7 +2165,9 @@ def build_predict_kwargs(
         - `rect=True` 对 `.pt` 与动态导出模型启用最小矩形 LetterBox 填充，`rect=False` 强制按设定尺寸固定填充；
         - 已导出模型（`.onnx` / `.torchscript` / `.engine`）已固化检测头，不传 `nms` 覆盖；
           静态导出模型（`export_dynamic=False`）自动对齐导出尺寸并固定 `rect=False`；
-        - 当预处理为 `stretch`（直接拉伸）时，强制 `rect=False`。
+        - 当预处理为 `stretch`（直接拉伸）时，强制 `rect=False`；
+        - 视频推理且 `render_config.style == "compact"` 时设置 `save=False` 改由引擎逐帧渲染写出；
+          其余视频推理场景交由 Ultralytics `save=True` 并透传 `show_labels` / `show_conf` / `line_width`。
     """
     fmt = detect_model_format(weights_path)
     is_exported = is_exported_model_path(weights_path)
@@ -1484,6 +2185,7 @@ def build_predict_kwargs(
         padding_value=padding_value,
         metadata=metadata,
     )
+    norm_render = normalize_predict_render_config(render_config) if render_config is not None else None
 
     imgsz_arg, pair = _format_imgsz_arg(imgsz)
     effective_rect = False if resize_mode == "stretch" else bool(rect)
@@ -1501,11 +2203,26 @@ def build_predict_kwargs(
     }
 
     if is_video:
-        pred_kwargs["save"] = True
-        if output_dir is not None:
-            pred_kwargs["project"] = str(output_dir.resolve())
-            pred_kwargs["name"] = "predict"
-            pred_kwargs["exist_ok"] = True
+        if norm_render is not None and norm_render.style == "compact":
+            pred_kwargs["save"] = False
+        else:
+            pred_kwargs["save"] = True
+            if output_dir is not None:
+                pred_kwargs["project"] = str(output_dir.resolve())
+                pred_kwargs["name"] = "predict"
+                pred_kwargs["exist_ok"] = True
+            if norm_render is not None:
+                pred_kwargs["show_labels"] = norm_render.show_labels
+                pred_kwargs["show_conf"] = norm_render.show_conf
+                _, _, _, ultra_lw = _resolve_render_scale(
+                    pair[0],
+                    pair[1],
+                    num_boxes=0,
+                    median_box_dim=0.0,
+                    line_width_mode=norm_render.line_width_mode,
+                )
+                if ultra_lw is not None:
+                    pred_kwargs["line_width"] = ultra_lw
     else:
         pred_kwargs["save"] = False
 
@@ -1550,6 +2267,7 @@ def format_submitted_predict_config(
     metadata: WeightsMetadata | None = None,
     preprocess_mode: str | None = None,
     padding_value: int | None = None,
+    render_config: PredictRenderConfig | None = None,
     warnings: Sequence[str] = (),
 ) -> str:
     """将提交给 Ultralytics `model.predict()` 的推理参数与提示格式化为可读多行日志。"""
@@ -1595,6 +2313,9 @@ def format_submitted_predict_config(
     }
     if "nms" in pred_kwargs:
         summary_dict["nms"] = pred_kwargs["nms"]
+    if render_config is not None:
+        eff_render = normalize_predict_render_config(render_config)
+        summary_dict["render_style"] = format_predict_render_summary(eff_render)
 
     json_lines = json.dumps(summary_dict, ensure_ascii=False, indent=2, default=str).splitlines()
     if json_lines:
@@ -1603,6 +2324,49 @@ def format_submitted_predict_config(
     for warn in warnings:
         lines.append(f"[提示] {warn}")
     return "\n".join(lines)
+
+
+def _read_video_fps(video_path: Path, default_fps: float = 25.0) -> float:
+    """读取源视频帧率（fps）；读取失败或数值异常时回退为 `default_fps`。"""
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        cap.release()
+    if not math.isfinite(fps) or fps <= 0.1 or fps > 240.0:
+        return default_fps
+    return fps
+
+
+def _open_video_writer_safe(
+    target_path: Path, fps: float, frame_w: int, frame_h: int
+) -> tuple[cv2.VideoWriter | None, Path | None]:
+    """打开 MP4 视频写入器；若目标路径含非 ASCII 导致 OpenCV 打不开，自动改写至临时 ASCII 文件。
+
+    返回值说明：
+        `(writer, temp_path)`；`writer` 为 `None` 表示当前环境无法创建 `mp4v` 写入器；
+        若使用临时文件，`temp_path` 非空，调用方关闭 `writer` 后须负责将其移动到 `target_path`。
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
+    if str(target_path).isascii():
+        writer = cv2.VideoWriter(str(target_path), fourcc, fps, (frame_w, frame_h))
+        if writer.isOpened():
+            return writer, None
+        writer.release()
+
+    tmp_file = NamedTemporaryFile(prefix="yolostudio_pred_", suffix=".mp4", delete=False)
+    tmp_path = Path(tmp_file.name)
+    tmp_file.close()
+    writer = cv2.VideoWriter(str(tmp_path), fourcc, fps, (frame_w, frame_h))
+    if writer.isOpened():
+        return writer, tmp_path
+    writer.release()
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return None, None
 
 
 def predict_source(
@@ -1619,6 +2383,7 @@ def predict_source(
     max_det: int = 300,
     preprocess_mode: str | None = None,
     padding_value: int | None = None,
+    render_config: PredictRenderConfig | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """对单张图片、图片目录或视频运行推理并将带框结果写入 `output_dir`。
@@ -1629,10 +2394,14 @@ def predict_source(
         - `nms` 仅对 `.pt` 权重生效（`None`=默认 `one2many` + 外部 NMS，`False`=YOLO26 `one2one` 无 NMS）；
         - `rect=True` 为最小矩形填充（PT 默认），`rect=False` 为严格按 `imgsz` 补灰边固定尺寸填充；
         - `preprocess_mode` / `padding_value` 支持复现 `letterbox_center` / `letterbox_top_left` / `stretch`
-          预处理契约；已导出模型未显式传入时自动沿用其内嵌元数据中的预处理设置。
+          预处理契约；已导出模型未显式传入时自动沿用其内嵌元数据中的预处理设置；
+        - `render_config` 控制框线粗细、紧凑防重叠半透明样式及类别/置信度显示（默认启用紧凑半透明防重叠，
+          置信度保持两位小数如 `0.94`）。
 
     输出与内存约束：
-        视频输入交由 Ultralytics 写出至 `output_dir / "predict"`；
+        紧凑模式下视频逐帧经 `render_predict_result` 写出至 `output_dir / "predict" / "<名>_pred.mp4"`
+        （编码器不可用时安全回退 Ultralytics `save=True`）；Ultralytics 默认模式下视频交由 Ultralytics
+        写出至 `output_dir / "predict"`；
         图片输入通过 `cv2.imencode` + `Path.write_bytes` 写出为 `*_pred.jpg` 以支持中文路径，
         同名图片自动消歧不互相覆盖。两种输入均以 `stream=True` 逐帧迭代，
         内存占用与视频长度或图片数量无关。模型或输入路径缺失时抛出 `FileNotFoundError`。
@@ -1641,6 +2410,8 @@ def predict_source(
         raise FileNotFoundError(f"模型文件不存在: {weights_path}")
     if not source_path.exists():
         raise FileNotFoundError(f"推理输入不存在: {source_path}")
+
+    effective_render = normalize_predict_render_config(render_config)
 
     meta: WeightsMetadata | None = None
     try:
@@ -1669,6 +2440,7 @@ def predict_source(
         max_det=max_det,
         preprocess_mode=mode_key,
         padding_value=pad_val,
+        render_config=effective_render,
         is_video=is_video,
         output_dir=output_dir,
         metadata=meta,
@@ -1681,6 +2453,7 @@ def predict_source(
             metadata=meta,
             preprocess_mode=mode_key,
             padding_value=pad_val,
+            render_config=effective_render,
             warnings=warnings,
         ),
     )
@@ -1713,8 +2486,58 @@ def predict_source(
 
     saved_outputs: list[Path] = []
     with capture_thread_output(log_callback):
-        if is_video:
-            save_dir: Path | None = None
+        if is_video and effective_render.style == "compact":
+            fps = _read_video_fps(source_path)
+            target_video = output_dir / "predict" / f"{source_path.stem}_pred.mp4"
+            writer: cv2.VideoWriter | None = None
+            tmp_video_path: Path | None = None
+            wrote_frames = 0
+            fallback_needed = False
+            try:
+                for r in model.predict(**call_kwargs):
+                    frame = render_predict_result(r, effective_render)
+                    if frame is None or frame.ndim < 2:
+                        continue
+                    fh, fw = frame.shape[:2]
+                    if writer is None:
+                        writer, tmp_video_path = _open_video_writer_safe(target_video, fps, fw, fh)
+                        if writer is None:
+                            fallback_needed = True
+                            break
+                    writer.write(frame)
+                    wrote_frames += 1
+            finally:
+                if writer is not None:
+                    writer.release()
+
+            if fallback_needed:
+                if tmp_video_path is not None:
+                    tmp_video_path.unlink(missing_ok=True)
+                if log_callback:
+                    log_callback("[提示] 当前环境无法初始化 MP4 视频编码器，已回退 Ultralytics 默认视频写出。")
+                fb_kwargs = dict(call_kwargs)
+                fb_kwargs["save"] = True
+                fb_kwargs["project"] = str(output_dir.resolve())
+                fb_kwargs["name"] = "predict"
+                fb_kwargs["exist_ok"] = True
+                fb_kwargs["show_labels"] = effective_render.show_labels
+                fb_kwargs["show_conf"] = effective_render.show_conf
+                save_dir: Path | None = None
+                for r in model.predict(**fb_kwargs):
+                    if save_dir is None and getattr(r, "save_dir", None):
+                        save_dir = Path(r.save_dir)
+                if save_dir is not None:
+                    saved_outputs = sorted(save_dir.glob("*"))
+            elif wrote_frames > 0:
+                if tmp_video_path is not None and tmp_video_path.is_file():
+                    target_video.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(tmp_video_path), str(target_video))
+                if target_video.is_file():
+                    saved_outputs.append(target_video)
+            elif tmp_video_path is not None:
+                tmp_video_path.unlink(missing_ok=True)
+        elif is_video:
+            save_dir = None
             for r in model.predict(**call_kwargs):
                 if save_dir is None and getattr(r, "save_dir", None):
                     save_dir = Path(r.save_dir)
@@ -1723,7 +2546,7 @@ def predict_source(
         else:
             used_names: set[str] = set()
             for idx, r in enumerate(model.predict(**call_kwargs), start=1):
-                plotted = r.plot()
+                plotted = render_predict_result(r, effective_render)
                 src = Path(r.path) if getattr(r, "path", None) else Path(f"pred_{idx}.jpg")
                 out_file = _unique_pred_path(output_dir, src, used_names)
                 ok, encoded = cv2.imencode(".jpg", plotted, [cv2.IMWRITE_JPEG_QUALITY, 95])

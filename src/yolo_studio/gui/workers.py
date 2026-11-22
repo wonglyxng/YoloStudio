@@ -40,6 +40,7 @@ from yolo_studio.core.mllm_reviewer import (
 from yolo_studio.core.trainer import (
     DeviceInfo,
     ExportConfig,
+    PredictRenderConfig,
     TrainConfig,
     TrainResult,
     detect_compute_device,
@@ -292,6 +293,7 @@ class PredictWorker(QThread):
         max_det: int = 300,
         preprocess_mode: str | None = None,
         padding_value: int | None = None,
+        render_config: PredictRenderConfig | None = None,
     ) -> None:
         super().__init__()
         self.weights_path = weights_path
@@ -306,6 +308,7 @@ class PredictWorker(QThread):
         self.max_det = max_det
         self.preprocess_mode = preprocess_mode
         self.padding_value = padding_value
+        self.render_config = render_config
 
     def run(self) -> None:
         """线程入口：执行 `predict_source` 并派发生成的输出文件路径列表。"""
@@ -323,6 +326,7 @@ class PredictWorker(QThread):
                 max_det=self.max_det,
                 preprocess_mode=self.preprocess_mode,
                 padding_value=self.padding_value,
+                render_config=self.render_config,
                 log_callback=lambda line: self.log_line.emit(line),
             )
             self.finished_outputs.emit(outputs)
