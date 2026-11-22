@@ -231,36 +231,120 @@ def install_runtime_excepthook(
     sys.excepthook = _runtime_hook
 
 
-def _find_app_icon_path(code_root: Path, workspace_root: Path) -> Path | None:
-    """在应用代码目录或工作区中查找内置 `icon.ico` 路径，不存在时返回 `None`。"""
-    rel = Path("third_party") / "X-AnyLabeling" / "anylabeling" / "resources" / "images" / "icon.ico"
+APP_USER_MODEL_ID = "YoloStudio.Desktop"
+APP_ICON_FILENAME = "logo.ico"
+APP_LOGO_FILENAME = "logo.png"
+
+
+def _configure_windows_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> None:
+    """在 Windows 桌面会话中注册显式 `AppUserModelID`，确保任务栏独立显示 YoloStudio 图标而非 Python 默认图标。
+
+    调用时机：
+        须在创建 `QApplication` 与显示任何顶层窗口之前调用；非 Windows 平台或 `offscreen` 无头测试环境直接跳过。
+    """
+    if os.name != "nt" or os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(ctypes.c_wchar_p(app_id))
+    except Exception:
+        pass
+
+
+def _find_package_resource(
+    filename: str,
+    code_root: Path,
+    workspace_root: Path,
+    *,
+    package_dir: Path | None = None,
+) -> Path | None:
+    """按应用代码目录、工作区及当前包目录顺序查找 `yolo_studio/resources/<filename>`，未找到返回 `None`。"""
+    candidates: list[Path] = []
     for base in (code_root, workspace_root):
-        candidate = base / rel
+        candidates.append(base / "src" / "yolo_studio" / "resources" / filename)
+        candidates.append(base / "yolo_studio" / "resources" / filename)
+    if package_dir is not None:
+        candidates.append(package_dir / "resources" / filename)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         if candidate.is_file():
             return candidate
     return None
 
 
-def _create_startup_splash(app: object, icon_path: Path | None) -> object | None:
-    """在非无头桌面环境下立即绘制并显示轻量启动欢迎图（`QSplashScreen`），消除冷启动视觉空白期。"""
-    if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
-        return None
+def _find_app_icon_path(
+    code_root: Path,
+    workspace_root: Path,
+    *,
+    package_dir: Path | None = None,
+) -> Path | None:
+    """优先查找 YoloStudio 自有 `resources/logo.ico`，缺失时回退至内置 X-AnyLabeling 图标，均不存在返回 `None`。"""
+    own_icon = _find_package_resource(
+        APP_ICON_FILENAME,
+        code_root,
+        workspace_root,
+        package_dir=package_dir,
+    )
+    if own_icon is not None:
+        return own_icon
 
+    fallback_rel = Path("third_party") / "X-AnyLabeling" / "anylabeling" / "resources" / "images" / "icon.ico"
+    for base in (code_root, workspace_root):
+        candidate = base / fallback_rel
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _find_app_logo_path(
+    code_root: Path,
+    workspace_root: Path,
+    *,
+    package_dir: Path | None = None,
+) -> Path | None:
+    """查找 YoloStudio 自有高分辨率透明底 `resources/logo.png`，用于高分屏启动欢迎图与窗口大图图标。"""
+    return _find_package_resource(
+        APP_LOGO_FILENAME,
+        code_root,
+        workspace_root,
+        package_dir=package_dir,
+    )
+
+
+def _build_app_icon(icon_path: Path | None, logo_path: Path | None = None) -> object | None:
+    """组合多尺寸 `.ico`（优化小尺寸锐度）与高清 `.png` 构建 `QIcon`；均不可用时返回 `None`。"""
+    from PyQt6.QtGui import QIcon
+
+    icon = QIcon()
+    if icon_path is not None and icon_path.is_file():
+        icon = QIcon(str(icon_path))
+    if logo_path is not None and logo_path.is_file():
+        icon.addFile(str(logo_path))
+    return None if icon.isNull() else icon
+
+
+def _render_startup_splash_pixmap(
+    dpr: float,
+    icon_path: Path | None,
+    logo_path: Path | None = None,
+) -> object:
+    """按目标设备像素比 `dpr` 绘制高分屏圆角启动欢迎图 `QPixmap`（供桌面启动与离线自检共用）。"""
     from PyQt6.QtCore import QRectF, Qt
     from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap
-    from PyQt6.QtWidgets import QApplication, QSplashScreen
 
-    qapp = app if isinstance(app, QApplication) else QApplication.instance()
-    screen = qapp.primaryScreen() if qapp is not None else None
-    dpr = float(screen.devicePixelRatio()) if screen is not None else 1.0
-
-    width, height = 460, 210
-    pixmap = QPixmap(int(width * dpr), int(height * dpr))
-    pixmap.setDevicePixelRatio(dpr)
+    scale = max(1.0, float(dpr))
+    width, height = 508, 210
+    pixmap = QPixmap(int(round(width * scale)), int(round(height * scale)))
+    pixmap.setDevicePixelRatio(scale)
     pixmap.fill(Qt.GlobalColor.transparent)
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
     path = QPainterPath()
     path.addRoundedRect(QRectF(2, 2, width - 4, height - 4), 12.0, 12.0)
@@ -268,29 +352,64 @@ def _create_startup_splash(app: object, icon_path: Path | None) -> object | None
     painter.setPen(QColor("#30363d"))
     painter.drawPath(path)
 
+    logo_size = 56
+    logo_pix = QPixmap()
+    if logo_path is not None and logo_path.is_file():
+        raw_logo = QPixmap(str(logo_path))
+        if not raw_logo.isNull():
+            phys_px = int(round(logo_size * scale))
+            logo_pix = raw_logo.scaled(
+                phys_px,
+                phys_px,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            logo_pix.setDevicePixelRatio(scale)
+    if logo_pix.isNull() and icon_path is not None and icon_path.is_file():
+        logo_pix = QIcon(str(icon_path)).pixmap(logo_size, logo_size)
+
     text_x = 28
-    if icon_path is not None:
-        icon_pix = QIcon(str(icon_path)).pixmap(48, 48)
-        if not icon_pix.isNull():
-            painter.drawPixmap(28, 34, 48, 48, icon_pix)
-            text_x = 90
+    if not logo_pix.isNull():
+        painter.drawPixmap(QRectF(26, 30, logo_size, logo_size), logo_pix, QRectF(logo_pix.rect()))
+        text_x = 96
 
     title_font = QFont("Microsoft YaHei UI", 16, QFont.Weight.Bold)
     painter.setFont(title_font)
     painter.setPen(QColor("#f0f6fc"))
-    painter.drawText(QRectF(text_x, 32, width - text_x - 24, 30), f"YoloStudio v{__version__}")
+    painter.drawText(QRectF(text_x, 30, width - text_x - 24, 32), f"YoloStudio v{__version__}")
 
     sub_font = QFont("Microsoft YaHei UI", 9)
     painter.setFont(sub_font)
     painter.setPen(QColor("#8b949e"))
     painter.drawText(
-        QRectF(text_x, 64, width - text_x - 24, 24),
+        QRectF(text_x, 66, width - text_x - 24, 28),
         "视频抽帧 → 内嵌 X-AnyLabeling → MLLM 纠错 → YOLO26 训练",
     )
 
     painter.setPen(QColor("#0969da"))
     painter.drawLine(28, 148, width - 28, 148)
     painter.end()
+    return pixmap
+
+
+def _create_startup_splash(
+    app: object,
+    icon_path: Path | None,
+    logo_path: Path | None = None,
+) -> object | None:
+    """在非无头桌面环境下立即绘制并显示轻量启动欢迎图（`QSplashScreen`），消除冷启动视觉空白期。"""
+    if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+        return None
+
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QColor
+    from PyQt6.QtWidgets import QApplication, QSplashScreen
+
+    qapp = app if isinstance(app, QApplication) else QApplication.instance()
+    screen = qapp.primaryScreen() if qapp is not None else None
+    dpr = float(screen.devicePixelRatio()) if screen is not None else 1.0
+
+    pixmap = _render_startup_splash_pixmap(dpr, icon_path, logo_path=logo_path)
 
     splash = QSplashScreen(
         pixmap,
@@ -319,6 +438,7 @@ def main(workspace_root: Path | None = None) -> int:
         else resolve_workspace_root()
     )
     code_root = _code_root_candidate()
+    package_dir = Path(__file__).resolve().parent
     for candidate_base in (code_root, root):
         xal_dir = candidate_base / "third_party" / "X-AnyLabeling"
         if xal_dir.is_dir() and str(xal_dir) not in sys.path:
@@ -333,27 +453,31 @@ def main(workspace_root: Path | None = None) -> int:
     os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.gui.icc=false")
 
     from PyQt6.QtCore import QCoreApplication, QTimer, Qt
-    from PyQt6.QtGui import QIcon
     from PyQt6.QtWidgets import QApplication
 
     from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
 
     ensure_cuda_dll_search_paths()
+    _configure_windows_app_user_model_id()
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
     app = QApplication(sys.argv)
     app.setApplicationName("YOLO26 Training Studio")
     app.setApplicationVersion(__version__)
     install_runtime_excepthook(workspace_root=root)
-    icon_path = _find_app_icon_path(code_root, root)
-    if icon_path is not None:
-        app.setWindowIcon(QIcon(str(icon_path)))
+    icon_path = _find_app_icon_path(code_root, root, package_dir=package_dir)
+    logo_path = _find_app_logo_path(code_root, root, package_dir=package_dir)
+    app_icon = _build_app_icon(icon_path, logo_path=logo_path)
+    if app_icon is not None:
+        app.setWindowIcon(app_icon)
 
-    splash = _create_startup_splash(app, icon_path)
+    splash = _create_startup_splash(app, icon_path, logo_path=logo_path)
 
     from yolo_studio.gui.main_window import MainWindow
 
     window = MainWindow(workspace_root=root, lazy_init=True)
+    if app_icon is not None:
+        window.setWindowIcon(app_icon)
     window.show()
     if splash is not None:
         splash.finish(window)

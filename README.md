@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src/yolo_studio/resources/logo.png" alt="YoloStudio Logo" width="112" />
+</p>
+
 # YOLO26 视频抽帧与训练工具 (YoloStudio)
 
 面向 **录制视频 → 抽帧 → 内嵌 X-AnyLabeling 标注 → MLLM 自动纠错清洗 → YOLO26 训练 / 验证 / 推理 / 导出** 的单进程一体化桌面 GUI 工具（同时提供 CLI 命令行入口）。

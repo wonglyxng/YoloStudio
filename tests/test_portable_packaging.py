@@ -205,6 +205,8 @@ def test_parse_pyvenv_home_and_slim_app_copy(tmp_path: Path) -> None:
     bp.copy_app_and_docs(REPO_ROOT, bundle_out)
     assert (bundle_out / "app" / "main.py").is_file()
     assert (bundle_out / "app" / "src" / "yolo_studio" / "app.py").is_file()
+    assert (bundle_out / "app" / "src" / "yolo_studio" / "resources" / "logo.ico").is_file()
+    assert (bundle_out / "app" / "src" / "yolo_studio" / "resources" / "logo.png").is_file()
     assert (bundle_out / "app" / "third_party" / "X-AnyLabeling" / "anylabeling" / "app_info.py").is_file()
     assert (bundle_out / "LICENSE").is_file()
     assert (bundle_out / "THIRD_PARTY_NOTICES.md").is_file()
@@ -244,15 +246,8 @@ def test_compile_windows_launcher_and_cli_cmd_with_parens_path(tmp_path: Path) -
     bp = _load_build_portable_module()
 
     launcher_cs = REPO_ROOT / "packaging" / "launcher" / "YoloStudioLauncher.cs"
-    icon_file = (
-        REPO_ROOT
-        / "third_party"
-        / "X-AnyLabeling"
-        / "anylabeling"
-        / "resources"
-        / "images"
-        / "icon.ico"
-    )
+    icon_file = bp.resolve_launcher_icon_path(REPO_ROOT)
+    assert icon_file == REPO_ROOT / "src" / "yolo_studio" / "resources" / "logo.ico"
     bundle_dir = tmp_path / "Program Files (x86)" / "YoloStudio 中文目录"
     out_exe = bundle_dir / "YoloStudio.exe"
     compiled = bp.compile_windows_launcher(launcher_cs, out_exe, icon_file=icon_file)
@@ -931,3 +926,82 @@ def test_reuse_runtime_cross_dir_and_inplace_skips_reinstall(
     assert keep_weight.read_bytes() == b"WEIGHT_KEEP"
     assert not stale_app_file.exists()
     assert precompile_calls == [("none", False), ("none", False)]
+
+
+def test_app_logo_assets_resolution_and_splash_render(tmp_path: Path) -> None:
+    """验证自有 LOGO 资产规格、图标解析优先级（自有优先、缺失回退）及高分屏启动图渲染。"""
+    from PIL import Image
+    from PyQt6.QtCore import QCoreApplication, Qt
+    from PyQt6.QtWidgets import QApplication
+
+    from yolo_studio.app import (
+        _build_app_icon,
+        _find_app_icon_path,
+        _find_app_logo_path,
+        _render_startup_splash_pixmap,
+    )
+
+    bp = _load_build_portable_module()
+
+    own_ico = REPO_ROOT / "src" / "yolo_studio" / "resources" / "logo.ico"
+    own_png = REPO_ROOT / "src" / "yolo_studio" / "resources" / "logo.png"
+    assert own_ico.is_file()
+    assert own_png.is_file()
+
+    # 1) 校验 PNG 主图与多尺寸 ICO 帧完整性
+    with Image.open(own_png) as png_img:
+        assert png_img.mode == "RGBA"
+        assert png_img.size == (512, 512)
+        # 四角为透明背景，说明圆角图标外无白底残留
+        assert png_img.getpixel((0, 0))[3] == 0
+        assert png_img.getpixel((511, 511))[3] == 0
+
+    with Image.open(own_ico) as ico_img:
+        sizes = set(ico_img.info.get("sizes", set()))
+        expected_sizes = {(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)}
+        assert expected_sizes.issubset(sizes)
+
+    # 2) 校验正常仓库环境优先命中 YoloStudio 自有图标
+    pkg_dir = REPO_ROOT / "src" / "yolo_studio"
+    assert _find_app_icon_path(REPO_ROOT, REPO_ROOT, package_dir=pkg_dir) == own_ico
+    assert _find_app_logo_path(REPO_ROOT, REPO_ROOT, package_dir=pkg_dir) == own_png
+    assert bp.resolve_launcher_icon_path(REPO_ROOT) == own_ico
+
+    # 3) 校验缺失自有图标时回退至 X-AnyLabeling 图标；均缺失时返回 None
+    empty_repo = tmp_path / "empty_repo"
+    empty_repo.mkdir()
+    assert _find_app_icon_path(empty_repo, empty_repo) is None
+    assert _find_app_logo_path(empty_repo, empty_repo) is None
+    assert bp.resolve_launcher_icon_path(empty_repo) is None
+
+    fallback_ico = (
+        empty_repo
+        / "third_party"
+        / "X-AnyLabeling"
+        / "anylabeling"
+        / "resources"
+        / "images"
+        / "icon.ico"
+    )
+    fallback_ico.parent.mkdir(parents=True)
+    fallback_ico.write_bytes(own_ico.read_bytes())
+    assert _find_app_icon_path(empty_repo, empty_repo) == fallback_ico
+    assert bp.resolve_launcher_icon_path(empty_repo) == fallback_ico
+
+    # 4) 校验离线 Qt 环境下 QIcon 构建与 1x/2x 高分屏启动欢迎图绘制
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance()
+    if app is None:
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+        app = QApplication([])
+
+    qicon = _build_app_icon(own_ico, logo_path=own_png)
+    assert qicon is not None and not qicon.isNull()
+    avail = {(s.width(), s.height()) for s in qicon.availableSizes()}
+    assert (16, 16) in avail and (256, 256) in avail and (512, 512) in avail
+
+    pm_1x = _render_startup_splash_pixmap(1.0, own_ico, logo_path=own_png)
+    pm_2x = _render_startup_splash_pixmap(2.0, own_ico, logo_path=own_png)
+    assert not pm_1x.isNull() and pm_1x.width() == 508 and pm_1x.height() == 210
+    assert not pm_2x.isNull() and pm_2x.width() == 1016 and pm_2x.height() == 420
+    assert pm_2x.devicePixelRatio() == 2.0

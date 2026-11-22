@@ -36,6 +36,9 @@ yolo-studio = "yolo_studio.app:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+yolo_studio = ["resources/*.ico", "resources/*.png"]
+
 [tool.setuptools.dynamic]
 version = {attr = "yolo_studio._version.__version__"}
 

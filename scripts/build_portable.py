@@ -2354,18 +2354,28 @@ def create_patch_archive(
     return archive_path
 
 
-def _build_launcher_for_bundle(config: BuildConfig, bundle_root: Path, version: str) -> None:
-    """为指定便携包目录生成含单一版本元数据与可选 SHA-256 防篡改清单的原生 `YoloStudio.exe`。"""
-    launcher_cs = config.repo_root / "packaging" / "launcher" / "YoloStudioLauncher.cs"
-    icon_path = (
-        config.repo_root
+def resolve_launcher_icon_path(repo_root: Path) -> Path | None:
+    """解析编译 `YoloStudio.exe` 时嵌入的 Windows 图标路径：优先自有 `logo.ico`，缺失时兜底 X-AnyLabeling 图标。"""
+    candidates = (
+        repo_root / "src" / "yolo_studio" / "resources" / "logo.ico",
+        repo_root
         / "third_party"
         / "X-AnyLabeling"
         / "anylabeling"
         / "resources"
         / "images"
-        / "icon.ico"
+        / "icon.ico",
     )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _build_launcher_for_bundle(config: BuildConfig, bundle_root: Path, version: str) -> None:
+    """为指定便携包目录生成含单一版本元数据与可选 SHA-256 防篡改清单的原生 `YoloStudio.exe`。"""
+    launcher_cs = config.repo_root / "packaging" / "launcher" / "YoloStudioLauncher.cs"
+    icon_path = resolve_launcher_icon_path(config.repo_root)
     print(f"[启动器] 编译无黑框原生桌面启动器 YoloStudio.exe (v{version})...")
     enable_integrity = config.protect.strip().lower() in {"pyc", "pyd"}
     with tempfile.TemporaryDirectory(prefix="ys_manifest_") as manifest_tmp:
