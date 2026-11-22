@@ -7,7 +7,8 @@
 
 运行环境与协作边界：
     运行于 PyQt6 主线程；训练任务委托给 `gui.workers.TrainWorker`，
-    在训练产出有效 `best.pt` 时通过 `send_best_weights` 信号向主窗口同步给标签页 3 与标签页 6；
+    在训练产出有效 `best.pt` 时通过 `send_best_weights` 信号向主窗口同步给标签页 3 与标签页 6，
+    点击「将 best.pt 发送到「6. 验证与推理」→」时再次同步并通过 `request_eval_tab` 请求主窗口切换至标签页 6；
     持久化读写通过 `save_settings` / `restore_settings` 接受主窗口或外部注入的 `QSettings` 实例。
 """
 
@@ -263,6 +264,7 @@ class TrainTab(QWidget):
     """
 
     send_best_weights = Signal(str, str)  # 信号参数：(weights_path, data_yaml)
+    request_eval_tab = Signal()  # 请求主窗口切换到「6. 验证、推理与导出」，不携带数据
 
     def __init__(
         self,
@@ -728,6 +730,9 @@ class TrainTab(QWidget):
         self.open_run_btn = QPushButton("打开训练结果目录")
         self.send_eval_btn = QPushButton("将 best.pt 发送到「6. 验证与推理」→")
         self.send_eval_btn.setEnabled(False)
+        self.send_eval_btn.setToolTip(
+            "训练产出 best.pt 后已自动同步到「6. 验证、推理与导出」与「3. LLM 标注清洗」；点击再次同步并切换过去"
+        )
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
         btn_row.addWidget(self.open_run_btn)
@@ -836,11 +841,7 @@ class TrainTab(QWidget):
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.open_run_btn.clicked.connect(lambda: open_local_path(self._last_save_dir))
-        self.send_eval_btn.clicked.connect(
-            lambda: self.send_best_weights.emit(self._last_best_pt, self.yaml_picker.text())
-            if self._last_best_pt
-            else None
-        )
+        self.send_eval_btn.clicked.connect(self._on_send_to_eval)
 
         # 初始同步防呆联动、梯度累积换算与增强摘要
         self._sync_control_states()
@@ -1934,6 +1935,18 @@ class TrainTab(QWidget):
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
             self.log_box.appendPlainText("正在请求停止训练，请等待当前 Epoch 完成保存...")
+
+    def _on_send_to_eval(self) -> None:
+        """将最近训练产出的 `best.pt` 与当前 `data.yaml` 再次同步至下游页并请求主窗口切换至标签页 6。
+
+        说明：
+            无有效 `_last_best_pt` 时静默返回；仅用户主动点击发送按钮时发射 `request_eval_tab`，
+            训练完成自动同步（`_on_finished`）不会强制切页，以免打断用户查看训练日志与最终评估指标。
+        """
+        if not self._last_best_pt:
+            return
+        self.send_best_weights.emit(self._last_best_pt, self.yaml_picker.text())
+        self.request_eval_tab.emit()
 
     def _on_epoch_updated(self, m: EpochMetrics) -> None:
         """更新右侧指标卡片：常规轮次更新实时/最后一轮卡片，`final_eval` 仅更新下方 `best.pt` 最终评估栏。"""

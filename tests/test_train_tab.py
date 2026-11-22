@@ -2,12 +2,14 @@
 
 职责：
     在离线 `offscreen` Qt 环境下验证训练时长格式化边界、重新开始训练时实时指标与进度条的立即重置、
-    单调时钟驱动的训练时长实时刷新与停表定格、旧训练线程信号隔离，以及校验失败/GPU 占用拦截、
-    `extra_args` 覆盖 `epochs`、断点续训与关闭窗口时的边界行为。
+    单调时钟驱动的训练时长实时刷新与停表定格、旧训练线程信号隔离、校验失败/GPU 占用拦截、
+    `extra_args` 覆盖 `epochs`、断点续训与关闭窗口时的边界行为，以及训练完成后点击
+    「将 best.pt 发送到「6. 验证与推理」→」按钮同步路径并切换主窗口至标签页 6。
 
 运行环境与协作边界：
-    通过 `pytest` 运行，依赖 `PyQt6`；仅实例化 `TrainTab` 并通过轻量假 `TrainWorker` 驱动信号，
-    不启动真实模型训练，不加载内嵌 X-AnyLabeling 或访问外部网络。
+    通过 `pytest` 运行，依赖 `PyQt6`；使用轻量假 `TrainWorker` / `WeightsInspectWorker` 驱动信号，
+    `MainWindow` 集成测试启用 `lazy_init=True` 与独立临时 `QSettings`，
+    不启动真实模型训练，不加载内嵌 X-AnyLabeling，不污染宿主机配置或访问外部网络。
 """
 
 from __future__ import annotations
@@ -16,12 +18,14 @@ import os
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QCoreApplication, QObject, Qt, pyqtSignal as Signal
+from PyQt6.QtCore import QCoreApplication, QObject, QSettings, Qt, pyqtSignal as Signal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+import yolo_studio.gui.tab_eval as tab_eval_module
 import yolo_studio.gui.tab_train as tab_train_module
 from yolo_studio.core.trainer import DeviceInfo, EpochMetrics, TrainConfig, TrainResult
 from yolo_studio.gui.common import GpuTaskGuard
+from yolo_studio.gui.main_window import MainWindow
 from yolo_studio.gui.tab_train import TrainTab, format_elapsed_duration
 
 
@@ -419,3 +423,107 @@ def test_final_eval_displays_best_metrics_without_overwriting_last_epoch(
         assert tab.val_best_map50_95.text() == "0.6840"
     finally:
         tab.close()
+
+
+def test_send_eval_button_emits_weights_and_requests_eval_tab(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证训练完成时自动同步不强制切页，点击发送按钮时同步 `best.pt` 并请求切换至第 6 页。"""
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text("names: [target]\n", encoding="utf-8")
+    best_pt = tmp_path / "runs" / "exp1" / "weights" / "best.pt"
+    best_pt.parent.mkdir(parents=True, exist_ok=True)
+    best_pt.write_bytes(b"pt")
+
+    tab = TrainTab(workspace_root=tmp_path, device_info=_make_cpu_device_info())
+    try:
+        tab.set_data_yaml(str(data_yaml))
+        sent_weights: list[tuple[str, str]] = []
+        requested_eval: list[bool] = []
+        tab.send_best_weights.connect(lambda w, y: sent_weights.append((w, y)))
+        tab.request_eval_tab.connect(lambda: requested_eval.append(True))
+
+        # 训练尚未产出 best.pt 时按钮禁用，且直接调用槽函数不会误发信号
+        assert tab.send_eval_btn.isEnabled() is False
+        tab._on_send_to_eval()
+        assert sent_weights == []
+        assert requested_eval == []
+
+        # 训练结束产出 best.pt：自动同步一次权重，但不强制切页
+        tab._on_finished(TrainResult(save_dir=best_pt.parents[1], best_weights=best_pt, last_weights=None))
+        assert tab.send_eval_btn.isEnabled() is True
+        assert sent_weights == [(str(best_pt), str(data_yaml))]
+        assert requested_eval == []
+
+        # 用户主动点击「将 best.pt 发送到「6. 验证与推理」→」：再次同步并请求切页
+        tab.send_eval_btn.click()
+        qt_app.processEvents()
+        assert sent_weights == [
+            (str(best_pt), str(data_yaml)),
+            (str(best_pt), str(data_yaml)),
+        ]
+        assert requested_eval == [True]
+    finally:
+        tab.close()
+
+
+def test_mainwindow_train_send_eval_button_syncs_and_switches_to_eval_tab(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证主窗口下点击训练页发送按钮可重新同步 `best.pt` / `data.yaml` 并切至「6. 验证、推理与导出」。"""
+
+    class _StubInspectWorker(QObject):
+        """替代 `WeightsInspectWorker` 的空桩，避免测试在后台反序列化占位 `.pt` 文件。"""
+
+        finished_metadata = Signal(int, object)
+        failed = Signal(int, str)
+        finished = Signal()
+
+        def __init__(self, weights_path: Path, request_id: int = 0) -> None:
+            super().__init__()
+            self.weights_path = weights_path
+            self.request_id = request_id
+
+        def isRunning(self) -> bool:
+            return False
+
+        def start(self) -> None:
+            self.finished.emit()
+
+    monkeypatch.setattr(tab_eval_module, "WeightsInspectWorker", _StubInspectWorker)
+
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text("names: [player]\n", encoding="utf-8")
+    best_pt = tmp_path / "runs" / "yolo26_train" / "weights" / "best.pt"
+    best_pt.parent.mkdir(parents=True, exist_ok=True)
+    best_pt.write_bytes(b"pt")
+
+    settings = QSettings(str(tmp_path / "mainwindow_test.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=settings)
+    try:
+        win.tabs.setCurrentWidget(win.train_tab)
+        win.train_tab.set_data_yaml(str(data_yaml))
+
+        # 1) 训练完成后自动同步到第 6 页与第 3 页，但当前视图仍停留在第 5 页方便查看日志
+        win.train_tab._on_finished(
+            TrainResult(save_dir=best_pt.parents[1], best_weights=best_pt, last_weights=None)
+        )
+        qt_app.processEvents()
+        assert win.tabs.currentWidget() is win.train_tab
+        assert win.eval_tab.weights_picker.text() == str(best_pt)
+        assert win.eval_tab.yaml_picker.text() == str(data_yaml)
+        assert win.review_tab.weights_picker.text() == str(best_pt)
+
+        # 2) 模拟用户曾在第 6 页改选其他权重，回到第 5 页点击发送按钮后重新覆盖同步并立即切至第 6 页
+        win.eval_tab.weights_picker.setText(str(tmp_path / "other.pt"))
+        win.eval_tab.yaml_picker.setText(str(tmp_path / "other.yaml"))
+        win.review_tab.weights_picker.setText(str(tmp_path / "other.pt"))
+
+        win.train_tab.send_eval_btn.click()
+        qt_app.processEvents()
+        assert win.tabs.currentWidget() is win.eval_tab
+        assert win.eval_tab.weights_picker.text() == str(best_pt)
+        assert win.eval_tab.yaml_picker.text() == str(data_yaml)
+        assert win.review_tab.weights_picker.text() == str(best_pt)
+    finally:
+        win.close()

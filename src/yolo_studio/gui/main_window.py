@@ -159,6 +159,9 @@ class MainWindow(QMainWindow):
             lambda: self.tabs.setCurrentWidget(self.train_tab)
         )
         self.train_tab.send_best_weights.connect(self._on_weights_ready)
+        self.train_tab.request_eval_tab.connect(
+            lambda: self.tabs.setCurrentWidget(self.eval_tab)
+        )
 
         self._restore_settings()
 
@@ -247,7 +250,10 @@ class MainWindow(QMainWindow):
         self.train_tab.set_data_yaml(yaml_path)
 
     def _on_weights_ready(self, weights_path: str, yaml_path: str) -> None:
-        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「3. LLM 标注清洗」。"""
+        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「3. LLM 标注清洗」。
+
+        仅同步路径不主动切换标签页；用户点击训练页发送按钮时由 `TrainTab.request_eval_tab` 独立触发切页。
+        """
         self.eval_tab.set_weights_and_yaml(weights_path, yaml_path)
         self.review_tab.set_weights_path(weights_path)
 
