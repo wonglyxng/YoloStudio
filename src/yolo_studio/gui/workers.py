@@ -229,18 +229,29 @@ class TrainWorker(QThread):
 
 
 class ValidateWorker(QThread):
-    """在后台线程运行 YOLO26 验证集评估。"""
+    """在后台线程运行 YOLO26 验证集评估（支持 `.pt` 及 `.onnx` / `.torchscript` / `.engine`）。"""
 
     log_line = Signal(str)
     finished_metrics = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, weights_path: Path, data_yaml: Path, imgsz: int, device: str) -> None:
+    def __init__(
+        self,
+        weights_path: Path,
+        data_yaml: Path,
+        imgsz: int | tuple[int, int],
+        device: str,
+        *,
+        nms: bool | None = None,
+        rect: bool | None = None,
+    ) -> None:
         super().__init__()
         self.weights_path = weights_path
         self.data_yaml = data_yaml
         self.imgsz = imgsz
         self.device = device
+        self.nms = nms
+        self.rect = rect
 
     def run(self) -> None:
         """线程入口：执行 `validate_model` 并派发日志及验证指标字典。"""
@@ -250,6 +261,8 @@ class ValidateWorker(QThread):
                 self.data_yaml,
                 imgsz=self.imgsz,
                 device=self.device,
+                nms=self.nms,
+                rect=self.rect,
                 log_callback=lambda line: self.log_line.emit(line),
             )
             self.finished_metrics.emit(metrics)
@@ -258,7 +271,7 @@ class ValidateWorker(QThread):
 
 
 class PredictWorker(QThread):
-    """在后台线程运行 YOLO26 推理预览并写出渲染结果。"""
+    """在后台线程运行 YOLO26 推理预览并写出渲染结果（支持 `.pt` 与已导出部署模型）。"""
 
     log_line = Signal(str)
     finished_outputs = Signal(object)
@@ -271,8 +284,12 @@ class PredictWorker(QThread):
         output_dir: Path,
         conf: float,
         iou: float,
-        imgsz: int,
+        imgsz: int | tuple[int, int],
         device: str,
+        *,
+        nms: bool | None = None,
+        rect: bool = True,
+        max_det: int = 300,
     ) -> None:
         super().__init__()
         self.weights_path = weights_path
@@ -282,6 +299,9 @@ class PredictWorker(QThread):
         self.iou = iou
         self.imgsz = imgsz
         self.device = device
+        self.nms = nms
+        self.rect = rect
+        self.max_det = max_det
 
     def run(self) -> None:
         """线程入口：执行 `predict_source` 并派发生成的输出文件路径列表。"""
@@ -294,6 +314,9 @@ class PredictWorker(QThread):
                 iou=self.iou,
                 imgsz=self.imgsz,
                 device=self.device,
+                nms=self.nms,
+                rect=self.rect,
+                max_det=self.max_det,
                 log_callback=lambda line: self.log_line.emit(line),
             )
             self.finished_outputs.emit(outputs)
@@ -302,11 +325,11 @@ class PredictWorker(QThread):
 
 
 class WeightsInspectWorker(QThread):
-    """在后台线程只读解析 `.pt` 权重的训练尺寸、类别顺序与检测头信息，避免阻塞主界面。
+    """在后台线程只读解析 `.pt` 权重或已导出部署模型的尺寸、类别顺序与检测头信息，避免阻塞主界面。
 
     信号契约：
         `finished_metadata(request_id, WeightsMetadata)`：读取成功时携带请求序号与元数据快照。
-        `failed(request_id, error_text)`：读取失败或权重格式非法时回传请求序号与中文错误信息。
+        `failed(request_id, error_text)`：读取失败或模型格式非法时回传请求序号与中文错误信息。
     """
 
     finished_metadata = Signal(int, object)

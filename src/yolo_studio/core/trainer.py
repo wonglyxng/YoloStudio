@@ -1,12 +1,14 @@
-"""Ultralytics YOLO26 模型训练、验证、推理预览、权重元数据探测与导出引擎。
+"""Ultralytics YOLO26 模型训练、验证、推理预览、模型元数据探测与导出引擎。
 
 职责：
-    封装本地硬件探测、`.pt` 权重元数据只读解析（训练尺寸、类别顺序与检测头能力），
-    以及 YOLO26 模型的训练、验证、图片/视频推理与部署格式导出，
-    并将训练与导出引擎的标准输出和 Epoch 指标实时桥接至调用方回调。
+    封装本地硬件探测、`.pt` 权重及已导出模型（`.onnx` / `.torchscript` / `.engine`）元数据只读解析
+    （训练/导出尺寸、类别顺序、动态维度与检测头能力），以及 YOLO26 模型的训练、验证、
+    图片/视频推理（支持检测头模式与填充方式配置）和部署格式导出，
+    并将训练、验证、推理与导出引擎的标准输出和 Epoch 指标实时桥接至调用方回调。
 
 运行环境：
     Python >= 3.11，依赖 `torch`、`ultralytics` 与 `opencv-python`；
+    推理已导出 `.onnx` 模型时依赖 `onnxruntime`（或 `onnxruntime-gpu`）；
     使用预训练名称（如 `yolo26s.pt`）且本地缺失权重时，Ultralytics 会触发模型下载。
 
 协作对象与职责边界：
@@ -1031,29 +1033,205 @@ def train_yolo26(
     )
 
 
+# 支持在验证与推理预览中直接加载的已导出部署模型后缀与标准格式名映射
+EXPORTED_MODEL_SUFFIX_TO_FORMAT: dict[str, str] = {
+    ".onnx": "onnx",
+    ".torchscript": "torchscript",
+    ".engine": "engine",
+}
+EXPORTED_MODEL_SUFFIXES: frozenset[str] = frozenset(EXPORTED_MODEL_SUFFIX_TO_FORMAT.keys())
+SUPPORTED_EVAL_MODEL_SUFFIXES: frozenset[str] = frozenset({".pt", *EXPORTED_MODEL_SUFFIXES})
+
+# PyTorch `.pt` 验证/推理可选检测头模式：(内部键名, 界面显示文案, 对应 Ultralytics `nms` 参数值)
+PREDICT_HEAD_MODES: list[tuple[str, str, bool | None]] = [
+    ("one2many", "one2many · 外部 NMS (PT 默认)", None),
+    ("end2end", "end2end · YOLO26 one2one 无 NMS", False),
+]
+PREDICT_HEAD_KEY_TO_NMS: dict[str, bool | None] = {
+    key: nms_val for key, _, nms_val in PREDICT_HEAD_MODES
+}
+
+# 推理效果测试输入尺寸与填充模式：(内部键名, 界面显示文案)
+PREDICT_PAD_MODES: list[tuple[str, str]] = [
+    ("rect", "最小矩形填充 (rect=True，PT 默认)"),
+    ("square", "固定方形填充 (rect=False，模拟方形导出)"),
+    ("export", "按导出尺寸固定填充 (H×W，rect=False)"),
+]
+
+
+def detect_model_format(model_path: Path) -> str:
+    """根据模型文件扩展名返回规范化格式键名（`pt` / `onnx` / `torchscript` / `engine` 等）。"""
+    suffix = model_path.suffix.lower()
+    if suffix in EXPORTED_MODEL_SUFFIX_TO_FORMAT:
+        return EXPORTED_MODEL_SUFFIX_TO_FORMAT[suffix]
+    if suffix == ".pt" or not suffix:
+        return "pt"
+    return suffix.lstrip(".")
+
+
+def is_exported_model_path(model_path: Path) -> bool:
+    """判断路径是否为已导出的部署模型文件（`.onnx` / `.torchscript` / `.engine`）。"""
+    return model_path.suffix.lower() in EXPORTED_MODEL_SUFFIXES
+
+
+def _format_imgsz_arg(imgsz: int | tuple[int, int]) -> tuple[int | list[int], tuple[int, int]]:
+    """将单整数或 `(高, 宽)` 元组校验并转换为 Ultralytics 可接受的 `imgsz` 参数及规范二元组。"""
+    pair = normalize_export_imgsz(imgsz)
+    h, w = pair
+    return (h if h == w else [h, w]), pair
+
+
+def build_val_kwargs(
+    weights_path: Path,
+    data_yaml: Path,
+    *,
+    imgsz: int | tuple[int, int] = 640,
+    device: str = "0",
+    nms: bool | None = None,
+    rect: bool | None = None,
+    metadata: WeightsMetadata | None = None,
+) -> tuple[dict[str, object], list[str]]:
+    """校验并组装传给 Ultralytics `model.val(**kwargs)` 的参数字典与提示列表。
+
+    规则说明：
+        - `.engine`（TensorRT）模型仅支持 CUDA GPU，在 CPU 设备模式下抛出 `ValueError`；
+        - 已导出模型（`.onnx` / `.torchscript` / `.engine`）的检测头已在导出时固化，不传入 `nms` 覆盖；
+        - 当传入非正方形 `(高, 宽)` 尺寸时，强制 `rect=False` 以避免矩形批排布与二元组 `imgsz` 冲突。
+    """
+    fmt = detect_model_format(weights_path)
+    is_exported = is_exported_model_path(weights_path)
+    dev_str = str(device).strip() or "0"
+    if fmt == "engine" and dev_str.lower() == "cpu":
+        raise ValueError("TensorRT (.engine) 模型仅支持在 CUDA GPU 上验证，请启用 GPU 加速。")
+
+    imgsz_arg, pair = _format_imgsz_arg(imgsz)
+    warnings: list[str] = []
+
+    val_kwargs: dict[str, object] = {
+        "data": str(data_yaml),
+        "imgsz": imgsz_arg,
+        "device": dev_str,
+    }
+
+    if is_exported:
+        if nms is not None:
+            warnings.append(f"已导出 {fmt.upper()} 模型的检测头已固化，忽略额外指定的 nms={nms}。")
+        if metadata is not None and metadata.export_dynamic is False:
+            val_kwargs["rect"] = False
+            if metadata.train_imgsz is not None:
+                mh, mw = metadata.train_imgsz
+                if pair != metadata.train_imgsz:
+                    warnings.append(
+                        f"静态 {fmt.upper()} 模型固定使用导出尺寸 {format_imgsz_text(metadata.train_imgsz)}，"
+                        "Ultralytics 验证时将自动沿用该固定尺寸。"
+                    )
+                val_kwargs["imgsz"] = mh if mh == mw else [mh, mw]
+        elif rect is not None:
+            val_kwargs["rect"] = bool(rect)
+    else:
+        if nms is not None:
+            val_kwargs["nms"] = nms
+            if nms is False and metadata is not None and not metadata.supports_end2end:
+                warnings.append("当前 .pt 权重未检测到 one2one 端到端分支，验证将回退为 one2many 检测头。")
+        elif metadata is not None and not metadata.one2many_available and metadata.supports_end2end:
+            warnings.append("当前 .pt 权重仅保留 one2one 端到端分支，将按端到端无 NMS 执行验证。")
+
+        if pair[0] != pair[1]:
+            if rect is True:
+                warnings.append("验证传入矩形输入尺寸时需关闭最小矩形批排布，已自动设置 rect=False。")
+            val_kwargs["rect"] = False
+        elif rect is not None:
+            val_kwargs["rect"] = bool(rect)
+
+    return val_kwargs, warnings
+
+
+def format_submitted_val_config(
+    weights_path: Path,
+    val_kwargs: Mapping[str, object],
+    *,
+    metadata: WeightsMetadata | None = None,
+    warnings: Sequence[str] = (),
+) -> str:
+    """将提交给 Ultralytics `model.val()` 的验证配置与提示格式化为可读多行日志。"""
+    fmt = detect_model_format(weights_path)
+    is_exported = is_exported_model_path(weights_path)
+    if is_exported:
+        mode_map = {
+            "end2end": "已固化 one2one 端到端无 NMS",
+            "embedded": "已固化图内嵌入 NMS",
+            "raw": "已固化原始 one2many (外部 NMS)",
+        }
+        head_desc = mode_map.get(metadata.export_nms_mode if metadata else None, "由导出模型决定")
+    elif val_kwargs.get("nms") is False:
+        head_desc = "end2end (YOLO26 one2one 无 NMS)"
+    else:
+        head_desc = "one2many (外部 NMS，PT 默认)"
+
+    payload: dict[str, object] = {
+        "model": weights_path.name,
+        "model_format": fmt,
+        "head_mode": head_desc,
+        **dict(val_kwargs),
+    }
+    json_lines = json.dumps(payload, ensure_ascii=False, indent=2, default=str).splitlines()
+    if json_lines:
+        json_lines[0] = f'"val_arguments": {json_lines[0]}'
+    lines = ["=== 模型验证配置 (提交至 Ultralytics) ===", *json_lines]
+    for warn in warnings:
+        lines.append(f"[提示] {warn}")
+    return "\n".join(lines)
+
+
 def validate_model(
     weights_path: Path,
     data_yaml: Path,
-    imgsz: int = 640,
+    imgsz: int | tuple[int, int] = 640,
     device: str = "0",
+    *,
+    nms: bool | None = None,
+    rect: bool | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
-    """在指定验证数据集上评估已训练的 YOLO26 权重并返回指标字典。
+    """在指定验证数据集上评估 `.pt` 权重或已导出部署模型（`.onnx` / `.torchscript` / `.engine`）并返回指标字典。
 
-    `weights_path` 或 `data_yaml` 不存在时抛出 `FileNotFoundError`；
-    当前线程的输出与 `ultralytics` 日志转发到 `log_callback`。
+    参数与行为说明：
+        - `imgsz` 支持正整数（方形）或 `(高, 宽)` 二元组；
+        - `nms` 仅对 `.pt` 权重生效（`None`=默认 `one2many` + 外部 NMS，`False`=YOLO26 `one2one` 端到端头）；
+        - `weights_path` 或 `data_yaml` 不存在时抛出 `FileNotFoundError`，非法设备或尺寸抛出 `ValueError`；
+        - 执行前向 `log_callback` 输出本次验证配置，并将当前线程输出与 `ultralytics` 日志转发至 `log_callback`。
     """
-    from ultralytics import YOLO
-
     if not weights_path.is_file():
-        raise FileNotFoundError(f"权重文件不存在: {weights_path}")
+        raise FileNotFoundError(f"模型文件不存在: {weights_path}")
     if not data_yaml.is_file():
         raise FileNotFoundError(f"data.yaml 不存在: {data_yaml}")
+
+    meta: WeightsMetadata | None = None
+    try:
+        meta = inspect_weights_metadata(weights_path)
+    except Exception:
+        meta = None
+
+    val_kwargs, warnings = build_val_kwargs(
+        weights_path,
+        data_yaml,
+        imgsz=imgsz,
+        device=device,
+        nms=nms,
+        rect=rect,
+        metadata=meta,
+    )
+    _emit_multiline_log(
+        log_callback,
+        format_submitted_val_config(weights_path, val_kwargs, metadata=meta, warnings=warnings),
+    )
+
+    from ultralytics import YOLO
 
     ensure_torch_cpu_threads()
     model = YOLO(str(weights_path))
     with capture_thread_output(log_callback):
-        metrics = model.val(data=str(data_yaml), imgsz=imgsz, device=device)
+        metrics = model.val(**val_kwargs)
 
     summary: dict[str, float] = {}
     results_dict = getattr(metrics, "results_dict", None)
@@ -1077,29 +1255,199 @@ def _unique_pred_path(output_dir: Path, src: Path, used: set[str]) -> Path:
     return output_dir / f"{candidate}.jpg"
 
 
+def build_predict_kwargs(
+    weights_path: Path,
+    source_path: Path,
+    *,
+    conf: float = 0.25,
+    iou: float = 0.45,
+    imgsz: int | tuple[int, int] = 640,
+    device: str = "0",
+    nms: bool | None = None,
+    rect: bool = True,
+    max_det: int = 300,
+    is_video: bool = False,
+    output_dir: Path | None = None,
+    metadata: WeightsMetadata | None = None,
+) -> tuple[dict[str, object], list[str]]:
+    """校验并组装传给 Ultralytics `model.predict(**kwargs)` 的完整参数字典与提示列表。
+
+    行为约束：
+        - `.engine`（TensorRT）模型仅支持 CUDA GPU，在 CPU 设备模式下抛出 `ValueError`；
+        - `.pt` 权重传入 `nms=False` 时启用 YOLO26 `one2one` 端到端无 NMS 头，`nms=None` 走 `one2many` + 外部 NMS；
+        - `rect=True` 对 `.pt` 与动态导出模型启用最小矩形 LetterBox 填充，`rect=False` 强制按设定尺寸固定填充；
+        - 已导出模型（`.onnx` / `.torchscript` / `.engine`）已固化检测头，不传 `nms` 覆盖；
+          静态导出模型（`export_dynamic=False`）自动对齐导出尺寸并固定 `rect=False`。
+    """
+    fmt = detect_model_format(weights_path)
+    is_exported = is_exported_model_path(weights_path)
+    dev_str = str(device).strip() or "0"
+    if fmt == "engine" and dev_str.lower() == "cpu":
+        raise ValueError("TensorRT (.engine) 模型仅支持在 CUDA GPU 上推理，请启用 GPU 加速。")
+
+    max_det_int = int(max_det)
+    if max_det_int < 1:
+        raise ValueError(f"最大检测框数 max_det 必须 >= 1，当前值: {max_det_int}")
+
+    imgsz_arg, pair = _format_imgsz_arg(imgsz)
+    effective_rect = bool(rect)
+    warnings: list[str] = []
+
+    pred_kwargs: dict[str, object] = {
+        "source": str(source_path),
+        "conf": float(conf),
+        "iou": float(iou),
+        "imgsz": imgsz_arg,
+        "device": dev_str,
+        "rect": effective_rect,
+        "max_det": max_det_int,
+        "stream": True,
+    }
+
+    if is_video:
+        pred_kwargs["save"] = True
+        if output_dir is not None:
+            pred_kwargs["project"] = str(output_dir.resolve())
+            pred_kwargs["name"] = "predict"
+            pred_kwargs["exist_ok"] = True
+    else:
+        pred_kwargs["save"] = False
+
+    if is_exported:
+        if nms is not None:
+            warnings.append(f"已导出 {fmt.upper()} 模型的检测头已固化，忽略额外指定的 nms={nms}。")
+        if metadata is not None and metadata.export_dynamic is False:
+            pred_kwargs["rect"] = False
+            if metadata.train_imgsz is not None:
+                mh, mw = metadata.train_imgsz
+                if pair != metadata.train_imgsz:
+                    warnings.append(
+                        f"静态 {fmt.upper()} 模型固定使用导出尺寸 {format_imgsz_text(metadata.train_imgsz)}，"
+                        "推理时将自动按该固定尺寸填充。"
+                    )
+                pred_kwargs["imgsz"] = mh if mh == mw else [mh, mw]
+        if metadata is not None and metadata.export_nms_mode == "embedded":
+            warnings.append(
+                "当前导出模型已在计算图内嵌入 NMS；若导出时图内 NMS Conf 高于当前 Conf，无法召回已被图内滤除的目标。"
+            )
+    else:
+        if nms is not None:
+            pred_kwargs["nms"] = nms
+            if nms is False and metadata is not None and not metadata.supports_end2end:
+                warnings.append("当前 .pt 权重未检测到 one2one 端到端分支，推理将回退为 one2many 检测头。")
+        elif metadata is not None and not metadata.one2many_available and metadata.supports_end2end:
+            warnings.append("当前 .pt 权重仅保留 one2one 端到端分支，实际将按端到端无 NMS 推理。")
+
+    return pred_kwargs, warnings
+
+
+def format_submitted_predict_config(
+    weights_path: Path,
+    pred_kwargs: Mapping[str, object],
+    *,
+    metadata: WeightsMetadata | None = None,
+    warnings: Sequence[str] = (),
+) -> str:
+    """将提交给 Ultralytics `model.predict()` 的推理参数与提示格式化为可读多行日志。"""
+    fmt = detect_model_format(weights_path)
+    is_exported = is_exported_model_path(weights_path)
+    if is_exported:
+        mode_map = {
+            "end2end": "已固化 one2one 端到端无 NMS",
+            "embedded": "已固化图内嵌入 NMS",
+            "raw": "已固化原始 one2many (外部 NMS)",
+        }
+        head_desc = mode_map.get(metadata.export_nms_mode if metadata else None, "由导出模型决定")
+    elif pred_kwargs.get("nms") is False:
+        head_desc = "end2end (YOLO26 one2one 无 NMS)"
+    else:
+        head_desc = "one2many (外部 NMS，PT 默认)"
+
+    pad_desc = "最小矩形填充 (rect=True)" if pred_kwargs.get("rect") else "固定尺寸填充 (rect=False)"
+    summary_dict: dict[str, object] = {
+        "model": weights_path.name,
+        "model_format": fmt,
+        "head_mode": head_desc,
+        "pad_mode": pad_desc,
+        "imgsz": pred_kwargs.get("imgsz"),
+        "rect": pred_kwargs.get("rect"),
+        "conf": pred_kwargs.get("conf"),
+        "iou": pred_kwargs.get("iou"),
+        "max_det": pred_kwargs.get("max_det"),
+        "device": pred_kwargs.get("device"),
+    }
+    if "nms" in pred_kwargs:
+        summary_dict["nms"] = pred_kwargs["nms"]
+
+    json_lines = json.dumps(summary_dict, ensure_ascii=False, indent=2, default=str).splitlines()
+    if json_lines:
+        json_lines[0] = f'"predict_arguments": {json_lines[0]}'
+    lines = ["=== 推理效果测试配置 (提交至 Ultralytics) ===", *json_lines]
+    for warn in warnings:
+        lines.append(f"[提示] {warn}")
+    return "\n".join(lines)
+
+
 def predict_source(
     weights_path: Path,
     source_path: Path,
     output_dir: Path,
     conf: float = 0.25,
     iou: float = 0.45,
-    imgsz: int = 640,
+    imgsz: int | tuple[int, int] = 640,
     device: str = "0",
+    *,
+    nms: bool | None = None,
+    rect: bool = True,
+    max_det: int = 300,
     log_callback: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """对单张图片、图片目录或视频运行推理并将带框结果写入 `output_dir`。
 
-    视频输入交由 Ultralytics 写出至 `output_dir / "predict"`；
-    图片输入通过 `cv2.imencode` + `Path.write_bytes` 写出为 `*_pred.jpg` 以支持中文路径，
-    同名图片自动消歧不互相覆盖。两种输入均以 `stream=True` 逐帧迭代，
-    内存占用与视频长度或图片数量无关。权重或输入路径缺失时抛出 `FileNotFoundError`。
-    """
-    from ultralytics import YOLO
+    模型与参数支持：
+        - 同时支持 `.pt` 源权重与已导出部署模型（`.onnx` / `.torchscript` / `.engine`）；
+        - `imgsz` 支持正整数（方形）或 `(高, 宽)` 矩形二元组；
+        - `nms` 仅对 `.pt` 权重生效（`None`=默认 `one2many` + 外部 NMS，`False`=YOLO26 `one2one` 无 NMS）；
+        - `rect=True` 为最小矩形填充（PT 默认），`rect=False` 为严格按 `imgsz` 补灰边固定尺寸填充。
 
+    输出与内存约束：
+        视频输入交由 Ultralytics 写出至 `output_dir / "predict"`；
+        图片输入通过 `cv2.imencode` + `Path.write_bytes` 写出为 `*_pred.jpg` 以支持中文路径，
+        同名图片自动消歧不互相覆盖。两种输入均以 `stream=True` 逐帧迭代，
+        内存占用与视频长度或图片数量无关。模型或输入路径缺失时抛出 `FileNotFoundError`。
+    """
     if not weights_path.is_file():
-        raise FileNotFoundError(f"权重文件不存在: {weights_path}")
+        raise FileNotFoundError(f"模型文件不存在: {weights_path}")
     if not source_path.exists():
         raise FileNotFoundError(f"推理输入不存在: {source_path}")
+
+    meta: WeightsMetadata | None = None
+    try:
+        meta = inspect_weights_metadata(weights_path)
+    except Exception:
+        meta = None
+
+    is_video = source_path.is_file() and source_path.suffix.lower() in VIDEO_EXTENSIONS
+    pred_kwargs, warnings = build_predict_kwargs(
+        weights_path,
+        source_path,
+        conf=conf,
+        iou=iou,
+        imgsz=imgsz,
+        device=device,
+        nms=nms,
+        rect=rect,
+        max_det=max_det,
+        is_video=is_video,
+        output_dir=output_dir,
+        metadata=meta,
+    )
+    _emit_multiline_log(
+        log_callback,
+        format_submitted_predict_config(weights_path, pred_kwargs, metadata=meta, warnings=warnings),
+    )
+
+    from ultralytics import YOLO
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_torch_cpu_threads()
@@ -1107,39 +1455,16 @@ def predict_source(
 
     saved_outputs: list[Path] = []
     with capture_thread_output(log_callback):
-        is_video = source_path.is_file() and source_path.suffix.lower() in VIDEO_EXTENSIONS
         if is_video:
             save_dir: Path | None = None
-            for r in model.predict(
-                source=str(source_path),
-                conf=conf,
-                iou=iou,
-                imgsz=imgsz,
-                device=device,
-                save=True,
-                project=str(output_dir.resolve()),
-                name="predict",
-                exist_ok=True,
-                stream=True,
-            ):
+            for r in model.predict(**pred_kwargs):
                 if save_dir is None and getattr(r, "save_dir", None):
                     save_dir = Path(r.save_dir)
             if save_dir is not None:
                 saved_outputs = sorted(save_dir.glob("*"))
         else:
             used_names: set[str] = set()
-            for idx, r in enumerate(
-                model.predict(
-                    source=str(source_path),
-                    conf=conf,
-                    iou=iou,
-                    imgsz=imgsz,
-                    device=device,
-                    save=False,
-                    stream=True,
-                ),
-                start=1,
-            ):
+            for idx, r in enumerate(model.predict(**pred_kwargs), start=1):
                 plotted = r.plot()
                 src = Path(r.path) if getattr(r, "path", None) else Path(f"pred_{idx}.jpg")
                 out_file = _unique_pred_path(output_dir, src, used_names)
@@ -1181,19 +1506,24 @@ DYNAMIC_EXPORT_FORMATS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class WeightsMetadata:
-    """从 `.pt` 权重文件中只读解析出的训练尺寸、类别顺序与检测头能力摘要。
+    """从 `.pt` 权重或已导出部署模型（`.onnx` / `.torchscript` / `.engine`）只读解析出的元数据摘要。
 
     字段说明：
-        `weights_path`：源 `.pt` 权重文件路径。
-        `task`：权重任务类型（如 `"detect"`、`"segment"`、`"pose"`、`"obb"`、`"classify"`），缺失时为空字符串。
-        `train_imgsz`：权重记录的训练输入尺寸 `(高, 宽)` 像素元组；单边整数（如 `960`）规范为 `(960, 960)`，
-            未记录有效尺寸时为 `None`。
+        `weights_path`：模型文件路径。
+        `task`：任务类型（如 `"detect"`、`"segment"`、`"pose"`、`"obb"`、`"classify"`），缺失时为空字符串。
+        `train_imgsz`：`.pt` 权重的训练输入尺寸或已导出模型的导出输入尺寸 `(高, 宽)` 像素元组；
+            单边整数（如 `960`）规范为 `(960, 960)`，未记录有效尺寸时为 `None`。
         `class_names`：按类别索引升序排列的 `(类别编号, 类别名称)` 元组，例如 `((0, "person"), (1, "car"))`。
         `strides`：检测头步长元组（像素，默认 `(8, 16, 32)`），用于校验尺寸对齐与估算候选框数量。
         `channels`：模型输入通道数（通常为 `3`）。
-        `supports_end2end`：检测头是否包含 YOLO26 `one2one` 原生无 NMS 端到端分支（`nms=False` 可用）。
-        `one2many_available`：检测头是否保留 `one2many` 原始分支（若已被融合移除，导出仅能使用 `one2one` 分支）。
-        `epoch`：权重保存时的训练轮次；预训练权重或缺失时为 `None`。
+        `supports_end2end`：检测头是否包含/固化 YOLO26 `one2one` 原生无 NMS 端到端分支（`nms=False` 可用）。
+        `one2many_available`：检测头是否保留 `one2many` 原始分支（若已被融合移除或已导出为 `end2end`，则为 `False`）。
+        `epoch`：`.pt` 权重保存时的训练轮次；预训练权重、导出模型或缺失时为 `None`。
+        `model_format`：模型格式键名（`"pt"` / `"onnx"` / `"torchscript"` / `"engine"` 等）。
+        `is_exported`：是否为已导出的部署模型（非 `.pt`）。
+        `export_nms_mode`：已导出模型固化的后处理模式（`"raw"` / `"end2end"` / `"embedded"`），未知或 `.pt` 时为 `None`。
+        `export_dynamic`：已导出模型是否支持动态输入维度；未知或 `.pt` 时为 `None`。
+        `export_batch`：已导出模型记录的批大小；未知或 `.pt` 时为 `None`。
     """
 
     weights_path: Path
@@ -1205,6 +1535,11 @@ class WeightsMetadata:
     supports_end2end: bool = False
     one2many_available: bool = True
     epoch: int | None = None
+    model_format: str = "pt"
+    is_exported: bool = False
+    export_nms_mode: str | None = None
+    export_dynamic: bool | None = None
+    export_batch: int | None = None
 
     @property
     def max_stride(self) -> int:
@@ -1414,16 +1749,158 @@ def format_class_order_lines(class_names: Sequence[tuple[int, str]]) -> str:
     return "\n".join(f"{idx}: {name}" for idx, name in class_names)
 
 
+def _parse_metadata_literal(value: object) -> object:
+    """将导出模型元数据中的字符串编码字段安全还原为 Python 基础/容器对象。"""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if lower in {"none", "null"}:
+        return None
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        return value
+
+
+def _probe_onnx_input_shape(
+    model_path: Path,
+) -> tuple[tuple[int, int] | None, int | None, int | None, bool | None]:
+    """当 `.onnx` 文件未包含完整 Ultralytics 元数据时，只读探测首输入张量 `(imgsz, channels, batch, dynamic)`。"""
+    try:
+        import onnx
+
+        proto = onnx.load(str(model_path), load_external_data=False)
+    except Exception:
+        return None, None, None, None
+
+    if not proto.graph.input:
+        return None, None, None, None
+    dims = proto.graph.input[0].type.tensor_type.shape.dim
+    if len(dims) < 4:
+        return None, None, None, None
+
+    def _dim_int(dim_obj: object) -> tuple[int | None, bool]:
+        param = str(getattr(dim_obj, "dim_param", "") or "").strip()
+        val = int(getattr(dim_obj, "dim_value", 0) or 0)
+        if param or val <= 0:
+            return None, True
+        return val, False
+
+    n_val, n_dyn = _dim_int(dims[0])
+    c_val, _ = _dim_int(dims[1])
+    h_val, h_dyn = _dim_int(dims[2])
+    w_val, w_dyn = _dim_int(dims[3])
+    is_dynamic = bool(n_dyn or h_dyn or w_dyn)
+    imgsz = (h_val, w_val) if (h_val is not None and w_val is not None) else None
+    return imgsz, c_val, n_val, is_dynamic
+
+
+def _inspect_exported_model_metadata(model_path: Path) -> WeightsMetadata:
+    """只读解析已导出部署模型（`.onnx` / `.torchscript` / `.engine`）的内嵌元数据与输入维度。
+
+    优先复用 Ultralytics `BaseBackend.read_metadata` 零权重加载读取内嵌配置；
+    若 `.onnx` 缺失部分字段（如外部工具导出），再回退读取 ONNX 图首输入张量维度。
+    文件为空或彻底不可解析时抛出中文 `ValueError`。
+    """
+    fmt = detect_model_format(model_path)
+    if model_path.stat().st_size == 0:
+        raise ValueError(f"导出模型文件为空: {model_path.name}")
+
+    raw_meta: dict[str, object] = {}
+    try:
+        from ultralytics.nn.backends.base import BaseBackend
+
+        loaded = BaseBackend.read_metadata(model_path)
+        if isinstance(loaded, Mapping):
+            raw_meta = dict(loaded)
+    except Exception:
+        raw_meta = {}
+
+    parsed_args = _parse_metadata_literal(raw_meta.get("args"))
+    args_map: Mapping[str, object] = parsed_args if isinstance(parsed_args, Mapping) else {}
+
+    task = str(raw_meta.get("task") or "").strip()
+    imgsz = _extract_imgsz_pair(_parse_metadata_literal(raw_meta.get("imgsz")))
+    class_names = _extract_class_names(_parse_metadata_literal(raw_meta.get("names")))
+    strides = _extract_strides(_parse_metadata_literal(raw_meta.get("stride")))
+    channels = _extract_positive_int(_parse_metadata_literal(raw_meta.get("channels"))) or 3
+    export_batch = _extract_positive_int(
+        _parse_metadata_literal(raw_meta.get("batch"))
+    ) or _extract_positive_int(args_map.get("batch"))
+
+    raw_dynamic = args_map.get("dynamic") if "dynamic" in args_map else raw_meta.get("dynamic")
+    parsed_dynamic = _parse_metadata_literal(raw_dynamic) if raw_dynamic is not None else None
+    export_dynamic: bool | None = parsed_dynamic if isinstance(parsed_dynamic, bool) else None
+
+    raw_end2end = _parse_metadata_literal(raw_meta.get("end2end"))
+    raw_args_nms = args_map.get("nms") if "nms" in args_map else None
+
+    export_nms_mode: str | None = None
+    supports_end2end = False
+    one2many_available = True
+    if raw_end2end is True or raw_args_nms is False:
+        export_nms_mode = "end2end"
+        supports_end2end = True
+        one2many_available = False
+    elif raw_args_nms is True:
+        export_nms_mode = "embedded"
+        supports_end2end = False
+        one2many_available = True
+    elif raw_meta:
+        export_nms_mode = "raw"
+        supports_end2end = False
+        one2many_available = True
+
+    if fmt == "onnx" and (imgsz is None or export_dynamic is None):
+        onnx_imgsz, onnx_ch, onnx_batch, onnx_dyn = _probe_onnx_input_shape(model_path)
+        if imgsz is None and onnx_imgsz is not None:
+            imgsz = onnx_imgsz
+        if onnx_ch is not None and "channels" not in raw_meta:
+            channels = onnx_ch
+        if export_batch is None and onnx_batch is not None:
+            export_batch = onnx_batch
+        if export_dynamic is None and onnx_dyn is not None:
+            export_dynamic = onnx_dyn
+
+    return WeightsMetadata(
+        weights_path=model_path,
+        task=task,
+        train_imgsz=imgsz,
+        class_names=class_names,
+        strides=strides,
+        channels=channels,
+        supports_end2end=supports_end2end,
+        one2many_available=one2many_available,
+        epoch=None,
+        model_format=fmt,
+        is_exported=True,
+        export_nms_mode=export_nms_mode,
+        export_dynamic=export_dynamic,
+        export_batch=export_batch,
+    )
+
+
 def inspect_weights_metadata(weights_path: Path) -> WeightsMetadata:
-    """只读解析本地 `.pt` 权重中的训练尺寸、类别顺序与检测头结构摘要。
+    """只读解析本地 `.pt` 权重或已导出部署模型（`.onnx` / `.torchscript` / `.engine`）的元数据摘要。
 
     调用条件与失败方式：
         - 要求 `weights_path` 为存在的本地文件，缺失时抛出 `FileNotFoundError`；
-        - 内部按需导入 `torch` / `ultralytics` 在 CPU 上反序列化，不会占用 GPU 显存，也不会修改权重文件；
-        - 若文件损坏或不是有效的 PyTorch/Ultralytics 权重，抛出中文 `ValueError`。
+        - `.pt` 权重在 CPU 上只读反序列化，已导出模型直接解析内嵌元数据或 ONNX 图头，
+          均不占用 GPU 显存且不修改源文件；
+        - 若文件损坏或不是有效的模型文件，抛出中文 `ValueError`。
     """
     if not weights_path.is_file():
-        raise FileNotFoundError(f"权重文件不存在: {weights_path}")
+        raise FileNotFoundError(f"模型文件不存在: {weights_path}")
+
+    if is_exported_model_path(weights_path):
+        return _inspect_exported_model_metadata(weights_path)
 
     ckpt: object
     try:
@@ -1522,13 +1999,39 @@ def inspect_weights_metadata(weights_path: Path) -> WeightsMetadata:
         supports_end2end=supports_end2end,
         one2many_available=one2many_available,
         epoch=epoch_val,
+        model_format="pt",
+        is_exported=False,
     )
 
 
 def format_weights_metadata_log(meta: WeightsMetadata) -> str:
-    """将权重元数据格式化为面向 GUI/CLI 日志区的多行中文摘要。"""
+    """将 `.pt` 权重或已导出模型元数据格式化为面向 GUI/CLI 日志区的多行中文摘要。"""
     task_text = meta.task or "未记录"
     imgsz_text = format_imgsz_text(meta.train_imgsz)
+
+    if meta.is_exported:
+        fmt_upper = meta.model_format.upper()
+        dyn_desc = (
+            "动态尺寸/批次"
+            if meta.export_dynamic is True
+            else ("静态固定尺寸" if meta.export_dynamic is False else "动态性未知")
+        )
+        batch_suffix = f", Batch={meta.export_batch}" if meta.export_batch is not None else ""
+        mode_map = {
+            "end2end": "已固化 YOLO26 one2one 端到端无 NMS（直出 [B,N,6]）",
+            "embedded": "已固化图内嵌入 NMS（直出 [B,N,6]）",
+            "raw": "已固化原始 one2many 输出（需外部 NMS）",
+        }
+        head_text = mode_map.get(meta.export_nms_mode, "未记录（由导出模型内部决定）")
+        lines = [
+            f"=== 导出模型元数据 ({meta.weights_path.name}, {fmt_upper}) ===",
+            f"  任务类型: {task_text}",
+            f"  导出输入尺寸: {imgsz_text}（{dyn_desc}{batch_suffix}）",
+            f"  固化输出头: {head_text}",
+            f"  类别顺序 ({meta.num_classes} 类): {format_class_order(meta.class_names)}",
+        ]
+        return "\n".join(lines)
+
     if meta.supports_end2end and meta.one2many_available:
         head_text = "双分支检测头（支持 raw 外部NMS / end2end YOLO26无NMS / embedded 图内NMS）"
     elif meta.supports_end2end:
@@ -1808,10 +2311,14 @@ def export_model_with_config(
         - 若 `config.imgsz` 为 `None` 且权重记录了训练尺寸，则自动沿用训练尺寸；
         - 产物生成在源权重同目录并返回其路径；权重缺失时抛出 `FileNotFoundError`，参数非法时抛出 `ValueError`。
     """
-    from ultralytics import YOLO
-
     if not config.weights_path.is_file():
         raise FileNotFoundError(f"权重文件不存在: {config.weights_path}")
+    if is_exported_model_path(config.weights_path):
+        raise ValueError(
+            f"模型导出仅支持 PyTorch (.pt) 源权重，当前文件为已导出模型: {config.weights_path.name}"
+        )
+
+    from ultralytics import YOLO
 
     meta: WeightsMetadata | None = None
     try:

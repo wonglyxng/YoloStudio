@@ -1,16 +1,19 @@
-"""权重元数据探测、模型导出配置/IO 预览、CLI `export` 子命令与第 6 页（`EvalTab`）单元测试。
+"""权重/导出模型元数据探测、验证与推理参数对齐、导出配置/IO 预览、CLI `export` 子命令与第 6 页（`EvalTab`）单元测试。
 
 职责：
-    1. 验证 `.pt` 权重元数据只读解析（训练尺寸方形/矩形、有序类别清单、检测头分支能力及异常兜底）；
-    2. 验证 `ExportConfig` 参数规范化、`build_export_kwargs` 按格式过滤（ONNX / TorchScript / TensorRT）、
+    1. 验证 `.pt` 权重与已导出部署模型（`.onnx` / `.torchscript` / `.engine`）元数据只读解析
+       （训练/导出尺寸方形/矩形、有序类别清单、动态属性、检测头分支/固化模式及异常兜底）；
+    2. 验证 `build_predict_kwargs` / `build_val_kwargs`、`predict_source` / `validate_model`
+       对检测头（`one2many` / `end2end`）、输入填充（`rect=True/False`）及已导出模型的传参与日志输出；
+    3. 验证 `ExportConfig` 参数规范化、`build_export_kwargs` 按格式过滤（ONNX / TorchScript / TensorRT）、
        `describe_export_io` 输入输出张量估算与风险告警，以及 `export_model_with_config` 端到端行为；
-    3. 验证 CLI `export` 子命令默认沿用权重训练尺寸、`--inspect-only`、全量导出选项与非法参数退出码 `2`；
-    4. 在离线 `offscreen` Qt 环境下验证 `EvalTab` 自动探测权重元数据并同步验证/导出尺寸、
-       独立导出尺寸（方形/矩形/一键恢复）、格式与 NMS 三态防呆联动、过期异步请求隔离及 `ExportWorker` 传参。
+    4. 验证 CLI `export` 子命令默认沿用权重训练尺寸、`--inspect-only`、全量导出选项与非法参数退出码 `2`；
+    5. 在离线 `offscreen` Qt 环境下验证 `EvalTab` 自动探测元数据并同步尺寸、推理检测头/填充与导出对齐、
+       直接加载 `.onnx` 实测联动、一键切回 `.pt` 保留自定义导出尺寸、过期异步请求隔离及 Worker 传参。
 
 运行环境与协作边界：
-    通过 `pytest` 离线运行，依赖 `PyQt6`；使用模拟 checkpoint、模拟 `YOLO` 及轻量假 Worker，
-    不触发真实模型导出或外部网络访问；若本地存在预置 `yolo26s.pt` 权重，额外执行一次只读实测。
+    通过 `pytest` 离线运行，依赖 `PyQt6`；主要测试使用模拟 checkpoint/元数据、模拟 `YOLO` 及轻量假 Worker，
+    不访问外部网络；若本地存在预置 `yolo26s.pt` / `yolo26n.pt` 权重，额外在隔离子进程中执行真实只读/临时导出实测。
 """
 
 from __future__ import annotations
@@ -33,13 +36,18 @@ from yolo_studio.core.trainer import (
     WeightsMetadata,
     align_imgsz_to_stride,
     build_export_kwargs,
+    build_predict_kwargs,
+    build_val_kwargs,
     describe_export_io,
     export_model,
     export_model_with_config,
     format_class_order,
+    format_weights_metadata_log,
     inspect_weights_metadata,
     normalize_export_imgsz,
     parse_export_nms_mode,
+    predict_source,
+    validate_model,
 )
 from yolo_studio.gui.tab_eval import EvalTab
 
@@ -687,5 +695,573 @@ def test_eval_tab_auto_reads_weights_syncs_imgsz_and_exports_independent_config(
         tab.device_ctrl.gpu_chk.setChecked(True)
         qt_app.processEvents()
         assert tab.export_btn.isEnabled() is True
+    finally:
+        tab.close()
+
+
+def test_build_predict_and_val_kwargs_pt_and_exported_models(tmp_path: Path) -> None:
+    """验证 `build_predict_kwargs` / `build_val_kwargs` 对 `.pt`、静态/动态 `.onnx` 及 `.engine` 的参数组装与拦截。"""
+    pt_file = tmp_path / "best.pt"
+    onnx_file = tmp_path / "best.onnx"
+    engine_file = tmp_path / "best.engine"
+    src_img = tmp_path / "sample.jpg"
+    data_yaml = tmp_path / "data.yaml"
+    for p in (pt_file, onnx_file, engine_file, src_img, data_yaml):
+        p.write_bytes(b"stub")
+
+    pt_dual = WeightsMetadata(
+        weights_path=pt_file,
+        train_imgsz=(960, 960),
+        supports_end2end=True,
+        one2many_available=True,
+    )
+    pt_raw_only = WeightsMetadata(
+        weights_path=pt_file,
+        train_imgsz=(640, 640),
+        supports_end2end=False,
+        one2many_available=True,
+    )
+    onnx_static_e2e = WeightsMetadata(
+        weights_path=onnx_file,
+        train_imgsz=(576, 960),
+        supports_end2end=True,
+        one2many_available=False,
+        model_format="onnx",
+        is_exported=True,
+        export_nms_mode="end2end",
+        export_dynamic=False,
+        export_batch=1,
+    )
+    onnx_dyn_emb = WeightsMetadata(
+        weights_path=onnx_file,
+        train_imgsz=(960, 960),
+        supports_end2end=False,
+        one2many_available=True,
+        model_format="onnx",
+        is_exported=True,
+        export_nms_mode="embedded",
+        export_dynamic=True,
+        export_batch=1,
+    )
+
+    # 1) PT 默认 one2many + rect=True；切换 end2end + 矩形 + rect=False
+    kw_pt_def, w_pt_def = build_predict_kwargs(
+        pt_file, src_img, imgsz=960, rect=True, nms=None, metadata=pt_dual
+    )
+    assert kw_pt_def["imgsz"] == 960
+    assert kw_pt_def["rect"] is True
+    assert "nms" not in kw_pt_def
+    assert not w_pt_def
+
+    kw_pt_e2e, w_pt_e2e = build_predict_kwargs(
+        pt_file,
+        src_img,
+        conf=0.6,
+        imgsz=(576, 960),
+        rect=False,
+        nms=False,
+        max_det=150,
+        metadata=pt_dual,
+    )
+    assert kw_pt_e2e["imgsz"] == [576, 960]
+    assert kw_pt_e2e["rect"] is False
+    assert kw_pt_e2e["nms"] is False
+    assert kw_pt_e2e["max_det"] == 150
+    assert kw_pt_e2e["conf"] == pytest.approx(0.6)
+    assert not w_pt_e2e
+
+    # 单分支 PT 选 end2end 给出回退提示
+    _, w_fallback = build_predict_kwargs(pt_file, src_img, nms=False, metadata=pt_raw_only)
+    assert any("one2one" in w for w in w_fallback)
+
+    # 2) 静态 ONNX 自动对齐导出尺寸 [576, 960] 并强制 rect=False，且忽略额外 nms 覆盖
+    kw_onnx_st, w_onnx_st = build_predict_kwargs(
+        onnx_file, src_img, imgsz=640, rect=True, nms=False, metadata=onnx_static_e2e
+    )
+    assert kw_onnx_st["imgsz"] == [576, 960]
+    assert kw_onnx_st["rect"] is False
+    assert "nms" not in kw_onnx_st
+    assert any("固定使用导出尺寸" in w for w in w_onnx_st)
+    assert any("忽略额外指定" in w for w in w_onnx_st)
+
+    # 3) 动态 embedded ONNX 保留传入尺寸与 rect，并提示图内 NMS 阈值约束
+    kw_onnx_dyn, w_onnx_dyn = build_predict_kwargs(
+        onnx_file, src_img, imgsz=800, rect=True, metadata=onnx_dyn_emb
+    )
+    assert kw_onnx_dyn["imgsz"] == 800
+    assert kw_onnx_dyn["rect"] is True
+    assert any("图内嵌入 NMS" in w for w in w_onnx_dyn)
+
+    # 4) 验证参数：矩形尺寸自动关闭 rect=False；TensorRT CPU 下推理/验证均拦截
+    kw_val_rect, w_val_rect = build_val_kwargs(
+        pt_file, data_yaml, imgsz=(544, 960), nms=False, rect=True, metadata=pt_dual
+    )
+    assert kw_val_rect["imgsz"] == [544, 960]
+    assert kw_val_rect["nms"] is False
+    assert kw_val_rect["rect"] is False
+    assert any("rect=False" in w for w in w_val_rect)
+
+    with pytest.raises(ValueError, match="CUDA GPU"):
+        build_predict_kwargs(engine_file, src_img, device="cpu")
+    with pytest.raises(ValueError, match="CUDA GPU"):
+        build_val_kwargs(engine_file, data_yaml, device="cpu")
+
+
+def test_predict_source_validate_and_exported_metadata_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 `predict_source` / `validate_model` 完整透传检测头与填充参数、输出日志及导出模型元数据解析。"""
+    import numpy as np
+
+    pt_file = tmp_path / "best.pt"
+    onnx_file = tmp_path / "best.onnx"
+    empty_onnx = tmp_path / "empty.onnx"
+    img_file = tmp_path / "frame.jpg"
+    data_yaml = tmp_path / "data.yaml"
+    pt_file.write_bytes(b"pt")
+    onnx_file.write_bytes(b"onnx-stub")
+    empty_onnx.write_bytes(b"")
+    img_file.write_bytes(b"jpg")
+    data_yaml.write_text("names: [boss]\n", encoding="utf-8")
+
+    # 1) 模拟 BaseBackend.read_metadata 校验 .onnx 元数据（end2end / embedded / raw 动态）解析
+    meta_cases = [
+        (
+            {
+                "task": "detect",
+                "imgsz": "[576, 960]",
+                "stride": "32",
+                "batch": "1",
+                "channels": "3",
+                "names": "{0: 'tree', 1: 'player'}",
+                "end2end": "True",
+                "args": "{'nms': False, 'dynamic': False, 'batch': 1}",
+            },
+            "end2end",
+            False,
+            (576, 960),
+        ),
+        (
+            {
+                "task": "detect",
+                "imgsz": "[960, 960]",
+                "stride": "32",
+                "batch": "2",
+                "channels": "3",
+                "names": "{0: 'tree'}",
+                "end2end": "False",
+                "args": "{'nms': True, 'dynamic': False, 'batch': 2}",
+            },
+            "embedded",
+            False,
+            (960, 960),
+        ),
+        (
+            {
+                "task": "detect",
+                "imgsz": "[640, 640]",
+                "stride": "32",
+                "batch": "1",
+                "channels": "3",
+                "names": "{0: 'tree'}",
+                "end2end": "False",
+                "args": "{'nms': None, 'dynamic': True, 'batch': 1}",
+            },
+            "raw",
+            True,
+            (640, 640),
+        ),
+    ]
+
+    fake_base_mod = types.ModuleType("ultralytics.nn.backends.base")
+    fake_backends_mod = types.ModuleType("ultralytics.nn.backends")
+    fake_backends_mod.base = fake_base_mod  # type: ignore[attr-defined]
+    fake_nn_mod = types.ModuleType("ultralytics.nn")
+    fake_nn_mod.backends = fake_backends_mod  # type: ignore[attr-defined]
+    fake_ultra = types.ModuleType("ultralytics")
+    fake_ultra.nn = fake_nn_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ultralytics", fake_ultra)
+    monkeypatch.setitem(sys.modules, "ultralytics.nn", fake_nn_mod)
+    monkeypatch.setitem(sys.modules, "ultralytics.nn.backends", fake_backends_mod)
+    monkeypatch.setitem(sys.modules, "ultralytics.nn.backends.base", fake_base_mod)
+
+    for raw_meta, exp_mode, exp_dyn, exp_sz in meta_cases:
+        fake_base_mod.BaseBackend = types.SimpleNamespace(read_metadata=staticmethod(lambda _p, m=raw_meta: dict(m)))  # type: ignore[attr-defined]
+        parsed = inspect_weights_metadata(onnx_file)
+        assert parsed.is_exported is True
+        assert parsed.model_format == "onnx"
+        assert parsed.export_nms_mode == exp_mode
+        assert parsed.export_dynamic is exp_dyn
+        assert parsed.train_imgsz == exp_sz
+        log_text = format_weights_metadata_log(parsed)
+        assert "导出模型元数据" in log_text
+
+    with pytest.raises(ValueError, match="为空"):
+        inspect_weights_metadata(empty_onnx)
+
+    # export_model_with_config 拒绝将已导出 .onnx 作为源权重再导出
+    with pytest.raises(ValueError, match="仅支持 PyTorch"):
+        export_model_with_config(ExportConfig(weights_path=onnx_file))
+
+    # 2) 验证 predict_source 与 validate_model 透传参数及日志块输出
+    captured_pred: list[dict[str, object]] = []
+    captured_val: list[dict[str, object]] = []
+
+    class _FakeResult:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        def plot(self) -> np.ndarray:
+            return np.zeros((32, 32, 3), dtype=np.uint8)
+
+    class _FakeYOLO:
+        def __init__(self, source: str) -> None:
+            self.source = source
+
+        def predict(self, **kwargs: object) -> list[_FakeResult]:
+            captured_pred.append(dict(kwargs))
+            return [_FakeResult(str(img_file))]
+
+        def val(self, **kwargs: object) -> object:
+            captured_val.append(dict(kwargs))
+            return types.SimpleNamespace(results_dict={"metrics/mAP50(B)": 0.91})
+
+    fake_ultra.YOLO = _FakeYOLO  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        trainer_module,
+        "inspect_weights_metadata",
+        lambda p: WeightsMetadata(
+            weights_path=p,
+            train_imgsz=(960, 960),
+            supports_end2end=True,
+            one2many_available=True,
+        ),
+    )
+
+    pred_logs: list[str] = []
+    outputs = predict_source(
+        pt_file,
+        img_file,
+        tmp_path / "pred_out",
+        conf=0.60,
+        iou=0.45,
+        imgsz=(576, 960),
+        device="cpu",
+        nms=False,
+        rect=False,
+        max_det=180,
+        log_callback=pred_logs.append,
+    )
+    assert len(outputs) == 1 and outputs[0].is_file()
+    assert captured_pred[-1]["imgsz"] == [576, 960]
+    assert captured_pred[-1]["rect"] is False
+    assert captured_pred[-1]["nms"] is False
+    assert captured_pred[-1]["max_det"] == 180
+    assert any("推理效果测试配置" in line for line in pred_logs)
+    assert any("one2one" in line for line in pred_logs)
+
+    val_logs: list[str] = []
+    metrics = validate_model(
+        pt_file,
+        data_yaml,
+        imgsz=960,
+        device="cpu",
+        nms=False,
+        log_callback=val_logs.append,
+    )
+    assert metrics["metrics/mAP50(B)"] == pytest.approx(0.91)
+    assert captured_val[-1]["nms"] is False
+    assert captured_val[-1]["imgsz"] == 960
+    assert any("模型验证配置" in line for line in val_logs)
+
+
+def test_real_exported_onnx_metadata_and_predict_if_present(tmp_path: Path) -> None:
+    """若本地存在预置 `yolo26n.pt`，在独立子进程中导出微型 ONNX 并实测元数据只读解析与 ONNX 推理。"""
+    import json
+    import subprocess
+
+    candidate = Path("build/portable_cache/weights/yolo26n.pt")
+    if not candidate.is_file():
+        pytest.skip("本地未找到预置 yolo26n.pt 权重，跳过真实 ONNX 导出与推理实测")
+
+    src_dir = str((Path(__file__).resolve().parents[1] / "src").resolve())
+    script = (
+        f"import json, shutil, sys; from pathlib import Path; import cv2, numpy as np; "
+        f"sys.path.insert(0, {src_dir!r}); "
+        "from yolo_studio.core.trainer import export_model, inspect_weights_metadata, predict_source; "
+        f"work = Path({str(tmp_path.resolve())!r}); "
+        f"pt = work / 'yolo26n.pt'; shutil.copy({str(candidate.resolve())!r}, pt); "
+        "onnx_p = export_model(pt, export_format='onnx', imgsz=(192, 320), nms=False, simplify=False, device='cpu'); "
+        "meta = inspect_weights_metadata(onnx_p); "
+        "img_p = work / 'blank.jpg'; cv2.imwrite(str(img_p), np.full((180, 320, 3), 120, dtype=np.uint8)); "
+        "outs = predict_source(onnx_p, img_p, work / 'out', conf=0.25, imgsz=640, device='cpu'); "
+        "print(json.dumps({'is_exported': meta.is_exported, 'fmt': meta.model_format, "
+        "'imgsz': list(meta.train_imgsz) if meta.train_imgsz else None, "
+        "'nms_mode': meta.export_nms_mode, 'dynamic': meta.export_dynamic, "
+        "'num_classes': meta.num_classes, 'out_count': len(outs)}))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
+    )
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["is_exported"] is True
+    assert payload["fmt"] == "onnx"
+    assert payload["imgsz"] == [192, 320]
+    assert payload["nms_mode"] == "end2end"
+    assert payload["dynamic"] is False
+    assert payload["num_classes"] == 80
+    assert payload["out_count"] == 1
+
+
+def test_eval_tab_predict_head_padding_sync_export_and_onnx_switching(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证第 6 页检测头/填充模式联动、对齐导出参数、实测导出 ONNX 及一键切回 `.pt` 保留导出尺寸。"""
+    pt_file = tmp_path / "best.pt"
+    onnx_file = tmp_path / "best.onnx"
+    engine_file = tmp_path / "best.engine"
+    img_file = tmp_path / "demo.jpg"
+    yaml_file = tmp_path / "data.yaml"
+    for p in (pt_file, onnx_file, engine_file, img_file, yaml_file):
+        p.write_bytes(b"stub")
+
+    inspect_workers: list[_StubWeightsInspectWorker] = []
+    pred_workers: list[object] = []
+    val_workers: list[object] = []
+
+    class _StubPredictWorker(QObject):
+        log_line = Signal(str)
+        finished_outputs = Signal(object)
+        failed = Signal(str)
+
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__()
+            self.kwargs = dict(kwargs)
+            self.running = False
+
+        def start(self) -> None:
+            self.running = True
+
+        def isRunning(self) -> bool:
+            return self.running
+
+    class _StubValidateWorker(QObject):
+        log_line = Signal(str)
+        finished_metrics = Signal(object)
+        failed = Signal(str)
+
+        def __init__(
+            self,
+            weights_path: Path,
+            data_yaml: Path,
+            imgsz: int | tuple[int, int],
+            device: str,
+            *,
+            nms: bool | None = None,
+            rect: bool | None = None,
+        ) -> None:
+            super().__init__()
+            self.weights_path = weights_path
+            self.data_yaml = data_yaml
+            self.imgsz = imgsz
+            self.device = device
+            self.nms = nms
+            self.rect = rect
+            self.running = False
+
+        def start(self) -> None:
+            self.running = True
+
+        def isRunning(self) -> bool:
+            return self.running
+
+    def _inspect_factory(path: Path, request_id: int = 0) -> _StubWeightsInspectWorker:
+        w = _StubWeightsInspectWorker(path, request_id=request_id)
+        inspect_workers.append(w)
+        return w
+
+    def _pred_factory(**kwargs: object) -> _StubPredictWorker:
+        w = _StubPredictWorker(**kwargs)
+        pred_workers.append(w)
+        return w
+
+    def _val_factory(*args: object, **kwargs: object) -> _StubValidateWorker:
+        w = _StubValidateWorker(*args, **kwargs)  # type: ignore[arg-type]
+        val_workers.append(w)
+        return w
+
+    monkeypatch.setattr(tab_eval_module, "WeightsInspectWorker", _inspect_factory)
+    monkeypatch.setattr(tab_eval_module, "PredictWorker", _pred_factory)
+    monkeypatch.setattr(tab_eval_module, "ValidateWorker", _val_factory)
+
+    warnings_shown: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        staticmethod(lambda _p, _t, msg: warnings_shown.append(str(msg))),
+    )
+    monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *_a: None))
+
+    tab = EvalTab(workspace_root=tmp_path, device_info=_make_device_info(has_gpu=True))
+    try:
+        # 1) 加载双头 .pt（960x960）
+        tab.set_weights_and_yaml(str(pt_file), str(yaml_file))
+        tab.source_edit.setText(str(img_file))
+        qt_app.processEvents()
+        meta_pt = WeightsMetadata(
+            weights_path=pt_file,
+            task="detect",
+            train_imgsz=(960, 960),
+            class_names=((0, "monster"), (1, "boss")),
+            supports_end2end=True,
+            one2many_available=True,
+        )
+        inspect_workers[-1].complete_with(meta_pt)
+        qt_app.processEvents()
+
+        assert tab.eval_head_combo.isEnabled() is True
+        assert tab.iou_spin.isEnabled() is True
+        # 默认 PT 预览是 rect=True，下方导出是静态 960x960 -> 摘要应给出填充方式差异提示
+        assert "存在差异" in tab.pred_summary_label.text()
+
+        # 2) 下方导出设为 end2end + 矩形 576x960 + MaxDet=180，点击「对齐导出参数」
+        tab.export_square_chk.setChecked(False)
+        tab.export_h_spin.setValue(576)
+        tab.export_w_spin.setValue(960)
+        tab.nms_mode_combo.setCurrentIndex(1)  # end2end
+        tab.export_max_det_spin.setValue(180)
+        qt_app.processEvents()
+
+        assert "检测头" in tab.pred_summary_label.text()
+        assert "输入尺寸" in tab.pred_summary_label.text()
+
+        tab.sync_export_pred_btn.click()
+        qt_app.processEvents()
+
+        assert tab.eval_head_combo.currentData() == "end2end"
+        assert tab.pred_pad_combo.currentData() == "export"
+        assert tab.iou_spin.isEnabled() is False
+        assert "存在差异" not in tab.pred_summary_label.text()
+
+        # 3) 运行推理预览与验证：验证 Worker 精确拿到对齐后的矩形尺寸、rect=False、nms=False、max_det=180
+        tab.predict_btn.click()
+        qt_app.processEvents()
+        assert len(pred_workers) == 1
+        sent_pred = pred_workers[-1].kwargs  # type: ignore[attr-defined]
+        assert sent_pred["imgsz"] == (576, 960)
+        assert sent_pred["rect"] is False
+        assert sent_pred["nms"] is False
+        assert sent_pred["max_det"] == 180
+        pred_workers[-1].running = False  # type: ignore[attr-defined]
+        tab._set_busy(False)
+
+        tab.val_btn.click()
+        qt_app.processEvents()
+        assert len(val_workers) == 1
+        assert val_workers[-1].nms is False  # type: ignore[attr-defined]
+        val_workers[-1].running = False  # type: ignore[attr-defined]
+        tab._set_busy(False)
+
+        # 4) 模拟导出 ONNX 成功 -> 出现「测刚导出模型」快捷按钮 -> 点击切换至 ONNX
+        tab._on_export_done(str(onnx_file))
+        qt_app.processEvents()
+        assert tab.switch_model_btn.isVisibleTo(tab) is True
+        assert tab.switch_model_btn.text() == "测刚导出模型"
+
+        tab.switch_model_btn.click()
+        qt_app.processEvents()
+        assert Path(tab.weights_picker.text()) == onnx_file
+        meta_onnx = WeightsMetadata(
+            weights_path=onnx_file,
+            task="detect",
+            train_imgsz=(576, 960),
+            class_names=((0, "monster"), (1, "boss")),
+            supports_end2end=True,
+            one2many_available=False,
+            model_format="onnx",
+            is_exported=True,
+            export_nms_mode="end2end",
+            export_dynamic=False,
+            export_batch=1,
+        )
+        inspect_workers[-1].complete_with(meta_onnx)
+        qt_app.processEvents()
+
+        # 加载静态 end2end ONNX 后：检测头、ImgSz、填充、IoU、对齐按钮、导出按钮全部锁定防呆
+        assert "ONNX 导出模型" in tab.weights_info_label.text()
+        assert tab.eval_head_combo.isEnabled() is False
+        assert tab.imgsz_spin.isEnabled() is False
+        assert tab.pred_pad_combo.isEnabled() is False
+        assert tab.iou_spin.isEnabled() is False
+        assert tab.sync_export_pred_btn.isEnabled() is False
+        assert tab.export_btn.isEnabled() is False
+        assert tab.switch_model_btn.text() == "切回 .pt 权重"
+
+        # 对静态 ONNX 点击推理：传给 PredictWorker 的是 onnx 路径、固定尺寸 (576, 960)、rect=False、nms=None
+        tab.predict_btn.click()
+        qt_app.processEvents()
+        sent_onnx = pred_workers[-1].kwargs  # type: ignore[attr-defined]
+        assert sent_onnx["weights_path"] == onnx_file
+        assert sent_onnx["imgsz"] == (576, 960)
+        assert sent_onnx["rect"] is False
+        assert sent_onnx["nms"] is None
+        pred_workers[-1].running = False  # type: ignore[attr-defined]
+        tab._set_busy(False)
+
+        # 5) 点击「切回 .pt 权重」：回到 best.pt，保留用户刚才调好的 576x960 自定义导出尺寸，且恢复导出按钮
+        tab.switch_model_btn.click()
+        qt_app.processEvents()
+        assert Path(tab.weights_picker.text()) == pt_file
+        inspect_workers[-1].complete_with(meta_pt)
+        qt_app.processEvents()
+
+        assert tab.export_square_chk.isChecked() is False
+        assert tab.export_h_spin.value() == 576
+        assert tab.export_w_spin.value() == 960
+        assert tab.export_btn.isEnabled() is True
+        assert tab.eval_head_combo.isEnabled() is True
+        assert tab.switch_model_btn.text() == "测刚导出模型"
+
+        # 6) 导出设为 embedded (conf=0.35, iou=0.55) 并对齐：检测头回切 one2many，且同步 Conf/IoU
+        tab.nms_mode_combo.setCurrentIndex(2)  # embedded
+        tab.export_nms_conf_spin.setValue(0.35)
+        tab.export_nms_iou_spin.setValue(0.55)
+        qt_app.processEvents()
+        tab.sync_export_pred_btn.click()
+        qt_app.processEvents()
+
+        assert tab.eval_head_combo.currentData() == "one2many"
+        assert tab.iou_spin.isEnabled() is True
+        assert tab.conf_spin.value() == pytest.approx(0.35)
+        assert tab.iou_spin.value() == pytest.approx(0.55)
+
+        # 7) 加载 .engine 模型并切至 CPU：验证与推理按钮均置灰防误点，直接调用也弹窗拦截
+        tab.set_weights_and_yaml(str(engine_file), str(yaml_file))
+        qt_app.processEvents()
+        inspect_workers[-1].complete_with(
+            WeightsMetadata(
+                weights_path=engine_file,
+                train_imgsz=(960, 960),
+                model_format="engine",
+                is_exported=True,
+                export_nms_mode="raw",
+                export_dynamic=False,
+            )
+        )
+        tab.device_ctrl.gpu_chk.setChecked(False)
+        qt_app.processEvents()
+        assert tab.val_btn.isEnabled() is False
+        assert tab.predict_btn.isEnabled() is False
+        assert tab.export_btn.isEnabled() is False
+
+        before_pred = len(pred_workers)
+        tab._on_predict()
+        assert len(pred_workers) == before_pred
+        assert any("TensorRT" in msg for msg in warnings_shown)
     finally:
         tab.close()

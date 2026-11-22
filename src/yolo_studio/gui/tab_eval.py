@@ -1,13 +1,16 @@
 """标签页 6：模型验证、推理预览与导出界面。
 
 职责：
-    对训练好的 YOLO26 `.pt` 权重执行验证集指标评估（Val）、图片/目录/视频推理可视化预览，
-    并在选择权重后自动后台只读解析训练输入尺寸、类别顺序与检测头能力以提示用户、同步尺寸，
+    对训练好的 YOLO26 `.pt` 权重或已导出部署模型（`.onnx` / `.torchscript` / `.engine`）
+    执行验证集指标评估（Val）与图片/目录/视频推理可视化预览，并在选择模型后自动后台只读解析
+    尺寸、类别顺序、动态维度与检测头能力以提示用户和自动联动；
+    支持在推理测试中选择检测头模式（`one2many` / `end2end`）与输入填充方式（最小矩形 / 固定方形 /
+    按导出尺寸固定填充），并提供「对齐导出参数」与「测刚导出模型 / 切回 .pt 权重」快捷联动；
     同时在独立导出面板中支持导出尺寸（方形/矩形）、`batch`、`dynamic`、`nms` 模式、`opset`、
     `simplify` 与 `FP16` 等完整部署导出参数配置与输入/输出张量实时预览。
 
 运行环境与协作边界：
-    运行于 PyQt6 主线程；权重元数据探测由 `WeightsInspectWorker` 在后台只读执行，
+    运行于 PyQt6 主线程；模型元数据探测由 `WeightsInspectWorker` 在后台只读执行，
     验证、推理、导出三类重计算任务分别委托给 `ValidateWorker`、`PredictWorker`、`ExportWorker`，
     并通过 `_set_busy()` 与 `GpuTaskGuard` 互斥保护，避免并发占用 GPU 显存。
 """
@@ -47,15 +50,20 @@ from yolo_studio.core.trainer import (
     EXPORT_NMS_MODES,
     EXPORT_OPSET_OPTIONS,
     ONNX_BACKED_EXPORT_FORMATS,
+    PREDICT_HEAD_KEY_TO_NMS,
+    PREDICT_HEAD_MODES,
+    PREDICT_PAD_MODES,
     DeviceInfo,
     ExportConfig,
     WeightsMetadata,
     describe_export_io,
     detect_compute_device,
+    detect_model_format,
     format_class_order,
     format_class_order_lines,
     format_imgsz_text,
     format_weights_metadata_log,
+    is_exported_model_path,
 )
 from yolo_studio.gui.common import (
     LOG_MAX_LINES,
@@ -76,30 +84,52 @@ from yolo_studio.gui.workers import (
 
 
 def _show_class_order_dialog(parent: QWidget, meta: WeightsMetadata) -> None:
-    """弹出对话框展示 `.pt` 权重的训练尺寸、检测头能力与完整有序类别清单，支持一键复制。"""
+    """弹出对话框展示模型文件的输入尺寸、检测头能力与完整有序类别清单，支持一键复制。"""
     dlg = QDialog(parent)
-    dlg.setWindowTitle(f"权重元数据与类别顺序 - {meta.weights_path.name}")
+    dlg.setWindowTitle(f"模型元数据与类别顺序 - {meta.weights_path.name}")
     dlg.resize(520, 440)
 
     layout = QVBoxLayout(dlg)
     layout.setSpacing(8)
 
-    head_desc = (
-        "双分支检测头（支持 raw / end2end / embedded）"
-        if meta.supports_end2end and meta.one2many_available
-        else (
-            "仅保留 one2one 端到端无 NMS 分支"
-            if meta.supports_end2end
-            else "标准 one2many 检测头"
+    if meta.is_exported:
+        mode_map = {
+            "end2end": "已固化 YOLO26 one2one 端到端无 NMS",
+            "embedded": "已固化图内嵌入 NMS",
+            "raw": "已固化原始 one2many（外部 NMS）",
+        }
+        head_desc = mode_map.get(meta.export_nms_mode, "未记录（由导出模型内部决定）")
+        dyn_desc = (
+            "动态"
+            if meta.export_dynamic is True
+            else ("静态" if meta.export_dynamic is False else "动态性未知")
         )
-    )
-    summary = QLabel(
-        f"权重文件：{meta.weights_path.name}\n"
-        f"任务类型：{meta.task or '未记录'}  |  "
-        f"训练输入尺寸：{format_imgsz_text(meta.train_imgsz)}  |  "
-        f"类别总数：{meta.num_classes}\n"
-        f"检测头能力：{head_desc}"
-    )
+        summary_text = (
+            f"模型文件：{meta.weights_path.name} ({meta.model_format.upper()} 导出模型)\n"
+            f"任务类型：{meta.task or '未记录'}  |  "
+            f"导出输入尺寸：{format_imgsz_text(meta.train_imgsz)} ({dyn_desc})  |  "
+            f"类别总数：{meta.num_classes}\n"
+            f"固化输出头：{head_desc}"
+        )
+    else:
+        head_desc = (
+            "双分支检测头（支持 raw / end2end / embedded）"
+            if meta.supports_end2end and meta.one2many_available
+            else (
+                "仅保留 one2one 端到端无 NMS 分支"
+                if meta.supports_end2end
+                else "标准 one2many 检测头"
+            )
+        )
+        summary_text = (
+            f"权重文件：{meta.weights_path.name}\n"
+            f"任务类型：{meta.task or '未记录'}  |  "
+            f"训练输入尺寸：{format_imgsz_text(meta.train_imgsz)}  |  "
+            f"类别总数：{meta.num_classes}\n"
+            f"检测头能力：{head_desc}"
+        )
+
+    summary = QLabel(summary_text)
     summary.setWordWrap(True)
     layout.addWidget(summary)
 
@@ -170,6 +200,10 @@ class EvalTab(QWidget):
         self._inspected_file_sig: tuple[str, int, int] | None = None
         self._inspect_request_id: int = 0
         self._syncing_export_dims: bool = False
+        self._syncing_eval_controls: bool = False
+        self._preserve_export_dims_once: bool = False
+        self._last_pt_weights_path: Path | None = None
+        self._last_exported_path: Path | None = None
         self._busy: bool = False
 
         # 用户在路径输入框手动键入时的短防抖定时器（180ms），程序写入路径时直接立即探测
@@ -187,27 +221,34 @@ class EvalTab(QWidget):
         left = QVBoxLayout()
         left.setSpacing(10)
 
-        # 分组 1：模型权重、自动元数据提示、运行设备与验证设置
+        # 分组 1：模型文件（支持 .pt 与已导出模型）、自动元数据提示、运行设备与验证/推理共享设置
         model_group = QGroupBox("1. 模型权重与运行设备")
         self._model_form = QFormLayout(model_group)
         configure_form_layout(self._model_form)
 
         self.weights_picker = PathPickerRow(
-            placeholder="选择训练好的 best.pt 权重（自动读取训练尺寸与类别顺序）",
+            placeholder="选择 .pt 权重或已导出模型 (.onnx / .torchscript / .engine)",
             mode="file",
-            file_filter="PyTorch 权重 (*.pt);;所有文件 (*.*)",
+            file_filter=(
+                "YOLO 模型 (*.pt *.onnx *.torchscript *.engine);;"
+                "PyTorch 权重 (*.pt);;"
+                "ONNX 模型 (*.onnx);;"
+                "TorchScript (*.torchscript);;"
+                "TensorRT Engine (*.engine);;"
+                "所有文件 (*.*)"
+            ),
         )
-        self._model_form.addRow("模型权重 (.pt):", self.weights_picker)
+        self._model_form.addRow("模型文件:", self.weights_picker)
 
         meta_row = QHBoxLayout()
         meta_row.setSpacing(6)
-        self.weights_info_label = QLabel("选择 .pt 权重后将自动读取训练尺寸与类别顺序")
+        self.weights_info_label = QLabel("选择 .pt 权重或已导出模型后将自动读取尺寸、检测头与类别顺序")
         self.weights_info_label.setWordWrap(True)
         self.weights_info_label.setStyleSheet("color: #666666;")
         self.view_classes_btn = QPushButton("类别清单")
         self.view_classes_btn.setEnabled(False)
         self.view_classes_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.view_classes_btn.setToolTip("查看并复制 .pt 权重记录的完整类别索引顺序")
+        self.view_classes_btn.setToolTip("查看并复制模型文件记录的完整类别索引顺序")
         meta_row.addWidget(self.weights_info_label, 1)
         meta_row.addWidget(self.view_classes_btn)
         self._model_form.addRow("权重信息:", meta_row)
@@ -238,10 +279,25 @@ class EvalTab(QWidget):
         self.imgsz_spin.setToolTip(
             "用于『运行验证 (Val)』与『推理效果测试』的输入尺寸；模型导出尺寸请在下方第 3 组独立设置"
         )
+        self.eval_head_label = QLabel("检测头:")
+        self.eval_head_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.eval_head_combo = QComboBox()
+        for key, label, _nms_val in PREDICT_HEAD_MODES:
+            self.eval_head_combo.addItem(label, key)
+        self.eval_head_combo.setToolTip(
+            "仅对 PyTorch (.pt) 权重生效，同时作用于『运行验证 (Val)』与『推理效果测试』：\n"
+            "one2many (nms=None): PT 默认头 + 外部 NMS；\n"
+            "end2end (nms=False): YOLO26 原生 one2one 无 NMS 端到端头（可复现 end2end 导出效果）。\n"
+            "加载已导出模型（.onnx 等）时自动按模型固化模式锁定。"
+        )
         self.val_btn = QPushButton("运行验证 (Val)")
+        self.val_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         hw_row.addWidget(QLabel("ImgSz:"))
         hw_row.addWidget(self.imgsz_spin)
-        hw_row.addStretch(1)
+        hw_row.addSpacing(8)
+        hw_row.addWidget(self.eval_head_label)
+        hw_row.addWidget(self.eval_head_combo, 1)
+        hw_row.addSpacing(6)
         hw_row.addWidget(self.val_btn)
         self._model_form.addRow("验证/推理:", hw_row)
         left.addWidget(model_group)
@@ -268,6 +324,26 @@ class EvalTab(QWidget):
         )
         self._pred_form.addRow("输出目录:", self.pred_out_picker)
 
+        pad_row = QHBoxLayout()
+        pad_row.setSpacing(6)
+        self.pred_pad_combo = QComboBox()
+        for key, label in PREDICT_PAD_MODES:
+            self.pred_pad_combo.addItem(label, key)
+        self.pred_pad_combo.setToolTip(
+            "控制推理测试的图像缩放与补边方式：\n"
+            "• 最小矩形填充 (rect=True): PT 默认，等比缩放后短边仅补齐至 32 倍数（如 576×960）；\n"
+            "• 固定方形填充 (rect=False): 补灰边凑满 ImgSz×ImgSz，模拟静态方形导出；\n"
+            "• 按导出尺寸固定填充 (H×W，rect=False): 按下方第 3 组导出尺寸（支持矩形）补灰边，精确模拟静态导出。"
+        )
+        self.sync_export_pred_btn = QPushButton("对齐导出参数")
+        self.sync_export_pred_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.sync_export_pred_btn.setToolTip(
+            "一键将检测头、输入尺寸与填充模式对齐下方「3. 模型导出」当前配置，用于复现导出后效果"
+        )
+        pad_row.addWidget(self.pred_pad_combo, 1)
+        pad_row.addWidget(self.sync_export_pred_btn)
+        self._pred_form.addRow("输入填充:", pad_row)
+
         thr_row = QHBoxLayout()
         thr_row.setSpacing(6)
         self.conf_spin = QDoubleSpinBox()
@@ -292,6 +368,18 @@ class EvalTab(QWidget):
         thr_row.addWidget(self.predict_btn)
         thr_row.addWidget(self.open_pred_btn)
         self._pred_form.addRow("阈值与执行:", thr_row)
+
+        pred_info_row = QHBoxLayout()
+        pred_info_row.setSpacing(8)
+        self.pred_summary_label = QLabel()
+        self.pred_summary_label.setWordWrap(True)
+        self.pred_summary_label.setTextFormat(Qt.TextFormat.RichText)
+        self.switch_model_btn = QPushButton()
+        self.switch_model_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.switch_model_btn.setVisible(False)
+        pred_info_row.addWidget(self.pred_summary_label, 1)
+        pred_info_row.addWidget(self.switch_model_btn)
+        self._pred_form.addRow("实际参数:", pred_info_row)
         left.addWidget(pred_group)
 
         # 分组 3：模型格式导出（独立导出尺寸、batch、dynamic、NMS 模式、opset、simplify 与 IO 预览）
@@ -475,6 +563,14 @@ class EvalTab(QWidget):
         # 信号与槽连接
         self.weights_picker.textChanged.connect(self._on_weights_text_changed)
         self.view_classes_btn.clicked.connect(self._on_view_classes)
+        self.imgsz_spin.valueChanged.connect(self._on_eval_param_changed)
+        self.eval_head_combo.currentIndexChanged.connect(self._on_eval_param_changed)
+        self.pred_pad_combo.currentIndexChanged.connect(self._on_eval_param_changed)
+        self.sync_export_pred_btn.clicked.connect(self._on_sync_export_to_predict)
+        self.switch_model_btn.clicked.connect(self._on_switch_model)
+        self.conf_spin.valueChanged.connect(self._on_eval_param_changed)
+        self.iou_spin.valueChanged.connect(self._on_eval_param_changed)
+
         self.pick_file_btn.clicked.connect(self._on_pick_file)
         self.pick_dir_btn.clicked.connect(self._on_pick_dir)
         self.val_btn.clicked.connect(self._on_validate)
@@ -500,14 +596,15 @@ class EvalTab(QWidget):
 
         self._on_export_square_toggled(self.export_square_chk.isChecked())
         self._on_export_format_changed()
+        self._refresh_eval_controls_state()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """关闭标签页时停止防抖定时器，避免关闭后触发新的权重探测。"""
+        """关闭标签页时停止防抖定时器，避免关闭后触发新的模型探测。"""
         self._inspect_timer.stop()
         super().closeEvent(event)
 
     def running_inspect_workers(self) -> list[WeightsInspectWorker]:
-        """返回仍在后台运行的权重元数据探测线程列表，供主窗口关闭前安全等待。"""
+        """返回仍在后台运行的模型元数据探测线程列表，供主窗口关闭前安全等待。"""
         workers: list[WeightsInspectWorker] = []
         if self.inspect_worker is not None and self.inspect_worker.isRunning():
             workers.append(self.inspect_worker)
@@ -517,16 +614,32 @@ class EvalTab(QWidget):
         return workers
 
     def current_weights_metadata(self) -> WeightsMetadata | None:
-        """返回当前已成功读取的 `.pt` 权重元数据快照；尚未加载或读取失败时返回 `None`。"""
+        """返回当前已成功读取的模型元数据快照；尚未加载或读取失败时返回 `None`。"""
         return self._weights_metadata
 
+    def _current_model_is_exported(self) -> bool:
+        """判断当前上方选择的模型是否为已导出部署模型（`.onnx` / `.torchscript` / `.engine`）。"""
+        if self._weights_metadata is not None:
+            return self._weights_metadata.is_exported
+        raw = self.weights_picker.text().strip()
+        return bool(raw) and is_exported_model_path(Path(raw))
+
+    def _current_model_format(self) -> str:
+        """返回当前上方所选模型文件的格式键名（`pt` / `onnx` / `torchscript` / `engine`）。"""
+        if self._weights_metadata is not None:
+            return self._weights_metadata.model_format
+        raw = self.weights_picker.text().strip()
+        return detect_model_format(Path(raw)) if raw else "pt"
+
     def _on_weights_text_changed(self, _text: str) -> None:
-        """权重路径变化后通过短防抖调度只读元数据探测，防止手输路径过程中频繁启动线程。"""
+        """模型路径变化后先立即刷新界面防呆状态，再通过短防抖调度只读元数据探测。"""
+        self._refresh_eval_controls_state()
         self._inspect_timer.start()
 
     def _clear_weights_metadata(self, message: str, *, color: str = "#666666") -> None:
         self._weights_metadata = None
         self._inspected_file_sig = None
+        self._preserve_export_dims_once = False
         self.weights_info_label.setText(message)
         self.weights_info_label.setStyleSheet(f"color: {color};")
         self.weights_info_label.setToolTip(message)
@@ -534,20 +647,21 @@ class EvalTab(QWidget):
         self.sync_train_imgsz_btn.setEnabled(False)
         self.sync_train_imgsz_btn.setToolTip("选择 .pt 权重并读取到训练尺寸后，可一键恢复为权重训练尺寸")
         self._refresh_export_io_preview()
+        self._refresh_eval_controls_state()
 
     def _trigger_weights_inspect(self) -> None:
-        """校验当前权重路径并在后台启动 `WeightsInspectWorker` 读取训练尺寸与类别顺序。"""
+        """校验当前模型路径并在后台启动 `WeightsInspectWorker` 读取尺寸、检测头与类别顺序。"""
         self._inspect_timer.stop()
         raw = self.weights_picker.text()
         if not raw:
             self._inspect_request_id += 1
-            self._clear_weights_metadata("选择 .pt 权重后将自动读取训练尺寸与类别顺序")
+            self._clear_weights_metadata("选择 .pt 权重或已导出模型后将自动读取尺寸、检测头与类别顺序")
             return
 
         path = Path(raw)
         if not path.is_file():
             self._inspect_request_id += 1
-            self._clear_weights_metadata("未找到有效的 .pt 权重文件", color="#b25900")
+            self._clear_weights_metadata("未找到有效的模型文件", color="#b25900")
             return
 
         try:
@@ -557,6 +671,7 @@ class EvalTab(QWidget):
             sig = (str(path), 0, 0)
 
         if self._inspected_file_sig == sig and self._weights_metadata is not None:
+            self._refresh_eval_controls_state()
             return
 
         self._inspect_request_id += 1
@@ -565,10 +680,11 @@ class EvalTab(QWidget):
         self._inspected_file_sig = None
         self.view_classes_btn.setEnabled(False)
         self.sync_train_imgsz_btn.setEnabled(False)
-        self.weights_info_label.setText("正在后台读取权重元数据（训练尺寸与类别顺序）...")
+        self.weights_info_label.setText("正在后台读取模型元数据（输入尺寸、检测头与类别顺序）...")
         self.weights_info_label.setStyleSheet("color: #0969da;")
-        self.weights_info_label.setToolTip("正在读取 .pt 权重文件头信息...")
+        self.weights_info_label.setToolTip("正在只读解析模型文件头信息...")
         self._refresh_export_io_preview()
+        self._refresh_eval_controls_state()
 
         if self.inspect_worker is not None and self.inspect_worker.isRunning():
             self._retired_inspect_workers.append(self.inspect_worker)
@@ -587,7 +703,7 @@ class EvalTab(QWidget):
             self._retired_inspect_workers.remove(worker)
 
     def _apply_train_imgsz_to_controls(self, train_imgsz: tuple[int, int]) -> None:
-        """将权重记录的 `(高, 宽)` 同步写入验证/推理 `ImgSz` 与独立导出尺寸控件。"""
+        """将 `.pt` 权重记录的 `(高, 宽)` 同步写入验证/推理 `ImgSz` 与独立导出尺寸控件。"""
         h, w = train_imgsz
         clamped_val = max(self.imgsz_spin.minimum(), min(self.imgsz_spin.maximum(), max(h, w)))
         self.imgsz_spin.setValue(clamped_val)
@@ -607,7 +723,7 @@ class EvalTab(QWidget):
     def _on_weights_inspected(
         self, request_id: int, meta: WeightsMetadata, file_sig: tuple[str, int, int]
     ) -> None:
-        """接收权重元数据探测结果：更新界面提示、自动同步训练尺寸并在日志区输出完整摘要。"""
+        """接收模型元数据探测结果：更新界面提示、自动同步尺寸与防呆状态并在日志区输出摘要。"""
         if request_id != self._inspect_request_id:
             return
 
@@ -616,49 +732,108 @@ class EvalTab(QWidget):
         self.view_classes_btn.setEnabled(meta.num_classes > 0)
 
         cls_brief = format_class_order(meta.class_names, max_items=5)
-        if meta.train_imgsz is not None:
-            self._apply_train_imgsz_to_controls(meta.train_imgsz)
-            size_text = format_imgsz_text(meta.train_imgsz)
-            self.sync_train_imgsz_btn.setEnabled(True)
-            self.sync_train_imgsz_btn.setToolTip(f"一键恢复导出尺寸为权重训练尺寸: {size_text}")
-            self.weights_info_label.setText(
-                f"训练尺寸: {size_text}（已自动同步） | 类别({meta.num_classes}): {cls_brief}"
-            )
-            self.weights_info_label.setStyleSheet("color: #1f7a1f; font-weight: 500;")
-        else:
+        if meta.is_exported:
             self.sync_train_imgsz_btn.setEnabled(False)
-            self.sync_train_imgsz_btn.setToolTip("当前权重未记录训练尺寸，无法自动同步")
+            self.sync_train_imgsz_btn.setToolTip("当前选中为已导出部署模型，请切回 .pt 权重后再执行导出")
+            if meta.train_imgsz is not None:
+                h, w = meta.train_imgsz
+                clamped_val = max(
+                    self.imgsz_spin.minimum(), min(self.imgsz_spin.maximum(), max(h, w))
+                )
+                self.imgsz_spin.setValue(clamped_val)
+            size_text = format_imgsz_text(meta.train_imgsz)
+            dyn_text = (
+                "动态"
+                if meta.export_dynamic is True
+                else ("静态" if meta.export_dynamic is False else "动态性未知")
+            )
+            mode_brief = {
+                "end2end": "one2one 无NMS",
+                "embedded": "图内嵌入NMS",
+                "raw": "one2many 外部NMS",
+            }.get(meta.export_nms_mode, "固化输出头")
             self.weights_info_label.setText(
-                f"训练尺寸: 未记录（请手动确认尺寸） | 类别({meta.num_classes}): {cls_brief}"
+                f"[{meta.model_format.upper()} 导出模型] 输入: {size_text} ({dyn_text}) | "
+                f"输出: {mode_brief} | 类别({meta.num_classes}): {cls_brief}"
             )
-            self.weights_info_label.setStyleSheet("color: #b25900; font-weight: 500;")
+            self.weights_info_label.setStyleSheet("color: #0969da; font-weight: 500;")
+            tooltip_lines = [
+                f"模型文件: {meta.weights_path.name} ({meta.model_format.upper()} 导出模型)",
+                f"任务类型: {meta.task or '未记录'}",
+                f"导出输入尺寸: {size_text} ({dyn_text})",
+                f"固化输出头: {mode_brief}",
+                f"类别总数: {meta.num_classes}",
+                "完整类别顺序:",
+                format_class_order_lines(meta.class_names),
+            ]
+            self.weights_info_label.setToolTip("\n".join(tooltip_lines))
 
-        tooltip_lines = [
-            f"权重文件: {meta.weights_path.name}",
-            f"任务类型: {meta.task or '未记录'}",
-            f"训练输入尺寸: {format_imgsz_text(meta.train_imgsz)}",
-            f"类别总数: {meta.num_classes}",
-            "完整类别顺序:",
-            format_class_order_lines(meta.class_names),
-        ]
-        self.weights_info_label.setToolTip("\n".join(tooltip_lines))
-
-        self.log_box.appendPlainText(format_weights_metadata_log(meta))
-        if meta.train_imgsz is not None:
-            self.log_box.appendPlainText(
-                f"  [自动同步] 已将验证/推理尺寸与导出尺寸同步为权重训练尺寸: {format_imgsz_text(meta.train_imgsz)}"
-            )
+            self.log_box.appendPlainText(format_weights_metadata_log(meta))
+            if meta.export_dynamic is False and meta.train_imgsz is not None:
+                self.log_box.appendPlainText(
+                    f"  [自动锁定] 该静态 {meta.model_format.upper()} 模型固定按 {size_text} 与其固化输出头运行验证/推理。"
+                )
         else:
-            self.log_box.appendPlainText(
-                "  [提示] 该权重未记录训练输入尺寸，请手动确认验证与导出尺寸。"
-            )
+            self._last_pt_weights_path = meta.weights_path
+            preserve_export = self._preserve_export_dims_once
+            self._preserve_export_dims_once = False
+            if meta.train_imgsz is not None:
+                if preserve_export:
+                    h, w = meta.train_imgsz
+                    clamped_val = max(
+                        self.imgsz_spin.minimum(), min(self.imgsz_spin.maximum(), max(h, w))
+                    )
+                    self.imgsz_spin.setValue(clamped_val)
+                else:
+                    self._apply_train_imgsz_to_controls(meta.train_imgsz)
+                size_text = format_imgsz_text(meta.train_imgsz)
+                self.sync_train_imgsz_btn.setEnabled(True)
+                self.sync_train_imgsz_btn.setToolTip(f"一键恢复导出尺寸为权重训练尺寸: {size_text}")
+                self.weights_info_label.setText(
+                    f"训练尺寸: {size_text}（已自动同步） | 类别({meta.num_classes}): {cls_brief}"
+                )
+                self.weights_info_label.setStyleSheet("color: #1f7a1f; font-weight: 500;")
+            else:
+                self.sync_train_imgsz_btn.setEnabled(False)
+                self.sync_train_imgsz_btn.setToolTip("当前权重未记录训练尺寸，无法自动同步")
+                self.weights_info_label.setText(
+                    f"训练尺寸: 未记录（请手动确认尺寸） | 类别({meta.num_classes}): {cls_brief}"
+                )
+                self.weights_info_label.setStyleSheet("color: #b25900; font-weight: 500;")
+
+            tooltip_lines = [
+                f"权重文件: {meta.weights_path.name}",
+                f"任务类型: {meta.task or '未记录'}",
+                f"训练输入尺寸: {format_imgsz_text(meta.train_imgsz)}",
+                f"类别总数: {meta.num_classes}",
+                "完整类别顺序:",
+                format_class_order_lines(meta.class_names),
+            ]
+            self.weights_info_label.setToolTip("\n".join(tooltip_lines))
+
+            self.log_box.appendPlainText(format_weights_metadata_log(meta))
+            if meta.train_imgsz is not None:
+                if preserve_export:
+                    self.log_box.appendPlainText(
+                        f"  [切回权重] 已保留下方自定义导出尺寸；验证/推理尺寸同步为: {format_imgsz_text(meta.train_imgsz)}"
+                    )
+                else:
+                    self.log_box.appendPlainText(
+                        f"  [自动同步] 已将验证/推理尺寸与导出尺寸同步为权重训练尺寸: {format_imgsz_text(meta.train_imgsz)}"
+                    )
+            else:
+                self.log_box.appendPlainText(
+                    "  [提示] 该权重未记录训练输入尺寸，请手动确认验证与导出尺寸。"
+                )
+
         self._refresh_export_io_preview()
+        self._refresh_eval_controls_state()
 
     def _on_weights_inspect_failed(self, request_id: int, err: str) -> None:
         if request_id != self._inspect_request_id:
             return
-        self._clear_weights_metadata(f"未能自动解析权重元数据：{err}", color="#b25900")
-        self.log_box.appendPlainText(f"[提示] 读取权重元数据失败: {err}")
+        self._clear_weights_metadata(f"未能自动解析模型元数据：{err}", color="#b25900")
+        self.log_box.appendPlainText(f"[提示] 读取模型元数据失败: {err}")
 
     def _on_view_classes(self) -> None:
         if self._weights_metadata is not None:
@@ -666,7 +841,11 @@ class EvalTab(QWidget):
 
     def _on_sync_train_imgsz(self) -> None:
         """一键将导出尺寸恢复为当前 `.pt` 权重记录的训练尺寸。"""
-        if self._weights_metadata is None or self._weights_metadata.train_imgsz is None:
+        if (
+            self._weights_metadata is None
+            or self._weights_metadata.is_exported
+            or self._weights_metadata.train_imgsz is None
+        ):
             return
         h, w = self._weights_metadata.train_imgsz
         clamped_h = max(self.export_h_spin.minimum(), min(self.export_h_spin.maximum(), h))
@@ -681,6 +860,364 @@ class EvalTab(QWidget):
         finally:
             self._syncing_export_dims = False
         self._refresh_export_io_preview()
+
+    def _on_eval_param_changed(self, *_args: object) -> None:
+        """检测头、尺寸、填充方式或阈值变化后刷新推理联动防呆与实际参数摘要。"""
+        if self._syncing_eval_controls:
+            return
+        self._refresh_eval_controls_state()
+
+    def _resolve_eval_head_nms(self) -> bool | None:
+        """根据当前模型与检测头下拉框返回传给 Ultralytics 的 `nms` 参数值（已导出模型返回 `None`）。"""
+        if self._current_model_is_exported():
+            return None
+        meta = self._weights_metadata
+        if meta is not None and not meta.supports_end2end:
+            return None
+        if meta is not None and meta.supports_end2end and not meta.one2many_available:
+            return False
+        head_key = str(self.eval_head_combo.currentData() or "one2many")
+        return PREDICT_HEAD_KEY_TO_NMS.get(head_key, None)
+
+    def build_predict_params(self) -> dict[str, object]:
+        """汇总当前「2. 推理效果测试」实际将提交的参数字典（含检测头、输入尺寸、填充与阈值）。"""
+        meta = self._weights_metadata
+        is_exported = self._current_model_is_exported()
+        static_exported = is_exported and meta is not None and meta.export_dynamic is False
+
+        if static_exported and meta is not None and meta.train_imgsz is not None:
+            mh, mw = meta.train_imgsz
+            imgsz: int | tuple[int, int] = mh if mh == mw else (mh, mw)
+            rect = False
+        else:
+            pad_mode = str(self.pred_pad_combo.currentData() or "rect")
+            if pad_mode == "export":
+                eh = self.export_h_spin.value()
+                ew = eh if self.export_square_chk.isChecked() else self.export_w_spin.value()
+                imgsz = eh if eh == ew else (eh, ew)
+                rect = False
+            elif pad_mode == "square":
+                imgsz = self.imgsz_spin.value()
+                rect = False
+            else:
+                imgsz = self.imgsz_spin.value()
+                rect = True
+
+        nms_val = self._resolve_eval_head_nms()
+        if is_exported:
+            uses_external_iou = meta is None or meta.export_nms_mode in {None, "raw"}
+            max_det = 300
+        else:
+            effective_end2end = nms_val is False
+            uses_external_iou = not effective_end2end
+            max_det = self.export_max_det_spin.value() if effective_end2end else 300
+
+        return {
+            "imgsz": imgsz,
+            "rect": rect,
+            "nms": nms_val,
+            "max_det": max_det,
+            "conf": self.conf_spin.value(),
+            "iou": self.iou_spin.value(),
+            "uses_external_iou": uses_external_iou,
+        }
+
+    def _refresh_eval_controls_state(self) -> None:
+        """同步模型验证与推理测试区域的防呆联动（检测头、尺寸/填充、IoU、对齐与切换按钮及参数摘要）。"""
+        meta = self._weights_metadata
+        is_exported = self._current_model_is_exported()
+        static_exported = is_exported and meta is not None and meta.export_dynamic is False
+
+        self._syncing_eval_controls = True
+        try:
+            # 1) 检测头下拉框联动与锁定
+            if is_exported:
+                self.eval_head_combo.setEnabled(False)
+                if meta is not None and meta.export_nms_mode == "end2end":
+                    idx = self.eval_head_combo.findData("end2end")
+                    if idx >= 0:
+                        self.eval_head_combo.setCurrentIndex(idx)
+                    self.eval_head_combo.setToolTip(
+                        "当前已导出模型已固化为 YOLO26 one2one 端到端无 NMS 输出，不可切换"
+                    )
+                elif meta is not None and meta.export_nms_mode == "embedded":
+                    idx = self.eval_head_combo.findData("one2many")
+                    if idx >= 0:
+                        self.eval_head_combo.setCurrentIndex(idx)
+                    self.eval_head_combo.setToolTip(
+                        "当前已导出模型已固化为图内嵌入 NMS 输出，推理期不可切换"
+                    )
+                elif meta is not None and meta.export_nms_mode == "raw":
+                    idx = self.eval_head_combo.findData("one2many")
+                    if idx >= 0:
+                        self.eval_head_combo.setCurrentIndex(idx)
+                    self.eval_head_combo.setToolTip(
+                        "当前已导出模型已固化为原始 one2many 输出（需外部 NMS），不可切换"
+                    )
+                else:
+                    self.eval_head_combo.setToolTip("已导出模型的检测头已在导出时固化，推理期不可切换")
+            elif meta is not None and not meta.supports_end2end:
+                idx = self.eval_head_combo.findData("one2many")
+                if idx >= 0:
+                    self.eval_head_combo.setCurrentIndex(idx)
+                self.eval_head_combo.setEnabled(False)
+                self.eval_head_combo.setToolTip(
+                    "当前 .pt 权重未包含 YOLO26 one2one 端到端分支，仅支持 one2many + 外部 NMS"
+                )
+            elif meta is not None and meta.supports_end2end and not meta.one2many_available:
+                idx = self.eval_head_combo.findData("end2end")
+                if idx >= 0:
+                    self.eval_head_combo.setCurrentIndex(idx)
+                self.eval_head_combo.setEnabled(False)
+                self.eval_head_combo.setToolTip("当前 .pt 权重仅保留 one2one 端到端无 NMS 分支")
+            else:
+                self.eval_head_combo.setEnabled(True)
+                self.eval_head_combo.setToolTip(
+                    "仅对 PyTorch (.pt) 权重生效，同时作用于『运行验证 (Val)』与『推理效果测试』：\n"
+                    "one2many (nms=None): PT 默认头 + 外部 NMS；\n"
+                    "end2end (nms=False): YOLO26 原生 one2one 无 NMS 端到端头（可复现 end2end 导出效果）。"
+                )
+
+            # 2) 静态导出模型锁定 ImgSz 与输入填充下拉框
+            if static_exported:
+                self.imgsz_spin.setEnabled(False)
+                self.imgsz_spin.setToolTip(
+                    f"当前静态 {meta.model_format.upper() if meta else ''} 模型固定使用导出尺寸 "
+                    f"{format_imgsz_text(meta.train_imgsz if meta else None)}，推理/验证将自动沿用该固定尺寸"
+                )
+                self.pred_pad_combo.setEnabled(False)
+                self.pred_pad_combo.setToolTip(
+                    "静态导出模型固定使用导出尺寸进行等比灰边填充 (rect=False)，无需手动选择填充模式"
+                )
+            else:
+                self.imgsz_spin.setEnabled(True)
+                self.imgsz_spin.setToolTip(
+                    "用于『运行验证 (Val)』与『推理效果测试』的输入尺寸；模型导出尺寸请在下方第 3 组独立设置"
+                )
+                self.pred_pad_combo.setEnabled(True)
+                self.pred_pad_combo.setToolTip(
+                    "控制推理测试的图像缩放与补边方式：\n"
+                    "• 最小矩形填充 (rect=True): PT 默认，等比缩放后短边仅补齐至 32 倍数（如 576×960）；\n"
+                    "• 固定方形填充 (rect=False): 补灰边凑满 ImgSz×ImgSz，模拟静态方形导出；\n"
+                    "• 按导出尺寸固定填充 (H×W，rect=False): 按下方第 3 组导出尺寸（支持矩形）补灰边，精确模拟静态导出。"
+                )
+        finally:
+            self._syncing_eval_controls = False
+
+        # 3) IoU 阈值与「对齐导出参数」按钮防呆联动
+        params = self.build_predict_params()
+        uses_external_iou = bool(params["uses_external_iou"])
+        self.iou_spin.setEnabled(uses_external_iou)
+        if uses_external_iou:
+            self.iou_spin.setToolTip("外部 NMS 去重 IoU 阈值（one2many / raw 原始输出模式生效）")
+        else:
+            self.iou_spin.setToolTip(
+                "当前为 YOLO26 one2one 端到端无 NMS 或图内嵌入 NMS 模式，不使用外部 IoU 阈值"
+            )
+
+        self.sync_export_pred_btn.setEnabled((not is_exported) and (not self._busy))
+        if is_exported:
+            self.sync_export_pred_btn.setToolTip("当前已直接加载导出模型，无需模拟导出参数")
+        else:
+            self.sync_export_pred_btn.setToolTip(
+                "一键将检测头、输入尺寸与填充模式对齐下方「3. 模型导出」当前配置，用于复现导出后效果"
+            )
+
+        # 4) 导出产物 ↔ .pt 源权重一键切换按钮
+        if (
+            not is_exported
+            and self._last_exported_path is not None
+            and self._last_exported_path.is_file()
+        ):
+            self.switch_model_btn.setText("测刚导出模型")
+            self.switch_model_btn.setToolTip(
+                f"一键切换上方模型为刚导出的 {self._last_exported_path.name}，直接实测导出后效果"
+            )
+            self.switch_model_btn.setVisible(True)
+            self.switch_model_btn.setEnabled(not self._busy)
+        elif (
+            is_exported
+            and self._last_pt_weights_path is not None
+            and self._last_pt_weights_path.is_file()
+        ):
+            self.switch_model_btn.setText("切回 .pt 权重")
+            self.switch_model_btn.setToolTip(
+                f"一键切回源 PyTorch 权重 {self._last_pt_weights_path.name} 以继续对比或重新导出"
+            )
+            self.switch_model_btn.setVisible(True)
+            self.switch_model_btn.setEnabled(not self._busy)
+        else:
+            self.switch_model_btn.setVisible(False)
+
+        self._refresh_action_btn_states()
+        self._refresh_pred_summary(params)
+
+    def _refresh_pred_summary(self, params: dict[str, object] | None = None) -> None:
+        """刷新「2. 推理效果测试」底部的实际生效参数摘要，并在与下方导出配置不一致时提醒。"""
+        if params is None:
+            params = self.build_predict_params()
+
+        meta = self._weights_metadata
+        is_exported = self._current_model_is_exported()
+        fmt_upper = self._current_model_format().upper()
+
+        imgsz_val = params["imgsz"]
+        size_pair = (
+            (int(imgsz_val[0]), int(imgsz_val[1]))
+            if isinstance(imgsz_val, tuple)
+            else (int(imgsz_val), int(imgsz_val))  # type: ignore[arg-type]
+        )
+        size_text = format_imgsz_text(size_pair)
+        rect_flag = bool(params["rect"])
+        conf_val = float(params["conf"])  # type: ignore[arg-type]
+        iou_val = float(params["iou"])  # type: ignore[arg-type]
+        max_det_val = int(params["max_det"])  # type: ignore[arg-type]
+
+        if is_exported:
+            mode_map = {
+                "end2end": "one2one 无 NMS (已固化)",
+                "embedded": "图内嵌入 NMS (已固化)",
+                "raw": "one2many 外部 NMS (已固化)",
+            }
+            head_txt = mode_map.get(meta.export_nms_mode if meta else None, "导出模型固化头")
+            pad_txt = (
+                "固定尺寸填充 (静态)"
+                if (meta is not None and meta.export_dynamic is False)
+                else ("最小矩形填充 (rect=True)" if rect_flag else "固定尺寸填充 (rect=False)")
+            )
+            model_tag = f"{fmt_upper} 导出模型"
+        else:
+            if params["nms"] is False:
+                head_txt = f"one2one 端到端无 NMS (MaxDet={max_det_val})"
+            else:
+                head_txt = "one2many + 外部 NMS"
+            pad_txt = "最小矩形填充 (rect=True)" if rect_flag else "固定尺寸填充 (rect=False)"
+            model_tag = "PT 权重"
+
+        thr_txt = (
+            f"Conf={conf_val:.2f}, IoU={iou_val:.2f}"
+            if bool(params["uses_external_iou"])
+            else f"Conf={conf_val:.2f} (无外部 IoU)"
+        )
+        summary_line = f"{model_tag}  |  {head_txt}  |  输入: {size_text} {pad_txt}  |  {thr_txt}"
+
+        hints: list[str] = []
+        if is_exported:
+            if meta is not None and meta.export_nms_mode == "embedded":
+                hints.append("图内嵌入 NMS 模型已固化导出阈值，调低此处 Conf 不会召回已被图内过滤的目标。")
+        else:
+            exp_cfg = self.build_export_config(allow_missing_weights=True)
+            exp_imgsz = exp_cfg.imgsz
+            exp_pair = (
+                (int(exp_imgsz[0]), int(exp_imgsz[1]))
+                if isinstance(exp_imgsz, tuple)
+                else (
+                    (int(exp_imgsz), int(exp_imgsz))
+                    if isinstance(exp_imgsz, int)
+                    else size_pair
+                )
+            )
+            diffs: list[str] = []
+            if (exp_cfg.nms is False) != (params["nms"] is False):
+                diffs.append("检测头")
+            if not exp_cfg.dynamic:
+                if rect_flag:
+                    diffs.append("填充方式")
+                if size_pair != exp_pair:
+                    diffs.append("输入尺寸")
+            if diffs:
+                diff_str = "/".join(diffs)
+                hints.append(
+                    f"与下方导出配置存在差异（{diff_str}），可点击「对齐导出参数」模拟导出后效果。"
+                )
+
+        html_parts = [f"<span style='color:#333333;'>{html.escape(summary_line)}</span>"]
+        for hint in hints:
+            html_parts.append(
+                f"<br><span style='color:#b25900; font-weight:500;'>[提示] {html.escape(hint)}</span>"
+            )
+        self.pred_summary_label.setText("".join(html_parts))
+        self.pred_summary_label.setToolTip("\n".join([summary_line, *(f"[提示] {h}" for h in hints)]))
+
+    def _on_sync_export_to_predict(self) -> None:
+        """一键将推理测试的检测头、输入尺寸、填充模式与必要阈值对齐下方第 3 组导出配置。"""
+        if self._current_model_is_exported():
+            return
+
+        exp_cfg = self.build_export_config(allow_missing_weights=True)
+        meta = self._weights_metadata
+
+        self._syncing_eval_controls = True
+        try:
+            # 1) 对齐检测头（导出 end2end -> one2one；raw / embedded -> one2many）
+            if exp_cfg.nms is False:
+                if meta is None or meta.supports_end2end:
+                    idx = self.eval_head_combo.findData("end2end")
+                    if idx >= 0:
+                        self.eval_head_combo.setCurrentIndex(idx)
+            else:
+                if meta is None or meta.one2many_available:
+                    idx = self.eval_head_combo.findData("one2many")
+                    if idx >= 0:
+                        self.eval_head_combo.setCurrentIndex(idx)
+
+            # 2) 对齐输入尺寸与填充模式
+            if isinstance(exp_cfg.imgsz, tuple):
+                ref_dim = max(exp_cfg.imgsz)
+            elif isinstance(exp_cfg.imgsz, int):
+                ref_dim = exp_cfg.imgsz
+            else:
+                ref_dim = self.imgsz_spin.value()
+            clamped = max(self.imgsz_spin.minimum(), min(self.imgsz_spin.maximum(), ref_dim))
+            self.imgsz_spin.setValue(clamped)
+
+            target_pad = "rect" if exp_cfg.dynamic else "export"
+            pad_idx = self.pred_pad_combo.findData(target_pad)
+            if pad_idx >= 0:
+                self.pred_pad_combo.setCurrentIndex(pad_idx)
+
+            # 3) 图内嵌入 NMS 模式下顺带对齐 Conf / IoU 便于模拟导出过滤阈值
+            if exp_cfg.nms is True:
+                if exp_cfg.conf is not None:
+                    self.conf_spin.setValue(exp_cfg.conf)
+                if exp_cfg.iou is not None:
+                    self.iou_spin.setValue(exp_cfg.iou)
+        finally:
+            self._syncing_eval_controls = False
+
+        self._refresh_eval_controls_state()
+        params = self.build_predict_params()
+        imgsz_val = params["imgsz"]
+        size_pair = (
+            (int(imgsz_val[0]), int(imgsz_val[1]))
+            if isinstance(imgsz_val, tuple)
+            else (int(imgsz_val), int(imgsz_val))  # type: ignore[arg-type]
+        )
+        head_label = "end2end (one2one 无 NMS)" if params["nms"] is False else "one2many (外部 NMS)"
+        pad_label = "最小矩形 (rect=True)" if params["rect"] else "固定尺寸填充 (rect=False)"
+        self.log_box.appendPlainText(
+            f"[对齐导出] 推理测试已同步下方导出配置：检测头={head_label}，"
+            f"输入={format_imgsz_text(size_pair)}，{pad_label}。"
+        )
+
+    def _on_switch_model(self) -> None:
+        """在最近成功导出的部署模型与源 `.pt` 权重之间一键来回切换并立即触发元数据探测。"""
+        if self._current_model_is_exported():
+            target = self._last_pt_weights_path
+            preserve_export = True
+        else:
+            cur_raw = self.weights_picker.text().strip()
+            if cur_raw and Path(cur_raw).is_file() and not is_exported_model_path(Path(cur_raw)):
+                self._last_pt_weights_path = Path(cur_raw)
+            target = self._last_exported_path
+            preserve_export = False
+
+        if target is None or not target.is_file():
+            self._refresh_eval_controls_state()
+            return
+        self._preserve_export_dims_once = preserve_export
+        self.weights_picker.setText(str(target))
+        self._trigger_weights_inspect()
 
     def _on_export_square_toggled(self, checked: bool) -> None:
         """切换方形联动开关：勾选时宽自动对齐高并禁用编辑，取消勾选即可设非正方形尺寸。"""
@@ -722,20 +1259,43 @@ class EvalTab(QWidget):
             self.export_batch_spin.setToolTip("静态批大小；TensorRT 开启动态输入时建议设为预期最大批大小")
 
     def _refresh_export_btn_state(self) -> None:
-        """同步「导出模型」按钮可用态：忙碌期间或 TensorRT 处于 CPU 模式时置灰防误点。"""
+        """同步「导出模型」按钮可用态：忙碌、已选中非 `.pt` 导出模型或 TensorRT 处于 CPU 模式时置灰防误点。"""
         fmt = str(self.format_combo.currentData() or "onnx")
         using_gpu = self.device_ctrl.is_using_gpu() and not self.device_info.probing
         blocked_engine_cpu = fmt == "engine" and not using_gpu
-        self.export_btn.setEnabled((not self._busy) and (not blocked_engine_cpu))
-        if blocked_engine_cpu:
+        blocked_exported_model = self._current_model_is_exported()
+        self.export_btn.setEnabled(
+            (not self._busy) and (not blocked_engine_cpu) and (not blocked_exported_model)
+        )
+        if blocked_exported_model:
+            self.export_btn.setToolTip(
+                "模型导出仅支持 PyTorch (.pt) 源权重；当前上方已选中导出模型，请切回 .pt 权重后再导出"
+            )
+        elif blocked_engine_cpu:
             self.export_btn.setToolTip(
                 "TensorRT (.engine) 导出需要可用的 CUDA GPU，请在上方运行设备中启用 GPU 加速后再导出"
             )
         else:
             self.export_btn.setToolTip("按当前配置导出部署模型（产物生成在源权重同目录）")
 
+    def _refresh_action_btn_states(self) -> None:
+        """统一同步验证、推理预览与导出三个执行按钮的防呆可用状态。"""
+        using_gpu = self.device_ctrl.is_using_gpu() and not self.device_info.probing
+        blocked_engine_model_cpu = self._current_model_format() == "engine" and not using_gpu
+        can_eval = (not self._busy) and (not blocked_engine_model_cpu)
+        self.val_btn.setEnabled(can_eval)
+        self.predict_btn.setEnabled(can_eval)
+        if blocked_engine_model_cpu:
+            tip = "TensorRT (.engine) 模型仅支持在 CUDA GPU 上运行，请在上方启用 GPU 加速"
+            self.val_btn.setToolTip(tip)
+            self.predict_btn.setToolTip(tip)
+        else:
+            self.val_btn.setToolTip("使用当前所选模型、尺寸与检测头在验证集上评估 mAP / Precision / Recall")
+            self.predict_btn.setToolTip("按当前模型、检测头、填充模式与阈值执行推理并预览结果")
+        self._refresh_export_btn_state()
+
     def _on_export_format_changed(self, *_args: object) -> None:
-        """同步导出面板各项防呆状态：FP16、ONNX 专属参数（opset/simplify）、dynamic、NMS 阈值及导出按钮。"""
+        """同步导出面板各项防呆状态：FP16、ONNX 专属参数（opset/simplify）、dynamic、NMS 阈值及执行按钮。"""
         fmt = str(self.format_combo.currentData() or "onnx")
         is_onnx = fmt == "onnx"
         is_onnx_backed = fmt in ONNX_BACKED_EXPORT_FORMATS
@@ -788,14 +1348,17 @@ class EvalTab(QWidget):
         self._exp_form.setRowVisible(self.nms_thresh_row_widget, is_embedded)
 
         self._refresh_export_batch_tooltip()
-        self._refresh_export_btn_state()
+        self._refresh_action_btn_states()
         self._refresh_export_io_preview()
 
     def build_export_config(self, *, allow_missing_weights: bool = False) -> ExportConfig:
         """从界面导出面板读取并组装完整的 `ExportConfig` 配置对象。"""
         w_text = self.weights_picker.text()
-        if not allow_missing_weights and (not w_text or not Path(w_text).is_file()):
-            raise ValueError("请选择有效的 .pt 权重文件。")
+        if not allow_missing_weights:
+            if not w_text or not Path(w_text).is_file():
+                raise ValueError("请选择有效的 .pt 权重文件。")
+            if is_exported_model_path(Path(w_text)):
+                raise ValueError("模型导出仅支持 PyTorch (.pt) 源权重，请先切回 .pt 权重。")
 
         fmt = str(self.format_combo.currentData() or "onnx")
         h = self.export_h_spin.value()
@@ -828,9 +1391,16 @@ class EvalTab(QWidget):
         )
 
     def _refresh_export_io_preview(self, *_args: object) -> None:
-        """根据当前导出面板控件值与已读取权重元数据，实时刷新输入/输出张量说明与风险提醒。"""
+        """根据当前导出面板控件值与已读取权重元数据，实时刷新输入/输出张量说明及推理参数摘要。"""
         cfg = self.build_export_config(allow_missing_weights=True)
-        io_text, warnings = describe_export_io(cfg, metadata=self._weights_metadata)
+        is_exported = self._current_model_is_exported()
+        meta_for_export = None if is_exported else self._weights_metadata
+        io_text, warnings = describe_export_io(cfg, metadata=meta_for_export)
+        if is_exported:
+            warnings = [
+                "当前上方选中的是已导出模型，模型导出功能仅支持 PyTorch (.pt) 源权重。",
+                *warnings,
+            ]
 
         html_parts = [
             f"<span style='color:#333333;'>{html.escape(io_text)}</span>",
@@ -848,6 +1418,9 @@ class EvalTab(QWidget):
         tip_lines = [io_text, *(f"[提示] {w}" for w in warnings)]
         self.export_io_label.setToolTip("\n".join(tip_lines))
 
+        if hasattr(self, "pred_summary_label"):
+            self._refresh_pred_summary()
+
     def apply_device_info(self, info: DeviceInfo) -> None:
         """异步硬件探测完成后刷新运行设备开关与导出 FP16 可用状态（保留用户已手动修改的选择）。"""
         self.device_info = info
@@ -855,8 +1428,9 @@ class EvalTab(QWidget):
         self._on_export_format_changed()
 
     def set_weights_and_yaml(self, weights_path: str, yaml_path: str) -> None:
-        """跨页写入：同步更新待评估权重与 `data.yaml` 路径，并立即触发权重元数据探测。"""
+        """跨页写入：同步更新待评估模型与 `data.yaml` 路径，并立即触发模型元数据探测。"""
         if weights_path:
+            self._preserve_export_dims_once = False
             self.weights_picker.setText(weights_path)
             self._trigger_weights_inspect()
         if yaml_path:
@@ -878,27 +1452,48 @@ class EvalTab(QWidget):
             self.source_edit.setText(chosen)
 
     def _set_busy(self, busy: bool) -> None:
-        """互斥启用或禁用验证、推理与导出三个执行按钮，防止后台任务冲突。"""
+        """互斥启用或禁用验证、推理与导出三个执行按钮及快捷按钮，防止后台任务冲突。"""
         self._busy = busy
-        self.val_btn.setEnabled(not busy)
-        self.predict_btn.setEnabled(not busy)
-        self._refresh_export_btn_state()
+        self._refresh_action_btn_states()
+        self.sync_export_pred_btn.setEnabled((not busy) and (not self._current_model_is_exported()))
+        if self.switch_model_btn.isVisible():
+            self.switch_model_btn.setEnabled(not busy)
 
     def _on_validate(self) -> None:
-        """校验权重与 `data.yaml` 后在后台启动 `ValidateWorker`。"""
+        """校验模型文件与 `data.yaml` 后在后台启动 `ValidateWorker`。"""
         if self.device_info.probing:
             self.apply_device_info(detect_compute_device())
         w = self.weights_picker.text()
         y = self.yaml_picker.text()
         if not w or not Path(w).is_file():
-            QMessageBox.warning(self, "提示", "请选择有效的 .pt 权重文件。")
+            QMessageBox.warning(self, "提示", "请选择有效的模型文件（.pt / .onnx / .torchscript / .engine）。")
             return
         if not y or not Path(y).is_file():
             QMessageBox.warning(self, "提示", "请选择有效的 data.yaml 文件。")
             return
+        device = self.device_ctrl.device()
+        if detect_model_format(Path(w)) == "engine" and device.strip().lower() == "cpu":
+            QMessageBox.warning(
+                self,
+                "提示",
+                "TensorRT (.engine) 模型仅支持在 CUDA GPU 上验证，请在上方启用 GPU 加速后再运行。",
+            )
+            return
 
         if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "模型验证 (Val)"):
             return
+
+        meta = self._weights_metadata
+        if (
+            meta is not None
+            and meta.is_exported
+            and meta.export_dynamic is False
+            and meta.train_imgsz is not None
+        ):
+            mh, mw = meta.train_imgsz
+            val_imgsz: int | tuple[int, int] = mh if mh == mw else (mh, mw)
+        else:
+            val_imgsz = self.imgsz_spin.value()
 
         self._set_busy(True)
         self.log_box.clear()
@@ -907,8 +1502,9 @@ class EvalTab(QWidget):
         self.val_worker = ValidateWorker(
             Path(w),
             Path(y),
-            imgsz=self.imgsz_spin.value(),
-            device=self.device_ctrl.device(),
+            imgsz=val_imgsz,
+            device=device,
+            nms=self._resolve_eval_head_nms(),
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.val_worker, "模型验证 (Val)")
@@ -924,21 +1520,30 @@ class EvalTab(QWidget):
             self.log_box.appendPlainText(f"{k}: {v:.4f}")
 
     def _on_predict(self) -> None:
-        """校验权重与测试输入路径后在后台启动 `PredictWorker`。"""
+        """校验模型文件与测试输入路径后在后台启动 `PredictWorker`。"""
         if self.device_info.probing:
             self.apply_device_info(detect_compute_device())
         w = self.weights_picker.text()
         src = self.source_edit.text().strip()
         if not w or not Path(w).is_file():
-            QMessageBox.warning(self, "提示", "请选择有效的 .pt 权重文件。")
+            QMessageBox.warning(self, "提示", "请选择有效的模型文件（.pt / .onnx / .torchscript / .engine）。")
             return
         if not src or not Path(src).exists():
             QMessageBox.warning(self, "提示", "请选择有效的测试输入文件或目录。")
+            return
+        device = self.device_ctrl.device()
+        if detect_model_format(Path(w)) == "engine" and device.strip().lower() == "cpu":
+            QMessageBox.warning(
+                self,
+                "提示",
+                "TensorRT (.engine) 模型仅支持在 CUDA GPU 上推理，请在上方启用 GPU 加速后再运行。",
+            )
             return
 
         if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "模型推理预览"):
             return
 
+        params = self.build_predict_params()
         out_dir = Path(self.pred_out_picker.text() or (self.workspace_root / "runs" / "predict_preview"))
         self._set_busy(True)
         self.log_box.clear()
@@ -948,10 +1553,13 @@ class EvalTab(QWidget):
             weights_path=Path(w),
             source_path=Path(src),
             output_dir=out_dir,
-            conf=self.conf_spin.value(),
-            iou=self.iou_spin.value(),
-            imgsz=self.imgsz_spin.value(),
-            device=self.device_ctrl.device(),
+            conf=float(params["conf"]),  # type: ignore[arg-type]
+            iou=float(params["iou"]),  # type: ignore[arg-type]
+            imgsz=params["imgsz"],  # type: ignore[arg-type]
+            device=device,
+            nms=params["nms"],  # type: ignore[arg-type]
+            rect=bool(params["rect"]),
+            max_det=int(params["max_det"]),  # type: ignore[arg-type]
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.pred_worker, "模型推理预览")
@@ -1000,6 +1608,7 @@ class EvalTab(QWidget):
         ):
             return
 
+        self._last_pt_weights_path = cfg.weights_path
         self._set_busy(True)
         self.log_box.clear()
         self.log_box.appendPlainText(f"开始导出为 {cfg.export_format} 格式...")
@@ -1013,8 +1622,15 @@ class EvalTab(QWidget):
         self.export_worker.start()
 
     def _on_export_done(self, exported_path: str) -> None:
+        exp_path = Path(exported_path)
+        if exp_path.is_file():
+            self._last_exported_path = exp_path
         self._set_busy(False)
+        self._refresh_eval_controls_state()
         self.log_box.appendPlainText(f"\n=== 导出成功 ===\n文件路径: {exported_path}")
+        self.log_box.appendPlainText(
+            "[提示] 可点击「2. 推理效果测试」中的「测刚导出模型」一键切换并实测该导出模型的推理效果。"
+        )
         QMessageBox.information(self, "导出成功", f"模型已导出到:\n{exported_path}")
 
     def _on_failed(self, err: str) -> None:
