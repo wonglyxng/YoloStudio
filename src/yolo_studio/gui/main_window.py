@@ -1,7 +1,7 @@
 """PyQt6 桌面主窗口模块，统筹六步工作流标签页及跨页数据流转。
 
 职责：
-    组装“1. 视频抽帧 → 2. 标注工作台 → 3. LLM 标注清洗 → 4. 数据集准备 →
+    组装“1. 视频抽帧 → 2. 标注工作台 → 3. LLM 智能标注 → 4. 数据集准备 →
     5. YOLO26 训练 → 6. 验证、推理与导出”六个标签页，协调内嵌工作台联动与跨页路径同步。
 
 运行环境与协作边界：
@@ -137,9 +137,9 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.extract_tab, "1. 视频抽帧")
         self.tabs.addTab(self.labeling_tab, "2. 标注工作台")
-        # 标签页按“采集 → 标注 → 质检 → 组装 → 训练 → 评估”排列；页面跳转一律按控件对象切换，
+        # 标签页按“采集 → 标注 → 智能标注 → 组装 → 训练 → 评估”排列；页面跳转一律按控件对象切换，
         # 不依赖序号，调整顺序时只需修改此处与界面文案中的编号
-        self.tabs.addTab(self.review_tab, "3. LLM 标注清洗")
+        self.tabs.addTab(self.review_tab, "3. LLM 智能标注")
         self.tabs.addTab(self.dataset_tab, "4. 数据集准备")
         self.tabs.addTab(self.train_tab, "5. YOLO26 训练")
         self.tabs.addTab(self.eval_tab, "6. 验证、推理与导出")
@@ -202,7 +202,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(summary, 5000)
 
     def _on_frames_ready(self, frames_dir: str) -> None:
-        """同步抽帧输出目录至数据集页与纠错页；用户仍停留在抽帧页时自动切至内嵌标注工作台。
+        """同步抽帧输出目录至数据集页与智能标注页；用户仍停留在抽帧页时自动切至内嵌标注工作台。
 
         抽帧完成与点击「发送到标注工作台」都会触发此槽；两种情况下用户通常都处于抽帧页。
         """
@@ -232,7 +232,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.dataset_tab)
 
     def _on_labeling_to_review(self, images_dir: str) -> None:
-        """将工作台当前图片目录同步至「3. LLM 标注清洗」并切换过去。"""
+        """将工作台当前图片目录同步至「3. LLM 智能标注」并切换过去。"""
         self.review_tab.set_images_dir(images_dir)
         self.tabs.setCurrentWidget(self.review_tab)
 
@@ -241,7 +241,7 @@ class MainWindow(QMainWindow):
         self.dataset_tab.mark_annotations_changed(dir_path)
 
     def _on_cleaned_ready(self, images_dir: str, classes_txt: str, recursive: bool) -> None:
-        """将 MLLM 清洗输出目录与类别清单填入「4. 数据集准备」并切换至该页。"""
+        """将 LLM 智能标注输出目录与类别清单填入「4. 数据集准备」并切换至该页。"""
         self.dataset_tab.set_dataset_source(images_dir, classes_txt, recursive)
         self.tabs.setCurrentWidget(self.dataset_tab)
 
@@ -250,7 +250,7 @@ class MainWindow(QMainWindow):
         self.train_tab.set_data_yaml(yaml_path)
 
     def _on_weights_ready(self, weights_path: str, yaml_path: str) -> None:
-        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「3. LLM 标注清洗」。
+        """将训练产出的 `best.pt` 权重与 `data.yaml` 同步至「6. 验证、推理与导出」和「3. LLM 智能标注」。
 
         仅同步路径不主动切换标签页；用户点击训练页发送按钮时由 `TrainTab.request_eval_tab` 独立触发切页。
         """
@@ -258,7 +258,7 @@ class MainWindow(QMainWindow):
         self.review_tab.set_weights_path(weights_path)
 
     def _restore_settings(self) -> None:
-        """从持久化 `QSettings` 恢复上次保存的工作区目录、MLLM 策略与训练超参数偏好（如存在）。"""
+        """从持久化 `QSettings` 恢复上次保存的工作区目录、LLM 智能标注策略与训练超参数偏好（如存在）。"""
         last_dir = self.settings.value("last_frames_dir", "")
         if (
             isinstance(last_dir, str)
@@ -333,7 +333,7 @@ class MainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self,
                 "后台任务仍在运行",
-                f"当前有 {len(running)} 个后台任务正在运行（如训练、抽帧或 MLLM 审核）。\n"
+                f"当前有 {len(running)} 个后台任务正在运行（如训练、抽帧或 LLM 智能标注）。\n"
                 "是否请求停止并在其安全结束后退出？\n"
                 "训练会在当前轮次结束并保存权重后停止；验证、推理、导出需等待完成。",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

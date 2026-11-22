@@ -3,7 +3,7 @@
 职责：
     在离线 `offscreen` Qt 环境下验证主窗口六标签页装配、X-AnyLabeling 内嵌宿主初始化与桥接适配层、
     快捷键作用域隔离、`open_directory` 精确目录/单图/类别加载、跨标签页联动跳转、
-    跨页 GPU 任务互斥与 ONNX 导出 FP16 置灰、异步视频探测、MLLM 对比图缓存，
+    跨页 GPU 任务互斥与 ONNX 导出 FP16 置灰、异步视频探测、LLM 智能标注对比图缓存，
     以及关闭主窗口时等待后台线程安全停止后再退出。
 
 运行环境与协作边界：
@@ -79,8 +79,8 @@ def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
         assert win.windowTitle() == f"YoloStudio v{__version__}"
         assert win.tabs.count() == 6
         assert win.tabs.tabText(1) == "2. 标注工作台"
-        assert win.tabs.tabText(2) == "3. LLM 标注清洗"
-        assert win.labeling_tab.to_review_btn.text() == "发送到「3. LLM 标注清洗」→"
+        assert win.tabs.tabText(2) == "3. LLM 智能标注"
+        assert win.labeling_tab.to_review_btn.text() == "发送到「3. LLM 智能标注」→"
         review_group_titles = [
             box.title() for box in win.review_tab.findChildren(QGroupBox)
         ]
@@ -219,7 +219,7 @@ def test_switching_next_image_with_long_path_does_not_resize_mainwindow(
 def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证 `open_directory`、`classes.txt` 预载、单图定位及数据集/纠错页双向联动信号。"""
+    """验证 `open_directory`、`classes.txt` 预载、单图定位及数据集/智能标注页双向联动信号。"""
     frames_dir = tmp_path / "frames"
     img_a = frames_dir / "frame_001.jpg"
     img_b = frames_dir / "frame_002.jpg"
@@ -231,7 +231,7 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
 
     win = _make_window(tmp_path)
     try:
-        # 从「3. LLM 标注清洗」触发跳转至「2. 标注工作台」并定位第二张图
+        # 从「3. LLM 智能标注」触发跳转至「2. 标注工作台」并定位第二张图
         win.tabs.setCurrentWidget(win.review_tab)
         win.review_tab.open_in_workbench.emit(
             str(frames_dir), str(classes_file), str(img_b)
@@ -245,7 +245,7 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
         assert lw.unique_label_list.count() == 2
         assert Path(str(lw.filename)).resolve() == img_b.resolve()
 
-        # 从「2. 标注工作台」发回「4. 数据集准备」与「3. LLM 标注清洗」
+        # 从「2. 标注工作台」发回「4. 数据集准备」与「3. LLM 智能标注」
         win.labeling_tab.send_to_dataset.emit(str(frames_dir), str(classes_file))
         assert win.tabs.currentWidget() is win.dataset_tab
         assert win.tabs.tabText(win.tabs.currentIndex()) == "4. 数据集准备"
@@ -254,7 +254,7 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
 
         win.labeling_tab.send_to_review.emit(str(frames_dir))
         assert win.tabs.currentWidget() is win.review_tab
-        assert win.tabs.tabText(win.tabs.currentIndex()) == "3. LLM 标注清洗"
+        assert win.tabs.tabText(win.tabs.currentIndex()) == "3. LLM 智能标注"
         assert Path(win.review_tab.images_picker.text()).resolve() == frames_dir.resolve()
     finally:
         assert win.labeling_tab.prepare_for_close() is True
@@ -836,7 +836,7 @@ def test_compute_device_control_across_tabs_4_5_6_and_multi_gpu_and_amp_fp16_gua
     finally:
         train_tab.close()
 
-    # 2) 标签页 3（MLLM 审核页）：单卡行内紧凑开关，切至已有 .json 模式时随推理参数一并禁用；无卡环境置灰 CPU
+    # 2) 标签页 3（LLM 智能标注页）：单卡行内紧凑开关，切至已有 .json 模式时随推理参数一并禁用；无卡环境置灰 CPU
     review_tab = MllmReviewTab(workspace_root=tmp_path, device_info=single_gpu)
     try:
         assert review_tab.yolo_device_ctrl.device() == "0"
@@ -969,7 +969,10 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
 
     tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=gpu_info)
     try:
-        # 1) 环境变量缺失提示、目录计数与按模式自动隐藏无关置灰行
+        # 1) 默认输出目录、工作模式说明、环境变量缺失提示、目录计数与按模式自动隐藏无关置灰行
+        assert Path(tab1.output_picker.text()) == (tmp_path / "data" / "smart_labeled").resolve()
+        assert tab1.start_btn.text() == "开始 LLM 智能标注"
+        assert "基准 .pt" in tab1.source_mode_hint_label.text()
         assert "未检测到环境变量 GEMINI_API_KEY" in tab1.api_key_status_label.text()
         assert tab1.high_conf_spin.minimumWidth() >= 100  # 防止 Win11 并排箭头截断两位小数
         assert tab1.ann_picker.isHidden() is True
@@ -992,10 +995,11 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         tab1.recursive_chk.setChecked(True)
         tab1.set_images_dir(str(in_dir))
 
-        # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行；切到 OpenAI 显示 Base URL
+        # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行并更新模式提示；切到 OpenAI 显示 Base URL
         tab1.source_mode_combo.setCurrentIndex(1)
         tab1.provider_combo.setCurrentIndex(1)
         qt_app.processEvents()
+        assert ".json" in tab1.source_mode_hint_label.text()
         assert tab1.weights_picker.isHidden() is True
         assert tab1.yolo_params_widget.isHidden() is True
         assert tab1.ann_picker.isHidden() is False
@@ -1023,7 +1027,7 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         tab1.max_images_spin.setValue(2)
         qt_app.processEvents()
         assert tab1.trial_5_btn.isChecked() is False
-        assert "仅审核前 2 张" in tab1.images_count_label.text()
+        assert "仅处理前 2 张" in tab1.images_count_label.text()
 
         # 3) 边框紧贴修正模式联动与动态人话说明：SAM_LOCAL 显示 SAM 行，MLLM_CROP 强制勾选并锁定局部裁剪
         assert tab1.sam_row_widget.isHidden() is True

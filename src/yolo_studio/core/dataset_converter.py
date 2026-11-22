@@ -104,7 +104,7 @@ class DatasetBuildConfig:
         `include_unannotated`：是否将**没有任何标注文件**的图片作为纯负样本纳入拆分输出；
             存在标注文件但无目标的显式负样本（见 `LabeledSample.is_negative`）始终纳入，不受此开关影响。
         `copy_images`：为 `True` 时复制源图片，为 `False` 时移动源图片到目标数据集目录。
-        `recursive`：是否递归扫描 `images_dir` 子目录（适配 MLLM 清洗分流后的多子目录）。
+        `recursive`：是否递归扫描 `images_dir` 子目录（适配 LLM 智能标注分流后的多子目录）。
         `exclude_subdirs`：仅在 `recursive=True` 时生效，相对 `images_dir` 路径中任一层目录名
             命中该集合的图片会被排除（例如排除尚未人工复核的 `need_review`）。
     """

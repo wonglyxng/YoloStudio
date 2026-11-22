@@ -1,4 +1,4 @@
-"""无头批处理命令行入口模块，覆盖视频抽帧、数据集构建、YOLO26 训练、模型导出与 MLLM 标注纠错。
+"""无头批处理命令行入口模块，覆盖视频抽帧、数据集构建、YOLO26 训练、模型导出与 LLM 智能标注。
 
 职责与真实入口：
     提供 `build_parser()` 与 `main(argv)`，既作为已安装命令 `yolo-studio-cli` 的入口点，
@@ -15,8 +15,8 @@
 输入输出与失败方式：
     按子命令从本地视频、图片、标注、`data.yaml` 或 `.pt` 权重读取输入，并在指定输出目录或权重同目录写出
     帧图、YOLO 数据集（含 `data.yaml` 与 `classes.txt`）、训练权重、部署导出文件（`.onnx`/`.torchscript`/
-    `.engine` 等）或 MLLM 清洗分流结果与报告。
-    参数非法时由 `argparse` 直接终止或返回退出码 `2`；`extract` 出现视频错误或 `review` 存在审核异常时返回
+    `.engine` 等）或 LLM 智能标注分流结果与报告。
+    参数非法时由 `argparse` 直接终止或返回退出码 `2`；`extract` 出现视频错误或 `review` 存在单图处理异常时返回
     退出码 `1`；缺失必需文件、权重或凭据时核心引擎抛出异常并导致进程非零退出。
 """
 
@@ -287,7 +287,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
-    """执行 `review` 子命令运行 MLLM 纠错清洗与可选边框紧贴修正；无单图错误返回 0，否则返回 1。"""
+    """执行 `review` 子命令运行 LLM 智能标注与可选边框紧贴修正；无单图错误返回 0，否则返回 1。"""
     from yolo_studio.core.mllm_reviewer import (
         BoxRefineMode,
         MllmProvider,
@@ -328,7 +328,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
     res = run_mllm_review(cfg, log_callback=print)
     refined_total = sum(r.refined_count for r in res.records)
     print(
-        f"MLLM 清洗完成: 总计={res.total_images}, 自动通过={res.auto_passed_count}, "
+        f"LLM 智能标注完成: 总计={res.total_images}, 自动通过={res.auto_passed_count}, "
         f"已删改/收框={res.llm_fixed_count}(收紧 {refined_total} 框), "
         f"待人工复核={res.need_review_count}, 出错={res.error_count}"
     )
@@ -379,7 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ds.add_argument("--test-ratio", type=float, default=0.0)
     p_ds.add_argument("--include-empty", action="store_true", help="同时纳入没有任何标注文件的图片作为负样本")
     p_ds.add_argument("--seed", type=int, default=42)
-    p_ds.add_argument("-r", "--recursive", action="store_true", help="递归扫描图片子目录（如 MLLM 清洗分流目录）")
+    p_ds.add_argument("-r", "--recursive", action="store_true", help="递归扫描图片子目录（如 LLM 智能标注分流目录）")
     p_ds.add_argument(
         "--include-need-review",
         action="store_true",
@@ -443,9 +443,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--exist-ok", action="store_true", help="允许覆盖同名实验目录（默认自动递增编号）")
     p_tr.set_defaults(func=_cmd_train)
 
-    p_rv = sub.add_parser("review", help="基准模型低阈值推理 + MLLM 纠错清洗")
-    p_rv.add_argument("-i", "--images", required=True, help="待纠错图片目录")
-    p_rv.add_argument("-o", "--output", default="data/reviewed_frames", help="清洗后输出目录")
+    p_rv = sub.add_parser("review", help="LLM 智能标注（基准模型预标 / 已有 .json + LLM 质检精修）")
+    p_rv.add_argument("-i", "--images", required=True, help="待标注图片目录")
+    p_rv.add_argument("-o", "--output", default="data/smart_labeled", help="智能标注输出目录")
     p_rv.add_argument("--source-mode", choices=["yolo_predict", "existing_json"], default="yolo_predict")
     p_rv.add_argument("-w", "--weights", default="", help="基准模型 .pt 路径 (yolo_predict 模式)")
     p_rv.add_argument("-a", "--annotations", default="", help="已有 .json 目录 (existing_json 模式)")
@@ -473,14 +473,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_rv.add_argument(
         "--sam-refine-all",
         action="store_true",
-        help="sam_local 模式下对全部保留框执行像素级收紧（默认仅收紧 MLLM 判定过松的框）",
+        help="sam_local 模式下对全部保留框执行像素级收紧（默认仅收紧 LLM 判定过松的框）",
     )
     p_rv.add_argument("--workers", type=int, default=2)
     p_rv.add_argument(
         "--max-images",
         type=int,
         default=0,
-        help="最多审核前 N 张图片用于小批量试跑（0 表示处理目录中全部图片）",
+        help="最多处理前 N 张图片用于小批量试跑（0 表示处理目录中全部图片）",
     )
     p_rv.add_argument("--flat", action="store_true", help="不按状态分建子目录")
     p_rv.add_argument("-r", "--recursive", action="store_true", help="递归扫描输入子目录")

@@ -1,9 +1,9 @@
-"""MLLM 自动标注审核与纠错清洗管线单元测试。
+"""LLM 智能标注与质检精修管线单元测试。
 
 职责：
     使用确定性桩客户端 `_FakeMllmClient` 离线验证 JSON 围栏解析、保留/改类/删误检/补漏与
     高重叠去重合并、三分类目录分流、对比图渲染及与 `dataset_converter` 的闭环衔接；
-    并覆盖重复审核跨桶去重、异常与损坏标注兜底写报告、非法改类强制复核、
+    并覆盖重复标注跨桶去重、异常与损坏标注兜底写报告、非法改类强制复核、
     递归同名输出消歧、空结果跳过调用以及 OpenAI 兼容客户端仅在 400 时降级等回归场景。
 
 运行环境与协作边界：
@@ -66,7 +66,7 @@ def _write_img(path: Path, size: tuple[int, int] = (400, 200)) -> None:
 
 
 def test_parse_review_response_with_markdown_fence() -> None:
-    """验证带有 Markdown 代码围栏的 MLLM 输出可被正确清理并解析为结构化模型。"""
+    """验证带有 Markdown 代码围栏的 LLM 输出可被正确清理并解析为结构化模型。"""
     raw = """```json
     {
       "box_reviews": [
@@ -128,7 +128,7 @@ def test_apply_review_decisions_and_deduplicate_added_box() -> None:
 def test_run_mllm_review_existing_json_triage_and_dataset_roundtrip(tmp_path: Path) -> None:
     """验证已有 `.json` 输入模式下的三分类分流、对比图渲染与数据集递归导入闭环。"""
     in_dir = tmp_path / "raw_frames"
-    out_dir = tmp_path / "reviewed_frames"
+    out_dir = tmp_path / "smart_labeled"
 
     for idx in range(3):
         img_path = in_dir / f"img_{idx}.jpg"
@@ -191,11 +191,11 @@ def test_run_mllm_review_existing_json_triage_and_dataset_roundtrip(tmp_path: Pa
     assert (out_dir / "need_review" / "img_2.json").is_file()
     assert res.report_path and res.report_path.is_file()
 
-    # 验证纠错前后左右对比图能够正常编码为 JPEG
+    # 验证处理前后左右对比图能够正常编码为 JPEG
     preview_bytes = render_review_comparison(res.records[2])
     assert preview_bytes[:2] == b"\xff\xd8"  # JPEG 文件头魔数
 
-    # 验证清洗分流后的子目录可通过 recursive=True 无缝导入 DatasetConverter
+    # 验证智能标注分流后的子目录可通过 recursive=True 无缝导入 DatasetConverter
     ds_res = build_yolo_dataset(
         DatasetBuildConfig(
             images_dir=out_dir,
@@ -319,7 +319,7 @@ def test_recursive_same_name_outputs_do_not_overwrite(tmp_path: Path) -> None:
 
 
 def test_empty_result_without_missing_check_skips_mllm_and_json(tmp_path: Path) -> None:
-    """验证无候选框且未开启漏标检查时跳过 MLLM 调用，且不写出未经确认的空 `.json`。"""
+    """验证无候选框且未开启漏标检查时跳过 LLM 调用，且不写出未经确认的空 `.json`。"""
     in_dir = tmp_path / "in"
     _write_img(in_dir / "empty.jpg")
     client = _FakeMllmClient([])
@@ -495,7 +495,7 @@ def test_box_refine_sam_local_and_load_history_report_roundtrip(tmp_path: Path) 
     _write_img(img, (400, 200))
     _person_json(img, score=0.95)
 
-    # 1) sam_refine_all_kept=False 且 MLLM 判定 tight -> 不触发 SAM，直接 auto_passed
+    # 1) sam_refine_all_kept=False 且 LLM 判定 tight -> 不触发 SAM，直接 auto_passed
     refiner1 = _FakeSamRefiner()
     res1 = run_mllm_review(
         _json_cfg(in_dir, out_dir, box_refine_mode=BoxRefineMode.SAM_LOCAL, sam_refine_all_kept=False),
@@ -507,7 +507,7 @@ def test_box_refine_sam_local_and_load_history_report_roundtrip(tmp_path: Path) 
     assert refiner1.called_ids == []
     assert res1.auto_passed_count == 1
 
-    # 2) sam_refine_all_kept=True 且 check_missing=False + 高置信度跳过 MLLM -> 仍自动触发 SAM 收紧并分流 llm_fixed
+    # 2) sam_refine_all_kept=True 且 check_missing=False + 高置信度跳过 LLM -> 仍自动触发 SAM 收紧并分流 llm_fixed
     refiner2 = _FakeSamRefiner()
     res2 = run_mllm_review(
         _json_cfg(
@@ -647,3 +647,27 @@ def test_collect_review_images_skips_output_inside_recursive_input(tmp_path: Pat
     # 输出与输入相同、或复审 out/need_review 输出回 out 时保持原行为
     assert len(collect_review_images(root, True, root)) == 3
     assert len(collect_review_images(out_inside, True, root)) == 1
+
+
+def test_cli_review_default_output_and_source_mode_hints() -> None:
+    """验证 CLI `review` 默认输出路径已统一为 `data/smart_labeled`，且模式与收框提示词均不含混用的 `MLLM` 字样。"""
+    from yolo_studio.cli import build_parser
+    from yolo_studio.core.mllm_reviewer import (
+        BOX_REFINE_MODE_HINTS,
+        BOX_REFINE_MODE_ITEMS,
+        SOURCE_MODE_HINTS,
+        SOURCE_MODE_ITEMS,
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(["review", "-i", "data/raw_frames"])
+    assert args.output == "data/smart_labeled"
+
+    for _, label in SOURCE_MODE_ITEMS:
+        assert "MLLM" not in label
+    for hint in SOURCE_MODE_HINTS.values():
+        assert "MLLM" not in hint
+    for _, label in BOX_REFINE_MODE_ITEMS:
+        assert "MLLM" not in label
+    for hint in BOX_REFINE_MODE_HINTS.values():
+        assert "MLLM" not in hint

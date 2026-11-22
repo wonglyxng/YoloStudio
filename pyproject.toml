@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yolo-studio"
 dynamic = ["version"]
-description = "Desktop GUI and CLI studio with embedded X-AnyLabeling, MLLM review, and YOLO26 training."
+description = "Desktop GUI and CLI studio with embedded X-AnyLabeling, LLM smart labeling, and YOLO26 training."
 readme = "README.md"
 license = "GPL-3.0-only"
 requires-python = ">=3.11"

@@ -1,8 +1,8 @@
-"""基于 MLLM 的自动标注审核、错标纠正与漏标发现引擎。
+"""基于多模态大语言模型（LLM）的智能标注、质检精修与漏标发现引擎。
 
 职责：
     串联“候选框发现（基准 YOLO 模型低阈值推理或读取已有 X-AnyLabeling `.json`）→
-    带编号总览图与局部裁剪图渲染 → 多模态大模型结构化审核 → 决策合并去重 →
+    带编号总览图与局部裁剪图渲染 → 多模态大模型结构化质检精修 → 决策合并去重 →
     结果分流落盘（`auto_passed` / `llm_fixed` / `need_review`）与前后对比图生成”。
 
 运行环境：
@@ -13,7 +13,7 @@
 协作对象与职责边界：
     为 `cli._cmd_review`、`gui.workers.MllmReviewWorker` 与 `gui.tab_review.MllmReviewTab`
     提供核心管线，复用 `dataset_converter` 的图片扫描与标注文件匹配函数。
-    仅负责审核清洗、X-AnyLabeling `.json` 产出与汇总报告写出，不执行数据集划分或模型训练。
+    仅负责智能标注、X-AnyLabeling `.json` 产出与汇总报告写出，不执行数据集划分或模型训练。
 """
 
 from __future__ import annotations
@@ -51,10 +51,26 @@ TRIAGE_BUCKETS = (BUCKET_AUTO_PASSED, BUCKET_LLM_FIXED, BUCKET_NEED_REVIEW)
 
 
 class ReviewSourceMode(str, Enum):
-    """MLLM 审核的候选标注来源模式。"""
+    """LLM 智能标注的候选标注来源模式。"""
 
     YOLO_PREDICT = "yolo_predict"
     EXISTING_JSON = "existing_json"
+
+
+SOURCE_MODE_ITEMS: list[tuple[ReviewSourceMode, str]] = [
+    (ReviewSourceMode.YOLO_PREDICT, "基准模型预标 + LLM 质检精修（推荐）"),
+    (ReviewSourceMode.EXISTING_JSON, "已有标注 (.json) + LLM 质检精修"),
+]
+
+SOURCE_MODE_HINTS: dict[ReviewSourceMode, str] = {
+    ReviewSourceMode.YOLO_PREDICT: (
+        "先用基准 .pt 低阈值推理拉高召回，再由 LLM 剔除误检、改类、补漏与收框；"
+        "尚无模型时可先在「2. 标注工作台」标少量样本训练。"
+    ),
+    ReviewSourceMode.EXISTING_JSON: (
+        "读取已有 X-AnyLabeling .json 标注，由 LLM 质检、补漏与收框，并将疑难样本分流到 need_review。"
+    ),
+}
 
 
 class MllmProvider(str, Enum):
@@ -74,16 +90,16 @@ class BoxRefineMode(str, Enum):
 
 
 BOX_REFINE_MODE_ITEMS: list[tuple[BoxRefineMode, str]] = [
-    (BoxRefineMode.OFF, "关闭（仅纠错类 / 删误检 / 补漏）"),
+    (BoxRefineMode.OFF, "关闭（仅改错类 / 删误检 / 补漏）"),
     (BoxRefineMode.FLAG_LOOSE, "仅标记过松框 → 转入待人工复核"),
-    (BoxRefineMode.MLLM_CROP, "MLLM 局部放大图精修（懂业务规则，零额外模型）"),
+    (BoxRefineMode.MLLM_CROP, "LLM 局部放大图精修（懂业务规则，零额外模型）"),
     (BoxRefineMode.SAM_LOCAL, "本地 SAM 像素级收紧（轮廓最贴边 + 安全门禁）"),
 ]
 
 BOX_REFINE_MODE_HINTS: dict[BoxRefineMode, str] = {
-    BoxRefineMode.OFF: "保持原有框坐标不变，仅执行删误检、纠错类与漏标检查，速度最快。",
-    BoxRefineMode.FLAG_LOOSE: "不改坐标，仅由 MLLM 识别偏松/截断框并分流到 need_review 供人工精修。",
-    BoxRefineMode.MLLM_CROP: "强制附带局部放大图，由 MLLM 在特写中输出更紧贴坐标（含安全门禁防缩坏，略增 Token）。",
+    BoxRefineMode.OFF: "保持原有框坐标不变，仅执行删误检、改错类与漏标检查，速度最快。",
+    BoxRefineMode.FLAG_LOOSE: "不改坐标，仅由 LLM 识别偏松/截断框并分流到 need_review 供人工精修。",
+    BoxRefineMode.MLLM_CROP: "强制附带局部放大图，由 LLM 在特写中输出更紧贴坐标（含安全门禁防缩坏，略增 Token）。",
     BoxRefineMode.SAM_LOCAL: "本地加载 SAM 零额外 API 费用像素级收边（首次自动下载权重），超门禁自动回退原框并转待复核。",
 }
 
@@ -111,7 +127,7 @@ GEMINI_MODELS: list[tuple[str, str]] = [
 
 
 class BoxDecision(BaseModel):
-    """针对单个已有候选框的审核与边框紧贴评估决策。"""
+    """针对单个已有候选框的质检与边框紧贴评估决策。"""
 
     box_id: int = Field(description="Candidate box ID shown in the overview image.")
     action: Literal["keep", "relabel", "delete"] = Field(
@@ -136,7 +152,7 @@ class BoxDecision(BaseModel):
 
 
 class MissingBox(BaseModel):
-    """MLLM 检出的漏标目标框（`box_2d` 为 `[ymin, xmin, ymax, xmax]`，归一化至 `0..1000`）。"""
+    """LLM 检出的漏标目标框（`box_2d` 为 `[ymin, xmin, ymax, xmax]`，归一化至 `0..1000`）。"""
 
     label: str = Field(description="Class name from the allowed class list.")
     box_2d: list[int] = Field(
@@ -146,7 +162,7 @@ class MissingBox(BaseModel):
 
 
 class MllmReviewResponse(BaseModel):
-    """期望 MLLM 返回的结构化审核响应模式。"""
+    """期望 LLM 返回的结构化质检响应模式。"""
 
     box_reviews: list[BoxDecision] = Field(default_factory=list)
     has_missing: bool = Field(
@@ -183,7 +199,7 @@ class CandidateBox:
 
 @dataclass
 class ImageReviewRecord:
-    """单张图片纠错前后的处理结果与统计记录。"""
+    """单张图片智能标注前后的处理结果与统计记录。"""
 
     image_path: Path
     output_image_path: Path | None
@@ -205,18 +221,18 @@ class ImageReviewRecord:
 
 @dataclass
 class MllmReviewConfig:
-    """MLLM 自动标注纠错清洗管线的运行配置。
+    """LLM 智能标注管线的运行配置。
 
     关键字段说明：
         `yolo_conf` / `yolo_iou` / `high_conf_skip`：置信度与 IoU 阈值，取值范围 `(0, 1]`；
             仅当已有候选框非空、所有框均具有不低于 `high_conf_skip` 的置信度、`check_missing=False`
-            且未启用要求全框收紧的边框修正时跳过 MLLM。
+            且未启用要求全框收紧的边框修正时跳过 LLM。
         `box_refine_mode`：边框紧贴标准化修正模式（`off` / `flag_loose` / `mllm_crop` / `sam_local`）。
         `sam_model_name` / `sam_refine_all_kept`：本地 SAM 收框使用的权重与触发范围（默认仅收紧过松框）。
         `refine_min_area_ratio` / `refine_min_iou`：自动收框安全门禁下限，超限时保留原框并转 `need_review`。
-        `max_crops_per_image`：每张图最多附带的局部放大裁剪数；`max_image_dim` 为送审图最长边像素限制。
-        `max_workers`：并发审核线程池工作线程数（至少为 `1`）。
-        `max_images`：本次最多审核的图片数量上限（`0` 表示处理目录中全部图片，`> 0` 仅按顺序抽取前 `N` 张用于快速试跑验证）。
+        `max_crops_per_image`：每张图最多附带的局部放大裁剪数；`max_image_dim` 为送检图最长边像素限制。
+        `max_workers`：并发处理线程池工作线程数（至少为 `1`）。
+        `max_images`：本次最多处理的图片数量上限（`0` 表示处理目录中全部图片，`> 0` 仅按顺序抽取前 `N` 张用于快速试跑验证）。
     """
 
     images_dir: Path
@@ -255,7 +271,7 @@ class MllmReviewConfig:
 
 @dataclass
 class MllmReviewResult:
-    """单次 MLLM 审核清洗任务完成或取消后的汇总结果。"""
+    """单次 LLM 智能标注任务完成或取消后的汇总结果。"""
 
     output_dir: Path
     classes: list[str]
@@ -492,7 +508,7 @@ class OpenAICompatMllmClient:
 
 
 def build_mllm_client(config: MllmReviewConfig) -> MllmClient:
-    """根据配置中的 `provider` 创建对应的 MLLM 审核客户端实例。"""
+    """根据配置中的 `provider` 创建对应的 LLM 标注质检客户端实例。"""
     if config.provider == MllmProvider.GEMINI:
         return GeminiMllmClient(api_key=config.api_key, model_name=config.model_name)
     return OpenAICompatMllmClient(
@@ -503,7 +519,7 @@ def build_mllm_client(config: MllmReviewConfig) -> MllmClient:
 
 
 def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
-    """向配置的 MLLM 接口发送极简纯文本探针请求，快速校验 API Key、Base URL 与模型名称是否连通。
+    """向配置的 LLM 接口发送极简纯文本探针请求，快速校验 API Key、Base URL 与模型名称是否连通。
 
     返回值与失败行为：
         不抛出网络或鉴权异常，统一返回 `(是否连通, 中文结果摘要)`；
@@ -556,7 +572,7 @@ class UltralyticsSamBoxRefiner:
     """基于 `ultralytics.SAM` 的本地像素级边框紧贴修正器（Box Prompt → 掩码最小外接矩形）。
 
     线程安全与运行环境：
-        内部持有 `threading.Lock` 串行化 GPU/CPU 模型推理，保证多并发 MLLM 审核线程共享同一 SAM 实例时
+        内部持有 `threading.Lock` 串行化 GPU/CPU 模型推理，保证多并发 LLM 标注线程共享同一 SAM 实例时
         不发生 CUDA 上下文争抢；若本地不存在权重，Ultralytics 会按模型名称自动下载。
     """
 
@@ -677,7 +693,7 @@ def _render_overview_and_crops(
     crop_regions: dict[int, tuple[int, int, int, int]] = {}
     if (include_crops or force_crops) and boxes:
         # 优先按置信度从低到高排序，确保低置信度可疑框优先获得局部裁剪放大图；
-        # 当 `force_crops=True`（MLLM 局部精修模式）时放宽上限以尽量覆盖全部候选框
+        # 当 `force_crops=True`（LLM 局部精修模式）时放宽上限以尽量覆盖全部候选框
         limit = max(max_crops, len(boxes)) if force_crops else max_crops
         prioritized = sorted(
             boxes,
@@ -997,7 +1013,7 @@ def apply_review_decisions(
     refine_min_area_ratio: float = 0.15,
     refine_min_iou: float = 0.25,
 ) -> tuple[list[CandidateBox], int, int, int, int]:
-    """将 MLLM 审核与边框紧贴决策合并到候选框集合中，并过滤重复补充框。
+    """将 LLM 质检与边框紧贴决策合并到候选框集合中，并过滤重复补充框。
 
     返回兼容的 5 元组 `(after_boxes, kept, relabeled, deleted, added)`；
     未出现在 `box_reviews` 中的候选框按保留（`kept`）处理，
@@ -1085,7 +1101,7 @@ def apply_review_decisions(
                     _apply_candidate_refinement(
                         out_box,
                         mapped_xyxy,
-                        source_tag="MLLM局部精修",
+                        source_tag="LLM局部精修",
                         min_area_ratio=refine_min_area_ratio,
                         min_iou=refine_min_iou,
                         mark_missing_as_suspect=True,
@@ -1327,10 +1343,10 @@ def _plan_output_names(images: list[Path], images_dir: Path) -> dict[Path, str]:
 
 
 def _remove_stale_bucket_outputs(output_dir: Path, out_name: str, keep_bucket: str) -> None:
-    """删除同名输出在其他分流桶中的旧图片与 `.json`，防止重复审核后同一图片同时留在多个桶中。
+    """删除同名输出在其他分流桶中的旧图片与 `.json`，防止重复标注后同一图片同时留在多个桶中。
 
     仅作用于 `output_dir/{auto_passed,llm_fixed,need_review}` 下与 `out_name` 同名的文件；
-    若本次输入恰好来自其中某个桶（例如复审 `need_review`），该输入会在新结果写出后被移除，
+    若本次输入恰好来自其中某个桶（例如复检 `need_review`），该输入会在新结果写出后被移除，
     效果等同于把图片移动到新的分流桶。
     """
     for bucket in TRIAGE_BUCKETS:
@@ -1386,14 +1402,14 @@ def _deserialize_candidate_box(raw: dict[str, object], fallback_id: int = 0) -> 
 def collect_review_images(
     images_dir: Path, recursive: bool = False, output_dir: Path | None = None
 ) -> list[Path]:
-    """返回本次审核的输入图片列表（只读）；递归时跳过位于输入目录内部的输出目录。
+    """返回本次智能标注的输入图片列表（只读）；递归时跳过位于输入目录内部的输出目录。
 
     设计原因：
-        递归扫描且 `output_dir` 位于 `images_dir` 内部（如 `raw_frames/reviewed/`）时，
-        上一轮写出的 `auto_passed` / `llm_fixed` / `need_review` 结果会被重新当作输入审核，
-        造成重复审核与结果互相覆盖，因此排除该输出子树。
-        `output_dir` 与 `images_dir` 相同、或输入目录位于输出目录内部（如复审 `out/need_review`
-        并输出回 `out`）时不做排除，保持原有复审行为。非递归扫描只看顶层，无需排除。
+        递归扫描且 `output_dir` 位于 `images_dir` 内部（如 `raw_frames/smart_labeled/`）时，
+        上一轮写出的 `auto_passed` / `llm_fixed` / `need_review` 结果会被重新当作输入处理，
+        造成重复标注与结果互相覆盖，因此排除该输出子树。
+        `output_dir` 与 `images_dir` 相同、或输入目录位于输出目录内部（如复检 `out/need_review`
+        并输出回 `out`）时不做排除，保持原有复检行为。非递归扫描只看顶层，无需排除。
     路径无法解析时按未排除处理，不抛出异常。
     """
     images = find_images(images_dir, recursive=recursive)
@@ -1412,7 +1428,7 @@ def collect_review_images(
 def count_review_images(
     images_dir: Path, recursive: bool = False, output_dir: Path | None = None
 ) -> int:
-    """安全统计待审核目录内的受支持图片数量（口径同 `collect_review_images`）；目录不存在或无权限访问时返回 `0`。"""
+    """安全统计待标注目录内的受支持图片数量（口径同 `collect_review_images`）；目录不存在或无权限访问时返回 `0`。"""
     if not images_dir or not images_dir.is_dir():
         return 0
     try:
@@ -1422,10 +1438,10 @@ def count_review_images(
 
 
 def format_record_detail_summary(record: ImageReviewRecord) -> str:
-    """将单张审核记录的逐框删改/收框/补漏理由整理为界面可读的简明中文摘要。"""
+    """将单张标注记录的逐框删改/收框/补漏理由整理为界面可读的简明中文摘要。"""
     parts: list[str] = []
     if record.error:
-        parts.append(f"审核异常：{record.error}")
+        parts.append(f"处理异常：{record.error}")
 
     # 收集被删除框的理由（新版记录在 before_boxes 标记 status="deleted"，旧报告按 box_id 差集回退）
     after_ids = {b.box_id for b in record.after_boxes}
@@ -1456,13 +1472,13 @@ def format_record_detail_summary(record: ImageReviewRecord) -> str:
 
     if not parts:
         if record.skipped_mllm:
-            return f"高置信度/空框跳过 MLLM（共 {len(record.after_boxes)} 框）"
+            return f"高置信度/空框跳过 LLM（共 {len(record.after_boxes)} 框）"
         return f"全部 {len(record.after_boxes)} 个目标核验通过，无删改或漏标"
     return "；".join(parts)
 
 
 def load_review_report(report_or_dir: Path) -> MllmReviewResult:
-    """从已有清洗输出目录或 `review_report.json` 加载历史审核记录以供界面复核与对比预览。
+    """从已有智能标注输出目录或 `review_report.json` 加载历史标注记录以供界面复核与对比预览。
 
     兼容策略：
         优先读取报告中保存的 `before_boxes` / `after_boxes`（保留完整删改、精修虚线对比信息）；
@@ -1471,15 +1487,15 @@ def load_review_report(report_or_dir: Path) -> MllmReviewResult:
     """
     report_path = report_or_dir / "review_report.json" if report_or_dir.is_dir() else report_or_dir
     if not report_path.is_file():
-        raise FileNotFoundError(f"未找到审核报告文件: {report_path}")
+        raise FileNotFoundError(f"未找到标注报告文件: {report_path}")
 
     try:
         payload = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
-        raise ValueError(f"无法解析审核报告 {report_path.name}: {exc}") from exc
+        raise ValueError(f"无法解析标注报告 {report_path.name}: {exc}") from exc
 
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
-        raise ValueError(f"审核报告格式无效（缺少 items 列表）: {report_path}")
+        raise ValueError(f"标注报告格式无效（缺少 items 列表）: {report_path}")
 
     out_dir = report_path.parent
     classes_raw = payload.get("classes") or []
@@ -1571,19 +1587,19 @@ def run_mllm_review(
     *,
     refiner_override: BoxRefinerProtocol | None = None,
 ) -> MllmReviewResult:
-    """执行基准候选框获取、MLLM 并发审核、可选边框紧贴修正、结果分流与 X-AnyLabeling `.json` 导出。
+    """执行基准候选框获取、LLM 并发质检精修、可选边框紧贴修正、结果分流与 X-AnyLabeling `.json` 导出。
 
     前置条件与失败方式：
         `images_dir` 不存在抛出 `FileNotFoundError`，无图片抛出 `ValueError`；
         在 `YOLO_PREDICT` 模式下需存在有效 `weights_path`，在 `EXISTING_JSON` 模式下需存在标注目录。
-        单张图片审核异常（含已有标注读取失败）不会中止整批流程，而是将该图连同原始候选框写入
+        单张图片处理异常（含已有标注读取失败）不会中止整批流程，而是将该图连同原始候选框写入
         `need_review` 并记录 `error`；即使错误结果本身写出失败，也只记录到该图的 `error` 中，
         保证 `review_report.json` 最终一定写出。
 
     分流规则：
         存在漏标提示、LLM 补框、`relabel_invalid` 框或过松/超门禁标记 `refine_suspect` 框 → `need_review`；
         有改类、删框或通过门禁的自动收框 → `llm_fixed`；其余 → `auto_passed`。
-        纠错后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`，只复制图片。
+        处理后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`，只复制图片。
     """
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
@@ -1594,7 +1610,7 @@ def run_mllm_review(
     if config.recursive and log_callback:
         skipped = len(find_images(config.images_dir, recursive=True)) - len(images)
         if skipped > 0:
-            log_callback(f"输出目录位于输入目录内部，已跳过其中 {skipped} 张上一轮结果图片，避免重复审核。")
+            log_callback(f"输出目录位于输入目录内部，已跳过其中 {skipped} 张上一轮结果图片，避免重复处理。")
     if not images:
         raise ValueError(f"未在目录中找到任何图片: {config.images_dir}")
 
@@ -1603,7 +1619,7 @@ def run_mllm_review(
         images = images[: config.max_images]
         if log_callback:
             log_callback(
-                f"已启用小批量试跑上限：目录共 {total_discovered} 张图，本次仅审核前 {len(images)} 张。"
+                f"已启用小批量试跑上限：目录共 {total_discovered} 张图，本次仅处理前 {len(images)} 张。"
             )
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1635,7 +1651,7 @@ def run_mllm_review(
     if log_callback:
         refine_desc = config.box_refine_mode.value
         log_callback(
-            f"开始 MLLM 纠错审核（共 {len(images)} 张图，类别: {allowed_classes}，"
+            f"开始 LLM 智能标注（共 {len(images)} 张图，类别: {allowed_classes}，"
             f"边框修正: {refine_desc}，并发={config.max_workers}）..."
         )
 
@@ -1672,7 +1688,7 @@ def run_mllm_review(
                 img_h=ih,
                 boxes=before_boxes,
                 has_missing=True,
-                missing_note=f"MLLM 审核异常: {message}",
+                missing_note=f"LLM 处理异常: {message}",
             )
             if config.triage_subfolders:
                 _remove_stale_bucket_outputs(config.output_dir, out_img_path.name, BUCKET_NEED_REVIEW)
@@ -1687,7 +1703,7 @@ def run_mllm_review(
             before_boxes=before_boxes,
             after_boxes=before_boxes,
             has_missing=True,
-            missing_note=f"审核出错: {message}",
+            missing_note=f"处理出错: {message}",
             error=message,
         )
 
@@ -1702,7 +1718,7 @@ def run_mllm_review(
             with Image.open(img_path) as pil_img:
                 img_w, img_h = pil_img.size
 
-            # 当未开启漏标巡检且无需借助 MLLM 判定框紧贴度时，高置信度图或空框图可直接跳过 MLLM
+            # 当未开启漏标巡检且无需借助 LLM 判定框紧贴度时，高置信度图或空框图可直接跳过 LLM
             needs_mllm_for_refine = bool(before_boxes) and (
                 config.box_refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP}
                 or (config.box_refine_mode == BoxRefineMode.SAM_LOCAL and not config.sam_refine_all_kept)
@@ -1714,9 +1730,9 @@ def run_mllm_review(
             skip_reason = ""
             if not config.check_missing and not needs_mllm_for_refine:
                 if all_high_conf:
-                    skip_reason = "高置信度跳过 MLLM"
+                    skip_reason = "高置信度跳过 LLM"
                 elif not before_boxes:
-                    skip_reason = "无候选框且未开启漏标检查，跳过 MLLM"
+                    skip_reason = "无候选框且未开启漏标检查，跳过 LLM"
 
             img_bgr: np.ndarray | None = None
             response: MllmReviewResponse | None = None
@@ -1896,7 +1912,7 @@ def run_mllm_review(
                     output_json_path=None,
                     triage_bucket=BUCKET_NEED_REVIEW,
                     has_missing=True,
-                    missing_note=f"审核出错: {exc}",
+                    missing_note=f"处理出错: {exc}",
                     error=str(exc),
                 )
             if rec is None:
@@ -2045,7 +2061,7 @@ def _draw_labeled_boxes(
 
 
 def render_review_comparison(record: ImageReviewRecord, max_width: int = 1200) -> bytes:
-    """渲染单张审核记录的“纠错前 vs 纠错后”左右拼接对比 JPEG 字节流。"""
+    """渲染单张标注记录的“处理前 vs 处理后”左右拼接对比 JPEG 字节流。"""
     src_path = record.output_image_path if (record.output_image_path and record.output_image_path.is_file()) else record.image_path
     img_bgr = _read_image_unicode_safe(src_path)
     left = _draw_labeled_boxes(img_bgr, record.before_boxes, f"Before ({len(record.before_boxes)})", use_status_colors=False)

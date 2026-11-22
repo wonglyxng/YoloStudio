@@ -3,7 +3,7 @@
 职责：
     在 YoloStudio 主进程与主窗口内直接托管原版 `anylabeling.views.mainwindow.MainWindow`
     （含完整画布、标注工具栏、标签/形状/文件面板与 AI 自动标注引擎），并提供顶部工作流联动栏，
-    与「1. 视频抽帧」「3. LLM 标注清洗」「4. 数据集准备」双向衔接。
+    与「1. 视频抽帧」「3. LLM 智能标注」「4. 数据集准备」双向衔接。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程，依赖 `third_party/X-AnyLabeling`（`x-anylabeling-cvhub`）源码包及
@@ -343,7 +343,7 @@ class LabelingStudioTab(QWidget):
         self.refresh_btn = QPushButton("刷新目录")
         self.to_dataset_btn = QPushButton("发送到「4. 数据集准备」→")
         self.to_dataset_btn.setObjectName("primaryBtn")
-        self.to_review_btn = QPushButton("发送到「3. LLM 标注清洗」→")
+        self.to_review_btn = QPushButton("发送到「3. LLM 智能标注」→")
 
         for btn in (
             self.open_dir_btn,

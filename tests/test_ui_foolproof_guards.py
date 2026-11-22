@@ -3,7 +3,7 @@
 职责：
     在离线 `offscreen` Qt 环境下系统性验证五个配置标签页的防呆交互逻辑：
     1. 「1. 视频抽帧」：选 `png` 置灰 `JPG质量`、起止时间段非法拦截、去重 0 值提示与列表增删按钮空态保护；
-    2. 「3. LLM 标注清洗」：已有 `.json` + 本地 SAM 模式下动态展示 GPU 开关、审核中禁用历史报告加载、
+    2. 「3. LLM 智能标注」：已有 `.json` + 本地 SAM 模式下动态展示 GPU 开关、运行中禁用历史报告加载、
        LLM 凭据/模型名/Base URL 前置校验（含本地/局域网地址豁免）与分流子目录开关联动按钮文案；
     3. 「4. 数据集准备」：`Train` 比例上限允许 `1.00` 且不再误报归一化提示；
     4. 「5. YOLO26 训练」：断点续训 (`resume`) 置灰全部被 Ultralytics 忽略的超参数并保留可覆盖项、
@@ -133,7 +133,7 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
 def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
     qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证清洗页已有 `.json`+SAM 动态展示 GPU 开关、LLM 前置校验、分流按钮文案与运行期禁用历史报告。"""
+    """验证智能标注页已有 `.json`+SAM 动态展示 GPU 开关、LLM 前置校验、分流按钮文案与运行期禁用历史报告。"""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 

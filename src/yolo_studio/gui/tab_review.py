@@ -1,14 +1,14 @@
-"""标签页 3：基准模型自动标注与 MLLM 纠错补漏界面。
+"""标签页 3：LLM 智能标注界面（基准模型预标 / 已有 .json + LLM 质检精修与标准收框）。
 
 职责：
-    配置候选框来源（基准 `.pt` 低阈值推理或已有 X-AnyLabeling `.json`）、MLLM 接口与预设、
-    连通性测试、边框紧贴标准化修正（标记过松 / MLLM 局部图精修 / 本地 SAM 像素级收紧）与审核分流策略；
-    右侧提供带实时计数的分流状态筛选、语义配色结果表与运行日志（同区双页签）、自适应缩放的 Before/After 对比图、
-    历史报告加载，并支持一键跳转「2. 标注工作台」精修或发送清洗结果至数据集准备页；
+    配置候选框来源（基准 `.pt` 低阈值推理或已有 X-AnyLabeling `.json`）、LLM 接口与预设、
+    连通性测试、边框紧贴标准化修正（标记过松 / LLM 局部图精修 / 本地 SAM 像素级收紧）与分流策略；
+    右侧提供带实时计数的分流状态筛选、语义配色结果表与运行日志（同区双页签）、自适应缩放的处理前后对比图、
+    历史报告加载，并支持一键跳转「2. 标注工作台」精修或发送结果至数据集准备页；
     左右两栏置于可拖拽的水平分割条中，用户可按屏幕宽度调整比例。
 
 运行环境与协作边界：
-    运行于 PyQt6 主线程；后台审核由 `MllmReviewWorker` 执行，接口连通性测试由
+    运行于 PyQt6 主线程；后台智能标注由 `MllmReviewWorker` 执行，接口连通性测试由
     `MllmConnectionTestWorker` 执行，`render_review_comparison` 在点击行时即时渲染对比图并做 LRU 缓存，
     通过 `open_in_workbench` 与 `send_cleaned_dataset` 信号与 `MainWindow` 协同；
     持久化配置通过 `save_settings` / `restore_settings` 接受外部注入的 `QSettings`（默认不保存明文 API Key）。
@@ -62,6 +62,8 @@ from yolo_studio.core.mllm_reviewer import (
     GEMINI_MODELS,
     OPENAI_PRESETS,
     SAM_REFINE_MODELS,
+    SOURCE_MODE_HINTS,
+    SOURCE_MODE_ITEMS,
     BoxRefineMode,
     ImageReviewRecord,
     MllmProvider,
@@ -158,11 +160,11 @@ class _ScaledPreviewLabel(QLabel):
 
 
 class MllmReviewTab(QWidget):
-    """MLLM 自动标注纠错、补漏与边框紧贴修正功能标签页（标签页 3）。
+    """LLM 智能标注、质检补漏与边框紧贴修正功能标签页（标签页 3）。
 
     内部状态：
-        持有硬件探测信息 `device_info`、跨页计算设备互斥协调器 `gpu_guard`、后台审核线程 `worker`、
-        连通性探测线程 `conn_test_worker`、逐图审核记录 `_records`、对比图 LRU 缓存 `_preview_cache`、
+        持有硬件探测信息 `device_info`、跨页计算设备互斥协调器 `gpu_guard`、后台标注线程 `worker`、
+        连通性探测线程 `conn_test_worker`、逐图标注记录 `_records`、对比图 LRU 缓存 `_preview_cache`、
         当前表格筛选器 `_active_filter`、配置持久化脏标记 `_settings_dirty`、
         最近输出目录 `_last_output_dir` 与类别文件 `_last_classes_txt`。
     """
@@ -189,7 +191,7 @@ class MllmReviewTab(QWidget):
         self._selected_row: int = -1
         self._restoring_state: bool = False
         self._settings_dirty: bool = False
-        self._last_output_dir: Path = workspace_root / "data" / "reviewed_frames"
+        self._last_output_dir: Path = workspace_root / "data" / "smart_labeled"
         self._last_classes_txt: str = ""
         self._count_timer = QTimer(self)
         self._count_timer.setSingleShot(True)
@@ -203,7 +205,7 @@ class MllmReviewTab(QWidget):
         self.yolo_device_ctrl.apply_device_info(info)
 
     def set_images_dir(self, path_str: str) -> None:
-        """跨页写入：同步待纠错图片目录输入框并立即刷新图片计数。"""
+        """跨页写入：同步待标注图片目录输入框并立即刷新图片计数。"""
         if path_str:
             self.images_picker.setText(path_str)
             self._refresh_images_count()
@@ -246,30 +248,34 @@ class MllmReviewTab(QWidget):
         form_stack.setContentsMargins(0, 0, 6, 0)
         form_stack.setSpacing(12)
 
-        # 1. 待纠错数据来源与基准模型
-        src_group = QGroupBox("1. 待纠错数据来源与基准模型")
+        # 1. 数据来源与预标模型
+        src_group = QGroupBox("1. 数据来源与预标模型")
         s_form = QFormLayout(src_group)
         self._tune_form(s_form)
         self._src_form = s_form
 
+        mode_box = QVBoxLayout()
+        mode_box.setContentsMargins(0, 0, 0, 0)
+        mode_box.setSpacing(3)
         self.source_mode_combo = QComboBox()
         self.source_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.source_mode_combo.setMinimumContentsLength(12)
-        self.source_mode_combo.addItem(
-            "基准模型低阈值推理 + MLLM 纠错（推荐）", ReviewSourceMode.YOLO_PREDICT
-        )
-        self.source_mode_combo.addItem(
-            "读取已有 X-AnyLabeling .json + MLLM 复核", ReviewSourceMode.EXISTING_JSON
-        )
+        for mode, label in SOURCE_MODE_ITEMS:
+            self.source_mode_combo.addItem(label, mode)
         self.source_mode_combo.currentIndexChanged.connect(self._on_source_mode_changed)
-        s_form.addRow("工作模式:", self.source_mode_combo)
+        self.source_mode_hint_label = QLabel()
+        self.source_mode_hint_label.setWordWrap(True)
+        self.source_mode_hint_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        mode_box.addWidget(self.source_mode_combo)
+        mode_box.addWidget(self.source_mode_hint_label)
+        s_form.addRow("工作模式:", mode_box)
 
         default_frames = str((self.workspace_root / "data" / "raw_frames").resolve())
         img_dir_box = QVBoxLayout()
         img_dir_box.setContentsMargins(0, 0, 0, 0)
         img_dir_box.setSpacing(3)
         self.images_picker = PathPickerRow(
-            placeholder="待自动标注或复核的图片目录",
+            placeholder="待智能标注或质检精修的图片目录",
             mode="dir",
             default_path=default_frames,
         )
@@ -279,7 +285,7 @@ class MllmReviewTab(QWidget):
         self.recursive_chk.setChecked(True)
         self.recursive_chk.setToolTip(
             "默认开启，与标注工作台一致（工作台打开目录时同样包含子目录中的图片）；"
-            "输出目录位于图片目录内部时会自动跳过，避免重复审核上一轮结果；只想处理顶层图片时取消勾选"
+            "输出目录位于图片目录内部时会自动跳过，避免重复处理上一轮结果；只想处理顶层图片时取消勾选"
         )
         self.images_count_label = QLabel()
         self.images_count_label.setStyleSheet("color: #57606a; font-size: 12px;")
@@ -290,7 +296,7 @@ class MllmReviewTab(QWidget):
         s_form.addRow("图片目录:", img_dir_box)
 
         self.weights_picker = PathPickerRow(
-            placeholder="选择基准模型 best.pt 权重（先手动标一批训练得出）",
+            placeholder="选择基准模型 best.pt 权重（可先在标注工作台标少量样本训练得出）",
             mode="file",
             file_filter="PyTorch 权重 (*.pt);;所有文件 (*.*)",
         )
@@ -306,7 +312,7 @@ class MllmReviewTab(QWidget):
         self.yolo_conf_spin.setSingleStep(0.02)
         self.yolo_conf_spin.setValue(0.12)
         self.yolo_conf_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.yolo_conf_spin.setToolTip("建议设低（0.08~0.15）以尽量召回潜在漏标，再由 MLLM 筛除误检")
+        self.yolo_conf_spin.setToolTip("建议设低（0.08~0.15）以尽量召回潜在目标，再由 LLM 筛除误检与错类")
         self.yolo_iou_spin = QDoubleSpinBox()
         self.yolo_iou_spin.setRange(0.10, 0.95)
         self.yolo_iou_spin.setSingleStep(0.05)
@@ -342,13 +348,13 @@ class MllmReviewTab(QWidget):
         )
         s_form.addRow("已有标注目录:", self.ann_picker)
 
-        default_out = str((self.workspace_root / "data" / "reviewed_frames").resolve())
+        default_out = str((self.workspace_root / "data" / "smart_labeled").resolve())
         self.output_picker = PathPickerRow(
-            placeholder="清洗后图片与 X-AnyLabeling .json 输出目录",
+            placeholder="智能标注后的图片与 X-AnyLabeling .json 输出目录",
             mode="dir",
             default_path=default_out,
         )
-        s_form.addRow("清洗输出目录:", self.output_picker)
+        s_form.addRow("标注输出目录:", self.output_picker)
         form_stack.addWidget(src_group)
 
         # 2. 大语言模型 (LLM) 配置
@@ -407,8 +413,8 @@ class MllmReviewTab(QWidget):
         l_form.addRow("API Key:", key_box)
         form_stack.addWidget(llm_group)
 
-        # 3. 纠错、补漏、边框紧贴修正与分流策略
-        pol_group = QGroupBox("3. 纠错、补漏、边框修正与分流策略")
+        # 3. 智能标注、收框与分流策略
+        pol_group = QGroupBox("3. 智能标注、收框与分流策略")
         p_form = QFormLayout(pol_group)
         self._tune_form(p_form)
         self._pol_form = p_form
@@ -437,7 +443,7 @@ class MllmReviewTab(QWidget):
         for mode, label in BOX_REFINE_MODE_ITEMS:
             self.refine_mode_combo.addItem(label, mode)
         self.refine_mode_combo.setToolTip(
-            "解决预训练模型框画偏大、包进多余背景的问题：可仅标记过松框转人工、由 MLLM 在局部放大图精修，或调用本地 SAM 像素级收紧"
+            "解决预训练模型框画偏大、包进多余背景的问题：可仅标记过松框转人工、由 LLM 在局部放大图精修，或调用本地 SAM 像素级收紧"
         )
         self.refine_hint_label = QLabel()
         self.refine_hint_label.setWordWrap(True)
@@ -447,7 +453,7 @@ class MllmReviewTab(QWidget):
         p_form.addRow("边框紧贴修正:", refine_box)
 
         # SAM 参数行：仅在选中 `SAM_LOCAL` 时展示，其余模式通过 setRowVisible 折叠保持界面清爽；
-        # 在「读取已有 .json」模式下因上方基准推理参数行隐藏，此处第二行会动态承载共享 GPU 加速开关
+        # 在「已有标注 (.json)」模式下因上方基准推理参数行隐藏，此处第二行会动态承载共享 GPU 加速开关
         self.sam_row_widget = QWidget()
         sam_vbox = QVBoxLayout(self.sam_row_widget)
         sam_vbox.setContentsMargins(0, 0, 0, 0)
@@ -466,7 +472,7 @@ class MllmReviewTab(QWidget):
         self.pick_sam_btn.setStyleSheet("padding: 4px 8px;")
         self.sam_refine_all_chk = QCheckBox("全部保留框收紧")
         self.sam_refine_all_chk.setToolTip(
-            "未勾选（默认）：仅对 MLLM 判定过松的框调用 SAM 像素级收紧；勾选：对全部保留/改类框统一执行 SAM 收紧"
+            "未勾选（默认）：仅对 LLM 判定过松的框调用 SAM 像素级收紧；勾选：对全部保留/改类框统一执行 SAM 收紧"
         )
         sam_row.addWidget(self.sam_model_combo, 1)
         sam_row.addWidget(self.pick_sam_btn)
@@ -524,7 +530,7 @@ class MllmReviewTab(QWidget):
             "QPushButton { padding: 3px 10px; font-size: 12px; }"
             "QPushButton:checked { background-color: #0969da; color: #ffffff; border-color: #085ec4; font-weight: 600; }"
         )
-        self.trial_5_btn.setToolTip("一键切换仅审核前 5 张图用于快速试跑，再次点击恢复处理全部图片")
+        self.trial_5_btn.setToolTip("一键切换仅处理前 5 张图用于快速试跑，再次点击恢复处理全部图片")
         limit_hint = QLabel("首次调整规则或收框模式时，建议先试跑验证效果")
         limit_hint.setStyleSheet("color: #8c959f; font-size: 12px;")
         limit_row.addWidget(self.max_images_spin)
@@ -545,7 +551,7 @@ class MllmReviewTab(QWidget):
         self.triage_dirs_chk.setToolTip("在输出目录下自动分建 auto_passed / llm_fixed / need_review 三个子目录")
 
         def _make_check_grid(boxes: list[QCheckBox]) -> QWidget:
-            """按统一的 3 列等宽网格排列复选框，保证“纠错选项”与“输出选项”两行纵向对齐。"""
+            """按统一的 3 列等宽网格排列复选框，保证“标注策略”与“输出选项”两行纵向对齐。"""
             holder = QWidget()
             grid = QGridLayout(holder)
             grid.setContentsMargins(0, 0, 0, 0)
@@ -557,7 +563,7 @@ class MllmReviewTab(QWidget):
             return holder
 
         p_form.addRow(
-            "纠错选项:", _make_check_grid([self.check_missing_chk, self.add_missing_chk, self.crops_chk])
+            "标注策略:", _make_check_grid([self.check_missing_chk, self.add_missing_chk, self.crops_chk])
         )
         p_form.addRow("输出选项:", _make_check_grid([self.triage_dirs_chk]))
         align_form_labels([s_form, l_form, p_form])
@@ -575,7 +581,7 @@ class MllmReviewTab(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self.start_btn = QPushButton("开始 MLLM 纠错清洗")
+        self.start_btn = QPushButton("开始 LLM 智能标注")
         self.start_btn.setObjectName("primaryBtn")
         self.start_btn.setMinimumWidth(160)
         self.stop_btn = QPushButton("停止")
@@ -603,7 +609,9 @@ class MllmReviewTab(QWidget):
         self.progress_bar.setValue(0)
         right.addWidget(self.progress_bar)
 
-        self.summary_label = QLabel("就绪：配置基准模型与 MLLM 后点击「开始 MLLM 纠错清洗」，或加载历史审核报告继续复核。")
+        self.summary_label = QLabel(
+            "就绪：选择「基准模型预标」或「已有标注 (.json)」并配置 LLM 后点击「开始 LLM 智能标注」，或加载历史报告继续复核。"
+        )
         self.summary_label.setWordWrap(True)
         self.summary_label.setStyleSheet("color: #424a53;")
         right.addWidget(self.summary_label)
@@ -633,7 +641,7 @@ class MllmReviewTab(QWidget):
         filter_row.addStretch(1)
         self.load_report_btn = QPushButton("加载历史报告...")
         self.load_report_btn.setStyleSheet("padding: 3px 10px; font-size: 12px;")
-        self.load_report_btn.setToolTip("读取历史清洗目录中的 review_report.json，直接还原结果表与对比预览继续复核")
+        self.load_report_btn.setToolTip("读取历史标注输出目录中的 review_report.json，直接还原结果表与对比预览继续复核")
         filter_row.addWidget(self.load_report_btn)
         right.addLayout(filter_row)
 
@@ -642,7 +650,7 @@ class MllmReviewTab(QWidget):
         splitter.setHandleWidth(10)
 
         # 结果列表与运行日志合并为同一区域的两个页签，省出一整块纵向空间留给对比预览
-        table_group = QGroupBox("4. 审核结果与日志")
+        table_group = QGroupBox("4. 标注结果与日志")
         table_group.setToolTip("单击结果行查看对比图与判定理由，双击直达「2. 标注工作台」精修")
         table_layout = QVBoxLayout(table_group)
         table_layout.setContentsMargins(8, 8, 8, 8)
@@ -673,12 +681,12 @@ class MllmReviewTab(QWidget):
         self.log_box = QPlainTextEdit()
         self.log_box.setMaximumBlockCount(LOG_MAX_LINES)
         self.log_box.setReadOnly(True)
-        self.log_box.setPlaceholderText("MLLM 逐张审核日志将在此输出...")
+        self.log_box.setPlaceholderText("LLM 逐张标注日志将在此输出...")
         self.result_tabs.addTab(self.log_box, "运行日志")
         table_layout.addWidget(self.result_tabs)
         splitter.addWidget(table_group)
 
-        preview_group = QGroupBox("5. 纠错前后对比预览")
+        preview_group = QGroupBox("5. 标注前后对比预览")
         preview_layout = QVBoxLayout(preview_group)
         preview_layout.setContentsMargins(8, 8, 8, 8)
         preview_layout.setSpacing(6)
@@ -695,14 +703,14 @@ class MllmReviewTab(QWidget):
         preview_layout.addWidget(self.legend_label)
 
         self.preview_label = _ScaledPreviewLabel(
-            "单击结果行对比「纠错前 vs 纠错后」标注框\n双击行或点击右下按钮可在「2. 标注工作台」精修"
+            "单击结果行对比「处理前 vs 处理后」标注框\n双击行或点击右下按钮可在「2. 标注工作台」精修"
         )
         preview_layout.addWidget(self.preview_label, 1)
 
         detail_row = QHBoxLayout()
         detail_row.setContentsMargins(0, 2, 0, 0)
         detail_row.setSpacing(10)
-        self.detail_label = QLabel("未选中图片：单击上方结果行可查看 MLLM 逐框判定理由与收框明细。")
+        self.detail_label = QLabel("未选中图片：单击上方结果行可查看 LLM 逐框判定理由与收框明细。")
         self.detail_label.setWordWrap(True)
         self.detail_label.setStyleSheet("color: #424a53; font-size: 12px;")
         self.open_selected_btn = QPushButton("在工作台精修此图 →")
@@ -795,18 +803,18 @@ class MllmReviewTab(QWidget):
             self._settings_dirty = True
 
     def _schedule_images_count(self, *_args: object) -> None:
-        """目录或递归勾选变更时防抖刷新待审核图片计数，避免连续输入路径时频繁扫盘。"""
+        """目录或递归勾选变更时防抖刷新待标注图片计数，避免连续输入路径时频繁扫盘。"""
         self._count_timer.start()
 
     def _refresh_images_count(self) -> None:
-        """立即统计并展示待纠错图片数、递归提示及试跑上限提示（口径同实际审核的 `collect_review_images`）。
+        """立即统计并展示待标注图片数、递归提示及试跑上限提示（口径同实际运行的 `collect_review_images`）。
 
         未勾选递归时额外统计子目录图片：顶层没有图片而子目录有图片时以橙色提示勾选递归，
         这是按视频或分流子目录组织数据时最常见的配置遗漏；递归时排除位于输入目录内部的输出目录。
         """
         raw_dir = self.images_picker.text()
         if not raw_dir:
-            self._set_count_hint("请选择待纠错图片目录", "#9a6700")
+            self._set_count_hint("请选择待标注图片目录", "#9a6700")
             return
         img_dir = Path(raw_dir)
         if not img_dir.is_dir():
@@ -831,7 +839,7 @@ class MllmReviewTab(QWidget):
             msg += f"；子目录另有 {nested_total - top_total} 张，勾选「包含子目录」可一并处理"
         limit = self.max_images_spin.value()
         if limit > 0 and total > limit:
-            msg += f"（已设试跑上限：本次仅审核前 {limit} 张）"
+            msg += f"（已设试跑上限：本次仅处理前 {limit} 张）"
         self._set_count_hint(msg, "#1a7f37")
 
     def _set_count_hint(self, text: str, color: str) -> None:
@@ -879,8 +887,10 @@ class MllmReviewTab(QWidget):
             self.yolo_device_ctrl.setEnabled(is_yolo)
 
     def _on_source_mode_changed(self) -> None:
-        """按候选框来源模式启用/禁用并动态折叠无关表单行，减少无效置灰项干扰。"""
-        is_yolo = self.source_mode_combo.currentData() == ReviewSourceMode.YOLO_PREDICT
+        """按候选框来源模式启用/禁用并动态折叠无关表单行，同时更新模式说明提示。"""
+        source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
+        is_yolo = source_mode == ReviewSourceMode.YOLO_PREDICT
+        self.source_mode_hint_label.setText(SOURCE_MODE_HINTS.get(source_mode, ""))
         self.weights_picker.setEnabled(is_yolo)
         self.yolo_conf_spin.setEnabled(is_yolo)
         self.yolo_iou_spin.setEnabled(is_yolo)
@@ -970,7 +980,7 @@ class MllmReviewTab(QWidget):
         else:
             self.refine_hint_label.setText(BOX_REFINE_MODE_HINTS.get(refine_mode, ""))
 
-        # MLLM 局部放大图精修必须依赖局部裁剪图坐标系
+        # LLM 局部放大图精修必须依赖局部裁剪图坐标系
         if is_mllm_crop:
             prev_restore = self._restoring_state
             self._restoring_state = True
@@ -979,10 +989,10 @@ class MllmReviewTab(QWidget):
             finally:
                 self._restoring_state = prev_restore
             self.crops_chk.setEnabled(False)
-            self.crops_chk.setToolTip("「MLLM 局部放大图精修」模式必须附带局部裁剪图以提供高精度局部坐标系")
+            self.crops_chk.setToolTip("「LLM 局部放大图精修」模式必须附带局部裁剪图以提供高精度局部坐标系")
         else:
             self.crops_chk.setEnabled(True)
-            self.crops_chk.setToolTip("将低置信度候选框外扩 20% 裁剪放大后一并送审，显著提升小目标纠错准确率")
+            self.crops_chk.setToolTip("将低置信度候选框外扩 20% 裁剪放大后一并送检，显著提升小目标判别准确率")
 
         check_missing = self.check_missing_chk.isChecked()
         self.add_missing_chk.setEnabled(check_missing)
@@ -990,12 +1000,12 @@ class MllmReviewTab(QWidget):
         if self.triage_dirs_chk.isChecked():
             self.open_need_review_btn.setText("在工作台打开待复核目录")
             self.open_need_review_btn.setToolTip(
-                "在「2. 标注工作台」中打开清洗输出下的 need_review/ 子目录重点复核"
+                "在「2. 标注工作台」中打开输出目录下的 need_review/ 子目录重点复核"
             )
         else:
             self.open_need_review_btn.setText("在工作台打开输出目录")
             self.open_need_review_btn.setToolTip(
-                "当前未按结果分建子目录，将在「2. 标注工作台」中直接打开清洗输出根目录"
+                "当前未按结果分建子目录，将在「2. 标注工作台」中直接打开标注输出根目录"
             )
 
         # 精准反映 high_conf_skip 在当前策略组合下的真实生效角色，并用方向符号（≥ / <）消除理解歧义
@@ -1009,13 +1019,13 @@ class MllmReviewTab(QWidget):
             self.high_conf_label.setText("免审阈值 ≥")
             self.high_conf_spin.setEnabled(True)
             self.high_conf_spin.setToolTip(
-                "当前未开启漏标检查：整张图所有框置信度均 ≥ 此值时直接通过并跳过 MLLM 调用，省钱提速"
+                "当前未开启漏标检查：整张图所有框置信度均 ≥ 此值时直接通过并跳过 LLM 调用，省钱提速"
             )
         elif crops_active:
             self.high_conf_label.setText("优先裁剪 <")
             self.high_conf_spin.setEnabled(True)
             self.high_conf_spin.setToolTip(
-                "当前已开启漏标或收框评估（不会跳过整图 MLLM）；单图目标超过 8 个时，优先为置信度 < 此值的框生成局部放大图"
+                "当前已开启漏标或收框评估（不会跳过整图 LLM）；单图目标超过 8 个时，优先为置信度 < 此值的框生成局部放大图"
             )
         else:
             self.high_conf_label.setText("免审阈值(停用):")
@@ -1062,7 +1072,7 @@ class MllmReviewTab(QWidget):
         self.classes_edit.setText(", ".join(classes))
 
     def _build_current_config(self) -> MllmReviewConfig:
-        """按当前表单控件组装 `MllmReviewConfig`（不校验目录磁盘存在性，供测试连接与审核启动复用）。"""
+        """按当前表单控件组装 `MllmReviewConfig`（不校验目录磁盘存在性，供测试连接与智能标注启动复用）。"""
         raw_classes = self.classes_edit.text().replace("，", ",")
         allowed_classes = [c.strip() for c in raw_classes.split(",") if c.strip()]
         ann_text = self.ann_picker.text()
@@ -1070,7 +1080,7 @@ class MllmReviewTab(QWidget):
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
         return MllmReviewConfig(
             images_dir=Path(self.images_picker.text() or "."),
-            output_dir=Path(self.output_picker.text() or (self.workspace_root / "data" / "reviewed_frames")),
+            output_dir=Path(self.output_picker.text() or (self.workspace_root / "data" / "smart_labeled")),
             source_mode=self.source_mode_combo.currentData(),
             annotations_dir=Path(ann_text) if ann_text else None,
             weights_path=Path(weights_text) if weights_text else None,
@@ -1098,14 +1108,14 @@ class MllmReviewTab(QWidget):
         )
 
     def _on_test_connection(self) -> None:
-        """在后台线程执行 MLLM 轻量连通性测试并在状态栏与日志反馈诊断结果。"""
+        """在后台线程执行 LLM 轻量连通性测试并在状态栏与日志反馈诊断结果。"""
         if self.conn_test_worker is not None and self.conn_test_worker.isRunning():
             return
         cfg = self._build_current_config()
         self.test_conn_btn.setEnabled(False)
         self.test_conn_btn.setText("测试中...")
         self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 12px;")
-        self.api_key_status_label.setText("正在向 MLLM 接口发送连通性探针...")
+        self.api_key_status_label.setText("正在向 LLM 接口发送连通性探针...")
 
         self.conn_test_worker = MllmConnectionTestWorker(cfg)
         self.conn_test_worker.finished_test.connect(self._on_test_connection_done)
@@ -1120,10 +1130,10 @@ class MllmReviewTab(QWidget):
         self.log_box.appendPlainText(f"[连接测试] {message}")
         if not ok:
             self.result_tabs.setCurrentWidget(self.log_box)
-            QMessageBox.warning(self, "MLLM 连接测试失败", message)
+            QMessageBox.warning(self, "LLM 连接测试失败", message)
 
     def save_settings(self, settings: QSettings, *, force: bool = False) -> None:
-        """将当前 MLLM 纠错策略配置序列化写入 `settings`（默认不保存明文 API Key）。"""
+        """将当前 LLM 智能标注策略配置序列化写入 `settings`（默认不保存明文 API Key）。"""
         if not force and not self._settings_dirty:
             return
         provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
@@ -1156,7 +1166,7 @@ class MllmReviewTab(QWidget):
         settings.setValue(_REVIEW_SETTINGS_KEY, json.dumps(state, ensure_ascii=False))
 
     def restore_settings(self, settings: QSettings) -> None:
-        """从 `settings` 恢复上次保存的 MLLM 纠错策略配置；数据缺失或损坏时静默保持默认。"""
+        """从 `settings` 恢复上次保存的 LLM 智能标注策略配置；数据缺失或损坏时静默保持默认。"""
         raw = settings.value(_REVIEW_SETTINGS_KEY, "")
         if not isinstance(raw, str) or not raw.strip():
             return
@@ -1246,10 +1256,10 @@ class MllmReviewTab(QWidget):
         images_text = self.images_picker.text()
         out_text = self.output_picker.text()
         if not images_text or not Path(images_text).is_dir():
-            QMessageBox.warning(self, "提示", "请选择有效的待纠错图片目录。")
+            QMessageBox.warning(self, "提示", "请选择有效的待标注图片目录。")
             return
         if not out_text:
-            QMessageBox.warning(self, "提示", "请选择清洗输出目录。")
+            QMessageBox.warning(self, "提示", "请选择标注输出目录。")
             return
 
         cfg = self._build_current_config()
@@ -1299,9 +1309,9 @@ class MllmReviewTab(QWidget):
 
         if uses_local_gpu_model and self.gpu_guard is not None:
             task_label = (
-                "MLLM 基准模型推理 / SAM 收框审核"
+                "LLM 基准模型预标 / SAM 收框"
                 if cfg.box_refine_mode == BoxRefineMode.SAM_LOCAL
-                else "MLLM 基准模型推理审核"
+                else "LLM 基准模型预标"
             )
             if not self.gpu_guard.try_acquire(self, task_label):
                 return
@@ -1312,7 +1322,7 @@ class MllmReviewTab(QWidget):
         self._preview_cache.clear()
         self._selected_row = -1
         self.preview_label.clear_preview()
-        self.detail_label.setText("未选中图片：单击上方结果行可查看 MLLM 逐框判定理由与收框明细。")
+        self.detail_label.setText("未选中图片：单击上方结果行可查看 LLM 逐框判定理由与收框明细。")
         self.detail_label.setToolTip("")
         self.open_selected_btn.setEnabled(False)
         self.result_table.setRowCount(0)
@@ -1324,11 +1334,11 @@ class MllmReviewTab(QWidget):
         self.stop_btn.setEnabled(True)
         self.load_report_btn.setEnabled(False)
         self.send_ds_btn.setEnabled(False)
-        self.summary_label.setText("正在运行候选框提取与 MLLM 纠错清洗...")
+        self.summary_label.setText("正在运行候选框提取与 LLM 智能标注...")
 
         self.worker = MllmReviewWorker(cfg)
         if uses_local_gpu_model and self.gpu_guard is not None:
-            self.gpu_guard.bind(self.worker, "MLLM 基准模型推理审核")
+            self.gpu_guard.bind(self.worker, task_label)
         self.worker.progress.connect(self._on_progress)
         self.worker.log_line.connect(self.log_box.appendPlainText)
         self.worker.finished_result.connect(self._on_finished)
@@ -1336,11 +1346,11 @@ class MllmReviewTab(QWidget):
         self.worker.start()
 
     def _on_stop(self) -> None:
-        """向正在运行的审核线程发送取消标志并禁用停止按钮防止重复点击。"""
+        """向正在运行的智能标注线程发送取消标志并禁用停止按钮防止重复点击。"""
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
-            self.log_box.appendPlainText("正在停止 MLLM 纠错任务...")
+            self.log_box.appendPlainText("正在停止 LLM 智能标注任务...")
 
     def _record_matches_filter(self, rec: ImageReviewRecord, filter_key: str) -> bool:
         if filter_key == "all":
@@ -1389,7 +1399,7 @@ class MllmReviewTab(QWidget):
         }
         status_label, status_color = bucket_meta.get(rec.triage_bucket, (rec.triage_bucket, "#333333"))
         if rec.error:
-            status_label = "审核出错"
+            status_label = "处理出错"
             status_color = "#cf222e"
 
         note_parts: list[str] = []
@@ -1431,13 +1441,13 @@ class MllmReviewTab(QWidget):
         self._refresh_filter_counts()
 
     def load_history_report(self, report_or_dir: Path) -> MllmReviewResult:
-        """加载历史清洗报告 `review_report.json` 并还原右侧表格、计数、对比预览与下游联动路径。"""
+        """加载历史智能标注报告 `review_report.json` 并还原右侧表格、计数、对比预览与下游联动路径。"""
         res = load_review_report(report_or_dir)
         self._records = list(res.records)
         self._preview_cache.clear()
         self._selected_row = -1
         self.preview_label.clear_preview()
-        self.detail_label.setText("未选中图片：单击上方结果行可查看 MLLM 逐框判定理由与收框明细。")
+        self.detail_label.setText("未选中图片：单击上方结果行可查看 LLM 逐框判定理由与收框明细。")
         self.detail_label.setToolTip("")
         self.open_selected_btn.setEnabled(False)
         self.result_table.setRowCount(0)
@@ -1466,9 +1476,9 @@ class MllmReviewTab(QWidget):
         start_dir = self.output_picker.text() or str(self.workspace_root)
         chosen, _ = QFileDialog.getOpenFileName(
             self,
-            "选择历史 MLLM 审核报告 (review_report.json)",
+            "选择历史 LLM 智能标注报告 (review_report.json)",
             start_dir,
-            "审核报告 (review_report.json);;JSON 文件 (*.json);;所有文件 (*.*)",
+            "标注报告 (review_report.json);;JSON 文件 (*.json);;所有文件 (*.*)",
         )
         if not chosen:
             return
@@ -1526,7 +1536,7 @@ class MllmReviewTab(QWidget):
         self.send_ds_btn.setEnabled(res.total_images > 0)
 
         refined_total = sum(r.refined_count for r in res.records)
-        state = "已停止" if res.cancelled else "清洗完成"
+        state = "已停止" if res.cancelled else "标注完成"
         self.summary_label.setText(
             f"{state}（共 {res.total_images} 张）：自动通过 {res.auto_passed_count} | "
             f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
@@ -1534,7 +1544,7 @@ class MllmReviewTab(QWidget):
         )
         self._refresh_filter_counts()
         if res.report_path:
-            self.log_box.appendPlainText(f"\n审核报告已保存: {res.report_path}")
+            self.log_box.appendPlainText(f"\n标注报告已保存: {res.report_path}")
 
     def _on_failed(self, err: str) -> None:
         self.start_btn.setEnabled(True)
@@ -1543,7 +1553,7 @@ class MllmReviewTab(QWidget):
         self.summary_label.setText(f"执行失败: {err}")
         # 日志与结果列表共用页签区域，失败时自动切到“运行日志”便于直接查看出错上下文
         self.result_tabs.setCurrentWidget(self.log_box)
-        QMessageBox.critical(self, "MLLM 纠错失败", err)
+        QMessageBox.critical(self, "LLM 智能标注失败", err)
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
         """双击结果行时跳转到内嵌标注工作台并定位到对应输出图片。"""
@@ -1568,7 +1578,7 @@ class MllmReviewTab(QWidget):
         need_dir = out_dir / "need_review"
         target_dir = need_dir if need_dir.is_dir() else out_dir
         if not target_dir.is_dir():
-            QMessageBox.warning(self, "提示", f"目录不存在，请先运行清洗或检查路径:\n{target_dir}")
+            QMessageBox.warning(self, "提示", f"目录不存在，请先运行智能标注或检查路径:\n{target_dir}")
             return
         cls_file = out_dir / "classes.txt"
         cls_str = str(cls_file) if cls_file.is_file() else self._last_classes_txt
@@ -1577,7 +1587,7 @@ class MllmReviewTab(QWidget):
     def _on_send_to_dataset(self) -> None:
         out_dir = self.output_picker.path()
         if not out_dir.is_dir():
-            QMessageBox.warning(self, "提示", f"清洗输出目录不存在:\n{out_dir}")
+            QMessageBox.warning(self, "提示", f"标注输出目录不存在:\n{out_dir}")
             return
         cls_file = out_dir / "classes.txt"
         cls_str = str(cls_file) if cls_file.is_file() else self._last_classes_txt

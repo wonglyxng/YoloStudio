@@ -1,7 +1,7 @@
 """PyQt6 `QThread` 后台工作线程封装模块。
 
 职责：
-    将视频元信息探测、视频抽帧、标注扫描与转换、YOLO26 训练/验证/推理/导出及 MLLM 纠错清洗等耗时任务
+    将视频元信息探测、视频抽帧、标注扫描与转换、YOLO26 训练/验证/推理/导出及 LLM 智能标注等耗时任务
     下沉至后台 `QThread` 执行，并通过 Qt `pyqtSignal` 安全回传进度与结果，避免阻塞主界面事件循环。
 
 运行环境与协作边界：
@@ -409,7 +409,7 @@ class ExportWorker(QThread):
 
 
 class MllmReviewWorker(QThread):
-    """在后台线程运行基准推理或 `.json` 加载及 MLLM 并发纠错任务。"""
+    """在后台线程运行基准预标或 `.json` 加载及 LLM 并发质检精修任务。"""
 
     progress = Signal(int, int, object)
     log_line = Signal(str)
@@ -422,11 +422,11 @@ class MllmReviewWorker(QThread):
         self.cancel_event = Event()
 
     def cancel(self) -> None:
-        """设置协同取消标志，停止提交新的审核图片并尝试取消待执行任务。"""
+        """设置协同取消标志，停止提交新的待处理图片并尝试取消待执行任务。"""
         self.cancel_event.set()
 
     def run(self) -> None:
-        """线程入口：执行 `run_mllm_review` 并派发单图进度、日志及最终审核汇总。"""
+        """线程入口：执行 `run_mllm_review` 并派发单图进度、日志及最终智能标注汇总。"""
         try:
             res: MllmReviewResult = run_mllm_review(
                 self.config,
@@ -440,7 +440,7 @@ class MllmReviewWorker(QThread):
 
 
 class MllmConnectionTestWorker(QThread):
-    """在后台线程执行 MLLM 接口轻量连通性探针，避免网络请求阻塞界面主线程。"""
+    """在后台线程执行 LLM 接口轻量连通性探针，避免网络请求阻塞界面主线程。"""
 
     finished_test = Signal(bool, str)  # 信号参数：(是否连通, 诊断摘要)
 
