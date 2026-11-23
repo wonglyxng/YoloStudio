@@ -152,6 +152,68 @@ def test_cli_extract_supports_time_slice_prefix_and_subfolder(tmp_path: Path) ->
     sub_files = sorted((out_dir / "clip").glob("camA_clip_*.jpg"))
     assert len(sub_files) == 3  # 0.5s(帧5)、1.0s(帧10)、1.5s(帧15)
 
+    # 未指定命名规则与前缀时，默认采用 vc{sha256前32位}_f{10位毫秒时长}
+    import hashlib
+
+    expected_hash = hashlib.sha256(video_path.read_bytes()).hexdigest()[:32]
+    default_out = tmp_path / "cli_default_out"
+    code_default = cli_main(
+        [
+            "extract",
+            str(video_path),
+            "-o",
+            str(default_out),
+            "--mode",
+            "every_n_frames",
+            "--step",
+            "10",
+            "--dedup",
+            "0",
+        ]
+    )
+    assert code_default == 0
+    assert sorted(p.name for p in default_out.glob("*.jpg")) == [
+        f"vc{expected_hash}_f0000000000.jpg",
+        f"vc{expected_hash}_f0000001000.jpg",
+        f"vc{expected_hash}_f0000002000.jpg",
+    ]
+
+    # 指定自定义 --naming-rule 模板时以模板为准；非法模板返回非零退出码
+    tpl_out = tmp_path / "cli_tpl_out"
+    code_tpl = cli_main(
+        [
+            "extract",
+            str(video_path),
+            "-o",
+            str(tpl_out),
+            "--mode",
+            "every_n_frames",
+            "--step",
+            "15",
+            "--dedup",
+            "0",
+            "--naming-rule",
+            "{video}_t{ms:010d}",
+        ]
+    )
+    assert code_tpl == 0
+    assert sorted(p.name for p in tpl_out.glob("*.jpg")) == [
+        "clip_t0000000000.jpg",
+        "clip_t0000001500.jpg",
+    ]
+
+    code_bad = cli_main(
+        [
+            "extract",
+            str(video_path),
+            "-o",
+            str(tmp_path / "cli_bad_out"),
+            "--naming-rule",
+            "{unknown_field}",
+        ]
+    )
+    assert code_bad == 1
+
 
 def test_capture_thread_output_reentrant_print_no_recursion() -> None:
     """验证把 `print` 本身作为 `capture_thread_output` 回调时不会触发无限递归。"""

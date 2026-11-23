@@ -51,6 +51,7 @@ def _cmd_extract(args: argparse.Namespace) -> int:
         image_format=args.format,
         jpeg_quality=args.quality,
         prefix=args.prefix,
+        naming_rule=args.naming_rule,
         create_video_subfolder=args.subfolder,
     )
     res = extract_frames([Path(p) for p in args.inputs], cfg)
@@ -365,7 +366,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_ext.add_argument("--max-dim", type=int, default=0, help="最长边缩放像素 (0=原尺寸)")
     p_ext.add_argument("--format", choices=["jpg", "png"], default="jpg")
     p_ext.add_argument("--quality", type=int, default=95, help="JPG 压缩质量 (1..100)")
-    p_ext.add_argument("--prefix", default="", help="输出帧文件名前缀")
+    p_ext.add_argument(
+        "--naming-rule",
+        default="",
+        help=(
+            "自定义命名规则（留空默认 vc{hash}_f{ms:010d}；填普通前缀如 cam1_ 按前缀+视频名+序号，"
+            "或使用占位符 {video}/{hash}/{hash_full}/{ms}/{frame}/{seq}/{index}/{prefix}）"
+        ),
+    )
+    p_ext.add_argument(
+        "--prefix",
+        default="",
+        help="输出帧文件名前缀（兼容选项；未指定 --naming-rule 时生效，或在模板中以 {prefix} 引用）",
+    )
     p_ext.add_argument("--subfolder", action="store_true", help="按视频名在输出目录下分建子目录")
     p_ext.set_defaults(func=_cmd_extract)
 

@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import string
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -25,6 +27,22 @@ import cv2
 import numpy as np
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".ts", ".m4v", ".webm"}
+VIDEO_HASH_LENGTH = 32
+VIDEO_HASH_CHUNK_BYTES = 1024 * 1024
+DEFAULT_NAMING_TEMPLATE = "vc{hash}_f{ms:010d}"
+SUPPORTED_NAMING_FIELDS = (
+    "video",
+    "hash",
+    "hash_full",
+    "ms",
+    "frame",
+    "seq",
+    "index",
+    "prefix",
+)
+_SUPPORTED_NAMING_FIELD_SET = frozenset(SUPPORTED_NAMING_FIELDS)
+_INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*')
+_SAMPLE_VIDEO_HASH_FULL = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 
 
 class ExtractionMode(str, Enum):
@@ -64,6 +82,11 @@ class ExtractionConfig:
             （编程接口默认 `0.0` 以保证确定性采样；GUI 与 CLI 入口默认设为 `2.0` 以过滤录制静止帧）。
         `max_dimension`：输出最长边像素上限，`<= 0` 保持原尺寸。
         `image_format` / `jpeg_quality`：输出格式（`jpg` 或 `png`）及 JPG 压缩质量（`1..100`）。
+        `naming_rule`：自定义帧文件命名规则（不含扩展名）。留空且 `prefix` 为空时，默认采用
+            `vc{hash}_f{ms:010d}`（`vc` + 视频完整内容 SHA-256 前 32 位小写十六进制 + `_f` + 10 位帧毫秒时长）；
+            填写不含占位符的普通文本时视作文件名前缀（拼接为 `{前缀}{视频名}_{seq:06d}`）；
+            填写含占位符模板时按模板渲染（可用字段见 `SUPPORTED_NAMING_FIELDS`）。
+        `prefix`：兼容旧版的文件名前缀选项；当 `naming_rule` 留空时生效，或在模板包含 `{prefix}` 时注入。
         `create_video_subfolder`：是否按视频文件名 `stem` 在 `output_dir` 下分建子目录。
     """
 
@@ -79,6 +102,7 @@ class ExtractionConfig:
     image_format: str = "jpg"
     jpeg_quality: int = 95
     prefix: str = ""
+    naming_rule: str = ""
     create_video_subfolder: bool = False
 
 
@@ -232,6 +256,212 @@ def _compute_step_frames(info: VideoInfo, config: ExtractionConfig, start_frame:
 SEEK_THRESHOLD_FRAMES = 300
 
 
+def _validate_filename_component(text: str, *, allow_empty: bool = False, context: str = "文件名") -> None:
+    """校验文件名片段不包含路径分隔符、Windows 非法字符或控制字符；非法时抛出 `ValueError`。"""
+    if not allow_empty and not text.strip():
+        raise ValueError(f"{context}不能为空。")
+    if text in {".", ".."}:
+        raise ValueError(f"{context}不能为 '.' 或 '..'。")
+    for ch in text:
+        if ch in _INVALID_FILENAME_CHARS or ord(ch) < 32:
+            raise ValueError(
+                f"{context}包含非法字符 {ch!r}，不能包含 <>:\"/\\|?* 或控制字符。"
+            )
+
+
+def compute_video_hash(
+    video_path: Path,
+    *,
+    length: int = VIDEO_HASH_LENGTH,
+    cancel_event: Event | None = None,
+) -> str | None:
+    """流式计算视频完整文件内容的 SHA-256 小写十六进制摘要。
+
+    参数与返回值：
+        `length` > 0 时截取前 `length` 位（默认 32 位）；`<= 0` 时返回完整 64 位摘要。
+        读取过程中若 `cancel_event` 被置位则立即中止并返回 `None`。
+    失败方式：
+        视频文件不存在或无读取权限时抛出 `OSError`。
+    """
+    hasher = hashlib.sha256()
+    with Path(video_path).open("rb") as fh:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            chunk = fh.read(VIDEO_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    digest = hasher.hexdigest()
+    return digest[:length] if length > 0 else digest
+
+
+@dataclass(frozen=True)
+class CompiledNamingRule:
+    """已解析并校验通过的帧文件命名规则。
+
+    状态与职责：
+        封装默认规则、普通前缀规则或自定义占位符模板的统一渲染入口；
+        `needs_video_hash` 指示抽帧前是否需要计算视频完整内容的 SHA-256 哈希，
+        避免未引用哈希的自定义命名场景产生额外文件读取开销。
+    """
+
+    template: str
+    is_default: bool
+    is_template: bool
+    needs_video_hash: bool
+    plain_prefix: str = ""
+    fallback_prefix: str = ""
+
+    def render(
+        self,
+        *,
+        video: str,
+        video_hash_full: str,
+        timestamp_ms: int,
+        frame_idx: int,
+        seq: int,
+    ) -> str:
+        """按已编译规则渲染不含扩展名的帧文件名 `stem`，并校验输出合法性。"""
+        if not self.is_template:
+            stem = f"{self.plain_prefix}{video}_{seq:06d}"
+        else:
+            ctx = {
+                "video": video,
+                "hash": video_hash_full[:VIDEO_HASH_LENGTH],
+                "hash_full": video_hash_full,
+                "ms": max(0, int(timestamp_ms)),
+                "frame": max(0, int(frame_idx)),
+                "seq": max(1, int(seq)),
+                "index": max(1, int(seq)),
+                "prefix": self.fallback_prefix,
+            }
+            stem = self.template.format_map(ctx)
+        _validate_filename_component(stem, context="生成的帧文件名")
+        if stem.endswith((" ", ".")):
+            raise ValueError("生成的帧文件名不能以空格或英文句点结尾。")
+        return stem
+
+
+def compile_naming_rule(naming_rule: str = "", prefix: str = "") -> CompiledNamingRule:
+    """解析并校验抽帧命名规则，返回可直接渲染的 `CompiledNamingRule`。
+
+    优先级与行为：
+        1. `naming_rule` 去除首尾空白后非空时以 `naming_rule` 为准；
+        2. 否则若 `prefix` 去除首尾空白后非空时以 `prefix` 为准（兼容旧参数）；
+        3. 两者均为空时启用默认规则 `vc{hash}_f{ms:010d}`。
+        非空规则若包含合法占位符（如 `{video}`、`{hash}`、`{ms}`、`{frame}`、`{seq}`、`{index}`），
+        则按模板渲染；若不含占位符则视作普通前缀，按 `{前缀}{视频名}_{seq:06d}` 拼接。
+
+    失败方式：
+        花括号未配对、使用不支持的占位符、包含属性/索引表达式、格式说明符非法
+        或包含 Windows 文件名非法字符时抛出 `ValueError`。
+    """
+    clean_rule = naming_rule.strip()
+    clean_prefix = prefix.strip()
+    raw_spec = clean_rule or clean_prefix
+
+    if not raw_spec:
+        return CompiledNamingRule(
+            template=DEFAULT_NAMING_TEMPLATE,
+            is_default=True,
+            is_template=True,
+            needs_video_hash=True,
+            fallback_prefix="",
+        )
+
+    try:
+        parsed = list(string.Formatter().parse(raw_spec))
+    except ValueError as exc:
+        raise ValueError("命名规则格式无效：存在未配对的花括号 '{' 或 '}'。") from exc
+
+    used_fields: set[str] = set()
+    has_placeholder = False
+    for literal_text, field_name, _format_spec, conversion in parsed:
+        _validate_filename_component(literal_text, allow_empty=True, context="命名规则")
+        if field_name is None:
+            continue
+        has_placeholder = True
+        if not field_name or field_name not in _SUPPORTED_NAMING_FIELD_SET:
+            allowed = "、".join(f"{{{name}}}" for name in SUPPORTED_NAMING_FIELDS)
+            raise ValueError(
+                f"命名规则包含不支持的占位符 '{{{field_name}}}'；可用占位符：{allowed}。"
+            )
+        if conversion not in (None, "s"):
+            raise ValueError(f"命名规则不支持转换标记 '!{conversion}'。")
+        used_fields.add(field_name)
+
+    if not has_placeholder:
+        _validate_filename_component(raw_spec, context="命名规则前缀")
+        compiled = CompiledNamingRule(
+            template="",
+            is_default=False,
+            is_template=False,
+            needs_video_hash=False,
+            plain_prefix=raw_spec,
+            fallback_prefix=clean_prefix,
+        )
+    else:
+        compiled = CompiledNamingRule(
+            template=raw_spec,
+            is_default=False,
+            is_template=True,
+            needs_video_hash=bool(used_fields & {"hash", "hash_full"}),
+            fallback_prefix=clean_prefix,
+        )
+
+    # 预渲染一次以提前暴露非法格式说明符（如 {video:06d}）或空/非法文件名结果
+    try:
+        compiled.render(
+            video="demo",
+            video_hash_full=_SAMPLE_VIDEO_HASH_FULL,
+            timestamp_ms=1500,
+            frame_idx=15,
+            seq=1,
+        )
+    except ValueError as exc:
+        raise ValueError(f"命名规则无效：{exc}") from exc
+    return compiled
+
+
+def preview_naming_rule(
+    naming_rule: str = "",
+    prefix: str = "",
+    image_format: str = "jpg",
+    sample_video: str = "demo",
+) -> str:
+    """根据当前命名规则与图片格式生成示例文件名（供界面实时预览；规则非法时抛出 `ValueError`）。"""
+    compiled = compile_naming_rule(naming_rule=naming_rule, prefix=prefix)
+    ext = ".png" if image_format.strip().lower() == "png" else ".jpg"
+    if compiled.is_default:
+        return f"vc<32位视频SHA256>_f0000001500{ext}"
+    stem = compiled.render(
+        video=sample_video,
+        video_hash_full=_SAMPLE_VIDEO_HASH_FULL,
+        timestamp_ms=1500,
+        frame_idx=15,
+        seq=1,
+    )
+    return f"{stem}{ext}"
+
+
+def _resolve_frame_timestamp_ms(cap: cv2.VideoCapture, frame_idx: int, fps: float) -> int:
+    """解析刚刚通过 `cap.read()` 读取帧的毫秒时间戳。
+
+    策略与时钟回退：
+        在 OpenCV FFmpeg 后端中，`cap.read()` 后的 `CAP_PROP_POS_MSEC` 对应该帧的显示时间戳（ms）。
+        若返回非有限值、负值，或在非首帧（`frame_idx > 0`）上返回 `<= 0`（容器缺少时间戳或 seek 后失准），
+        则回退为 `round(frame_idx * 1000 / fps)`。
+    """
+    fallback_ms = max(0, int(round(max(0, frame_idx) * 1000.0 / max(fps, 1e-6))))
+    raw_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+    if not math.isfinite(raw_ms) or raw_ms < 0.0:
+        return fallback_ms
+    if frame_idx > 0 and raw_ms <= 0.0:
+        return fallback_ms
+    return max(0, int(round(raw_ms)))
+
+
 def _plan_video_name_keys(videos: list[Path]) -> dict[Path, str]:
     """为每个视频规划输出命名键（用作帧文件名前缀与子目录名），保证不同视频之间不重名。
 
@@ -255,6 +485,21 @@ def _plan_video_name_keys(videos: list[Path]) -> dict[Path, str]:
     return keys
 
 
+def _allocate_unique_run_path(
+    target_dir: Path, stem: str, ext: str, written_paths_in_run: set[str]
+) -> Path:
+    """在单次抽帧运行内为目标路径做去重保护，避免异常时间戳或重复模板导致同次运行内互相覆盖。"""
+    candidate = target_dir / f"{stem}{ext}"
+    key = str(candidate.resolve()).lower()
+    suffix = 1
+    while key in written_paths_in_run:
+        candidate = target_dir / f"{stem}_{suffix}{ext}"
+        key = str(candidate.resolve()).lower()
+        suffix += 1
+    written_paths_in_run.add(key)
+    return candidate
+
+
 def extract_frames(
     video_paths: list[Path],
     config: ExtractionConfig,
@@ -264,8 +509,11 @@ def extract_frames(
     """按配置从多个视频中批量抽取帧图片并写入输出目录。
 
     副作用与资源管理：
-        自动创建 `config.output_dir` 及子目录并写出图片文件，存在同名文件时直接覆盖；
-        多个视频同名时由 `_plan_video_name_keys` 消歧，帧文件不会跨视频互相覆盖。
+        自动创建 `config.output_dir` 及子目录并写出图片文件；跨次运行存在同名文件时直接覆盖，
+        单次运行内部若出现同路径冲突（如自定义模板未含序号或容器时间戳重复）则自动追加 `_1`/`_2` 消歧。
+        未指定命名规则（`naming_rule` 与 `prefix` 均为空）时，默认按
+        `vc{视频SHA256前32位}_f{10位毫秒时长}` 命名；
+        多个视频同名且使用 `{video}` 占位符、普通前缀或分建子目录时，由 `_plan_video_name_keys` 消歧。
         每个视频的 `cv2.VideoCapture` 在内部 `finally` 块释放，防止句柄泄漏。
 
     读取策略：
@@ -273,9 +521,9 @@ def extract_frames(
 
     回调、取消与失败行为：
         保存新帧时立即触发 `progress_callback`，跳过的帧每 30 帧触发一次进度更新；
-        外部通过 `cancel_event` 请求取消后将在下个检查点停止并返回已保存结果
+        外部通过 `cancel_event` 请求取消后将在下个检查点（含视频哈希计算分块循环）停止并返回已保存结果
         （`result.cancelled = True`，已落盘文件不回滚，被中断的视频不计入 `videos_processed`）；
-        未找到任何有效视频或单视频打开失败/时间段非法时将错误信息记入 `result.errors`，
+        命名规则非法、未找到任何有效视频或单视频打开失败/时间段非法时将错误信息记入 `result.errors`，
         单视频失败不会中断其余视频处理。
     """
     videos = collect_videos(video_paths)
@@ -287,6 +535,15 @@ def extract_frames(
         frames_saved=0,
         frames_skipped_similar=0,
     )
+    try:
+        compiled_rule = compile_naming_rule(
+            naming_rule=config.naming_rule,
+            prefix=config.prefix,
+        )
+    except ValueError as exc:
+        result.errors.append(str(exc))
+        return result
+
     if not videos:
         result.errors.append("未找到有效的视频文件。")
         return result
@@ -294,6 +551,7 @@ def extract_frames(
     ext = ".png" if config.image_format.lower() == "png" else ".jpg"
     total_videos = len(videos)
     name_keys = _plan_video_name_keys(videos)
+    written_paths_in_run: set[str] = set()
 
     def _cancelled() -> bool:
         return bool(cancel_event and cancel_event.is_set())
@@ -308,6 +566,20 @@ def extract_frames(
         except Exception as exc:
             result.errors.append(str(exc))
             continue
+
+        video_hash_full = ""
+        if compiled_rule.needs_video_hash:
+            try:
+                computed_hash = compute_video_hash(
+                    video_path, length=0, cancel_event=cancel_event
+                )
+            except OSError as exc:
+                result.errors.append(f"计算视频哈希失败 ({video_path.name}): {exc}")
+                continue
+            if computed_hash is None:
+                result.cancelled = True
+                break
+            video_hash_full = computed_hash
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -333,7 +605,6 @@ def extract_frames(
             target_dir = (
                 config.output_dir / name_key if config.create_video_subfolder else config.output_dir
             )
-            name_prefix = f"{config.prefix}{name_key}" if config.prefix else name_key
 
             def _emit_progress(frame_idx: int, last_saved: Path | None) -> None:
                 if progress_callback is None:
@@ -391,6 +662,7 @@ def extract_frames(
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     break
+                timestamp_ms = _resolve_frame_timestamp_ms(cap, frame_idx, info.fps)
 
                 while next_sample_at <= frame_idx + 1e-6:
                     next_sample_at += step
@@ -407,7 +679,16 @@ def extract_frames(
                 if not is_duplicate:
                     processed = _resize_if_needed(frame, config.max_dimension)
                     saved_for_video += 1
-                    out_path = target_dir / f"{name_prefix}_{saved_for_video:06d}{ext}"
+                    stem = compiled_rule.render(
+                        video=name_key,
+                        video_hash_full=video_hash_full,
+                        timestamp_ms=timestamp_ms,
+                        frame_idx=frame_idx,
+                        seq=saved_for_video,
+                    )
+                    out_path = _allocate_unique_run_path(
+                        target_dir, stem, ext, written_paths_in_run
+                    )
                     _write_image_unicode_safe(
                         out_path, processed, config.image_format, config.jpeg_quality
                     )

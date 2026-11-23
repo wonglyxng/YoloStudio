@@ -120,6 +120,31 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
         assert len(started_workers) == 0
         assert any("结束时间必须大于开始时间" in m for m in warnings)
 
+        # 5) 命名规则实时预览（含默认规则、格式联动、普通前缀、占位符模板）及非法规则前置拦截
+        tab.start_sec_spin.setValue(0.0)
+        tab.end_sec_spin.setValue(0.0)
+        assert "vc<32位视频SHA256>_f0000001500.jpg" in tab.naming_preview_label.text()
+
+        tab.format_combo.setCurrentText("png")
+        qt_app.processEvents()
+        assert "vc<32位视频SHA256>_f0000001500.png" in tab.naming_preview_label.text()
+
+        tab.naming_rule_edit.setText("cam1_")
+        qt_app.processEvents()
+        assert "cam1_demo_000001.png" in tab.naming_preview_label.text()
+
+        tab.naming_rule_edit.setText("{video}_f{ms:010d}")
+        qt_app.processEvents()
+        assert "demo_f0000001500.png" in tab.naming_preview_label.text()
+
+        warnings.clear()
+        tab.naming_rule_edit.setText("{invalid_key}")
+        qt_app.processEvents()
+        assert "不支持的占位符" in tab.naming_preview_label.text()
+        tab._on_start()
+        assert len(started_workers) == 0
+        assert any("不支持的占位符" in m for m in warnings)
+
         # 移除选中条目后列表再次为空，按钮恢复置灰
         tab._on_remove_selected()
         qt_app.processEvents()

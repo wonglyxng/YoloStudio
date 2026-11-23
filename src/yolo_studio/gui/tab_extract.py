@@ -40,6 +40,8 @@ from yolo_studio.core.frame_extractor import (
     ExtractionMode,
     ExtractionProgress,
     ExtractionResult,
+    compile_naming_rule,
+    preview_naming_rule,
 )
 from yolo_studio.gui.common import (
     PathPickerRow,
@@ -198,12 +200,27 @@ class ExtractTab(QWidget):
 
         naming_row = QHBoxLayout()
         naming_row.setSpacing(8)
-        self.prefix_edit = QLineEdit()
-        self.prefix_edit.setPlaceholderText("可选文件名前缀，如 cam1_")
+        self.naming_rule_edit = QLineEdit()
+        self.naming_rule_edit.setPlaceholderText(
+            "留空默认 vc{hash}_f{ms:010d}；可填前缀(如 cam1_)或模板(如 {video}_{seq:06d})"
+        )
+        self.naming_rule_edit.setToolTip(
+            "帧图片命名规则（不含扩展名）：\n"
+            "• 留空：默认按 vc + 视频SHA256前32位 + _f + 10位毫秒时长（如 vc9f86d0..._f0000001500.jpg）\n"
+            "• 普通文本（不含占位符，如 cam1_）：作为文件名前缀，输出 {前缀}{视频名}_{6位序号}\n"
+            "• 占位符模板：支持 {video}、{hash}(32位)、{hash_full}(64位)、{ms}(毫秒)、{frame}(帧号)、{seq}/{index}(保存序号)"
+        )
+        # 保留旧属性别名，兼容外部脚本或测试读取
+        self.prefix_edit = self.naming_rule_edit
         self.subfolder_chk = QCheckBox("按视频名分建子目录")
-        naming_row.addWidget(self.prefix_edit, 1)
+        naming_row.addWidget(self.naming_rule_edit, 1)
         naming_row.addWidget(self.subfolder_chk)
-        form.addRow("命名选项:", naming_row)
+        form.addRow("命名规则:", naming_row)
+
+        self.naming_preview_label = QLabel()
+        self.naming_preview_label.setWordWrap(True)
+        self.naming_preview_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        form.addRow("", self.naming_preview_label)
         align_form_labels([form])
 
         left.addWidget(param_group)
@@ -257,12 +274,14 @@ class ExtractTab(QWidget):
         self.clear_btn.clicked.connect(self._on_clear_videos)
         self.video_list.itemSelectionChanged.connect(self._refresh_list_action_states)
         self.format_combo.currentTextChanged.connect(self._on_format_changed)
+        self.naming_rule_edit.textChanged.connect(self._refresh_naming_preview)
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.open_dir_btn.clicked.connect(lambda: open_local_path(self.output_picker.path()))
         self.send_next_btn.clicked.connect(lambda: self.send_frames_dir.emit(self.output_picker.text()))
         self._on_mode_changed()
         self._on_format_changed()
+        self._refresh_naming_preview()
         self._refresh_list_action_states()
 
     def _on_mode_changed(self) -> None:
@@ -283,6 +302,23 @@ class ExtractTab(QWidget):
         )
         self.quality_label.setToolTip(tip)
         self.quality_spin.setToolTip(tip)
+        self._refresh_naming_preview()
+
+    def _refresh_naming_preview(self) -> None:
+        """按当前命名规则与输出图片格式实时刷新示例文件名，并在规则非法时给出红色提示。"""
+        raw_rule = self.naming_rule_edit.text().strip()
+        image_format = self.format_combo.currentText().strip() or "jpg"
+        try:
+            sample = preview_naming_rule(naming_rule=raw_rule, image_format=image_format)
+        except ValueError as exc:
+            self.naming_preview_label.setStyleSheet("color: #cf222e; font-size: 12px;")
+            self.naming_preview_label.setText(str(exc))
+            return
+        self.naming_preview_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        if not raw_rule:
+            self.naming_preview_label.setText(f"默认命名示例：{sample}")
+        else:
+            self.naming_preview_label.setText(f"命名示例：{sample}")
 
     def _refresh_list_action_states(self) -> None:
         """按当前锁定状态、列表数量与选中态刷新增删与清空按钮的可用性。"""
@@ -396,6 +432,13 @@ class ExtractTab(QWidget):
             )
             return
 
+        naming_rule = self.naming_rule_edit.text().strip()
+        try:
+            compile_naming_rule(naming_rule=naming_rule)
+        except ValueError as exc:
+            QMessageBox.warning(self, "提示", str(exc))
+            return
+
         config = ExtractionConfig(
             output_dir=Path(out_text),
             mode=self.mode_combo.currentData(),
@@ -408,7 +451,7 @@ class ExtractTab(QWidget):
             max_dimension=self.max_dim_spin.value(),
             image_format=self.format_combo.currentText(),
             jpeg_quality=self.quality_spin.value(),
-            prefix=self.prefix_edit.text().strip(),
+            naming_rule=naming_rule,
             create_video_subfolder=self.subfolder_chk.isChecked(),
         )
 
