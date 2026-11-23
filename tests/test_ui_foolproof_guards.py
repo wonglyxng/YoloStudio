@@ -339,11 +339,13 @@ def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
         assert tab.refine_mode_combo.isEnabled() is False
         assert tab.guideline_edit.isEnabled() is False
 
-        # 训练回填 best.pt 在 SAM 3 模式下不覆写用户指定的 sam3.pt
+        # 训练回填 best.pt 在 SAM 3 模式下不覆写用户指定的 sam3.pt，但切回基准模型模式后可自动恢复 best.pt
         fake_sam3_pt = tmp_path / "sam3.pt"
         fake_sam3_pt.write_bytes(b"sam3")
+        fake_best_pt = tmp_path / "best.pt"
+        fake_best_pt.write_bytes(b"best")
         tab.weights_picker.setText(str(fake_sam3_pt))
-        tab.set_weights_path(str(tmp_path / "best.pt"))
+        tab.set_weights_path(str(fake_best_pt))
         assert Path(tab.weights_picker.text()) == fake_sam3_pt
 
         # 清空 API Key 并切到 Gemini（无环境变量），纯本地 SAM 3 无需 Key 即可直接启动
@@ -368,6 +370,14 @@ def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
         tab._on_start()
         assert len(started_configs) == prev_started
         assert any("GEMINI_API_KEY" in m for m in warnings)
+
+        # 切回基准模型模式时自动恢复此前记忆的 best.pt，再切回 SAM 3 时恢复 sam3.pt
+        tab.source_mode_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+        assert Path(tab.weights_picker.text()) == fake_best_pt
+        tab.source_mode_combo.setCurrentIndex(sam3_idx)
+        qt_app.processEvents()
+        assert Path(tab.weights_picker.text()) == fake_sam3_pt
     finally:
         tab.close()
 

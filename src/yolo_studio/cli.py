@@ -453,7 +453,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="yolo_predict",
         help="候选标注来源：yolo_predict(基准模型预标) / existing_json(已有.json) / llm_zero_shot(零样本) / sam3_text(SAM 3文本自动标注)",
     )
-    p_rv.add_argument("-w", "--weights", default="", help="模型 .pt 路径（yolo_predict 传基准 best.pt，sam3_text 传本地 sam3.pt）")
+    p_rv.add_argument(
+        "-w",
+        "--weights",
+        default="",
+        help="模型 .pt 路径（yolo_predict 传基准 best.pt；sam3_text 传本地 sam3.pt，留空自动识别 weights/sam3.pt）",
+    )
     p_rv.add_argument("-a", "--annotations", default="", help="已有 .json 目录 (existing_json 模式)")
     p_rv.add_argument("--yolo-conf", type=float, default=0.12)
     p_rv.add_argument("--yolo-iou", type=float, default=0.60)

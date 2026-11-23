@@ -16,3 +16,6 @@ pydantic>=2.0.0
 
 # 开发与单元测试依赖（对应 pyproject.toml 中的 [project.optional-dependencies].dev）
 pytest>=8.0.0
+
+# 可选：SAM 3 文本自动标注依赖（需额外执行：
+#   pip install --no-deps git+https://github.com/ultralytics/CLIP.git && pip install ftfy regex timm）

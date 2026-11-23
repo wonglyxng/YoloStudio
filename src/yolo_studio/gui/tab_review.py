@@ -74,6 +74,7 @@ from yolo_studio.core.mllm_reviewer import (
     format_record_detail_summary,
     load_review_report,
     render_review_comparison,
+    resolve_sam3_weights,
 )
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.common import (
@@ -193,6 +194,8 @@ class MllmReviewTab(QWidget):
         self._settings_dirty: bool = False
         self._last_output_dir: Path = workspace_root / "data" / "smart_labeled"
         self._last_classes_txt: str = ""
+        self._last_yolo_weights: str = ""
+        self._last_sam3_weights: str = ""
         self._count_timer = QTimer(self)
         self._count_timer.setSingleShot(True)
         self._count_timer.setInterval(150)
@@ -211,9 +214,11 @@ class MllmReviewTab(QWidget):
             self._refresh_images_count()
 
     def set_weights_path(self, path_str: str) -> None:
-        """跨页写入：将新训练的 `best.pt` 路径更新至权重输入框（SAM 3 模式下保留用户所选 `sam3.pt` 不覆盖）。"""
-        if path_str and self.source_mode_combo.currentData() != ReviewSourceMode.SAM3_TEXT:
-            self.weights_picker.setText(path_str)
+        """跨页写入：将新训练的 `best.pt` 路径更新至权重输入框（SAM 3 模式下仅记忆，保留用户所选 `sam3.pt`）。"""
+        if path_str:
+            self._last_yolo_weights = path_str
+            if self.source_mode_combo.currentData() != ReviewSourceMode.SAM3_TEXT:
+                self.weights_picker.setText(path_str)
 
     @staticmethod
     def _tune_form(form: QFormLayout) -> None:
@@ -907,14 +912,30 @@ class MllmReviewTab(QWidget):
 
         self.source_mode_hint_label.setText(SOURCE_MODE_HINTS.get(source_mode, ""))
         self.weights_picker.setEnabled(uses_primary_pt)
+        cur_w = self.weights_picker.text().strip()
         if is_sam3:
+            if cur_w and "sam3" not in Path(cur_w).name.lower():
+                self._last_yolo_weights = cur_w
+            if not cur_w or "sam3" not in Path(cur_w).name.lower():
+                auto_sam3: str = ""
+                if self._last_sam3_weights and Path(self._last_sam3_weights).is_file():
+                    auto_sam3 = self._last_sam3_weights
+                else:
+                    found = resolve_sam3_weights(workspace_root=self.workspace_root)
+                    if found is not None:
+                        auto_sam3 = str(found)
+                self.weights_picker.setText(auto_sam3)
             self.weights_picker.line_edit.setPlaceholderText(
-                "选择本地 sam3.pt 权重（Meta 受限权重，需预先从 HuggingFace 下载至本地）"
+                "自动识别 weights/sam3.pt（或手动选择本地 sam3.pt / sam3.1_multiplex.pt）"
             )
             self.yolo_conf_spin.setToolTip(
                 "SAM 3 置信度阈值：纯本地模式建议 0.25~0.40；启用 LLM 二次质检时可调低至 0.15~0.25 拉高召回"
             )
         else:
+            if is_yolo:
+                if cur_w and "sam3" in Path(cur_w).name.lower():
+                    self._last_sam3_weights = cur_w
+                    self.weights_picker.setText(self._last_yolo_weights)
             self.weights_picker.line_edit.setPlaceholderText(
                 "选择基准模型 best.pt 权重（可先在标注工作台标少量样本训练得出）"
             )
@@ -1444,13 +1465,20 @@ class MllmReviewTab(QWidget):
         ):
             QMessageBox.warning(self, "提示", "请选择有效的基准模型 .pt 权重文件。")
             return
-        if is_sam3 and (not cfg.weights_path or not cfg.weights_path.is_file()):
-            QMessageBox.warning(
-                self,
-                "提示",
-                "请选择有效的本地 SAM 3 权重文件（如 sam3.pt；该权重为 Meta 受限模型，需预先从 HuggingFace 下载至本地）。",
-            )
-            return
+        if is_sam3:
+            if not cfg.weights_path:
+                auto_sam3 = resolve_sam3_weights(workspace_root=self.workspace_root)
+                if auto_sam3 is not None:
+                    cfg.weights_path = auto_sam3
+                    self.weights_picker.setText(str(auto_sam3))
+            if not cfg.weights_path or not cfg.weights_path.is_file():
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "未找到有效的本地 SAM 3 权重文件（如 weights/sam3.pt 或 sam3.1_multiplex.pt；"
+                    "可从魔搭社区 facebook/sam3 免审批下载放入 weights/ 目录自动识别，或在上方手动选择）。",
+                )
+                return
         if cfg.source_mode in {ReviewSourceMode.LLM_ZERO_SHOT, ReviewSourceMode.SAM3_TEXT} and not cfg.allowed_classes:
             mode_tip = (
                 "SAM 3 文本自动标注模式必须填写「目标类别清单」（支持 类别名=英文提示词，如 头盔=safety helmet）。"

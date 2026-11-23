@@ -1064,3 +1064,19 @@ def test_sam3_text_pure_local_and_with_llm_review(tmp_path: Path, monkeypatch) -
     report_hybrid = json.loads(res_hybrid.report_path.read_text(encoding="utf-8"))
     assert report_hybrid["source_mode"] == "sam3_text"
     assert report_hybrid["sam3_enable_llm_review"] is True
+
+    # 5) 验证 resolve_sam3_weights 自动发现 workspace_root/weights 下的 sam3.pt / sam3.1_multiplex.pt，
+    #    且显式传入不存在路径时返回 None（不静默回退）
+    from yolo_studio.core.mllm_reviewer import resolve_sam3_weights
+
+    ws = tmp_path / "ws_auto"
+    ws_weights = ws / "weights"
+    ws_weights.mkdir(parents=True)
+    sam31 = ws_weights / "sam3.1_multiplex.pt"
+    sam31.write_bytes(b"fake-sam31")
+    assert resolve_sam3_weights(None, workspace_root=ws) == sam31.resolve()
+
+    sam30 = ws_weights / "sam3.pt"
+    sam30.write_bytes(b"fake-sam30")
+    assert resolve_sam3_weights(None, workspace_root=ws) == sam30.resolve()
+    assert resolve_sam3_weights(tmp_path / "definitely_missing.pt", workspace_root=ws) is None

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -152,6 +153,158 @@ SAM_REFINE_MODELS: list[tuple[str, str]] = [
     ("sam2.1_b.pt", "SAM 2.1 Base (更高边缘精度)"),
     ("mobile_sam.pt", "MobileSAM (超轻量快速分割)"),
 ]
+
+# 本地 SAM 3 自动发现默认权重名顺序及对应的魔搭（ModelScope）官方公开镜像仓库
+SAM3_DEFAULT_WEIGHT_NAMES: tuple[str, ...] = ("sam3.pt", "sam3.1_multiplex.pt")
+SAM3_MODELSCOPE_REPOS: dict[str, str] = {
+    "sam3.pt": "facebook/sam3",
+    "sam3.1_multiplex.pt": "facebook/sam3.1",
+}
+
+
+def resolve_sam3_weights(
+    weights_path: Path | None = None,
+    workspace_root: Path | None = None,
+) -> Path | None:
+    """解析本地 SAM 3 / SAM 3.1 权重文件绝对路径；未命中时返回 `None`。
+
+    查找规则：
+        - 若显式传入 `weights_path`：仅当该文件存在且非空时返回其绝对路径，不静默回退其他文件；
+        - 若 `weights_path` 为 `None`：按目录优先级依次检索环境变量 `YOLO_STUDIO_WEIGHTS_DIR`、
+          `workspace_root / "weights"`、`Path.cwd() / "weights"`、应用代码根 `weights/`
+          及独立便携包根 `<便携包根>/weights/`；在每个目录内按 `SAM3_DEFAULT_WEIGHT_NAMES`
+          顺序（优先 `sam3.pt`，其次 `sam3.1_multiplex.pt`）查找非空文件。
+          目录优先级高于文件名优先级，保证工作区权重不被仓库默认权重覆盖。
+    """
+    if weights_path is not None:
+        return weights_path.resolve() if (weights_path.is_file() and weights_path.stat().st_size > 0) else None
+
+    from yolo_studio.core.trainer import WEIGHTS_DIR_ENV_VAR
+
+    code_root = Path(__file__).resolve().parents[3]
+    search_dirs: list[Path] = []
+    env_weights = os.environ.get(WEIGHTS_DIR_ENV_VAR, "").strip()
+    if env_weights:
+        search_dirs.append(Path(env_weights).expanduser())
+    if workspace_root is not None:
+        search_dirs.append(workspace_root / "weights")
+    search_dirs.extend(
+        [
+            Path.cwd() / "weights",
+            code_root / "weights",
+            code_root.parent / "weights",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for folder in search_dirs:
+        try:
+            resolved_dir = folder.resolve()
+        except OSError:
+            continue
+        if resolved_dir in seen:
+            continue
+        seen.add(resolved_dir)
+        for name in SAM3_DEFAULT_WEIGHT_NAMES:
+            candidate = resolved_dir / name
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate.resolve()
+    return None
+
+
+def download_sam3_from_modelscope(
+    dest_dir: Path,
+    filename: str = "sam3.pt",
+    repo_id: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    cancel_event: Event | None = None,
+) -> Path:
+    """从魔搭社区（ModelScope）公开镜像下载 SAM 3 / SAM 3.1 `.pt` 权重并校验文件大小与 SHA-256。
+
+    断点续传与原子落盘：
+        先写入 `<filename>.part` 临时文件并支持 HTTP Range 续传；全部接收并完成体积与 SHA-256 校验后
+        原子重命名为目标 `.pt` 文件。取消下载或校验失败时抛出 `RuntimeError`。
+    """
+    import httpx
+
+    resolved_repo = (repo_id or "").strip() or SAM3_MODELSCOPE_REPOS.get(filename, "facebook/sam3")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / filename
+    part = dest_dir / f"{filename}.part"
+
+    with httpx.Client(timeout=httpx.Timeout(30.0, read=60.0), follow_redirects=True) as client:
+        meta_resp = client.get(f"https://modelscope.cn/api/v1/models/{resolved_repo}/repo/files")
+        meta_resp.raise_for_status()
+        meta_json = meta_resp.json()
+        files = meta_json.get("Data", {}).get("Files", []) if isinstance(meta_json.get("Data"), dict) else []
+        finfo = next((f for f in files if f.get("Name") == filename), None)
+        if not finfo:
+            raise FileNotFoundError(f"魔搭仓库 {resolved_repo} 中未找到权重文件 {filename}。")
+
+        expected_size = int(finfo.get("Size") or 0)
+        expected_sha256 = str(finfo.get("Sha256") or "").strip().lower()
+        if target.is_file() and expected_size > 0 and target.stat().st_size == expected_size:
+            if progress_callback:
+                progress_callback(expected_size, expected_size)
+            return target.resolve()
+
+        url = f"https://modelscope.cn/api/v1/models/{resolved_repo}/repo?Revision=master&FilePath={filename}"
+        downloaded = part.stat().st_size if part.is_file() else 0
+        if expected_size > 0 and downloaded > expected_size:
+            part.unlink()
+            downloaded = 0
+
+        for attempt in range(1, 6):
+            if cancel_event and cancel_event.is_set():
+                raise RuntimeError("已取消 SAM 3 权重下载。")
+            downloaded = part.stat().st_size if part.is_file() else 0
+            if expected_size > 0 and downloaded >= expected_size:
+                break
+            headers = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else {}
+            mode = "ab" if downloaded > 0 else "wb"
+            try:
+                with client.stream("GET", url, headers=headers) as resp:
+                    if resp.status_code not in (200, 206):
+                        raise RuntimeError(f"魔搭下载响应异常: HTTP {resp.status_code}")
+                    if resp.status_code == 200 and downloaded > 0:
+                        downloaded = 0
+                        mode = "wb"
+                    with open(part, mode) as fh:
+                        for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                            if cancel_event and cancel_event.is_set():
+                                raise RuntimeError("已取消 SAM 3 权重下载。")
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback and expected_size > 0:
+                                progress_callback(downloaded, expected_size)
+            except RuntimeError:
+                raise
+            except Exception:
+                if attempt >= 5:
+                    raise
+                time.sleep(2.0)
+
+    actual_size = part.stat().st_size if part.is_file() else 0
+    if expected_size > 0 and actual_size != expected_size:
+        raise RuntimeError(f"SAM 3 权重下载不完整：已下载 {actual_size} 字节，预期 {expected_size} 字节。")
+
+    if expected_sha256:
+        digest = hashlib.sha256()
+        with open(part, "rb") as fh:
+            while True:
+                buf = fh.read(8 * 1024 * 1024)
+                if not buf:
+                    break
+                digest.update(buf)
+        got_sha = digest.hexdigest().lower()
+        if got_sha != expected_sha256:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"SAM 3 权重 SHA-256 校验失败：期望 {expected_sha256}，实际 {got_sha}。")
+
+    part.replace(target)
+    return target.resolve()
 
 
 OPENAI_PRESETS: list[tuple[str, str, str]] = [
@@ -763,8 +916,8 @@ class UltralyticsSam3Detector:
                 results = self._predictor(source=img_bgr, text=text_prompts)
             except (ImportError, ModuleNotFoundError) as exc:
                 raise RuntimeError(
-                    f"加载 SAM 3 文本分词器失败: {exc}。"
-                    "请在当前 Python 环境安装依赖：pip install git+https://github.com/ultralytics/CLIP.git"
+                    f"加载 SAM 3 文本分词器或视觉依赖失败: {exc}。"
+                    "请在当前 Python 环境安装依赖：pip install --no-deps git+https://github.com/ultralytics/CLIP.git && pip install ftfy regex timm"
                 ) from exc
 
         if not results:
@@ -1519,17 +1672,18 @@ def _discover_sam3_candidates(
     if detector_override is not None:
         detector: Sam3DetectorProtocol = detector_override
     else:
-        if not config.weights_path or not config.weights_path.is_file():
+        resolved_weights = resolve_sam3_weights(config.weights_path)
+        if resolved_weights is None:
             raise FileNotFoundError(
-                f"SAM 3 权重文件不存在: {config.weights_path}（请先下载本地 sam3.pt 权重并在界面选择）。"
+                f"SAM 3 权重文件不存在: {config.weights_path or 'weights/sam3.pt'}（可从魔搭 facebook/sam3 下载 sam3.pt 放入 weights/ 目录后自动识别）。"
             )
         if log_callback:
             log_callback(
-                f"正在加载本地 SAM 3 模型 {config.weights_path.name} 对 {len(images)} 张图片执行文本自动标注 "
+                f"正在加载本地 SAM 3 模型 {resolved_weights.name} 对 {len(images)} 张图片执行文本自动标注 "
                 f"(提示词: {text_prompts}, conf={config.yolo_conf}, device={config.yolo_device})..."
             )
         detector = UltralyticsSam3Detector(
-            config.weights_path,
+            resolved_weights,
             conf=config.yolo_conf,
             iou=config.yolo_iou,
             imgsz=config.yolo_imgsz,
