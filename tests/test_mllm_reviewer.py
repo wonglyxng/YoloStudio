@@ -680,6 +680,25 @@ def test_cli_review_default_output_and_source_mode_hints() -> None:
     assert zs_args.box_refine == "sam_local"
     assert zs_args.classes == "person,helmet"
 
+    sam3_args = parser.parse_args(
+        [
+            "review",
+            "-i",
+            "data/raw_frames",
+            "--source-mode",
+            "sam3_text",
+            "-w",
+            "sam3.pt",
+            "--classes",
+            "安全帽=safety helmet,person",
+            "--sam3-llm-review",
+        ]
+    )
+    assert sam3_args.source_mode == "sam3_text"
+    assert sam3_args.weights == "sam3.pt"
+    assert sam3_args.sam3_llm_review is True
+    assert sam3_args.classes == "安全帽=safety helmet,person"
+
     for _, label in SOURCE_MODE_ITEMS:
         assert "MLLM" not in label
     for hint in SOURCE_MODE_HINTS.values():
@@ -872,3 +891,176 @@ def test_zero_shot_mode_with_sam_local_refinement_and_safety_gate(tmp_path: Path
     assert "新增标注+收框[person]" in summary
     assert "过松/超门禁待修" in summary
     assert render_review_comparison(rec)[:2] == b"\xff\xd8"
+
+
+def test_sam3_text_pure_local_and_with_llm_review(tmp_path: Path, monkeypatch) -> None:
+    """验证 `SAM3_TEXT` 提示词映射、纯本地零 API 费用分流，以及叠加 LLM 二次质检的完整闭环。"""
+    import pytest
+
+    from yolo_studio.core.mllm_reviewer import (
+        BoxRefineMode,
+        format_record_detail_summary,
+        parse_sam3_class_prompts,
+    )
+
+    # 1) 类别与英文提示词映射解析（支持半角/全角等号与去重）
+    cls_names, prompts = parse_sam3_class_prompts(
+        [" 人物 = person ", "安全帽＝safety helmet", "car", "人物=duplicate", " "]
+    )
+    assert cls_names == ["人物", "安全帽", "car"]
+    assert prompts == ["person", "safety helmet", "car"]
+
+    in_dir = tmp_path / "raw"
+    out_local = tmp_path / "out_local"
+    _write_img(in_dir / "01_high.jpg", (400, 200))
+    _write_img(in_dir / "02_low.jpg", (400, 200))
+    _write_img(in_dir / "03_empty.jpg", (400, 200))
+    _write_img(in_dir / "04_err.jpg", (400, 200))
+
+    # 2) 缺失类别或缺失本地 sam3.pt 明确报错
+    with pytest.raises(ValueError, match="目标类别清单"):
+        run_mllm_review(
+            MllmReviewConfig(
+                images_dir=in_dir,
+                output_dir=out_local,
+                source_mode=ReviewSourceMode.SAM3_TEXT,
+                allowed_classes=[],
+            )
+        )
+    with pytest.raises(FileNotFoundError, match="SAM 3 权重文件不存在"):
+        run_mllm_review(
+            MllmReviewConfig(
+                images_dir=in_dir,
+                output_dir=out_local,
+                source_mode=ReviewSourceMode.SAM3_TEXT,
+                weights_path=tmp_path / "missing_sam3.pt",
+                allowed_classes=["person"],
+            )
+        )
+
+    class _FakeSam3Detector:
+        def __init__(self) -> None:
+            self.seen_prompts: list[tuple[list[str], list[str]]] = []
+
+        def detect_image(
+            self,
+            image_path: Path,
+            class_names: list[str],
+            text_prompts: list[str],
+        ) -> list[CandidateBox]:
+            self.seen_prompts.append((list(class_names), list(text_prompts)))
+            if image_path.name == "01_high.jpg":
+                return [
+                    CandidateBox(
+                        box_id=0,
+                        label=class_names[0],
+                        x1=40.0,
+                        y1=20.0,
+                        x2=160.0,
+                        y2=180.0,
+                        confidence=0.92,
+                        original_label=class_names[0],
+                    )
+                ]
+            if image_path.name == "02_low.jpg":
+                return [
+                    CandidateBox(
+                        box_id=0,
+                        label=class_names[1],
+                        x1=200.0,
+                        y1=30.0,
+                        x2=320.0,
+                        y2=150.0,
+                        confidence=0.42,
+                        original_label=class_names[1],
+                    )
+                ]
+            if image_path.name == "04_err.jpg":
+                raise RuntimeError("模拟单图解码失败")
+            return []
+
+    # 3) 纯本地模式：清空环境变量 Key 且不传 client_override，仍可直接成功运行
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    detector = _FakeSam3Detector()
+    res_local = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_local,
+            source_mode=ReviewSourceMode.SAM3_TEXT,
+            allowed_classes=["人物=person", "安全帽=safety helmet"],
+            sam3_enable_llm_review=False,
+            high_conf_skip=0.85,
+            box_refine_mode=BoxRefineMode.SAM_LOCAL,  # 纯本地模式应自动忽略二次收框
+            max_workers=1,
+        ),
+        sam3_detector_override=detector,
+    )
+
+    assert detector.seen_prompts[0] == (["人物", "安全帽"], ["person", "safety helmet"])
+    assert res_local.classes == ["人物", "安全帽"]
+    assert res_local.auto_passed_count == 1
+    assert res_local.need_review_count == 3
+    assert res_local.error_count == 1
+    assert res_local.classes_txt_path is not None
+    assert res_local.classes_txt_path.read_text(encoding="utf-8").splitlines() == ["人物", "安全帽"]
+
+    rec_high = next(r for r in res_local.records if r.image_path.name == "01_high.jpg")
+    assert rec_high.triage_bucket == "auto_passed"
+    assert rec_high.added_count == 1
+    assert rec_high.before_boxes == []
+    assert "SAM 3 自动标注检出 1 个高置信度目标" in format_record_detail_summary(rec_high)
+    assert render_review_comparison(rec_high)[:2] == b"\xff\xd8"
+
+    rec_low = next(r for r in res_local.records if r.image_path.name == "02_low.jpg")
+    assert rec_low.triage_bucket == "need_review"
+    assert "低置信度" in rec_low.missing_note
+
+    rec_empty = next(r for r in res_local.records if r.image_path.name == "03_empty.jpg")
+    assert rec_empty.triage_bucket == "need_review"
+    assert rec_empty.output_json_path is not None and rec_empty.output_json_path.is_file()
+    assert json.loads(rec_empty.output_json_path.read_text(encoding="utf-8"))["shapes"] == []
+
+    report_local = json.loads(res_local.report_path.read_text(encoding="utf-8"))
+    assert report_local["source_mode"] == "sam3_text"
+    assert report_local["sam3_enable_llm_review"] is False
+    assert report_local["box_refine_mode"] == "off"
+
+    # 4) SAM 3 预标 + LLM 二次质检：对 SAM 3 候选框执行改类/删误检，正确分流至 llm_fixed
+    out_hybrid = tmp_path / "out_hybrid"
+    hybrid_dir = tmp_path / "hybrid_in"
+    _write_img(hybrid_dir / "01_high.jpg", (400, 200))
+    _write_img(hybrid_dir / "02_low.jpg", (400, 200))
+    fake_llm = _FakeMllmClient(
+        [
+            MllmReviewResponse(
+                box_reviews=[BoxDecision(box_id=0, action="keep", reason="ok")],
+                has_missing=False,
+            ),
+            MllmReviewResponse(
+                box_reviews=[BoxDecision(box_id=0, action="relabel", new_label="人物", reason="误标为安全帽")],
+                has_missing=False,
+            ),
+        ]
+    )
+    res_hybrid = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=hybrid_dir,
+            output_dir=out_hybrid,
+            source_mode=ReviewSourceMode.SAM3_TEXT,
+            allowed_classes=["人物=person", "安全帽=safety helmet"],
+            sam3_enable_llm_review=True,
+            max_workers=1,
+        ),
+        client_override=fake_llm,
+        sam3_detector_override=_FakeSam3Detector(),
+    )
+    assert len(fake_llm.calls) == 2
+    assert res_hybrid.auto_passed_count == 1
+    assert res_hybrid.llm_fixed_count == 1
+    rec_fixed = next(r for r in res_hybrid.records if r.image_path.name == "02_low.jpg")
+    assert rec_fixed.relabeled_count == 1
+    assert rec_fixed.after_boxes[0].label == "人物"
+    report_hybrid = json.loads(res_hybrid.report_path.read_text(encoding="utf-8"))
+    assert report_hybrid["source_mode"] == "sam3_text"
+    assert report_hybrid["sam3_enable_llm_review"] is True

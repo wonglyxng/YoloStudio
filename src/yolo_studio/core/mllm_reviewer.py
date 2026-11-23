@@ -1,9 +1,10 @@
 """基于多模态大语言模型（LLM）的智能标注、质检精修与漏标发现引擎。
 
 职责：
-    串联“候选框发现（基准 YOLO 模型低阈值推理、读取已有 X-AnyLabeling `.json`，或 LLM 零样本直接标注）→
-    带编号总览图与局部裁剪图渲染（零样本模式直接发送干净原图）→ 多模态大模型结构化识别与质检精修 →
-    决策合并去重与可选本地 SAM 像素级收边 → 结果分流落盘（`auto_passed` / `llm_fixed` / `need_review`）与前后对比图生成”。
+    串联“候选框发现（基准 YOLO 模型低阈值推理、读取已有 X-AnyLabeling `.json`、LLM 零样本直接标注，
+    或本地 SAM 3 文本概念自动标注）→ 带编号总览图与局部裁剪图渲染（零样本模式直接发送干净原图）→
+    多模态大模型结构化识别与质检精修（纯本地 SAM 3 模式可跳过 LLM）→ 决策合并去重与可选本地 SAM 像素级收边 →
+    结果分流落盘（`auto_passed` / `llm_fixed` / `need_review`）与前后对比图生成”。
 
 运行环境：
     Python >= 3.11，依赖 `opencv-python`、`numpy`、`Pillow`、`pydantic`；
@@ -56,18 +57,20 @@ class ReviewSourceMode(str, Enum):
     YOLO_PREDICT = "yolo_predict"
     EXISTING_JSON = "existing_json"
     LLM_ZERO_SHOT = "llm_zero_shot"
+    SAM3_TEXT = "sam3_text"
 
 
 SOURCE_MODE_ITEMS: list[tuple[ReviewSourceMode, str]] = [
     (ReviewSourceMode.YOLO_PREDICT, "基准模型预标 + LLM 质检精修（推荐）"),
     (ReviewSourceMode.EXISTING_JSON, "已有标注 (.json) + LLM 质检精修"),
     (ReviewSourceMode.LLM_ZERO_SHOT, "LLM 零样本直接标注（冷启动，无需模型）"),
+    (ReviewSourceMode.SAM3_TEXT, "SAM 3 文本自动标注（本地免费 / 可选 LLM 质检）"),
 ]
 
 SOURCE_MODE_HINTS: dict[ReviewSourceMode, str] = {
     ReviewSourceMode.YOLO_PREDICT: (
         "先用基准 .pt 低阈值推理拉高召回，再由 LLM 剔除误检、改类、补漏与收框；"
-        "尚无模型时可切换「LLM 零样本直接标注」冷启动，或在「2. 标注工作台」标少量样本训练。"
+        "尚无模型时可切换「LLM 零样本直接标注」或「SAM 3 文本自动标注」冷启动。"
     ),
     ReviewSourceMode.EXISTING_JSON: (
         "读取已有 X-AnyLabeling .json 标注，由 LLM 质检、补漏与收框，并将疑难样本分流到 need_review。"
@@ -76,7 +79,41 @@ SOURCE_MODE_HINTS: dict[ReviewSourceMode, str] = {
         "无需预训练模型或已有标注，必填「目标类别清单」由 LLM 直接全图定位目标（推荐配合「本地 SAM 像素级收紧」自动贴边）；"
         "检出有目标的图片统一进入 need_review 供工作台快速过目确认。"
     ),
+    ReviewSourceMode.SAM3_TEXT: (
+        "加载本地 sam3.pt，按「目标类别清单」（支持“类别名=英文提示词”如 头盔=safety helmet）直接输出像素级贴边框；"
+        "默认纯本地零 API 费用，勾选「启用 LLM 二次质检」即可叠加复杂业务规则删误检、改类与补漏。"
+    ),
 }
+
+
+def parse_sam3_class_prompts(raw_entries: list[str]) -> tuple[list[str], list[str]]:
+    """解析 SAM 3 目标类别与文本提示词清单，支持 `类别名` 或 `类别名=英文提示词` 语法。
+
+    示例：
+        `["person", "头盔=safety helmet"]` → `(["person", "头盔"], ["person", "safety helmet"])`。
+        保留首次出现的类别顺序，忽略空白项及重复类别名。
+    """
+    class_names: list[str] = []
+    text_prompts: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_entries:
+        item = raw.strip()
+        if not item:
+            continue
+        normalized = item.replace("＝", "=")
+        if "=" in normalized:
+            cls_part, prompt_part = normalized.split("=", 1)
+            cls_name = cls_part.strip()
+            prompt = prompt_part.strip() or cls_name
+        else:
+            cls_name = item
+            prompt = item
+        if not cls_name or cls_name in seen:
+            continue
+        seen.add(cls_name)
+        class_names.append(cls_name)
+        text_prompts.append(prompt)
+    return class_names, text_prompts
 
 
 class MllmProvider(str, Enum):
@@ -271,6 +308,7 @@ class MllmReviewConfig:
     box_refine_mode: BoxRefineMode = BoxRefineMode.OFF
     sam_model_name: str = "sam2.1_t.pt"
     sam_refine_all_kept: bool = False
+    sam3_enable_llm_review: bool = False
     refine_min_area_ratio: float = 0.15
     refine_min_iou: float = 0.25
 
@@ -310,6 +348,17 @@ class BoxRefinerProtocol(Protocol):
     def refine_boxes(
         self, image_bgr: np.ndarray, boxes: list[CandidateBox]
     ) -> dict[int, tuple[float, float, float, float] | None]: ...
+
+
+class Sam3DetectorProtocol(Protocol):
+    """SAM 3 文本概念自动标注检测器抽象协议（输入图片路径、输出类别名与文本提示词，返回像素候选框）。"""
+
+    def detect_image(
+        self,
+        image_path: Path,
+        class_names: list[str],
+        text_prompts: list[str],
+    ) -> list[CandidateBox]: ...
 
 
 def _read_image_unicode_safe(image_path: Path) -> np.ndarray:
@@ -645,6 +694,141 @@ class UltralyticsSamBoxRefiner:
             if (nx2 - nx1) > 2.0 and (ny2 - ny1) > 2.0:
                 refined_map[box.box_id] = (nx1, ny1, min(float(img_w), nx2), min(float(img_h), ny2))
         return refined_map
+
+
+class UltralyticsSam3Detector:
+    """基于 `ultralytics.models.sam.SAM3SemanticPredictor` 的本地 SAM 3 文本概念自动标注检测器。
+
+    运行环境与前置依赖：
+        依赖 `ultralytics >= 8.4`（提供 `SAM3SemanticPredictor`）、`clip` 分词器包
+        （`pip install git+https://github.com/ultralytics/CLIP.git`）以及本地 `sam3.pt` 权重文件
+        （Meta 受限权重，需预先从 HuggingFace 下载至本地）。
+        GPU 设备下通过 `quantize=16` 启用 FP16 推理降低显存占用，CPU 下由底层自动回退至 FP32。
+        内部持 `threading.Lock` 串行化推理调用，并使用 Unicode 安全读图以兼容 Windows 中文路径。
+    """
+
+    def __init__(
+        self,
+        weights_path: Path,
+        *,
+        conf: float = 0.25,
+        iou: float = 0.60,
+        imgsz: int = 640,
+        device: str = "0",
+    ) -> None:
+        if not weights_path or not weights_path.is_file():
+            raise FileNotFoundError(
+                f"SAM 3 权重文件不存在: {weights_path}（sam3.pt 为 Meta 受限权重，请先下载至本地后再选择）。"
+            )
+        try:
+            from ultralytics.models.sam import SAM3SemanticPredictor
+        except ImportError as exc:
+            raise RuntimeError(
+                "当前 ultralytics 版本不支持 SAM3SemanticPredictor，请升级 ultralytics 至最新版本。"
+            ) from exc
+
+        from yolo_studio.core.trainer import ensure_torch_cpu_threads
+
+        ensure_torch_cpu_threads()
+        overrides: dict[str, object] = {
+            "model": str(weights_path),
+            "conf": float(conf),
+            "iou": float(iou),
+            "imgsz": int(imgsz),
+            "device": str(device),
+            "task": "segment",
+            "mode": "predict",
+            "quantize": 16,
+            "save": False,
+            "verbose": False,
+        }
+        self._lock = Lock()
+        self._predictor = SAM3SemanticPredictor(overrides=overrides)
+
+    def detect_image(
+        self,
+        image_path: Path,
+        class_names: list[str],
+        text_prompts: list[str],
+    ) -> list[CandidateBox]:
+        """对单张图片按 `text_prompts` 执行 SAM 3 语义检测分割，并将类别索引映射回 `class_names`。"""
+        if not text_prompts:
+            return []
+        img_bgr = _read_image_unicode_safe(image_path)
+        img_h, img_w = img_bgr.shape[:2]
+
+        with self._lock:
+            self._predictor.features = None
+            try:
+                results = self._predictor(source=img_bgr, text=text_prompts)
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise RuntimeError(
+                    f"加载 SAM 3 文本分词器失败: {exc}。"
+                    "请在当前 Python 环境安装依赖：pip install git+https://github.com/ultralytics/CLIP.git"
+                ) from exc
+
+        if not results:
+            return []
+        res0 = results[0]
+        r_boxes = getattr(res0, "boxes", None)
+        if r_boxes is None or len(r_boxes) == 0:
+            return []
+
+        xyxy_list = r_boxes.xyxy.detach().cpu().tolist()
+        cls_list = r_boxes.cls.detach().cpu().tolist()
+        conf_list = r_boxes.conf.detach().cpu().tolist()
+
+        masks_obj = getattr(res0, "masks", None)
+        mask_arr = (
+            masks_obj.data.detach().cpu().numpy()
+            if (masks_obj is not None and getattr(masks_obj, "data", None) is not None)
+            else None
+        )
+
+        boxes: list[CandidateBox] = []
+        for idx, (xyxy, cls_id, score) in enumerate(zip(xyxy_list, cls_list, conf_list)):
+            cid = int(cls_id)
+            if 0 <= cid < len(class_names):
+                label = class_names[cid]
+            else:
+                label = f"class_{cid}"
+
+            x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+            # 若存在高分辨率像素掩码，优先取掩码最小外接矩形获得更紧贴像素边界的目标框
+            if mask_arr is not None and idx < len(mask_arr):
+                mask = mask_arr[idx]
+                mh, mw = mask.shape[:2]
+                if mh != img_h or mw != img_w:
+                    mask = cv2.resize(mask.astype(np.float32), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+                ys, xs = np.nonzero(mask > 0.5)
+                if len(xs) > 0 and len(ys) > 0:
+                    mx1 = float(int(xs.min()))
+                    my1 = float(int(ys.min()))
+                    mx2 = min(float(img_w), float(int(xs.max()) + 1))
+                    my2 = min(float(img_h), float(int(ys.max()) + 1))
+                    if (mx2 - mx1) > 2.0 and (my2 - my1) > 2.0:
+                        x1, y1, x2, y2 = mx1, my1, mx2, my2
+
+            x1 = max(0.0, min(float(img_w), x1))
+            y1 = max(0.0, min(float(img_h), y1))
+            x2 = max(0.0, min(float(img_w), x2))
+            y2 = max(0.0, min(float(img_h), y2))
+            if (x2 - x1) <= 2.0 or (y2 - y1) <= 2.0:
+                continue
+
+            boxes.append(
+                CandidateBox(
+                    box_id=len(boxes),
+                    label=str(label),
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    confidence=float(score),
+                    original_label=str(label),
+                )
+            )
+        return boxes
 
 
 def _render_overview_and_crops(
@@ -1321,6 +1505,50 @@ def _discover_yolo_candidates(
     return candidates_map, model_names
 
 
+def _discover_sam3_candidates(
+    images: list[Path],
+    class_names: list[str],
+    text_prompts: list[str],
+    config: MllmReviewConfig,
+    log_callback: Callable[[str], None] | None,
+    cancel_event: Event | None = None,
+    *,
+    detector_override: Sam3DetectorProtocol | None = None,
+) -> tuple[dict[Path, list[CandidateBox]], dict[Path, str]]:
+    """使用本地 SAM 3 按文本概念提示逐张推理获取像素级贴边候选框；单图异常不中断整批。"""
+    if detector_override is not None:
+        detector: Sam3DetectorProtocol = detector_override
+    else:
+        if not config.weights_path or not config.weights_path.is_file():
+            raise FileNotFoundError(
+                f"SAM 3 权重文件不存在: {config.weights_path}（请先下载本地 sam3.pt 权重并在界面选择）。"
+            )
+        if log_callback:
+            log_callback(
+                f"正在加载本地 SAM 3 模型 {config.weights_path.name} 对 {len(images)} 张图片执行文本自动标注 "
+                f"(提示词: {text_prompts}, conf={config.yolo_conf}, device={config.yolo_device})..."
+            )
+        detector = UltralyticsSam3Detector(
+            config.weights_path,
+            conf=config.yolo_conf,
+            iou=config.yolo_iou,
+            imgsz=config.yolo_imgsz,
+            device=config.yolo_device,
+        )
+
+    candidates_map: dict[Path, list[CandidateBox]] = {}
+    load_errors: dict[Path, str] = {}
+    for img_path in images:
+        if cancel_event and cancel_event.is_set():
+            break
+        try:
+            candidates_map[img_path] = detector.detect_image(img_path, class_names, text_prompts)
+        except Exception as exc:
+            candidates_map[img_path] = []
+            load_errors[img_path] = f"SAM 3 推理失败: {exc}"
+    return candidates_map, load_errors
+
+
 def _discover_json_candidates(
     images: list[Path],
     config: MllmReviewConfig,
@@ -1525,6 +1753,8 @@ def format_record_detail_summary(record: ImageReviewRecord) -> str:
 
     if not parts:
         if record.skipped_mllm:
+            if not record.before_boxes and record.after_boxes:
+                return f"SAM 3 自动标注检出 {len(record.after_boxes)} 个高置信度目标，自动通过"
             return f"高置信度/空框跳过 LLM（共 {len(record.after_boxes)} 框）"
         return f"全部 {len(record.after_boxes)} 个目标核验通过，无删改或漏标"
     return "；".join(parts)
@@ -1639,21 +1869,18 @@ def run_mllm_review(
     cancel_event: Event | None = None,
     *,
     refiner_override: BoxRefinerProtocol | None = None,
+    sam3_detector_override: Sam3DetectorProtocol | None = None,
 ) -> MllmReviewResult:
-    """执行基准候选框获取（或 LLM 零样本直接定位）、LLM 并发识别与质检、可选边框紧贴修正、结果分流与 `.json` 导出。
+    """执行候选框获取（YOLO 预标 / 已有 `.json` / LLM 零样本 / 本地 SAM 3 文本自动标注）、可选 LLM 并发质检与分流落盘。
 
     前置条件与失败方式：
         `images_dir` 不存在抛出 `FileNotFoundError`，无图片抛出 `ValueError`；
-        在 `YOLO_PREDICT` 模式下需存在有效 `weights_path`，在 `EXISTING_JSON` 模式下需存在标注目录，
-        在 `LLM_ZERO_SHOT` 模式下必须提供非空 `allowed_classes`（否则抛出 `ValueError`）。
-        单张图片处理异常（含已有标注读取失败）不会中止整批流程，而是将该图连同原始候选框写入
-        `need_review` 并记录 `error`；即使错误结果本身写出失败，也只记录到该图的 `error` 中，
-        保证 `review_report.json` 最终一定写出。
-
-    分流规则：
-        存在漏标提示、LLM 补框/零样本检出框、`relabel_invalid` 框或过松/超门禁标记 `refine_suspect` 框 → `need_review`；
-        有改类、删框或通过门禁的自动收框 → `llm_fixed`；其余（含零样本确认无目标背景图）→ `auto_passed`。
-        非零样本模式下处理后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`，只复制图片。
+        在 `YOLO_PREDICT` 模式下需存在有效基准 `weights_path`，在 `EXISTING_JSON` 模式下需存在标注目录，
+        在 `LLM_ZERO_SHOT` 模式下必须提供非空 `allowed_classes`，
+        在 `SAM3_TEXT` 模式下必须提供非空 `allowed_classes` 与有效的本地 `sam3.pt`（或测试桩 `sam3_detector_override`）。
+        当 `SAM3_TEXT` 未开启 `sam3_enable_llm_review` 时以纯本地模式运行，不初始化也不调用 LLM 客户端；
+        所有检出框置信度均 >= `high_conf_skip` 且非空时归入 `auto_passed`，存在低置信度框或 0 框时归入 `need_review`。
+        单张图片处理异常不会中止整批流程，而是写入 `need_review` 并记录 `error`，保证 `review_report.json` 必落盘。
     """
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
@@ -1679,30 +1906,59 @@ def run_mllm_review(
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     is_zero_shot = config.source_mode == ReviewSourceMode.LLM_ZERO_SHOT
+    is_sam3_text = config.source_mode == ReviewSourceMode.SAM3_TEXT
+    sam3_pure_local = is_sam3_text and not config.sam3_enable_llm_review
     load_errors: dict[Path, str] = {}
     if config.source_mode == ReviewSourceMode.YOLO_PREDICT:
         candidates_map, discovered_classes = _discover_yolo_candidates(
             images, config, log_callback, cancel_event
         )
+        allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
     elif config.source_mode == ReviewSourceMode.EXISTING_JSON:
         candidates_map, discovered_classes, load_errors = _discover_json_candidates(images, config)
+        allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
+    elif is_sam3_text:
+        sam3_classes, sam3_prompts = parse_sam3_class_prompts(config.allowed_classes)
+        if not sam3_classes:
+            raise ValueError(
+                "SAM 3 文本自动标注模式必须指定「目标类别清单」（支持“类别名=英文提示词”，如 头盔=safety helmet）。"
+            )
+        allowed_classes = sam3_classes
+        candidates_map, load_errors = _discover_sam3_candidates(
+            images,
+            sam3_classes,
+            sam3_prompts,
+            config,
+            log_callback,
+            cancel_event,
+            detector_override=sam3_detector_override,
+        )
     else:
         candidates_map = {img_path: [] for img_path in images}
-        discovered_classes = []
-
-    allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
-    if is_zero_shot and not allowed_classes:
-        raise ValueError("LLM 零样本直接标注模式必须指定「目标类别清单」（请至少提供一个类别名称或导入 classes.txt）。")
+        allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()]
+        if not allowed_classes:
+            raise ValueError(
+                "LLM 零样本直接标注模式必须指定「目标类别清单」（请至少提供一个类别名称或导入 classes.txt）。"
+            )
 
     effective_refine_mode = config.box_refine_mode
-    if is_zero_shot and effective_refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP}:
+    if sam3_pure_local and effective_refine_mode != BoxRefineMode.OFF:
+        if log_callback:
+            log_callback(
+                f"提示：纯本地 SAM 3 模式已输出像素级掩码贴边框，已自动忽略二次边框修正模式 '{effective_refine_mode.value}'。"
+            )
+        effective_refine_mode = BoxRefineMode.OFF
+    elif is_zero_shot and effective_refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP}:
         if log_callback:
             log_callback(
                 f"提示：零样本直接标注模式仅支持关闭或本地 SAM 像素级收紧，已自动忽略边框修正模式 '{effective_refine_mode.value}'。"
             )
         effective_refine_mode = BoxRefineMode.OFF
 
-    client: MllmClient = client_override or build_mllm_client(config)
+    client: MllmClient | None = None
+    if not sam3_pure_local:
+        client = client_override or build_mllm_client(config)
+
     sam_refiner: BoxRefinerProtocol | None = None
     if effective_refine_mode == BoxRefineMode.SAM_LOCAL:
         if refiner_override is not None:
@@ -1719,11 +1975,22 @@ def run_mllm_review(
 
     if log_callback:
         refine_desc = effective_refine_mode.value
-        mode_title = "LLM 零样本直接标注" if is_zero_shot else "LLM 智能标注"
-        log_callback(
-            f"开始 {mode_title}（共 {len(images)} 张图，类别: {allowed_classes}，"
-            f"边框修正: {refine_desc}，并发={config.max_workers}）..."
-        )
+        if sam3_pure_local:
+            log_callback(
+                f"开始纯本地 SAM 3 自动标注分流（共 {len(images)} 张图，类别: {allowed_classes}，"
+                f"自动通过阈值 ≥ {config.high_conf_skip:.2f}）..."
+            )
+        elif is_sam3_text:
+            log_callback(
+                f"开始 SAM 3 预标 + LLM 二次质检（共 {len(images)} 张图，类别: {allowed_classes}，"
+                f"边框修正: {refine_desc}，并发={config.max_workers}）..."
+            )
+        else:
+            mode_title = "LLM 零样本直接标注" if is_zero_shot else "LLM 智能标注"
+            log_callback(
+                f"开始 {mode_title}（共 {len(images)} 张图，类别: {allowed_classes}，"
+                f"边框修正: {refine_desc}，并发={config.max_workers}）..."
+            )
 
     def _bucket_dir(bucket: str) -> Path:
         return (config.output_dir / bucket) if config.triage_subfolders else config.output_dir
@@ -1790,7 +2057,47 @@ def run_mllm_review(
 
             img_bgr: np.ndarray | None = None
             response: MllmReviewResponse | None = None
-            if is_zero_shot:
+            if sam3_pure_local:
+                raw_sam3_boxes = before_boxes
+                before_boxes = []
+                after_boxes = []
+                has_low_conf = False
+                for b in raw_sam3_boxes:
+                    conf_val = b.confidence if b.confidence is not None else 0.0
+                    is_low = conf_val < config.high_conf_skip
+                    if is_low:
+                        has_low_conf = True
+                    after_boxes.append(
+                        CandidateBox(
+                            box_id=b.box_id,
+                            label=b.label,
+                            x1=b.x1,
+                            y1=b.y1,
+                            x2=b.x2,
+                            y2=b.y2,
+                            confidence=b.confidence,
+                            status="kept",
+                            reason=(
+                                f"SAM 3 低置信度 (conf={conf_val:.2f} < {config.high_conf_skip:.2f})，建议复核"
+                                if is_low
+                                else f"SAM 3 自动标注 (conf={conf_val:.2f})"
+                            ),
+                            original_label=b.label,
+                        )
+                    )
+                kept, relabeled, deleted, added = 0, 0, 0, len(after_boxes)
+                if not after_boxes:
+                    has_missing = True
+                    missing_note = "SAM 3 未检出目标，请人工确认是否为负样本或调低 Conf 阈值"
+                elif has_low_conf:
+                    has_missing = False
+                    missing_note = f"含低置信度目标（< {config.high_conf_skip:.2f}），建议人工复核"
+                else:
+                    has_missing = False
+                    missing_note = ""
+                skipped_mllm = True
+            elif is_zero_shot:
+                assert client is not None
                 img_bgr = _read_image_unicode_safe(img_path)
                 overview_jpeg = _encode_jpeg_bytes(img_bgr, max_dim=config.max_image_dim, quality=90)
                 system_prompt, user_prompt = _build_zero_shot_prompts(allowed_classes, config)
@@ -1845,6 +2152,7 @@ def run_mllm_review(
                     missing_note = ""
                     skipped_mllm = True
                 else:
+                    assert client is not None
                     img_bgr = _read_image_unicode_safe(img_path)
                     force_crops = effective_refine_mode == BoxRefineMode.MLLM_CROP
                     overview_jpeg, crops, crop_regions = _render_overview_and_crops(
@@ -1924,7 +2232,13 @@ def run_mllm_review(
             loose_flagged_count = sum(1 for b in after_boxes if b.status == "refine_suspect")
             has_invalid_relabel = any(b.status == "relabel_invalid" for b in after_boxes)
 
-            if has_missing or added > 0 or has_invalid_relabel or loose_flagged_count > 0:
+            if sam3_pure_local:
+                all_sam3_high = bool(after_boxes) and all(
+                    (b.confidence is not None and b.confidence >= config.high_conf_skip)
+                    for b in after_boxes
+                )
+                bucket = BUCKET_AUTO_PASSED if all_sam3_high else BUCKET_NEED_REVIEW
+            elif has_missing or added > 0 or has_invalid_relabel or loose_flagged_count > 0:
                 bucket = BUCKET_NEED_REVIEW
             elif relabeled > 0 or deleted > 0 or refined_count > 0:
                 bucket = BUCKET_LLM_FIXED
@@ -1933,7 +2247,7 @@ def run_mllm_review(
 
             out_img_path = _copy_image(img_path, bucket)
             out_json_path: Path | None = out_img_path.with_suffix(".json")
-            if after_boxes or config.check_missing or is_zero_shot:
+            if after_boxes or config.check_missing or is_zero_shot or sam3_pure_local:
                 _write_xanylabeling_json(
                     out_json_path,
                     out_img_path.name,
@@ -2014,7 +2328,7 @@ def run_mllm_review(
             if log_callback:
                 refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
                 loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
-                if is_zero_shot:
+                if is_zero_shot or sam3_pure_local:
                     log_callback(
                         f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
                         f"(检出:{rec.added_count}{refine_part}{loose_part})"
@@ -2046,6 +2360,7 @@ def run_mllm_review(
         "cancelled": cancelled,
         "classes": allowed_classes,
         "source_mode": config.source_mode.value,
+        "sam3_enable_llm_review": bool(config.sam3_enable_llm_review) if is_sam3_text else False,
         "box_refine_mode": effective_refine_mode.value,
         "items": [
             {

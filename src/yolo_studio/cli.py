@@ -324,6 +324,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
         box_refine_mode=BoxRefineMode(args.box_refine),
         sam_model_name=args.sam_model,
         sam_refine_all_kept=args.sam_refine_all,
+        sam3_enable_llm_review=args.sam3_llm_review,
     )
     res = run_mllm_review(cfg, log_callback=print)
     refined_total = sum(r.refined_count for r in res.records)
@@ -443,16 +444,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--exist-ok", action="store_true", help="允许覆盖同名实验目录（默认自动递增编号）")
     p_tr.set_defaults(func=_cmd_train)
 
-    p_rv = sub.add_parser("review", help="LLM 智能标注（基准模型预标 / 已有 .json 质检 / 零样本直接标注）")
+    p_rv = sub.add_parser("review", help="LLM 智能标注（基准模型预标 / 已有 .json / 零样本 / SAM 3 文本自动标注）")
     p_rv.add_argument("-i", "--images", required=True, help="待标注图片目录")
     p_rv.add_argument("-o", "--output", default="data/smart_labeled", help="智能标注输出目录")
     p_rv.add_argument(
         "--source-mode",
-        choices=["yolo_predict", "existing_json", "llm_zero_shot"],
+        choices=["yolo_predict", "existing_json", "llm_zero_shot", "sam3_text"],
         default="yolo_predict",
-        help="候选标注来源：yolo_predict(基准模型预标) / existing_json(已有.json) / llm_zero_shot(零样本直接标注)",
+        help="候选标注来源：yolo_predict(基准模型预标) / existing_json(已有.json) / llm_zero_shot(零样本) / sam3_text(SAM 3文本自动标注)",
     )
-    p_rv.add_argument("-w", "--weights", default="", help="基准模型 .pt 路径 (yolo_predict 模式)")
+    p_rv.add_argument("-w", "--weights", default="", help="模型 .pt 路径（yolo_predict 传基准 best.pt，sam3_text 传本地 sam3.pt）")
     p_rv.add_argument("-a", "--annotations", default="", help="已有 .json 目录 (existing_json 模式)")
     p_rv.add_argument("--yolo-conf", type=float, default=0.12)
     p_rv.add_argument("--yolo-iou", type=float, default=0.60)
@@ -462,7 +463,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_rv.add_argument("--model", default="gemini-3.8-flash")
     p_rv.add_argument("--api-key", default="")
     p_rv.add_argument("--base-url", default="")
-    p_rv.add_argument("--classes", default="", help="逗号分隔的目标类别名称（llm_zero_shot 模式必填）")
+    p_rv.add_argument(
+        "--classes",
+        default="",
+        help="逗号分隔的目标类别名称（llm_zero_shot 与 sam3_text 模式必填；sam3_text 支持 类别名=英文提示词）",
+    )
+    p_rv.add_argument(
+        "--sam3-llm-review",
+        action="store_true",
+        help="仅 sam3_text 模式生效：叠加 LLM 按业务规则执行二次质检（默认不开启，纯本地免 API 费用）",
+    )
     p_rv.add_argument("--guideline", default="", help="附加标注判定规则")
     p_rv.add_argument("--high-conf-skip", type=float, default=0.85)
     p_rv.add_argument("--no-check-missing", action="store_true")

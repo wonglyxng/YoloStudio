@@ -321,6 +321,53 @@ def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
         assert tab.sam_refine_all_chk.isEnabled() is True
         assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.FLAG_LOOSE)).isEnabled() is True
         assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.MLLM_CROP)).isEnabled() is True
+
+        # 7) SAM 3 文本自动标注模式：默认纯本地禁用 LLM 配置且免 API Key 启动；勾选 LLM 二次质检后恢复校验
+        sam3_idx = tab.source_mode_combo.findData(ReviewSourceMode.SAM3_TEXT)
+        assert sam3_idx >= 0
+        tab.source_mode_combo.setCurrentIndex(sam3_idx)
+        qt_app.processEvents()
+
+        assert tab.weights_picker.isHidden() is False
+        assert tab.yolo_params_widget.isHidden() is False
+        assert tab.sam3_llm_review_chk.isHidden() is False
+        assert tab.ann_picker.isHidden() is True
+        assert tab.llm_group.isEnabled() is False
+        assert tab.start_btn.text() == "开始 SAM 3 自动标注"
+        assert "自动通过" in tab.high_conf_label.text()
+        assert tab.high_conf_spin.isEnabled() is True
+        assert tab.refine_mode_combo.isEnabled() is False
+        assert tab.guideline_edit.isEnabled() is False
+
+        # 训练回填 best.pt 在 SAM 3 模式下不覆写用户指定的 sam3.pt
+        fake_sam3_pt = tmp_path / "sam3.pt"
+        fake_sam3_pt.write_bytes(b"sam3")
+        tab.weights_picker.setText(str(fake_sam3_pt))
+        tab.set_weights_path(str(tmp_path / "best.pt"))
+        assert Path(tab.weights_picker.text()) == fake_sam3_pt
+
+        # 清空 API Key 并切到 Gemini（无环境变量），纯本地 SAM 3 无需 Key 即可直接启动
+        tab.provider_combo.setCurrentIndex(0)
+        tab.api_key_edit.clear()
+        tab.classes_edit.setText("人物=person, 安全帽=safety helmet")
+        prev_started = len(started_configs)
+        tab._on_start()
+        assert len(started_configs) == prev_started + 1
+        assert started_configs[-1].source_mode == ReviewSourceMode.SAM3_TEXT
+        assert started_configs[-1].sam3_enable_llm_review is False
+
+        # 勾选「启用 LLM 二次质检」后激活分组 2，缺失 Gemini Key 将被拦截
+        tab._on_failed("reset")
+        tab.sam3_llm_review_chk.setChecked(True)
+        qt_app.processEvents()
+        assert tab.llm_group.isEnabled() is True
+        assert tab.start_btn.text() == "开始 LLM 智能标注"
+        assert tab.guideline_edit.isEnabled() is True
+        warnings.clear()
+        prev_started = len(started_configs)
+        tab._on_start()
+        assert len(started_configs) == prev_started
+        assert any("GEMINI_API_KEY" in m for m in warnings)
     finally:
         tab.close()
 

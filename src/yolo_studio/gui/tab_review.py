@@ -1,8 +1,8 @@
-"""标签页 3：LLM 智能标注界面（基准模型预标 / 已有 .json 质检精修 / 零样本冷启动直接标注）。
+"""标签页 3：LLM 智能标注界面（基准模型预标 / 已有 .json 质检 / 零样本标注 / SAM 3 文本自动标注）。
 
 职责：
-    配置候选框来源（基准 `.pt` 低阈值推理、已有 X-AnyLabeling `.json` 或 LLM 零样本直接标注）、
-    LLM 接口与预设、连通性测试、边框紧贴标准化修正（标记过松 / LLM 局部图精修 / 本地 SAM 像素级收紧）与分流策略；
+    配置候选框来源（基准 `.pt` 低阈值推理、已有 X-AnyLabeling `.json`、LLM 零样本直接标注
+    或本地 SAM 3 文本自动标注）、LLM 接口与预设、连通性测试、边框紧贴标准化修正与分流策略；
     右侧提供带实时计数的分流状态筛选、语义配色结果表与运行日志（同区双页签）、自适应缩放的处理前后对比图、
     历史报告加载，并支持一键跳转「2. 标注工作台」精修或发送结果至数据集准备页；
     左右两栏置于可拖拽的水平分割条中，用户可按屏幕宽度调整比例。
@@ -211,8 +211,8 @@ class MllmReviewTab(QWidget):
             self._refresh_images_count()
 
     def set_weights_path(self, path_str: str) -> None:
-        """跨页写入：将新训练的 `best.pt` 路径更新至基准模型输入框。"""
-        if path_str:
+        """跨页写入：将新训练的 `best.pt` 路径更新至权重输入框（SAM 3 模式下保留用户所选 `sam3.pt` 不覆盖）。"""
+        if path_str and self.source_mode_combo.currentData() != ReviewSourceMode.SAM3_TEXT:
             self.weights_picker.setText(path_str)
 
     @staticmethod
@@ -300,7 +300,7 @@ class MllmReviewTab(QWidget):
             mode="file",
             file_filter="PyTorch 权重 (*.pt);;所有文件 (*.*)",
         )
-        s_form.addRow("基准模型 (.pt):", self.weights_picker)
+        s_form.addRow("模型权重 (.pt):", self.weights_picker)
 
         self.yolo_params_widget = QWidget()
         yolo_row = QHBoxLayout(self.yolo_params_widget)
@@ -340,7 +340,15 @@ class MllmReviewTab(QWidget):
         yolo_row.addWidget(self.yolo_imgsz_spin)
         yolo_row.addSpacing(6)
         yolo_row.addWidget(self.yolo_device_ctrl, 1)
-        s_form.addRow("基准推理参数:", self.yolo_params_widget)
+        s_form.addRow("预标推理参数:", self.yolo_params_widget)
+
+        self.sam3_llm_review_chk = QCheckBox("启用 LLM 二次质检（按业务规则删误检 / 改类 / 补漏）")
+        self.sam3_llm_review_chk.setChecked(False)
+        self.sam3_llm_review_chk.setToolTip(
+            "默认关闭（纯本地零 API 费用直接出贴边框并按置信度分流）；"
+            "勾选后将 SAM 3 检出框送交 LLM 按中文业务规则执行删误检、改类与漏标检查"
+        )
+        s_form.addRow("LLM 质检:", self.sam3_llm_review_chk)
 
         self.ann_picker = PathPickerRow(
             placeholder="可选：已有 .json 目录（留空则同图片目录）",
@@ -358,8 +366,8 @@ class MllmReviewTab(QWidget):
         form_stack.addWidget(src_group)
 
         # 2. 大语言模型 (LLM) 配置
-        llm_group = QGroupBox("2. 大语言模型 (LLM) 配置")
-        l_form = QFormLayout(llm_group)
+        self.llm_group = QGroupBox("2. 大语言模型 (LLM) 配置")
+        l_form = QFormLayout(self.llm_group)
         self._tune_form(l_form)
         self._llm_form = l_form
 
@@ -411,7 +419,7 @@ class MllmReviewTab(QWidget):
         key_box.addLayout(key_row)
         key_box.addWidget(self.api_key_status_label)
         l_form.addRow("API Key:", key_box)
-        form_stack.addWidget(llm_group)
+        form_stack.addWidget(self.llm_group)
 
         # 3. 智能标注、收框与分流策略
         pol_group = QGroupBox("3. 智能标注、收框与分流策略")
@@ -610,7 +618,7 @@ class MllmReviewTab(QWidget):
         right.addWidget(self.progress_bar)
 
         self.summary_label = QLabel(
-            "就绪：选择工作模式（基准模型预标 / 已有 .json / 零样本直接标注）并配置 LLM 后点击「开始 LLM 智能标注」，或加载历史报告继续复核。"
+            "就绪：选择工作模式（基准模型预标 / 已有 .json / 零样本标注 / SAM 3 自动标注）后点击开始，或加载历史报告继续复核。"
         )
         self.summary_label.setWordWrap(True)
         self.summary_label.setStyleSheet("color: #424a53;")
@@ -751,6 +759,7 @@ class MllmReviewTab(QWidget):
         self.base_url_edit.textChanged.connect(self._refresh_api_key_status)
         self.refine_mode_combo.currentIndexChanged.connect(self._sync_strategy_states)
         self.sam_refine_all_chk.toggled.connect(self._sync_strategy_states)
+        self.sam3_llm_review_chk.toggled.connect(self._sync_strategy_states)
         self.check_missing_chk.toggled.connect(self._sync_strategy_states)
         self.crops_chk.toggled.connect(self._sync_strategy_states)
         self.triage_dirs_chk.toggled.connect(self._sync_strategy_states)
@@ -795,6 +804,7 @@ class MllmReviewTab(QWidget):
             self.triage_dirs_chk,
             self.recursive_chk,
             self.sam_refine_all_chk,
+            self.sam3_llm_review_chk,
         ):
             chk.toggled.connect(self._mark_settings_dirty)
 
@@ -863,14 +873,15 @@ class MllmReviewTab(QWidget):
         """按数据来源与 SAM 收框模式动态安置并启停本地 GPU 加速开关。
 
         规则：
-            - 基准模型推理模式下保留在「基准推理参数」行并启用（同时服务 YOLO 推理与 SAM 收框）；
+            - 基准模型预标或 SAM 3 文本自动标注模式下保留在「预标推理参数」行并启用（同时服务主模型与可选 SAM 收框）；
             - 已有 `.json` 或零样本模式且启用本地 SAM 收框时，迁移展示至 SAM 配置行下方并启用；
             - 已有 `.json` 或零样本模式且未启用本地 SAM 时，收起并禁用，避免无效控件干扰。
         """
-        is_yolo = self.source_mode_combo.currentData() == ReviewSourceMode.YOLO_PREDICT
+        source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
+        uses_primary_pt = source_mode in {ReviewSourceMode.YOLO_PREDICT, ReviewSourceMode.SAM3_TEXT}
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
         is_sam = refine_mode == BoxRefineMode.SAM_LOCAL
-        show_in_sam = (not is_yolo) and is_sam
+        show_in_sam = (not uses_primary_pt) and is_sam
 
         if show_in_sam:
             if self._sam_device_row.indexOf(self.yolo_device_ctrl) < 0:
@@ -884,21 +895,40 @@ class MllmReviewTab(QWidget):
                 self._sam_device_row.removeWidget(self.yolo_device_ctrl)
                 self._yolo_row.addWidget(self.yolo_device_ctrl, 1)
             self.sam_device_holder.setVisible(False)
-            self.yolo_device_ctrl.setEnabled(is_yolo)
+            self.yolo_device_ctrl.setEnabled(uses_primary_pt)
 
     def _on_source_mode_changed(self) -> None:
         """按候选框来源模式启用/禁用并动态折叠无关表单行，同时更新模式说明与策略联动状态。"""
         source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
         is_yolo = source_mode == ReviewSourceMode.YOLO_PREDICT
+        is_sam3 = source_mode == ReviewSourceMode.SAM3_TEXT
+        uses_primary_pt = is_yolo or is_sam3
         is_existing_json = source_mode == ReviewSourceMode.EXISTING_JSON
+
         self.source_mode_hint_label.setText(SOURCE_MODE_HINTS.get(source_mode, ""))
-        self.weights_picker.setEnabled(is_yolo)
-        self.yolo_conf_spin.setEnabled(is_yolo)
-        self.yolo_iou_spin.setEnabled(is_yolo)
-        self.yolo_imgsz_spin.setEnabled(is_yolo)
+        self.weights_picker.setEnabled(uses_primary_pt)
+        if is_sam3:
+            self.weights_picker.line_edit.setPlaceholderText(
+                "选择本地 sam3.pt 权重（Meta 受限权重，需预先从 HuggingFace 下载至本地）"
+            )
+            self.yolo_conf_spin.setToolTip(
+                "SAM 3 置信度阈值：纯本地模式建议 0.25~0.40；启用 LLM 二次质检时可调低至 0.15~0.25 拉高召回"
+            )
+        else:
+            self.weights_picker.line_edit.setPlaceholderText(
+                "选择基准模型 best.pt 权重（可先在标注工作台标少量样本训练得出）"
+            )
+            self.yolo_conf_spin.setToolTip("建议设低（0.08~0.15）以尽量召回潜在目标，再由 LLM 筛除误检与错类")
+
+        self.yolo_conf_spin.setEnabled(uses_primary_pt)
+        self.yolo_iou_spin.setEnabled(uses_primary_pt)
+        self.yolo_imgsz_spin.setEnabled(uses_primary_pt)
+        self.sam3_llm_review_chk.setEnabled(is_sam3)
         self.ann_picker.setEnabled(is_existing_json)
-        self._src_form.setRowVisible(self.weights_picker, is_yolo)
-        self._src_form.setRowVisible(self.yolo_params_widget, is_yolo)
+
+        self._src_form.setRowVisible(self.weights_picker, uses_primary_pt)
+        self._src_form.setRowVisible(self.yolo_params_widget, uses_primary_pt)
+        self._src_form.setRowVisible(self.sam3_llm_review_chk, is_sam3)
         self._src_form.setRowVisible(self.ann_picker, is_existing_json)
         self._sync_strategy_states()
 
@@ -936,6 +966,14 @@ class MllmReviewTab(QWidget):
 
     def _refresh_api_key_status(self, *_args: object) -> None:
         """实时检测手动 Key 或系统环境变量是否已就绪，减少启动任务后才报鉴权失败的挫败感。"""
+        source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
+        if source_mode == ReviewSourceMode.SAM3_TEXT and not self.sam3_llm_review_chk.isChecked():
+            self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 12px;")
+            self.api_key_status_label.setText(
+                "当前为纯本地 SAM 3 自动标注模式，无需配置 LLM 与 API Key（勾选「启用 LLM 二次质检」后激活）"
+            )
+            return
+
         provider = self.provider_combo.currentData()
         manual_key = self.api_key_edit.text().strip()
         if manual_key:
@@ -970,19 +1008,35 @@ class MllmReviewTab(QWidget):
         """同步来源模式、边框修正模式、漏标开关、局部裁剪、高置信度阈值与分流目录按钮之间的防呆联动状态。"""
         source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
         is_zero_shot = source_mode == ReviewSourceMode.LLM_ZERO_SHOT
+        is_sam3 = source_mode == ReviewSourceMode.SAM3_TEXT
+        sam3_pure_local = is_sam3 and not self.sam3_llm_review_chk.isChecked()
 
-        # 零样本模式下无上游候选框，边框紧贴修正仅支持「关闭」与「本地 SAM 像素级收紧」
+        # 纯本地 SAM 3 无需配置 LLM，禁用分组 2 并在状态栏提示；开启 LLM 质检或其他模式时启用
+        self.llm_group.setEnabled(not sam3_pure_local)
+        self.start_btn.setText("开始 SAM 3 自动标注" if sam3_pure_local else "开始 LLM 智能标注")
+        self._refresh_api_key_status()
+
+        # 零样本模式下无上游候选框，边框紧贴修正仅支持「关闭」与「本地 SAM 像素级收紧」；
+        # 纯本地 SAM 3 模式本身已输出掩码贴边框，统一禁用二次收框并回落为 OFF
         refine_model = self.refine_mode_combo.model()
         if isinstance(refine_model, QStandardItemModel):
             for idx in range(self.refine_mode_combo.count()):
                 mode_data = self.refine_mode_combo.itemData(idx)
                 item = refine_model.item(idx)
                 if item is not None:
-                    supported = (not is_zero_shot) or (mode_data in {BoxRefineMode.OFF, BoxRefineMode.SAM_LOCAL})
+                    if sam3_pure_local:
+                        supported = mode_data == BoxRefineMode.OFF
+                    elif is_zero_shot:
+                        supported = mode_data in {BoxRefineMode.OFF, BoxRefineMode.SAM_LOCAL}
+                    else:
+                        supported = True
                     item.setEnabled(supported)
 
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
-        if is_zero_shot and refine_mode not in {BoxRefineMode.OFF, BoxRefineMode.SAM_LOCAL}:
+        force_off = (sam3_pure_local and refine_mode != BoxRefineMode.OFF) or (
+            is_zero_shot and refine_mode not in {BoxRefineMode.OFF, BoxRefineMode.SAM_LOCAL}
+        )
+        if force_off:
             off_idx = self.refine_mode_combo.findData(BoxRefineMode.OFF)
             if off_idx >= 0:
                 prev_restore = self._restoring_state
@@ -995,19 +1049,39 @@ class MllmReviewTab(QWidget):
                     self._restoring_state = prev_restore
             refine_mode = BoxRefineMode.OFF
 
+        self.refine_mode_combo.setEnabled(not sam3_pure_local)
         is_sam = refine_mode == BoxRefineMode.SAM_LOCAL
         is_mllm_crop = refine_mode == BoxRefineMode.MLLM_CROP
 
-        self.classes_edit.setPlaceholderText(
-            "必填！英文逗号分隔，如 person, helmet（可点右侧导入 classes.txt）"
-            if is_zero_shot
-            else "英文逗号分隔，如 person, helmet（留空自动从模型或 .json 提取）"
+        if is_sam3:
+            self.classes_edit.setPlaceholderText(
+                "必填！逗号分隔，支持 类别名=英文提示词，如 头盔=safety helmet, person"
+            )
+        elif is_zero_shot:
+            self.classes_edit.setPlaceholderText(
+                "必填！英文逗号分隔，如 person, helmet（可点右侧导入 classes.txt）"
+            )
+        else:
+            self.classes_edit.setPlaceholderText(
+                "英文逗号分隔，如 person, helmet（留空自动从模型或 .json 提取）"
+            )
+
+        self.guideline_edit.setEnabled(not sam3_pure_local)
+        self.guideline_edit.setToolTip(
+            "纯本地 SAM 3 模式不使用自然语言判定规则；勾选「启用 LLM 二次质检」后生效"
+            if sam3_pure_local
+            else "可选业务标注口径，辅助 LLM 降低误判"
         )
 
         self._pol_form.setRowVisible(self.sam_row_widget, is_sam)
         self._sync_local_device_ctrl()
 
-        if is_zero_shot and is_sam:
+        if sam3_pure_local:
+            self.sam_refine_all_chk.setEnabled(True)
+            self.refine_hint_label.setText(
+                "SAM 3 自身直接输出像素级掩码贴边框，无需二次收框；勾选「启用 LLM 二次质检」后可按需调整。"
+            )
+        elif is_zero_shot and is_sam:
             prev_restore = self._restoring_state
             self._restoring_state = True
             try:
@@ -1035,14 +1109,18 @@ class MllmReviewTab(QWidget):
             else:
                 self.refine_hint_label.setText(BOX_REFINE_MODE_HINTS.get(refine_mode, ""))
 
-        if is_zero_shot:
-            zero_shot_tip = "零样本模式由 LLM 直接全图定位并输出目标框，此项仅在预标/已有标注质检模式下生效"
+        if is_zero_shot or sam3_pure_local:
+            disabled_tip = (
+                "纯本地 SAM 3 模式不调用 LLM，勾选「启用 LLM 二次质检」后生效"
+                if sam3_pure_local
+                else "零样本模式由 LLM 直接全图定位并输出目标框，此项仅在预标/已有标注质检模式下生效"
+            )
             self.check_missing_chk.setEnabled(False)
-            self.check_missing_chk.setToolTip(zero_shot_tip)
+            self.check_missing_chk.setToolTip(disabled_tip)
             self.add_missing_chk.setEnabled(False)
-            self.add_missing_chk.setToolTip(zero_shot_tip)
+            self.add_missing_chk.setToolTip(disabled_tip)
             self.crops_chk.setEnabled(False)
-            self.crops_chk.setToolTip(zero_shot_tip)
+            self.crops_chk.setToolTip(disabled_tip)
         else:
             self.check_missing_chk.setEnabled(True)
             self.check_missing_chk.setToolTip("")
@@ -1074,6 +1152,14 @@ class MllmReviewTab(QWidget):
             self.open_need_review_btn.setToolTip(
                 "当前未按结果分建子目录，将在「2. 标注工作台」中直接打开标注输出根目录"
             )
+
+        if sam3_pure_local:
+            self.high_conf_label.setText("自动通过 ≥")
+            self.high_conf_spin.setEnabled(True)
+            self.high_conf_spin.setToolTip(
+                "纯本地 SAM 3 模式：有检出目标且整张图所有框置信度均 ≥ 此值时归入 auto_passed，存在低分框或 0 框则转入 need_review 复核"
+            )
+            return
 
         if is_zero_shot:
             self.high_conf_label.setText("免审阈值(停用):")
@@ -1181,6 +1267,7 @@ class MllmReviewTab(QWidget):
             box_refine_mode=refine_mode,
             sam_model_name=self._resolve_sam_model_name(),
             sam_refine_all_kept=self.sam_refine_all_chk.isChecked(),
+            sam3_enable_llm_review=self.sam3_llm_review_chk.isChecked(),
         )
 
     def _on_test_connection(self) -> None:
@@ -1238,6 +1325,7 @@ class MllmReviewTab(QWidget):
             "box_refine_mode": refine_mode.value,
             "sam_model_name": self._resolve_sam_model_name(),
             "sam_refine_all": self.sam_refine_all_chk.isChecked(),
+            "sam3_enable_llm_review": self.sam3_llm_review_chk.isChecked(),
         }
         settings.setValue(_REVIEW_SETTINGS_KEY, json.dumps(state, ensure_ascii=False))
 
@@ -1317,6 +1405,8 @@ class MllmReviewTab(QWidget):
                     self.sam_model_combo.setCurrentText(sam_model)
             if "sam_refine_all" in state:
                 self.sam_refine_all_chk.setChecked(bool(state["sam_refine_all"]))
+            if "sam3_enable_llm_review" in state:
+                self.sam3_llm_review_chk.setChecked(bool(state["sam3_enable_llm_review"]))
         except Exception:
             pass
         finally:
@@ -1339,8 +1429,10 @@ class MllmReviewTab(QWidget):
             return
 
         cfg = self._build_current_config()
+        is_sam3 = cfg.source_mode == ReviewSourceMode.SAM3_TEXT
+        needs_llm = (not is_sam3) or cfg.sam3_enable_llm_review
         uses_local_gpu_model = (
-            cfg.source_mode == ReviewSourceMode.YOLO_PREDICT
+            cfg.source_mode in {ReviewSourceMode.YOLO_PREDICT, ReviewSourceMode.SAM3_TEXT}
             or cfg.box_refine_mode == BoxRefineMode.SAM_LOCAL
         )
         if uses_local_gpu_model and self.device_info.probing:
@@ -1352,46 +1444,57 @@ class MllmReviewTab(QWidget):
         ):
             QMessageBox.warning(self, "提示", "请选择有效的基准模型 .pt 权重文件。")
             return
-        if cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT and not cfg.allowed_classes:
+        if is_sam3 and (not cfg.weights_path or not cfg.weights_path.is_file()):
             QMessageBox.warning(
                 self,
                 "提示",
-                "LLM 零样本直接标注模式必须填写「目标类别清单」（英文逗号分隔，或点击「导入 classes.txt」）。",
+                "请选择有效的本地 SAM 3 权重文件（如 sam3.pt；该权重为 Meta 受限模型，需预先从 HuggingFace 下载至本地）。",
             )
             return
-
-        # 前置校验 LLM 必填参数与凭据，避免先跑完耗时的基准模型推理才因缺少 Key/模型名失败
-        if not cfg.model_name:
-            QMessageBox.warning(self, "提示", "请在「2. 大语言模型 (LLM) 配置」中填写模型名称。")
+        if cfg.source_mode in {ReviewSourceMode.LLM_ZERO_SHOT, ReviewSourceMode.SAM3_TEXT} and not cfg.allowed_classes:
+            mode_tip = (
+                "SAM 3 文本自动标注模式必须填写「目标类别清单」（支持 类别名=英文提示词，如 头盔=safety helmet）。"
+                if is_sam3
+                else "LLM 零样本直接标注模式必须填写「目标类别清单」（英文逗号分隔，或点击「导入 classes.txt」）。"
+            )
+            QMessageBox.warning(self, "提示", mode_tip)
             return
-        if cfg.provider == MllmProvider.GEMINI:
-            if not (cfg.api_key or os.environ.get("GEMINI_API_KEY", "").strip()):
-                QMessageBox.warning(
-                    self,
-                    "提示",
-                    "未检测到 Gemini API Key：请在「2. 大语言模型 (LLM) 配置」中填写 API Key，"
-                    "或配置环境变量 GEMINI_API_KEY。",
-                )
+
+        # 前置校验 LLM 必填参数与凭据（纯本地 SAM 3 模式跳过，免填 API Key）
+        if needs_llm:
+            if not cfg.model_name:
+                QMessageBox.warning(self, "提示", "请在「2. 大语言模型 (LLM) 配置」中填写模型名称。")
                 return
-        else:
-            if not cfg.base_url:
-                QMessageBox.warning(self, "提示", "请填写 OpenAI 兼容接口的 Base URL。")
-                return
-            if (
-                not cfg.api_key
-                and not os.environ.get("OPENAI_API_KEY", "").strip()
-                and not _is_local_or_lan_url(cfg.base_url)
-            ):
-                QMessageBox.warning(
-                    self,
-                    "提示",
-                    "未检测到 API Key 或环境变量 OPENAI_API_KEY。\n"
-                    "如使用云端接口请在上方填写 API Key；如使用本地服务请确认 Base URL 为本地或局域网地址。",
-                )
-                return
+            if cfg.provider == MllmProvider.GEMINI:
+                if not (cfg.api_key or os.environ.get("GEMINI_API_KEY", "").strip()):
+                    QMessageBox.warning(
+                        self,
+                        "提示",
+                        "未检测到 Gemini API Key：请在「2. 大语言模型 (LLM) 配置」中填写 API Key，"
+                        "或配置环境变量 GEMINI_API_KEY。",
+                    )
+                    return
+            else:
+                if not cfg.base_url:
+                    QMessageBox.warning(self, "提示", "请填写 OpenAI 兼容接口的 Base URL。")
+                    return
+                if (
+                    not cfg.api_key
+                    and not os.environ.get("OPENAI_API_KEY", "").strip()
+                    and not _is_local_or_lan_url(cfg.base_url)
+                ):
+                    QMessageBox.warning(
+                        self,
+                        "提示",
+                        "未检测到 API Key 或环境变量 OPENAI_API_KEY。\n"
+                        "如使用云端接口请在上方填写 API Key；如使用本地服务请确认 Base URL 为本地或局域网地址。",
+                    )
+                    return
 
         if uses_local_gpu_model and self.gpu_guard is not None:
-            if cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT:
+            if is_sam3:
+                task_label = "SAM 3 文本自动标注 + LLM 质检" if cfg.sam3_enable_llm_review else "SAM 3 文本自动标注"
+            elif cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT:
                 task_label = "LLM 零样本标注 / SAM 收框"
             elif cfg.source_mode == ReviewSourceMode.EXISTING_JSON:
                 task_label = "LLM 质检 / SAM 收框"
@@ -1408,7 +1511,7 @@ class MllmReviewTab(QWidget):
         self._preview_cache.clear()
         self._selected_row = -1
         self.preview_label.clear_preview()
-        self.detail_label.setText("未选中图片：单击上方结果行可查看 LLM 逐框判定理由与收框明细。")
+        self.detail_label.setText("未选中图片：单击上方结果行可查看逐框判定理由与收框明细。")
         self.detail_label.setToolTip("")
         self.open_selected_btn.setEnabled(False)
         self.result_table.setRowCount(0)
@@ -1420,7 +1523,13 @@ class MllmReviewTab(QWidget):
         self.stop_btn.setEnabled(True)
         self.load_report_btn.setEnabled(False)
         self.send_ds_btn.setEnabled(False)
-        if cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT:
+        if is_sam3:
+            self.summary_label.setText(
+                "正在运行 SAM 3 文本预标与 LLM 二次质检..."
+                if cfg.sam3_enable_llm_review
+                else "正在运行本地 SAM 3 文本自动标注..."
+            )
+        elif cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT:
             self.summary_label.setText(
                 "正在运行 LLM 零样本直接标注与本地 SAM 收框..."
                 if cfg.box_refine_mode == BoxRefineMode.SAM_LOCAL
