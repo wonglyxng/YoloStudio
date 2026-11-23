@@ -1,9 +1,9 @@
 """基于多模态大语言模型（LLM）的智能标注、质检精修与漏标发现引擎。
 
 职责：
-    串联“候选框发现（基准 YOLO 模型低阈值推理或读取已有 X-AnyLabeling `.json`）→
-    带编号总览图与局部裁剪图渲染 → 多模态大模型结构化质检精修 → 决策合并去重 →
-    结果分流落盘（`auto_passed` / `llm_fixed` / `need_review`）与前后对比图生成”。
+    串联“候选框发现（基准 YOLO 模型低阈值推理、读取已有 X-AnyLabeling `.json`，或 LLM 零样本直接标注）→
+    带编号总览图与局部裁剪图渲染（零样本模式直接发送干净原图）→ 多模态大模型结构化识别与质检精修 →
+    决策合并去重与可选本地 SAM 像素级收边 → 结果分流落盘（`auto_passed` / `llm_fixed` / `need_review`）与前后对比图生成”。
 
 运行环境：
     Python >= 3.11，依赖 `opencv-python`、`numpy`、`Pillow`、`pydantic`；
@@ -55,20 +55,26 @@ class ReviewSourceMode(str, Enum):
 
     YOLO_PREDICT = "yolo_predict"
     EXISTING_JSON = "existing_json"
+    LLM_ZERO_SHOT = "llm_zero_shot"
 
 
 SOURCE_MODE_ITEMS: list[tuple[ReviewSourceMode, str]] = [
     (ReviewSourceMode.YOLO_PREDICT, "基准模型预标 + LLM 质检精修（推荐）"),
     (ReviewSourceMode.EXISTING_JSON, "已有标注 (.json) + LLM 质检精修"),
+    (ReviewSourceMode.LLM_ZERO_SHOT, "LLM 零样本直接标注（冷启动，无需模型）"),
 ]
 
 SOURCE_MODE_HINTS: dict[ReviewSourceMode, str] = {
     ReviewSourceMode.YOLO_PREDICT: (
         "先用基准 .pt 低阈值推理拉高召回，再由 LLM 剔除误检、改类、补漏与收框；"
-        "尚无模型时可先在「2. 标注工作台」标少量样本训练。"
+        "尚无模型时可切换「LLM 零样本直接标注」冷启动，或在「2. 标注工作台」标少量样本训练。"
     ),
     ReviewSourceMode.EXISTING_JSON: (
         "读取已有 X-AnyLabeling .json 标注，由 LLM 质检、补漏与收框，并将疑难样本分流到 need_review。"
+    ),
+    ReviewSourceMode.LLM_ZERO_SHOT: (
+        "无需预训练模型或已有标注，必填「目标类别清单」由 LLM 直接全图定位目标（推荐配合「本地 SAM 像素级收紧」自动贴边）；"
+        "检出有目标的图片统一进入 need_review 供工作台快速过目确认。"
     ),
 }
 
@@ -814,6 +820,41 @@ def _build_prompts(
     return system_prompt, user_prompt
 
 
+def _build_zero_shot_prompts(
+    allowed_classes: list[str],
+    config: MllmReviewConfig,
+) -> tuple[str, str]:
+    """构造 LLM 零样本直接标注模式的系统提示词与用户提示词。"""
+    classes_str = ", ".join(allowed_classes)
+    system_prompt = (
+        "You are a strict, accurate computer vision object detection annotator. "
+        "Your job is to inspect the provided image from scratch and output ONLY valid JSON "
+        "matching the requested schema.\n"
+        f"Allowed target classes: [{classes_str}].\n"
+        "Rules:\n"
+        "1. Detect every clearly visible target object belonging to Allowed target classes and list them in `added_boxes`.\n"
+        "2. For each detected object in `added_boxes`:\n"
+        "   - `label` MUST be an EXACT name from Allowed target classes (never invent new classes).\n"
+        "   - `box_2d` MUST be [ymin, xmin, ymax, xmax] integers normalized to 0-1000 tightly enclosing the visible target.\n"
+        "   - Avoid duplicate overlapping boxes for the same object.\n"
+        "   - `reason` gives a brief description (Chinese or English).\n"
+        "3. Always return `box_reviews` as an empty list [].\n"
+        "4. If no target objects exist in the image, return `added_boxes=[]` and `has_missing=false`.\n"
+        "5. Set `has_missing=true` and describe in `missing_note` ONLY if the scene is too crowded, occluded, or ambiguous "
+        "to accurately box every target; otherwise set `has_missing=false`."
+    )
+    if config.custom_guideline.strip():
+        system_prompt += f"\nDomain Annotation Guidelines:\n{config.custom_guideline.strip()}"
+
+    user_prompt = (
+        "Detect and tightly bound ALL target objects in this image belonging to Allowed target classes.\n"
+        "Return strict JSON with keys: box_reviews (always []), "
+        "has_missing (bool), missing_note (str), "
+        "added_boxes (list of {label, box_2d, reason} where box_2d is [ymin, xmin, ymax, xmax] normalized to 0-1000)."
+    )
+    return system_prompt, user_prompt
+
+
 def _normalize_class_name(raw_name: str | None, allowed_classes: list[str]) -> str | None:
     if not raw_name:
         return None
@@ -968,15 +1009,25 @@ def apply_sam_box_refinement(
     refiner: BoxRefinerProtocol,
     *,
     refine_all_kept: bool = False,
+    include_llm_added: bool = False,
     min_area_ratio: float = 0.15,
     min_iou: float = 0.25,
 ) -> None:
-    """在原地对满足条件的保留/改类候选框执行本地 SAM 像素级收框并套用安全门禁。"""
+    """在原地对满足条件的有效框执行本地 SAM 像素级收框并套用安全门禁。
+
+    触发范围：
+        默认跳过 `llm_added` 与 `relabel_invalid`，仅收紧判定过松（或 `refine_all_kept=True` 时的全部保留/改类）框；
+        在 `LLM_ZERO_SHOT` 零样本模式下传入 `include_llm_added=True`，对 LLM 直接定位出的粗框统一执行 SAM 收边。
+    """
     decision_map = {d.box_id: d for d in response.box_reviews} if response is not None else {}
     targets: list[CandidateBox] = []
     explicit_loose_ids: set[int] = set()
     for b in after_boxes:
-        if b.status in {"llm_added", "relabel_invalid"}:
+        if b.status == "relabel_invalid":
+            continue
+        if b.status == "llm_added":
+            if include_llm_added:
+                targets.append(b)
             continue
         dec = decision_map.get(b.box_id)
         is_loose = dec is not None and dec.box_quality in {"loose", "partial"}
@@ -1460,10 +1511,12 @@ def format_record_detail_summary(record: ImageReviewRecord) -> str:
             parts.append(f"非法改类待修 #{b.box_id}[{b.label}]{reason}")
         elif b.status == "refine_suspect":
             parts.append(f"过松/超门禁待修 #{b.box_id}[{b.label}]{reason}")
+        elif b.status == "llm_added":
+            prefix = "新增标注" if not record.before_boxes else "补漏"
+            tight = "+收框" if b.refined else ""
+            parts.append(f"{prefix}{tight}[{b.label}]{reason}")
         elif b.refined or b.status == "refined":
             parts.append(f"已收框 #{b.box_id}[{b.label}]{reason}")
-        elif b.status == "llm_added":
-            parts.append(f"补漏[{b.label}]{reason}")
 
     if record.missing_note:
         parts.append(f"漏标提示：{record.missing_note}")
@@ -1587,19 +1640,20 @@ def run_mllm_review(
     *,
     refiner_override: BoxRefinerProtocol | None = None,
 ) -> MllmReviewResult:
-    """执行基准候选框获取、LLM 并发质检精修、可选边框紧贴修正、结果分流与 X-AnyLabeling `.json` 导出。
+    """执行基准候选框获取（或 LLM 零样本直接定位）、LLM 并发识别与质检、可选边框紧贴修正、结果分流与 `.json` 导出。
 
     前置条件与失败方式：
         `images_dir` 不存在抛出 `FileNotFoundError`，无图片抛出 `ValueError`；
-        在 `YOLO_PREDICT` 模式下需存在有效 `weights_path`，在 `EXISTING_JSON` 模式下需存在标注目录。
+        在 `YOLO_PREDICT` 模式下需存在有效 `weights_path`，在 `EXISTING_JSON` 模式下需存在标注目录，
+        在 `LLM_ZERO_SHOT` 模式下必须提供非空 `allowed_classes`（否则抛出 `ValueError`）。
         单张图片处理异常（含已有标注读取失败）不会中止整批流程，而是将该图连同原始候选框写入
         `need_review` 并记录 `error`；即使错误结果本身写出失败，也只记录到该图的 `error` 中，
         保证 `review_report.json` 最终一定写出。
 
     分流规则：
-        存在漏标提示、LLM 补框、`relabel_invalid` 框或过松/超门禁标记 `refine_suspect` 框 → `need_review`；
-        有改类、删框或通过门禁的自动收框 → `llm_fixed`；其余 → `auto_passed`。
-        处理后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`，只复制图片。
+        存在漏标提示、LLM 补框/零样本检出框、`relabel_invalid` 框或过松/超门禁标记 `refine_suspect` 框 → `need_review`；
+        有改类、删框或通过门禁的自动收框 → `llm_fixed`；其余（含零样本确认无目标背景图）→ `auto_passed`。
+        非零样本模式下处理后无任何框且未开启漏标检查时，空结果未经确认，不写出 `.json`，只复制图片。
     """
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
@@ -1624,18 +1678,33 @@ def run_mllm_review(
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    is_zero_shot = config.source_mode == ReviewSourceMode.LLM_ZERO_SHOT
     load_errors: dict[Path, str] = {}
     if config.source_mode == ReviewSourceMode.YOLO_PREDICT:
         candidates_map, discovered_classes = _discover_yolo_candidates(
             images, config, log_callback, cancel_event
         )
-    else:
+    elif config.source_mode == ReviewSourceMode.EXISTING_JSON:
         candidates_map, discovered_classes, load_errors = _discover_json_candidates(images, config)
+    else:
+        candidates_map = {img_path: [] for img_path in images}
+        discovered_classes = []
 
     allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
+    if is_zero_shot and not allowed_classes:
+        raise ValueError("LLM 零样本直接标注模式必须指定「目标类别清单」（请至少提供一个类别名称或导入 classes.txt）。")
+
+    effective_refine_mode = config.box_refine_mode
+    if is_zero_shot and effective_refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP}:
+        if log_callback:
+            log_callback(
+                f"提示：零样本直接标注模式仅支持关闭或本地 SAM 像素级收紧，已自动忽略边框修正模式 '{effective_refine_mode.value}'。"
+            )
+        effective_refine_mode = BoxRefineMode.OFF
+
     client: MllmClient = client_override or build_mllm_client(config)
     sam_refiner: BoxRefinerProtocol | None = None
-    if config.box_refine_mode == BoxRefineMode.SAM_LOCAL:
+    if effective_refine_mode == BoxRefineMode.SAM_LOCAL:
         if refiner_override is not None:
             sam_refiner = refiner_override
         else:
@@ -1649,9 +1718,10 @@ def run_mllm_review(
     output_names = _plan_output_names(images, config.images_dir)
 
     if log_callback:
-        refine_desc = config.box_refine_mode.value
+        refine_desc = effective_refine_mode.value
+        mode_title = "LLM 零样本直接标注" if is_zero_shot else "LLM 智能标注"
         log_callback(
-            f"开始 LLM 智能标注（共 {len(images)} 张图，类别: {allowed_classes}，"
+            f"开始 {mode_title}（共 {len(images)} 张图，类别: {allowed_classes}，"
             f"边框修正: {refine_desc}，并发={config.max_workers}）..."
         )
 
@@ -1718,78 +1788,96 @@ def run_mllm_review(
             with Image.open(img_path) as pil_img:
                 img_w, img_h = pil_img.size
 
-            # 当未开启漏标巡检且无需借助 LLM 判定框紧贴度时，高置信度图或空框图可直接跳过 LLM
-            needs_mllm_for_refine = bool(before_boxes) and (
-                config.box_refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP}
-                or (config.box_refine_mode == BoxRefineMode.SAM_LOCAL and not config.sam_refine_all_kept)
-            )
-            all_high_conf = bool(before_boxes) and all(
-                (b.confidence is not None and b.confidence >= config.high_conf_skip)
-                for b in before_boxes
-            )
-            skip_reason = ""
-            if not config.check_missing and not needs_mllm_for_refine:
-                if all_high_conf:
-                    skip_reason = "高置信度跳过 LLM"
-                elif not before_boxes:
-                    skip_reason = "无候选框且未开启漏标检查，跳过 LLM"
-
             img_bgr: np.ndarray | None = None
             response: MllmReviewResponse | None = None
-            if skip_reason:
-                after_boxes = [
-                    CandidateBox(
-                        box_id=b.box_id,
-                        label=b.label,
-                        x1=b.x1,
-                        y1=b.y1,
-                        x2=b.x2,
-                        y2=b.y2,
-                        confidence=b.confidence,
-                        status="kept",
-                        reason=skip_reason,
-                        original_label=b.label,
-                    )
-                    for b in before_boxes
-                ]
-                kept, relabeled, deleted, added = len(after_boxes), 0, 0, 0
-                has_missing = False
-                missing_note = ""
-                skipped_mllm = True
-            else:
+            if is_zero_shot:
                 img_bgr = _read_image_unicode_safe(img_path)
-                force_crops = config.box_refine_mode == BoxRefineMode.MLLM_CROP
-                overview_jpeg, crops, crop_regions = _render_overview_and_crops(
-                    img_bgr,
-                    before_boxes,
-                    include_crops=config.include_crops,
-                    max_crops=config.max_crops_per_image,
-                    high_conf_skip=config.high_conf_skip,
-                    max_dim=config.max_image_dim,
-                    force_crops=force_crops,
-                )
-                system_prompt, user_prompt = _build_prompts(
-                    before_boxes,
-                    allowed_classes,
-                    config,
-                    coord_scale=_overview_scale(img_w, img_h, config.max_image_dim),
-                )
-                response = client.review_image(overview_jpeg, crops, system_prompt, user_prompt)
+                overview_jpeg = _encode_jpeg_bytes(img_bgr, max_dim=config.max_image_dim, quality=90)
+                system_prompt, user_prompt = _build_zero_shot_prompts(allowed_classes, config)
+                response = client.review_image(overview_jpeg, [], system_prompt, user_prompt)
                 after_boxes, kept, relabeled, deleted, added = apply_review_decisions(
-                    before_boxes,
+                    [],
                     response,
                     allowed_classes,
                     img_w=img_w,
                     img_h=img_h,
-                    add_missing_boxes=config.add_missing_boxes,
-                    box_refine_mode=config.box_refine_mode,
-                    crop_regions=crop_regions,
-                    refine_min_area_ratio=config.refine_min_area_ratio,
-                    refine_min_iou=config.refine_min_iou,
+                    add_missing_boxes=True,
+                    box_refine_mode=BoxRefineMode.OFF,
                 )
                 has_missing = response.has_missing
                 missing_note = response.missing_note
                 skipped_mllm = False
+            else:
+                # 当未开启漏标巡检且无需借助 LLM 判定框紧贴度时，高置信度图或空框图可直接跳过 LLM
+                needs_mllm_for_refine = bool(before_boxes) and (
+                    effective_refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP}
+                    or (effective_refine_mode == BoxRefineMode.SAM_LOCAL and not config.sam_refine_all_kept)
+                )
+                all_high_conf = bool(before_boxes) and all(
+                    (b.confidence is not None and b.confidence >= config.high_conf_skip)
+                    for b in before_boxes
+                )
+                skip_reason = ""
+                if not config.check_missing and not needs_mllm_for_refine:
+                    if all_high_conf:
+                        skip_reason = "高置信度跳过 LLM"
+                    elif not before_boxes:
+                        skip_reason = "无候选框且未开启漏标检查，跳过 LLM"
+
+                if skip_reason:
+                    after_boxes = [
+                        CandidateBox(
+                            box_id=b.box_id,
+                            label=b.label,
+                            x1=b.x1,
+                            y1=b.y1,
+                            x2=b.x2,
+                            y2=b.y2,
+                            confidence=b.confidence,
+                            status="kept",
+                            reason=skip_reason,
+                            original_label=b.label,
+                        )
+                        for b in before_boxes
+                    ]
+                    kept, relabeled, deleted, added = len(after_boxes), 0, 0, 0
+                    has_missing = False
+                    missing_note = ""
+                    skipped_mllm = True
+                else:
+                    img_bgr = _read_image_unicode_safe(img_path)
+                    force_crops = effective_refine_mode == BoxRefineMode.MLLM_CROP
+                    overview_jpeg, crops, crop_regions = _render_overview_and_crops(
+                        img_bgr,
+                        before_boxes,
+                        include_crops=config.include_crops,
+                        max_crops=config.max_crops_per_image,
+                        high_conf_skip=config.high_conf_skip,
+                        max_dim=config.max_image_dim,
+                        force_crops=force_crops,
+                    )
+                    system_prompt, user_prompt = _build_prompts(
+                        before_boxes,
+                        allowed_classes,
+                        config,
+                        coord_scale=_overview_scale(img_w, img_h, config.max_image_dim),
+                    )
+                    response = client.review_image(overview_jpeg, crops, system_prompt, user_prompt)
+                    after_boxes, kept, relabeled, deleted, added = apply_review_decisions(
+                        before_boxes,
+                        response,
+                        allowed_classes,
+                        img_w=img_w,
+                        img_h=img_h,
+                        add_missing_boxes=config.add_missing_boxes,
+                        box_refine_mode=effective_refine_mode,
+                        crop_regions=crop_regions,
+                        refine_min_area_ratio=config.refine_min_area_ratio,
+                        refine_min_iou=config.refine_min_iou,
+                    )
+                    has_missing = response.has_missing
+                    missing_note = response.missing_note
+                    skipped_mllm = False
 
             # 在不修改上游候选缓存的前提下，把删框理由写入记录快照，便于界面展示与历史报告回看
             record_before_boxes = before_boxes
@@ -1818,7 +1906,7 @@ def run_mllm_review(
                         for b in before_boxes
                     ]
 
-            if config.box_refine_mode == BoxRefineMode.SAM_LOCAL and sam_refiner is not None and after_boxes:
+            if effective_refine_mode == BoxRefineMode.SAM_LOCAL and sam_refiner is not None and after_boxes:
                 if img_bgr is None:
                     img_bgr = _read_image_unicode_safe(img_path)
                 apply_sam_box_refinement(
@@ -1826,7 +1914,8 @@ def run_mllm_review(
                     after_boxes,
                     response,
                     sam_refiner,
-                    refine_all_kept=config.sam_refine_all_kept,
+                    refine_all_kept=True if is_zero_shot else config.sam_refine_all_kept,
+                    include_llm_added=is_zero_shot,
                     min_area_ratio=config.refine_min_area_ratio,
                     min_iou=config.refine_min_iou,
                 )
@@ -1844,7 +1933,7 @@ def run_mllm_review(
 
             out_img_path = _copy_image(img_path, bucket)
             out_json_path: Path | None = out_img_path.with_suffix(".json")
-            if after_boxes or config.check_missing:
+            if after_boxes or config.check_missing or is_zero_shot:
                 _write_xanylabeling_json(
                     out_json_path,
                     out_img_path.name,
@@ -1924,12 +2013,18 @@ def run_mllm_review(
                 progress_callback(completed_count, total, rec)
             if log_callback:
                 refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
-                loose_part = f", 过松:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
-                log_callback(
-                    f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                    f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
-                    f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
-                )
+                loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
+                if is_zero_shot:
+                    log_callback(
+                        f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                        f"(检出:{rec.added_count}{refine_part}{loose_part})"
+                    )
+                else:
+                    log_callback(
+                        f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                        f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
+                        f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
+                    )
 
     records.sort(key=lambda r: str(r.image_path))
 
@@ -1950,7 +2045,8 @@ def run_mllm_review(
         "errors": error_count,
         "cancelled": cancelled,
         "classes": allowed_classes,
-        "box_refine_mode": config.box_refine_mode.value,
+        "source_mode": config.source_mode.value,
+        "box_refine_mode": effective_refine_mode.value,
         "items": [
             {
                 "image": r.image_path.name,
@@ -2029,7 +2125,10 @@ def _draw_labeled_boxes(
     }
 
     for b in boxes:
-        color = status_colors.get(b.status, (0, 200, 0)) if use_status_colors else (200, 180, 0)
+        if use_status_colors and b.status == "llm_added" and b.refined:
+            color = status_colors["refined"]
+        else:
+            color = status_colors.get(b.status, (0, 200, 0)) if use_status_colors else (200, 180, 0)
         # 在 After 侧用虚线叠加原框位置，直观呈现收紧前后背景裁除幅度
         if use_status_colors and b.refined and b.original_xyxy is not None:
             op1 = (int(round(b.original_xyxy[0])), int(round(b.original_xyxy[1])))
@@ -2042,7 +2141,7 @@ def _draw_labeled_boxes(
         if b.status == "relabeled" and b.original_label:
             tag = f"{b.original_label}->{b.label}" + (" [Tight]" if b.refined else "")
         elif b.status == "llm_added":
-            tag = f"+{b.label} (LLM)"
+            tag = f"+{b.label} (LLM)" + (" [Tight]" if b.refined else "")
         elif b.status == "refined":
             tag = f"{b.label} [Tight]"
         elif b.status == "refine_suspect":

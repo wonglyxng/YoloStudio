@@ -663,6 +663,23 @@ def test_cli_review_default_output_and_source_mode_hints() -> None:
     args = parser.parse_args(["review", "-i", "data/raw_frames"])
     assert args.output == "data/smart_labeled"
 
+    zs_args = parser.parse_args(
+        [
+            "review",
+            "-i",
+            "data/raw_frames",
+            "--source-mode",
+            "llm_zero_shot",
+            "--classes",
+            "person,helmet",
+            "--box-refine",
+            "sam_local",
+        ]
+    )
+    assert zs_args.source_mode == "llm_zero_shot"
+    assert zs_args.box_refine == "sam_local"
+    assert zs_args.classes == "person,helmet"
+
     for _, label in SOURCE_MODE_ITEMS:
         assert "MLLM" not in label
     for hint in SOURCE_MODE_HINTS.values():
@@ -671,3 +688,187 @@ def test_cli_review_default_output_and_source_mode_hints() -> None:
         assert "MLLM" not in label
     for hint in BOX_REFINE_MODE_HINTS.values():
         assert "MLLM" not in hint
+
+
+def test_zero_shot_mode_requires_classes_and_handles_objects_and_negatives(tmp_path: Path) -> None:
+    """验证 `LLM_ZERO_SHOT` 模式必填类别校验、零样本全图检出/去重与确认无目标负样本 `.json` 写出。"""
+    import pytest
+
+    from yolo_studio.core.mllm_reviewer import BoxRefineMode, format_record_detail_summary
+
+    in_dir = tmp_path / "raw"
+    out_dir = tmp_path / "out"
+    _write_img(in_dir / "01_has_obj.jpg", (400, 200))
+    _write_img(in_dir / "02_empty_bg.jpg", (400, 200))
+
+    # 1) 缺失 allowed_classes 直接抛出 ValueError
+    with pytest.raises(ValueError, match="目标类别清单"):
+        run_mllm_review(
+            MllmReviewConfig(
+                images_dir=in_dir,
+                output_dir=out_dir,
+                source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+                allowed_classes=[],
+                max_workers=1,
+            ),
+            client_override=_FakeMllmClient([]),
+        )
+
+    # 2) 零样本正常识别：01 检出有效目标 + 过滤白名单外类别 + 过滤重复重叠框 -> need_review；
+    #    02 确认无目标背景图 -> auto_passed 且写出空 shapes=[] .json；
+    #    且传入不适用的 MLLM_CROP 自动降级并记录提示
+    class _PromptCaptureClient:
+        def __init__(self, responses: list[MllmReviewResponse]) -> None:
+            self._responses = list(responses)
+            self.calls: list[tuple[int, str, str]] = []
+
+        def review_image(
+            self,
+            overview_jpeg: bytes,
+            crops: list[tuple[int, str, bytes]],
+            system_prompt: str,
+            user_prompt: str,
+        ) -> MllmReviewResponse:
+            idx = len(self.calls)
+            self.calls.append((len(crops), system_prompt, user_prompt))
+            return self._responses[idx]
+
+    client = _PromptCaptureClient(
+        [
+            MllmReviewResponse(
+                added_boxes=[
+                    MissingBox(label="PERSON", box_2d=[100, 100, 900, 400], reason="前景人物"),
+                    # 同类完全重叠重复框，应被去重
+                    MissingBox(label="person", box_2d=[105, 105, 895, 395], reason="重复框"),
+                    # 不在白名单内的非法类别，应被过滤
+                    MissingBox(label="cat", box_2d=[100, 500, 500, 700], reason="无关类别"),
+                ],
+                has_missing=False,
+            ),
+            MllmReviewResponse(added_boxes=[], has_missing=False),
+        ]
+    )
+    logs: list[str] = []
+    res = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["person", "helmet"],
+            check_missing=False,  # 零样本模式下应忽略该开关，始终执行全图识别并写出负样本 .json
+            add_missing_boxes=False,
+            box_refine_mode=BoxRefineMode.MLLM_CROP,
+            max_workers=1,
+        ),
+        client_override=client,
+        log_callback=logs.append,
+    )
+
+    assert len(client.calls) == 2
+    assert all(crop_cnt == 0 for crop_cnt, _, _ in client.calls)
+    assert all("from scratch" in sys_p for _, sys_p, _ in client.calls)
+    assert any("已自动忽略边框修正模式" in line for line in logs)
+
+    assert res.total_images == 2
+    assert res.need_review_count == 1
+    assert res.auto_passed_count == 1
+
+    rec_obj = next(r for r in res.records if r.image_path.name == "01_has_obj.jpg")
+    assert rec_obj.triage_bucket == "need_review"
+    assert rec_obj.added_count == 1
+    assert len(rec_obj.after_boxes) == 1
+    assert rec_obj.after_boxes[0].label == "person"
+    assert rec_obj.after_boxes[0].status == "llm_added"
+    assert "新增标注[person]" in format_record_detail_summary(rec_obj)
+
+    rec_bg = next(r for r in res.records if r.image_path.name == "02_empty_bg.jpg")
+    assert rec_bg.triage_bucket == "auto_passed"
+    assert rec_bg.output_json_path is not None and rec_bg.output_json_path.is_file()
+    bg_payload = json.loads(rec_bg.output_json_path.read_text(encoding="utf-8"))
+    assert bg_payload["shapes"] == []
+
+    assert res.report_path is not None
+    report = json.loads(res.report_path.read_text(encoding="utf-8"))
+    assert report["source_mode"] == "llm_zero_shot"
+    assert report["box_refine_mode"] == "off"
+
+
+def test_zero_shot_mode_with_sam_local_refinement_and_safety_gate(tmp_path: Path) -> None:
+    """验证 `LLM_ZERO_SHOT` + `SAM_LOCAL` 联动对 LLM 粗框执行像素收紧，并保留安全门禁兜底保护。"""
+    from yolo_studio.core.mllm_reviewer import BoxRefineMode, format_record_detail_summary
+
+    class _MixedSamRefiner:
+        def __init__(self) -> None:
+            self.called_count = 0
+
+        def refine_boxes(self, image_bgr, boxes: list[CandidateBox]):
+            self.called_count += 1
+            out: dict[int, tuple[float, float, float, float] | None] = {}
+            for b in boxes:
+                if b.label == "person":
+                    # 合理向内收紧，应通过安全门禁
+                    out[b.box_id] = (b.x1 + 10.0, b.y1 + 8.0, b.x2 - 10.0, b.y2 - 8.0)
+                else:
+                    # 极端缩成小噪点，应触发安全门禁保留原框并标记 refine_suspect
+                    out[b.box_id] = (b.x1 + 1.0, b.y1 + 1.0, b.x1 + 4.0, b.y1 + 4.0)
+            return out
+
+    in_dir = tmp_path / "raw"
+    out_dir = tmp_path / "out"
+    _write_img(in_dir / "scene.jpg", (400, 200))
+
+    client = _FakeMllmClient(
+        [
+            MllmReviewResponse(
+                added_boxes=[
+                    # 原图坐标 (40, 20, 160, 180)
+                    MissingBox(label="person", box_2d=[100, 100, 900, 400], reason="主体人物"),
+                    # 原图坐标 (240, 40, 360, 160)
+                    MissingBox(label="helmet", box_2d=[200, 600, 800, 900], reason="安全帽"),
+                ],
+                has_missing=False,
+            )
+        ]
+    )
+    refiner = _MixedSamRefiner()
+    res = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["person", "helmet"],
+            box_refine_mode=BoxRefineMode.SAM_LOCAL,
+            sam_refine_all_kept=False,  # 零样本模式下应自动对全部检出框启用 SAM 收边
+            max_workers=1,
+        ),
+        client_override=client,
+        refiner_override=refiner,
+    )
+
+    assert refiner.called_count == 1
+    assert res.need_review_count == 1
+    rec = res.records[0]
+    assert rec.added_count == 2
+    assert rec.refined_count == 1
+    assert rec.loose_flagged_count == 1
+
+    person_box = next(b for b in rec.after_boxes if b.label == "person")
+    assert person_box.status == "llm_added"
+    assert person_box.refined is True
+    assert person_box.original_xyxy == (40.0, 20.0, 160.0, 180.0)
+    assert (person_box.x1, person_box.y1, person_box.x2, person_box.y2) == (50.0, 28.0, 150.0, 172.0)
+
+    helmet_box = next(b for b in rec.after_boxes if b.label == "helmet")
+    assert helmet_box.status == "refine_suspect"
+    assert helmet_box.refined is False
+    assert (helmet_box.x1, helmet_box.y1, helmet_box.x2, helmet_box.y2) == (240.0, 40.0, 360.0, 160.0)
+
+    assert rec.output_json_path is not None and rec.output_json_path.is_file()
+    saved_json = json.loads(rec.output_json_path.read_text(encoding="utf-8"))
+    person_shape = next(s for s in saved_json["shapes"] if s["label"] == "person")
+    assert person_shape["flags"] == {"llm_added": True, "box_refined": True}
+
+    summary = format_record_detail_summary(rec)
+    assert "新增标注+收框[person]" in summary
+    assert "过松/超门禁待修" in summary
+    assert render_review_comparison(rec)[:2] == b"\xff\xd8"

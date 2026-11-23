@@ -1,8 +1,8 @@
-"""标签页 3：LLM 智能标注界面（基准模型预标 / 已有 .json + LLM 质检精修与标准收框）。
+"""标签页 3：LLM 智能标注界面（基准模型预标 / 已有 .json 质检精修 / 零样本冷启动直接标注）。
 
 职责：
-    配置候选框来源（基准 `.pt` 低阈值推理或已有 X-AnyLabeling `.json`）、LLM 接口与预设、
-    连通性测试、边框紧贴标准化修正（标记过松 / LLM 局部图精修 / 本地 SAM 像素级收紧）与分流策略；
+    配置候选框来源（基准 `.pt` 低阈值推理、已有 X-AnyLabeling `.json` 或 LLM 零样本直接标注）、
+    LLM 接口与预设、连通性测试、边框紧贴标准化修正（标记过松 / LLM 局部图精修 / 本地 SAM 像素级收紧）与分流策略；
     右侧提供带实时计数的分流状态筛选、语义配色结果表与运行日志（同区双页签）、自适应缩放的处理前后对比图、
     历史报告加载，并支持一键跳转「2. 标注工作台」精修或发送结果至数据集准备页；
     左右两栏置于可拖拽的水平分割条中，用户可按屏幕宽度调整比例。
@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal as Signal
-from PyQt6.QtGui import QColor, QFont, QPixmap, QResizeEvent
+from PyQt6.QtGui import QColor, QFont, QPixmap, QResizeEvent, QStandardItemModel
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -610,7 +610,7 @@ class MllmReviewTab(QWidget):
         right.addWidget(self.progress_bar)
 
         self.summary_label = QLabel(
-            "就绪：选择「基准模型预标」或「已有标注 (.json)」并配置 LLM 后点击「开始 LLM 智能标注」，或加载历史报告继续复核。"
+            "就绪：选择工作模式（基准模型预标 / 已有 .json / 零样本直接标注）并配置 LLM 后点击「开始 LLM 智能标注」，或加载历史报告继续复核。"
         )
         self.summary_label.setWordWrap(True)
         self.summary_label.setStyleSheet("color: #424a53;")
@@ -659,7 +659,7 @@ class MllmReviewTab(QWidget):
 
         self.result_table = QTableWidget(0, 8)
         self.result_table.setHorizontalHeaderLabels(
-            ["图片", "分流结果", "保留", "改类", "删误检", "收框", "补漏", "说明"]
+            ["图片", "分流结果", "保留", "改类", "删误检", "收框", "新增/补漏", "说明"]
         )
         header = self.result_table.horizontalHeader()
         header.setMinimumSectionSize(44)
@@ -694,7 +694,7 @@ class MllmReviewTab(QWidget):
             "框色图例："
             '<span style="color:#16a34a; font-weight:600;">■</span> 保留&nbsp;&nbsp;&nbsp;'
             '<span style="color:#ea580c; font-weight:600;">■</span> 改类&nbsp;&nbsp;&nbsp;'
-            '<span style="color:#ca8a04; font-weight:600;">■</span> 补漏&nbsp;&nbsp;&nbsp;'
+            '<span style="color:#ca8a04; font-weight:600;">■</span> 新增/补漏&nbsp;&nbsp;&nbsp;'
             '<span style="color:#0284c7; font-weight:600;">■</span> 已收框(虚线为原框)&nbsp;&nbsp;&nbsp;'
             '<span style="color:#c026d3; font-weight:600;">■</span> 过松/超门禁待修'
         )
@@ -864,8 +864,8 @@ class MllmReviewTab(QWidget):
 
         规则：
             - 基准模型推理模式下保留在「基准推理参数」行并启用（同时服务 YOLO 推理与 SAM 收框）；
-            - 读取已有 `.json` 且启用本地 SAM 收框时，迁移展示至 SAM 配置行下方并启用；
-            - 读取已有 `.json` 且未启用本地 SAM 时，收起并禁用，避免无效控件干扰。
+            - 已有 `.json` 或零样本模式且启用本地 SAM 收框时，迁移展示至 SAM 配置行下方并启用；
+            - 已有 `.json` 或零样本模式且未启用本地 SAM 时，收起并禁用，避免无效控件干扰。
         """
         is_yolo = self.source_mode_combo.currentData() == ReviewSourceMode.YOLO_PREDICT
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
@@ -887,19 +887,20 @@ class MllmReviewTab(QWidget):
             self.yolo_device_ctrl.setEnabled(is_yolo)
 
     def _on_source_mode_changed(self) -> None:
-        """按候选框来源模式启用/禁用并动态折叠无关表单行，同时更新模式说明提示。"""
+        """按候选框来源模式启用/禁用并动态折叠无关表单行，同时更新模式说明与策略联动状态。"""
         source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
         is_yolo = source_mode == ReviewSourceMode.YOLO_PREDICT
+        is_existing_json = source_mode == ReviewSourceMode.EXISTING_JSON
         self.source_mode_hint_label.setText(SOURCE_MODE_HINTS.get(source_mode, ""))
         self.weights_picker.setEnabled(is_yolo)
         self.yolo_conf_spin.setEnabled(is_yolo)
         self.yolo_iou_spin.setEnabled(is_yolo)
         self.yolo_imgsz_spin.setEnabled(is_yolo)
-        self.ann_picker.setEnabled(not is_yolo)
+        self.ann_picker.setEnabled(is_existing_json)
         self._src_form.setRowVisible(self.weights_picker, is_yolo)
         self._src_form.setRowVisible(self.yolo_params_widget, is_yolo)
-        self._src_form.setRowVisible(self.ann_picker, not is_yolo)
-        self._sync_local_device_ctrl()
+        self._src_form.setRowVisible(self.ann_picker, is_existing_json)
+        self._sync_strategy_states()
 
     def _on_provider_changed(self) -> None:
         """切换 Gemini 与 OpenAI 兼容接口时更新常用预设并按需折叠 Base URL 行。"""
@@ -966,36 +967,102 @@ class MllmReviewTab(QWidget):
             self.api_key_status_label.setText("未检测到环境变量 OPENAI_API_KEY，请在上方填写或配置环境变量")
 
     def _sync_strategy_states(self, *_args: object) -> None:
-        """同步边框修正模式、漏标开关、局部裁剪、高置信度阈值与分流目录按钮之间的防呆联动状态。"""
+        """同步来源模式、边框修正模式、漏标开关、局部裁剪、高置信度阈值与分流目录按钮之间的防呆联动状态。"""
+        source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
+        is_zero_shot = source_mode == ReviewSourceMode.LLM_ZERO_SHOT
+
+        # 零样本模式下无上游候选框，边框紧贴修正仅支持「关闭」与「本地 SAM 像素级收紧」
+        refine_model = self.refine_mode_combo.model()
+        if isinstance(refine_model, QStandardItemModel):
+            for idx in range(self.refine_mode_combo.count()):
+                mode_data = self.refine_mode_combo.itemData(idx)
+                item = refine_model.item(idx)
+                if item is not None:
+                    supported = (not is_zero_shot) or (mode_data in {BoxRefineMode.OFF, BoxRefineMode.SAM_LOCAL})
+                    item.setEnabled(supported)
+
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
+        if is_zero_shot and refine_mode not in {BoxRefineMode.OFF, BoxRefineMode.SAM_LOCAL}:
+            off_idx = self.refine_mode_combo.findData(BoxRefineMode.OFF)
+            if off_idx >= 0:
+                prev_restore = self._restoring_state
+                self._restoring_state = True
+                self.refine_mode_combo.blockSignals(True)
+                try:
+                    self.refine_mode_combo.setCurrentIndex(off_idx)
+                finally:
+                    self.refine_mode_combo.blockSignals(False)
+                    self._restoring_state = prev_restore
+            refine_mode = BoxRefineMode.OFF
+
         is_sam = refine_mode == BoxRefineMode.SAM_LOCAL
         is_mllm_crop = refine_mode == BoxRefineMode.MLLM_CROP
 
+        self.classes_edit.setPlaceholderText(
+            "必填！英文逗号分隔，如 person, helmet（可点右侧导入 classes.txt）"
+            if is_zero_shot
+            else "英文逗号分隔，如 person, helmet（留空自动从模型或 .json 提取）"
+        )
+
         self._pol_form.setRowVisible(self.sam_row_widget, is_sam)
         self._sync_local_device_ctrl()
-        if is_sam and self.sam_refine_all_chk.isChecked():
-            self.refine_hint_label.setText(
-                "已开启全量收紧：本地 SAM 对所有保留/改类框统一贴边收框（零额外 API 费），超门禁自动回退原框转待复核。"
-            )
-        else:
-            self.refine_hint_label.setText(BOX_REFINE_MODE_HINTS.get(refine_mode, ""))
 
-        # LLM 局部放大图精修必须依赖局部裁剪图坐标系
-        if is_mllm_crop:
+        if is_zero_shot and is_sam:
             prev_restore = self._restoring_state
             self._restoring_state = True
             try:
-                self.crops_chk.setChecked(True)
+                self.sam_refine_all_chk.setChecked(True)
             finally:
                 self._restoring_state = prev_restore
-            self.crops_chk.setEnabled(False)
-            self.crops_chk.setToolTip("「LLM 局部放大图精修」模式必须附带局部裁剪图以提供高精度局部坐标系")
+            self.sam_refine_all_chk.setEnabled(False)
+            self.sam_refine_all_chk.setToolTip("零样本模式下启用本地 SAM 将自动对全部 LLM 检出框执行像素级收紧")
+            self.refine_hint_label.setText(
+                "零样本 + 本地 SAM 联动：LLM 输出语义粗框后，本地 SAM 自动对全部检出框做像素级贴边收紧（零额外 API 费），超门禁回退原框。"
+            )
         else:
-            self.crops_chk.setEnabled(True)
-            self.crops_chk.setToolTip("将低置信度候选框外扩 20% 裁剪放大后一并送检，显著提升小目标判别准确率")
+            self.sam_refine_all_chk.setEnabled(True)
+            self.sam_refine_all_chk.setToolTip(
+                "未勾选（默认）：仅对 LLM 判定过松的框调用 SAM 像素级收紧；勾选：对全部保留/改类框统一执行 SAM 收紧"
+            )
+            if is_sam and self.sam_refine_all_chk.isChecked():
+                self.refine_hint_label.setText(
+                    "已开启全量收紧：本地 SAM 对所有保留/改类框统一贴边收框（零额外 API 费），超门禁自动回退原框转待复核。"
+                )
+            elif is_zero_shot:
+                self.refine_hint_label.setText(
+                    "零样本模式直接采用 LLM 输出的边界框坐标；如需更高贴边精度，推荐切换为「本地 SAM 像素级收紧」。"
+                )
+            else:
+                self.refine_hint_label.setText(BOX_REFINE_MODE_HINTS.get(refine_mode, ""))
 
-        check_missing = self.check_missing_chk.isChecked()
-        self.add_missing_chk.setEnabled(check_missing)
+        if is_zero_shot:
+            zero_shot_tip = "零样本模式由 LLM 直接全图定位并输出目标框，此项仅在预标/已有标注质检模式下生效"
+            self.check_missing_chk.setEnabled(False)
+            self.check_missing_chk.setToolTip(zero_shot_tip)
+            self.add_missing_chk.setEnabled(False)
+            self.add_missing_chk.setToolTip(zero_shot_tip)
+            self.crops_chk.setEnabled(False)
+            self.crops_chk.setToolTip(zero_shot_tip)
+        else:
+            self.check_missing_chk.setEnabled(True)
+            self.check_missing_chk.setToolTip("")
+            # LLM 局部放大图精修必须依赖局部裁剪图坐标系
+            if is_mllm_crop:
+                prev_restore = self._restoring_state
+                self._restoring_state = True
+                try:
+                    self.crops_chk.setChecked(True)
+                finally:
+                    self._restoring_state = prev_restore
+                self.crops_chk.setEnabled(False)
+                self.crops_chk.setToolTip("「LLM 局部放大图精修」模式必须附带局部裁剪图以提供高精度局部坐标系")
+            else:
+                self.crops_chk.setEnabled(True)
+                self.crops_chk.setToolTip("将低置信度候选框外扩 20% 裁剪放大后一并送检，显著提升小目标判别准确率")
+
+            check_missing = self.check_missing_chk.isChecked()
+            self.add_missing_chk.setEnabled(check_missing)
+            self.add_missing_chk.setToolTip("")
 
         if self.triage_dirs_chk.isChecked():
             self.open_need_review_btn.setText("在工作台打开待复核目录")
@@ -1008,7 +1075,16 @@ class MllmReviewTab(QWidget):
                 "当前未按结果分建子目录，将在「2. 标注工作台」中直接打开标注输出根目录"
             )
 
+        if is_zero_shot:
+            self.high_conf_label.setText("免审阈值(停用):")
+            self.high_conf_spin.setEnabled(False)
+            self.high_conf_spin.setToolTip(
+                "零样本直接标注模式每张图均由 LLM 全图识别定位，无需置信度免审或局部裁剪阈值"
+            )
+            return
+
         # 精准反映 high_conf_skip 在当前策略组合下的真实生效角色，并用方向符号（≥ / <）消除理解歧义
+        check_missing = self.check_missing_chk.isChecked()
         needs_mllm_for_refine = refine_mode in {BoxRefineMode.FLAG_LOOSE, BoxRefineMode.MLLM_CROP} or (
             is_sam and not self.sam_refine_all_chk.isChecked()
         )
@@ -1276,6 +1352,13 @@ class MllmReviewTab(QWidget):
         ):
             QMessageBox.warning(self, "提示", "请选择有效的基准模型 .pt 权重文件。")
             return
+        if cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT and not cfg.allowed_classes:
+            QMessageBox.warning(
+                self,
+                "提示",
+                "LLM 零样本直接标注模式必须填写「目标类别清单」（英文逗号分隔，或点击「导入 classes.txt」）。",
+            )
+            return
 
         # 前置校验 LLM 必填参数与凭据，避免先跑完耗时的基准模型推理才因缺少 Key/模型名失败
         if not cfg.model_name:
@@ -1308,11 +1391,14 @@ class MllmReviewTab(QWidget):
                 return
 
         if uses_local_gpu_model and self.gpu_guard is not None:
-            task_label = (
-                "LLM 基准模型预标 / SAM 收框"
-                if cfg.box_refine_mode == BoxRefineMode.SAM_LOCAL
-                else "LLM 基准模型预标"
-            )
+            if cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT:
+                task_label = "LLM 零样本标注 / SAM 收框"
+            elif cfg.source_mode == ReviewSourceMode.EXISTING_JSON:
+                task_label = "LLM 质检 / SAM 收框"
+            elif cfg.box_refine_mode == BoxRefineMode.SAM_LOCAL:
+                task_label = "LLM 基准模型预标 / SAM 收框"
+            else:
+                task_label = "LLM 基准模型预标"
             if not self.gpu_guard.try_acquire(self, task_label):
                 return
 
@@ -1334,7 +1420,14 @@ class MllmReviewTab(QWidget):
         self.stop_btn.setEnabled(True)
         self.load_report_btn.setEnabled(False)
         self.send_ds_btn.setEnabled(False)
-        self.summary_label.setText("正在运行候选框提取与 LLM 智能标注...")
+        if cfg.source_mode == ReviewSourceMode.LLM_ZERO_SHOT:
+            self.summary_label.setText(
+                "正在运行 LLM 零样本直接标注与本地 SAM 收框..."
+                if cfg.box_refine_mode == BoxRefineMode.SAM_LOCAL
+                else "正在运行 LLM 零样本直接标注..."
+            )
+        else:
+            self.summary_label.setText("正在运行候选框提取与 LLM 智能标注...")
 
         self.worker = MllmReviewWorker(cfg)
         if uses_local_gpu_model and self.gpu_guard is not None:

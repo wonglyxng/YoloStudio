@@ -258,6 +258,69 @@ def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
         monkeypatch.setattr(QMessageBox, "critical", lambda *_a: None)
         tab._on_failed("simulated error")
         assert tab.load_report_btn.isEnabled() is True
+
+        # 6) 零样本直接标注模式防呆联动：隐藏权重/推理/已有标注行、禁用不适用收框与策略选项、必填类别校验与 SAM GPU 联动
+        from PyQt6.QtGui import QStandardItemModel
+        from yolo_studio.core.mllm_reviewer import ReviewSourceMode
+
+        crop_idx = tab.refine_mode_combo.findData(BoxRefineMode.MLLM_CROP)
+        tab.refine_mode_combo.setCurrentIndex(crop_idx)
+        qt_app.processEvents()
+        assert tab.refine_mode_combo.currentData() == BoxRefineMode.MLLM_CROP
+
+        zs_idx = tab.source_mode_combo.findData(ReviewSourceMode.LLM_ZERO_SHOT)
+        assert zs_idx >= 0
+        tab.source_mode_combo.setCurrentIndex(zs_idx)
+        qt_app.processEvents()
+
+        assert tab.weights_picker.isHidden() is True
+        assert tab.yolo_params_widget.isHidden() is True
+        assert tab.ann_picker.isHidden() is True
+        assert tab.refine_mode_combo.currentData() == BoxRefineMode.OFF
+        assert tab.check_missing_chk.isEnabled() is False
+        assert tab.add_missing_chk.isEnabled() is False
+        assert tab.crops_chk.isEnabled() is False
+        assert tab.high_conf_spin.isEnabled() is False
+        assert "必填" in tab.classes_edit.placeholderText()
+
+        refine_model = tab.refine_mode_combo.model()
+        assert isinstance(refine_model, QStandardItemModel)
+        assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.OFF)).isEnabled() is True
+        assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.SAM_LOCAL)).isEnabled() is True
+        assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.FLAG_LOOSE)).isEnabled() is False
+        assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.MLLM_CROP)).isEnabled() is False
+
+        # 未填目标类别清单时拦截启动
+        tab.classes_edit.clear()
+        warnings.clear()
+        prev_started = len(started_configs)
+        tab._on_start()
+        assert len(started_configs) == prev_started
+        assert any("目标类别清单" in m for m in warnings)
+
+        # 零样本 + 本地 SAM：GPU 开关迁移到 SAM 行下方启用，且自动勾选并锁定“全部保留框收紧”
+        tab.refine_mode_combo.setCurrentIndex(sam_idx)
+        qt_app.processEvents()
+        assert tab.sam_device_holder.isHidden() is False
+        assert tab.yolo_device_ctrl.isEnabled() is True
+        assert tab.sam_refine_all_chk.isChecked() is True
+        assert tab.sam_refine_all_chk.isEnabled() is False
+
+        tab.classes_edit.setText("person, helmet")
+        tab._on_start()
+        assert len(started_configs) == prev_started + 1
+        assert started_configs[-1].source_mode == ReviewSourceMode.LLM_ZERO_SHOT
+        assert started_configs[-1].box_refine_mode == BoxRefineMode.SAM_LOCAL
+        assert started_configs[-1].allowed_classes == ["person", "helmet"]
+
+        # 切回基准模型模式后，全部策略与收框下拉项恢复可用
+        tab._on_failed("reset")
+        tab.source_mode_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+        assert tab.check_missing_chk.isEnabled() is True
+        assert tab.sam_refine_all_chk.isEnabled() is True
+        assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.FLAG_LOOSE)).isEnabled() is True
+        assert refine_model.item(tab.refine_mode_combo.findData(BoxRefineMode.MLLM_CROP)).isEnabled() is True
     finally:
         tab.close()
 

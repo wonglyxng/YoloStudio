@@ -443,10 +443,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--exist-ok", action="store_true", help="允许覆盖同名实验目录（默认自动递增编号）")
     p_tr.set_defaults(func=_cmd_train)
 
-    p_rv = sub.add_parser("review", help="LLM 智能标注（基准模型预标 / 已有 .json + LLM 质检精修）")
+    p_rv = sub.add_parser("review", help="LLM 智能标注（基准模型预标 / 已有 .json 质检 / 零样本直接标注）")
     p_rv.add_argument("-i", "--images", required=True, help="待标注图片目录")
     p_rv.add_argument("-o", "--output", default="data/smart_labeled", help="智能标注输出目录")
-    p_rv.add_argument("--source-mode", choices=["yolo_predict", "existing_json"], default="yolo_predict")
+    p_rv.add_argument(
+        "--source-mode",
+        choices=["yolo_predict", "existing_json", "llm_zero_shot"],
+        default="yolo_predict",
+        help="候选标注来源：yolo_predict(基准模型预标) / existing_json(已有.json) / llm_zero_shot(零样本直接标注)",
+    )
     p_rv.add_argument("-w", "--weights", default="", help="基准模型 .pt 路径 (yolo_predict 模式)")
     p_rv.add_argument("-a", "--annotations", default="", help="已有 .json 目录 (existing_json 模式)")
     p_rv.add_argument("--yolo-conf", type=float, default=0.12)
@@ -457,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rv.add_argument("--model", default="gemini-3.8-flash")
     p_rv.add_argument("--api-key", default="")
     p_rv.add_argument("--base-url", default="")
-    p_rv.add_argument("--classes", default="", help="逗号分隔的类别名称")
+    p_rv.add_argument("--classes", default="", help="逗号分隔的目标类别名称（llm_zero_shot 模式必填）")
     p_rv.add_argument("--guideline", default="", help="附加标注判定规则")
     p_rv.add_argument("--high-conf-skip", type=float, default=0.85)
     p_rv.add_argument("--no-check-missing", action="store_true")
