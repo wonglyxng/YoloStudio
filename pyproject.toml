@@ -5,14 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yolo-studio"
 dynamic = ["version"]
-description = "Desktop GUI and CLI studio with embedded X-AnyLabeling, LLM smart labeling, and YOLO26 training."
+description = "Desktop GUI and CLI studio with native PyQt6 labeling workbench, LLM/SAM3 smart labeling, and YOLO26 training."
 readme = "README.md"
 license = "GPL-3.0-only"
 requires-python = ">=3.11"
 dependencies = [
     "ultralytics>=8.4.0",
     "PyQt6>=6.6.0",
-    "PyQt6-WebEngine>=6.6.0",
     "opencv-contrib-python-headless>=4.7.0.72",
     "Pillow>=10.0.0",
     "PyYAML>=6.0.1",

@@ -1,4 +1,4 @@
-"""YoloStudio 桌面图形界面应用入口模块（单进程内嵌 X-AnyLabeling）。
+"""YoloStudio 桌面图形界面应用入口模块。
 
 职责与真实入口：
     提供 `main(workspace_root)`、`resolve_workspace_root(preferred_root)` 与无控制台启动异常兜底函数，
@@ -6,15 +6,13 @@
     （操作流程见 `README.md` 与 `docs/` 使用说明）。
 
 运行环境与依赖：
-    需 Python >= 3.11、已安装 `PyQt6`、`PyQt6-WebEngine`、`x-anylabeling-cvhub`（或本地
-    `third_party/X-AnyLabeling` 源码树）及可用的本地桌面图形会话。
+    需 Python >= 3.11、已安装 `PyQt6` 及可用的本地桌面图形会话。
 
 输入、输出与协作边界：
     `workspace_root` 指定默认数据/训练产物相对目录；未指定或通过 `resolve_workspace_root` 解析时，
     按 `YOLO_STUDIO_WORKSPACE` 环境变量 → 便携包同级 `workspace/` 目录 → 源码根目录/当前工作目录的顺序确定，
     并在目标位置不可写时自动回退至用户个人目录下的 `YoloStudio` 工作区。
-    启动流程配置线程环境变量、CUDA DLL 搜索路径、`AA_ShareOpenGLContexts` 与 X-AnyLabeling 运行时资源后，
-    交由 `gui.main_window.MainWindow` 接管。
+    启动流程配置线程环境变量、CUDA DLL 搜索路径与启动欢迎图后，交由 `gui.main_window.MainWindow` 接管。
 
 失败方式：
     缺少 `PyQt6` 等依赖或当前环境无法初始化图形界面时抛出导入或 Qt 异常并返回非零退出码。
@@ -100,7 +98,7 @@ def resolve_workspace_root(preferred_root: Path | None = None) -> Path:
     优先级顺序：
         1. 环境变量 `YOLO_STUDIO_WORKSPACE`（非空白字符串时优先采用）；
         2. 传入的 `preferred_root`（若其位于便携整合包的 `app/` 目录，则自动映射为同级 `workspace/`）；
-        3. 当前模块所在源码根（若包含 `third_party/X-AnyLabeling`，便携包下同样映射至 `workspace/`）或 `Path.cwd()`。
+        3. 当前模块所在源码根（若包含 `main.py` 或 `src/yolo_studio`，便携包下同样映射至 `workspace/`）或 `Path.cwd()`。
 
     副作用与回退行为：
         若选定目录不存在会自动创建；若因系统权限限制（如解压在只读目录）无法写入，
@@ -114,7 +112,7 @@ def resolve_workspace_root(preferred_root: Path | None = None) -> Path:
         candidate = (portable_ws or preferred_root).resolve()
     else:
         code_root = _code_root_candidate()
-        if (code_root / "third_party" / "X-AnyLabeling").is_dir():
+        if (code_root / "main.py").is_file() or (code_root / "src" / "yolo_studio").is_dir():
             portable_ws = _portable_bundle_workspace(code_root)
             candidate = (portable_ws or code_root).resolve()
         else:
@@ -283,22 +281,13 @@ def _find_app_icon_path(
     *,
     package_dir: Path | None = None,
 ) -> Path | None:
-    """优先查找 YoloStudio 自有 `resources/logo.ico`，缺失时回退至内置 X-AnyLabeling 图标，均不存在返回 `None`。"""
-    own_icon = _find_package_resource(
+    """查找 YoloStudio 自有 `resources/logo.ico`，不存在时返回 `None`。"""
+    return _find_package_resource(
         APP_ICON_FILENAME,
         code_root,
         workspace_root,
         package_dir=package_dir,
     )
-    if own_icon is not None:
-        return own_icon
-
-    fallback_rel = Path("third_party") / "X-AnyLabeling" / "anylabeling" / "resources" / "images" / "icon.ico"
-    for base in (code_root, workspace_root):
-        candidate = base / fallback_rel
-        if candidate.is_file():
-            return candidate
-    return None
 
 
 def _find_app_logo_path(
@@ -430,7 +419,7 @@ def main(workspace_root: Path | None = None) -> int:
 
     性能优化设计：
         1. `QApplication` 就绪后立即弹出轻量 `QSplashScreen`（约 `0.15s` 上屏反馈）；
-        2. 主窗口采用 `lazy_init=True` 构建：内嵌 X-AnyLabeling 推迟至首次进入「2. 标注工作台」或跨页打开目录时挂载，
+        2. 主窗口采用 `lazy_init=True` 构建：原生 PyQt6 标注工作台零重型外部依赖同步瞬时就绪，
            `torch` 计算设备检测推迟至主窗口显示后由后台 `DeviceProbeWorker` 异步完成，使首屏在亚秒级直接可交互。
     """
     root = (
@@ -440,27 +429,21 @@ def main(workspace_root: Path | None = None) -> int:
     )
     code_root = _code_root_candidate()
     package_dir = Path(__file__).resolve().parent
-    for candidate_base in (code_root, root):
-        xal_dir = candidate_base / "third_party" / "X-AnyLabeling"
-        if xal_dir.is_dir() and str(xal_dir) not in sys.path:
-            sys.path.insert(0, str(xal_dir))
 
-    # 与原版 X-AnyLabeling 入口保持一致，降低内嵌标注工作台中科学计算库多线程冲突并抑制无关 ICC 日志；
-    # 该设置会让 torch 默认只用 1 个 CPU 线程，训练/推理入口通过
-    # `core.trainer.ensure_torch_cpu_threads()` 恢复 torch 线程数，不受此影响
+    # 限制 GUI 主线程中 BLAS/OpenMP 盲目抢核并抑制无关 ICC 日志；
+    # 训练/推理入口会通过 `core.trainer.ensure_torch_cpu_threads()` 恢复 torch 线程数，不受此影响
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.gui.icc=false")
 
-    from PyQt6.QtCore import QCoreApplication, QTimer, Qt
+    from PyQt6.QtCore import QTimer
     from PyQt6.QtWidgets import QApplication
 
     from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
 
     ensure_cuda_dll_search_paths()
     _configure_windows_app_user_model_id()
-    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
     app = QApplication(sys.argv)
     app.setApplicationName("YOLO26 Training Studio")

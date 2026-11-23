@@ -1,44 +1,35 @@
-"""PyQt6 单进程内嵌 X-AnyLabeling 工作台与跨页联动集成测试。
+"""PyQt6 原生轻量标注与复核工作台及跨页联动集成测试。
 
 职责：
-    在离线 `offscreen` Qt 环境下验证主窗口六标签页装配、X-AnyLabeling 内嵌宿主初始化与桥接适配层、
+    在离线 `offscreen` Qt 环境下验证主窗口六标签页装配、原生 PyQt6 标注工作台画布交互
+    （画框、选框移动/调大小、数字键与列表改类、复制、删除、撤销重做、AI 漏标提醒条、
+    `F` 一键复核确认、本地 SAM 收框结果回填与撤回、自动保存与未保存拦截）、
     快捷键作用域隔离、`open_directory` 精确目录/单图/类别加载、跨标签页联动跳转、
     跨页 GPU 任务互斥与 ONNX 导出 FP16 置灰、异步视频探测、LLM 智能标注对比图缓存，
     以及关闭主窗口时等待后台线程安全停止后再退出。
 
 运行环境与协作边界：
-    通过 `pytest` 运行，依赖 `PyQt6`、`PyQt6-WebEngine`、`Pillow` 与本地安装的
-    `third_party/X-AnyLabeling`（`anylabeling` 包）；不访问外部网络，也不弹出可见桌面窗口
-    （关闭确认对话框在测试中被替换为直接返回“是”）。
+    通过 `pytest` 运行，仅依赖 `PyQt6` 与 `Pillow`（完全不依赖 X-AnyLabeling 或 `PyQt6-WebEngine`）；
+    不访问外部网络，也不弹出可见桌面窗口。
 """
 
 from __future__ import annotations
 
+import json
 import os
-import sys
 import time
 from pathlib import Path
 from threading import Event
 
 import pytest
 from PIL import Image
+from PyQt6.QtCore import QSettings, Qt, QThread
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QGroupBox, QMessageBox
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-XAL_ROOT = PROJECT_ROOT / "third_party" / "X-AnyLabeling"
-if XAL_ROOT.is_dir() and str(XAL_ROOT) not in sys.path:
-    sys.path.insert(0, str(XAL_ROOT))
-
-from PyQt6.QtCore import QCoreApplication, QSettings, Qt, QThread  # noqa: E402
-from PyQt6.QtGui import QAction  # noqa: E402
-from PyQt6.QtTest import QTest  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QGroupBox, QMessageBox  # noqa: E402
-
-from yolo_studio._version import __version__  # noqa: E402
-from yolo_studio.gui.main_window import MainWindow  # noqa: E402
-from yolo_studio.gui.tab_labeling import (  # noqa: E402
-    ensure_cuda_dll_search_paths,
-    ensure_xanylabeling_runtime_initialized,
-)
+from yolo_studio._version import __version__
+from yolo_studio.gui.main_window import MainWindow
+from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
 
 
 def _make_window(tmp_path: Path, *, lazy_init: bool = False) -> MainWindow:
@@ -49,16 +40,14 @@ def _make_window(tmp_path: Path, *, lazy_init: bool = False) -> MainWindow:
 
 @pytest.fixture(scope="module")
 def qt_app() -> QApplication:
-    """初始化模块级无头 `QApplication` 与 X-AnyLabeling 运行时资源。"""
+    """初始化模块级无头 `QApplication`。"""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     ensure_cuda_dll_search_paths()
     existing = QApplication.instance()
     if existing is None:
-        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
         app = QApplication([])
     else:
         app = existing
-    ensure_xanylabeling_runtime_initialized(app)
     return app
 
 
@@ -68,10 +57,10 @@ def _write_sample_frame(path: Path, size: tuple[int, int] = (160, 120)) -> None:
     Image.new("RGB", size, color=(60, 130, 180)).save(path)
 
 
-def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
+def test_mainwindow_mounts_native_workbench_and_scopes_shortcuts(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证主窗口装配 6 个标签页，且内嵌 X-AnyLabeling 快捷键随可见态切换 WindowShortcut / WidgetShortcut。"""
+    """验证主窗口装配 6 个标签页，且原生标注工作台组合快捷键随可见态自动启停隔离。"""
     win = _make_window(tmp_path)
     win.show()
     qt_app.processEvents()
@@ -85,40 +74,34 @@ def test_mainwindow_mounts_embedded_xanylabeling_and_scopes_shortcuts(
             box.title() for box in win.review_tab.findChildren(QGroupBox)
         ]
         assert "2. 大语言模型 (LLM) 配置" in review_group_titles
-        assert win.labeling_tab._xal_window is not None
+        assert win.labeling_tab.ensure_mounted() is True
 
-        # 初始位于第 1 页（视频抽帧），工作台不可见，快捷键处于收起隔离态
-        actions = [a for a in win.labeling_tab._xal_window.findChildren(QAction) if a.shortcuts()]
-        assert len(actions) > 10
-        assert all(
-            action.shortcutContext() == Qt.ShortcutContext.WidgetShortcut
-            for action in actions
-        )
+        # 初始位于第 1 页（视频抽帧），工作台不可见，快捷键处于停用隔离态
+        actions = list(win.labeling_tab._scoped_actions)
+        assert len(actions) >= 4
+        assert all(not act.isEnabled() for act in actions)
 
-        # 切入第 2 页（标注工作台）后激活原生 WindowShortcut
+        # 切入第 2 页（标注工作台）后激活工作台内快捷键
         win.tabs.setCurrentIndex(1)
         qt_app.processEvents()
         assert all(
-            action.shortcutContext() == Qt.ShortcutContext.WindowShortcut
-            for action in actions
+            act.isEnabled() and act.shortcutContext() == Qt.ShortcutContext.WidgetWithChildrenShortcut
+            for act in actions
         )
 
-        # 切离第 2 页后再次收起为 WidgetShortcut
+        # 切离第 2 页后再次停用隔离
         win.tabs.setCurrentIndex(2)
         qt_app.processEvents()
-        assert all(
-            action.shortcutContext() == Qt.ShortcutContext.WidgetShortcut
-            for action in actions
-        )
+        assert all(not act.isEnabled() for act in actions)
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
 
 
-def test_embedded_workbench_keyboard_shortcuts_and_tab_isolation(
+def test_native_workbench_keyboard_shortcuts_and_tab_isolation(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """用真实按键验证内嵌工作台 R/A/D 快捷键生效、搜索框打字不误触、切至其他标签页不串键。"""
+    """用真实按键验证原生工作台 R/W/E/A/D 快捷键生效、搜索框打字不误触、切至其他标签页不串键。"""
     frames_dir = tmp_path / "shortcut_frames"
     _write_sample_frame(frames_dir / "f1.jpg")
     _write_sample_frame(frames_dir / "f2.jpg")
@@ -133,35 +116,37 @@ def test_embedded_workbench_keyboard_shortcuts_and_tab_isolation(
         qt_app.processEvents()
 
         assert win.tabs.currentIndex() == 1
-        lw = win.labeling_tab._label_widget()
-        assert lw is not None
-        assert qt_app.focusWidget() is lw.canvas
-        assert Path(str(lw.filename)).name == "f1.jpg"
+        tab = win.labeling_tab
+        assert qt_app.focusWidget() is tab.canvas
+        assert tab.current_image_path() is not None
+        assert tab.current_image_path().name == "f1.jpg"
 
-        # 1) 工作台内按 D 切下一张、按 A 切回上一张、按 R 进入画矩形框模式
-        QTest.keyClick(lw.canvas, Qt.Key.Key_D)
+        # 1) 工作台内按 D 切下一张、按 A 切回上一张、按 R 进入画矩形框模式、按 E 回到编辑模式
+        QTest.keyClick(tab.canvas, Qt.Key.Key_D)
         qt_app.processEvents()
-        assert Path(str(lw.filename)).name == "f2.jpg"
+        assert tab.current_image_path().name == "f2.jpg"
 
-        QTest.keyClick(lw.canvas, Qt.Key.Key_A)
+        QTest.keyClick(tab.canvas, Qt.Key.Key_A)
         qt_app.processEvents()
-        assert Path(str(lw.filename)).name == "f1.jpg"
+        assert tab.current_image_path().name == "f1.jpg"
 
-        QTest.keyClick(lw.canvas, Qt.Key.Key_R)
+        QTest.keyClick(tab.canvas, Qt.Key.Key_R)
         qt_app.processEvents()
-        assert lw.canvas.drawing() is True
-        assert lw.canvas.create_mode == "rectangle"
+        assert tab.canvas.drawing() is True
+
+        QTest.keyClick(tab.canvas, Qt.Key.Key_E)
+        qt_app.processEvents()
+        assert tab.canvas.editing() is True
 
         # 2) 聚焦工作台内文件搜索框打字 d、r 时走文本输入，不触发翻页或模式切换
-        lw.set_edit_mode()
-        lw.file_search.setFocus()
+        tab.file_search.setFocus()
         qt_app.processEvents()
-        QTest.keyClick(lw.file_search, Qt.Key.Key_D)
-        QTest.keyClick(lw.file_search, Qt.Key.Key_R)
+        QTest.keyClick(tab.file_search, Qt.Key.Key_D)
+        QTest.keyClick(tab.file_search, Qt.Key.Key_R)
         qt_app.processEvents()
-        assert lw.file_search.text() == "dr"
-        assert lw.canvas.editing() is True
-        lw.file_search.clear()
+        assert tab.file_search.text() == "dr"
+        assert tab.canvas.editing() is True
+        tab.file_search.clear()
         qt_app.processEvents()
 
         # 3) 切回第 1 页（视频抽帧）后按 D、R 不影响工作台状态
@@ -171,8 +156,8 @@ def test_embedded_workbench_keyboard_shortcuts_and_tab_isolation(
         QTest.keyClick(win.extract_tab.start_btn, Qt.Key.Key_D)
         QTest.keyClick(win.extract_tab.start_btn, Qt.Key.Key_R)
         qt_app.processEvents()
-        assert Path(str(lw.filename)).name == "f1.jpg"
-        assert lw.canvas.editing() is True
+        assert tab.current_image_path().name == "f1.jpg"
+        assert tab.canvas.editing() is True
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
@@ -201,9 +186,7 @@ def test_switching_next_image_with_long_path_does_not_resize_mainwindow(
         size_after_first = win.size()
         assert size_after_first == initial_size
 
-        lw = win.labeling_tab._label_widget()
-        assert lw is not None
-        lw.open_next_image()
+        assert win.labeling_tab.open_next_image() is True
         qt_app.processEvents()
 
         # 切换到超长路径的第二张大图后，主窗口尺寸与最小宽度保持不变，且全文保存在 full_text/toolTip 中
@@ -216,7 +199,7 @@ def test_switching_next_image_with_long_path_does_not_resize_mainwindow(
         win.close()
 
 
-def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
+def test_native_workbench_open_directory_classes_and_cross_tab_routing(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
     """验证 `open_directory`、`classes.txt` 预载、单图定位及数据集/智能标注页双向联动信号。"""
@@ -239,11 +222,8 @@ def test_embedded_workbench_open_directory_classes_and_cross_tab_routing(
 
         assert win.tabs.currentIndex() == 1
         assert win.labeling_tab.current_directory() == frames_dir.resolve()
-
-        lw = win.labeling_tab._label_widget()
-        assert lw is not None
-        assert lw.unique_label_list.count() == 2
-        assert Path(str(lw.filename)).resolve() == img_b.resolve()
+        assert win.labeling_tab.unique_label_list.count() == 2
+        assert win.labeling_tab.current_image_path() == img_b.resolve()
 
         # 从「2. 标注工作台」发回「4. 数据集准备」与「3. LLM 智能标注」
         win.labeling_tab.send_to_dataset.emit(str(frames_dir), str(classes_file))
@@ -303,26 +283,184 @@ def test_close_waits_for_running_workers(
         worker.wait(2000)
 
 
-def test_xal_label_bridge_and_defensive_fallback(qt_app: QApplication, tmp_path: Path) -> None:
-    """验证 X-AnyLabeling 类别桥接函数同步写入配置、唯一标签列表与弹窗历史词库，且对不兼容对象安全返回 False。"""
-    from yolo_studio.gui.tab_labeling import _apply_labels_to_xal_view
+def test_native_workbench_full_edit_review_undo_sam_and_unsaved_guard(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证原生工作台的画框、几何微调、数字键改类、复制、撤销重做、AI 漏标横幅、SAM 收框回调与未保存拦截。"""
+    frames_dir = tmp_path / "review_batch"
+    img1 = frames_dir / "01_need_review.jpg"
+    img2 = frames_dir / "02_clean.jpg"
+    _write_sample_frame(img1, size=(400, 300))
+    _write_sample_frame(img2, size=(400, 300))
 
-    assert _apply_labels_to_xal_view(object(), ["person"]) is False
+    # 为第 1 张图写入含 LLM 漏标提示与审核说明的初始 .json
+    init_json = {
+        "version": "2.4.4",
+        "flags": {"has_missing_hint": True, "missing_note": "画面右侧疑似漏标安全帽"},
+        "shapes": [
+            {
+                "label": "worker",
+                "score": 0.62,
+                "points": [[20.0, 30.0], [140.0, 220.0]],
+                "description": "relabeled: 修正为工人",
+                "shape_type": "rectangle",
+                "flags": {"llm_added": False, "box_refined": False},
+            }
+        ],
+        "imagePath": img1.name,
+        "imageData": None,
+        "imageHeight": 300,
+        "imageWidth": 400,
+    }
+    img1.with_suffix(".json").write_text(json.dumps(init_json, ensure_ascii=False), encoding="utf-8")
 
     classes_file = tmp_path / "classes.txt"
-    classes_file.write_text("worker\nvest\ngoggles\n", encoding="utf-8")
+    classes_file.write_text("worker\nhelmet\nvest\n", encoding="utf-8")
 
     win = _make_window(tmp_path)
+    win.show()
+    qt_app.processEvents()
+    changed_dirs: list[str] = []
+    win.labeling_tab.annotations_changed.connect(changed_dirs.append)
     try:
-        count = win.labeling_tab.load_classes_file(classes_file)
-        assert count == 3
-        lw = win.labeling_tab._label_widget()
-        assert lw is not None
-        assert lw._config["labels"] == ["worker", "vest", "goggles"]
-        assert lw.unique_label_list.count() == 3
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir, classes_file=classes_file) is True
+        qt_app.processEvents()
+
+        # 1) 类别加载、AI 漏标提醒条自动亮起、对象列表与详情展示审核理由
+        assert tab.unique_label_list.count() == 3
+        assert tab.review_banner.isHidden() is False
+        assert "漏标安全帽" in tab.review_banner_label.text()
+        assert tab.shape_list.count() == 1
+        tab.canvas.select_box(0, emit_signal=True)
+        assert "修正为工人" in tab.box_detail_label.text()
+        assert "0.620" in tab.box_detail_label.text()
+
+        # 2) 数字键 2 将选中框快速改类为 helmet；画新框、几何微调、复制框与撤销/重做
+        QTest.keyClick(tab.canvas, Qt.Key.Key_2)
+        qt_app.processEvents()
+        assert tab._doc is not None and tab._doc.boxes[0].label == "helmet"
+
+        tab.canvas.box_drawn.emit(200.0, 40.0, 300.0, 160.0)
+        assert len(tab._doc.boxes) == 2
+        tab.canvas.box_geometry_committed.emit(1, 210.0, 50.0, 310.0, 170.0)
+        assert tab._doc.boxes[1].x1 == 210.0
+
+        tab._duplicate_selected_box()
+        assert len(tab._doc.boxes) == 3
+
+        tab._undo()
+        assert len(tab._doc.boxes) == 2
+        tab._redo()
+        assert len(tab._doc.boxes) == 3
+
+        # 3) 模拟本地 SAM 收框结果回填与一键 Ctrl+Z 撤回
+        tab._on_sam_refine_finished(str(img1.resolve()), {0: (25.0, 35.0, 130.0, 210.0)})
+        assert tab._doc.boxes[0].x1 == 25.0
+        assert tab._doc.boxes[0].flags.get("box_refined") is True
+        tab._undo()
+        assert tab._doc.boxes[0].x1 == 20.0
+
+        # 4) 关闭自动保存后，测试未保存修改在取消关闭时拦截
+        tab.auto_save_chk.setChecked(False)
+        monkeypatch.setattr(
+            QMessageBox, "question", staticmethod(lambda *_a, **_k: QMessageBox.StandardButton.Cancel)
+        )
+        assert tab.prepare_for_close() is False
+
+        # 5) 按 F 一键「确认通过→下张」：清除漏标提醒、保存 .json 并发出变更通知、自动跳至第 2 张图
+        tab.auto_save_chk.setChecked(True)
+        QTest.keyClick(tab.canvas, Qt.Key.Key_F)
+        qt_app.processEvents()
+        assert tab.current_image_path() == img2.resolve()
+        assert len(changed_dirs) >= 1
+
+        saved_payload = json.loads(img1.with_suffix(".json").read_text(encoding="utf-8"))
+        assert saved_payload["flags"]["verified"] is True
+        assert saved_payload["flags"]["has_missing_hint"] is False
+        assert len(saved_payload["shapes"]) == 3
+        assert saved_payload["shapes"][0]["label"] == "helmet"
+
+        # 第 2 张 0 框图按 F 同样写出显式空图负样本 .json
+        QTest.keyClick(tab.canvas, Qt.Key.Key_F)
+        qt_app.processEvents()
+        empty_payload = json.loads(img2.with_suffix(".json").read_text(encoding="utf-8"))
+        assert empty_payload["shapes"] == []
+        assert empty_payload["flags"]["verified"] is True
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_annotation_canvas_mouse_draw_move_resize_overlap_and_zoom(
+    qt_app: QApplication,
+) -> None:
+    """验证原生画布真实鼠标拖拽画框、8 手柄调框、整框平移、重叠框小面积优先点选与缩放。"""
+    from PyQt6.QtCore import QPointF
+    from PyQt6.QtGui import QColor, QPixmap
+
+    from yolo_studio.core.annotation_io import RectAnnotation
+    from yolo_studio.gui.annotation_canvas import AnnotationCanvasView
+
+    canvas = AnnotationCanvasView()
+    canvas.resize(600, 450)
+    canvas.show()
+    qt_app.processEvents()
+    try:
+        pix = QPixmap(400, 300)
+        pix.fill(QColor("#334155"))
+        canvas.set_image(pix, 400, 300)
+        canvas.set_zoom(1.0)
+        qt_app.processEvents()
+
+        # 1) 绘制模式真实鼠标拉框触发 box_drawn
+        drawn: list[tuple[float, float, float, float]] = []
+        canvas.box_drawn.connect(lambda x1, y1, x2, y2: drawn.append((x1, y1, x2, y2)))
+        canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
+        p_start = canvas.mapFromScene(QPointF(40.0, 50.0))
+        p_end = canvas.mapFromScene(QPointF(160.0, 170.0))
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, p_start)
+        QTest.mouseMove(canvas.viewport(), p_end)
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, p_end)
+        qt_app.processEvents()
+        assert len(drawn) == 1
+        assert drawn[0][0] == pytest.approx(40.0, abs=2.0)
+        assert drawn[0][2] == pytest.approx(160.0, abs=2.0)
+
+        # 2) 重叠框：大框包含小框，点击重叠区域优先选中面积更小的小框
+        big_box = RectAnnotation("person", 20.0, 20.0, 300.0, 260.0)
+        small_box = RectAnnotation("helmet", 100.0, 40.0, 180.0, 110.0)
+        canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
+        canvas.set_boxes([big_box, small_box], selected_index=-1)
+        hit_pt = canvas.mapFromScene(QPointF(140.0, 75.0))
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, hit_pt)
+        qt_app.processEvents()
+        assert canvas.selected_index() == 1
+
+        # 3) 拖动已选中框的右下角手柄 (se) 扩大尺寸，验证提交几何变更
+        committed: list[tuple[int, float, float, float, float]] = []
+        canvas.box_geometry_committed.connect(
+            lambda idx, x1, y1, x2, y2: committed.append((idx, x1, y1, x2, y2))
+        )
+        se_pt = canvas.mapFromScene(QPointF(180.0, 110.0))
+        se_target = canvas.mapFromScene(QPointF(210.0, 140.0))
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, se_pt)
+        QTest.mouseMove(canvas.viewport(), se_target)
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, se_target)
+        qt_app.processEvents()
+        assert len(committed) == 1
+        assert committed[0][0] == 1
+        assert committed[0][3] == pytest.approx(210.0, abs=2.0)
+        assert committed[0][4] == pytest.approx(140.0, abs=2.0)
+
+        # 4) 缩放倍率与适应窗口正常工作
+        canvas.zoom_by(1.5)
+        assert canvas.zoom_factor() == pytest.approx(1.5, abs=0.05)
+        canvas.fit_to_window()
+        assert canvas.zoom_factor() > 0.0
+    finally:
+        canvas.close()
 
 
 def test_gpu_guard_shared_device_and_eval_onnx_half_toggle(
@@ -446,17 +584,17 @@ def test_async_video_probe_and_review_preview_cache(
         win.close()
 
 
-def test_lazy_init_fast_startup_and_async_device_probe_and_on_demand_mount(
+def test_lazy_init_fast_startup_and_async_device_probe_and_cross_tab_open(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证 `lazy_init=True` 首屏不挂载工作台、异步探测无损刷新设备状态，且跨页跳转时自动按需挂载。"""
+    """验证 `lazy_init=True` 首屏秒开、原生工作台即刻就绪、异步探测无损刷新设备状态及跨页联动打开目录。"""
     frames_dir = tmp_path / "lazy_frames"
     _write_sample_frame(frames_dir / "f001.jpg")
 
     win = _make_window(tmp_path, lazy_init=True)
     try:
-        # 1) 首屏秒开阶段：内嵌工作台处于未挂载占位态，设备处于后台探测态
-        assert win.labeling_tab._xal_window is None
+        # 1) 首屏秒开阶段：原生标注工作台无需重型依赖即刻就绪，设备处于后台探测态
+        assert win.labeling_tab.ensure_mounted() is True
         assert win.device_info.probing is True
         assert "正在后台检测" in win.train_tab.hw_label.text()
 
@@ -474,15 +612,15 @@ def test_lazy_init_fast_startup_and_async_device_probe_and_on_demand_mount(
 
         assert win.device_info.probing is False
         assert win.train_tab.device_info is win.device_info
+        assert win.labeling_tab.device_info is win.device_info
         assert "正在后台检测" not in win.train_tab.hw_label.text()
         assert win.train_tab.device_ctrl.device() == win.device_info.recommended_device
         # 用户手动修改过的设备值不被后台探测覆盖
         assert win.eval_tab.device_ctrl.device() == "custom:1"
 
-        # 3) 从第 1 页发送抽帧目录时，第 2 页自动按需挂载内嵌 X-AnyLabeling 并打开目录
+        # 3) 从第 1 页发送抽帧目录时，自动跳转第 2 页原生工作台并打开目录
         assert win.tabs.currentIndex() == 0
         win.extract_tab.send_frames_dir.emit(str(frames_dir))
-        assert win.labeling_tab._xal_window is not None
         assert win.tabs.currentIndex() == 1
         assert win.labeling_tab.current_directory() == frames_dir.resolve()
     finally:

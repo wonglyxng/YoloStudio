@@ -1,7 +1,7 @@
 """YoloStudio Windows 独立便携整合包（方案 A）自动化构建与自检工具。
 
 职责与真实入口：
-    将免安装的独立 Python 3.12 运行时、第三方依赖库、YoloStudio 应用代码、内嵌 X-AnyLabeling 源码、
+    将免安装的独立 Python 3.12 运行时、第三方依赖库、YoloStudio 应用代码（含原生 PyQt6 标注工作台）、
     原生无控制台启动器 `YoloStudio.exe`、命令行入口 `YoloStudio-CLI.cmd`、预置模型权重与开源协议文件
     组装为无外部 Python 依赖即可在目标 Windows x64 电脑解压运行的便携目录（及可选 `.7z`/`.zip` 归档包）。
     可通过 `python scripts/build_portable.py` 或包装脚本 `scripts/build_portable.ps1` 直接调用
@@ -98,37 +98,28 @@ DEV_ONLY_PACKAGE_PREFIXES: tuple[str, ...] = (
     "py.py",
 )
 
-# 复制 third_party/X-AnyLabeling 时仅保留运行与许可证必需项，剔除宣传大图、示例与单元测试
-XAL_ALLOWED_ITEMS: tuple[str, ...] = (
-    "anylabeling",
-    "LICENSE",
-    "pyproject.toml",
-    "README.md",
-    "README_zh-CN.md",
-)
-
 CORE_PIP_REQUIREMENTS: tuple[str, ...] = (
     "ultralytics>=8.4.0",
     "PyQt6>=6.6.0",
-    "PyQt6-WebEngine>=6.6.0",
     "Pillow>=10.0.0",
     "PyYAML>=6.0.1",
     "numpy>=2.0.0",
     "google-genai>=2.30.1",
     "openai>=1.50.0",
     "pydantic>=2.0.0",
+    "ftfy>=6.0.0",
+    "regex>=2023.0.0",
+    "timm>=1.0.0",
+)
+
+SAM3_CLIP_ARCHIVE_URL = (
+    "https://github.com/ultralytics/CLIP/archive/refs/heads/main.zip"
 )
 
 PBS_LATEST_API_URL = (
     "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest"
 )
 
-
-# 保护模式下 X-AnyLabeling 内需要按 `.py` 原路径读取的极少数运行期脚本/配置文件
-XAL_KEEP_PY_REL_MARKERS: tuple[str, ...] = (
-    "services/auto_training/ultralytics/worker.py",
-    "services/auto_labeling/configs/",
-)
 
 # 保护模式下替换 `app/main.py` 与 `app/cli.py` 的极简无注释启动桩（仅转发至已编译的核心模块）
 PROTECTED_MAIN_STUB = (
@@ -195,7 +186,7 @@ class BuildConfig:
 
     关键字段说明：
         `mode`：`"clean"` 表示从纯净独立 Python 重新安装依赖；`"from-venv"` 表示克隆现有虚拟环境。
-        `variant`：`"gpu"`（含 CUDA PyTorch 与 `onnxruntime-gpu`）或 `"cpu"`（轻量纯 CPU 推理/标注版）。
+        `variant`：`"gpu"`（含 CUDA PyTorch）或 `"cpu"`（轻量纯 CPU 推理/标注版）。
         `protect`：源码保护级别，`"pyd"`（Cython 编译自研核心为原生 `.pyd` 机器码 + 剥离明文 `.py` +
             启动器硬编码 SHA-256 防篡改校验，适合内部防查看与防篡改）、`"pyc"`（仅留同级 `.pyc` +
             防篡改校验）或 `"none"`（保留明文源码，适合开源合规对外分发）。
@@ -602,9 +593,6 @@ def compute_runtime_fingerprint(config: BuildConfig) -> dict[str, object]:
         "core_pip_requirements": list(CORE_PIP_REQUIREMENTS) if config.mode == "clean" else [],
         "requirements_txt_sha256": _hash_requirements_txt(repo_root / "requirements.txt"),
         "pyproject_deps_sha256": _hash_pyproject_dependencies(repo_root / "pyproject.toml"),
-        "xal_pyproject_deps_sha256": _hash_pyproject_dependencies(
-            repo_root / "third_party" / "X-AnyLabeling" / "pyproject.toml"
-        ),
     }
     if config.mode == "from-venv":
         cfg_hash, pkg_hash = _hash_venv_packages(config.venv_dir.resolve())
@@ -952,19 +940,81 @@ def prepare_clean_runtime(config: BuildConfig, runtime_dir: Path) -> None:
         check=True,
     )
 
-    xal_extra = "gpu" if config.variant == "gpu" else "cpu"
-    xal_path = config.repo_root / "third_party" / "X-AnyLabeling"
-    print(f"[依赖] 安装 X-AnyLabeling[{xal_extra}] 运行时依赖...")
-    subprocess.run(
-        [*pip_common, f"{xal_path}[{xal_extra}]"],
-        env=pip_env,
-        check=True,
-    )
-
-    print("[依赖] 安装 YoloStudio 核心依赖...")
+    print("[依赖] 安装 YoloStudio 核心依赖（含 SAM 3 文本自动标注依赖）...")
     subprocess.run([*pip_common, *CORE_PIP_REQUIREMENTS], env=pip_env, check=True)
 
+    _install_ultralytics_clip(py_exe, pip_env, runtime_dir, config)
     _enforce_single_opencv_headless(py_exe, pip_env, config.pip_index_url)
+
+
+def _install_ultralytics_clip(
+    py_exe: Path,
+    env: dict[str, str],
+    runtime_dir: Path,
+    config: BuildConfig,
+) -> None:
+    """为 SAM 3 文本分词器安装纯 Python `ultralytics/CLIP` 包，支持归档缓存与本地 `.venv` 离线兜底。"""
+    cache_wheels_dir = config.cache_dir / "wheels"
+    cache_wheels_dir.mkdir(parents=True, exist_ok=True)
+    clip_zip = cache_wheels_dir / "ultralytics-clip-main.zip"
+
+    if not clip_zip.is_file() or clip_zip.stat().st_size == 0:
+        print(f"[依赖] 下载并缓存 ultralytics/CLIP 源码归档: {SAM3_CLIP_ARCHIVE_URL}")
+        tmp_zip = clip_zip.with_suffix(".zip.part")
+        try:
+            req = urllib.request.Request(
+                SAM3_CLIP_ARCHIVE_URL,
+                headers={"User-Agent": "YoloStudio-Packager"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as src, tmp_zip.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            tmp_zip.replace(clip_zip)
+        except Exception as exc:
+            tmp_zip.unlink(missing_ok=True)
+            print(f"[警告] 下载 ultralytics/CLIP 失败 ({exc})，尝试从本地 .venv 离线复制纯 Python clip 包...")
+
+    if clip_zip.is_file() and clip_zip.stat().st_size > 0:
+        print(f"[依赖] 安装 SAM 3 文本分词器 ultralytics/CLIP ({clip_zip.name})...")
+        fast_cmd = [
+            str(py_exe),
+            "-m",
+            "pip",
+            "install",
+            "--no-warn-script-location",
+            "--no-deps",
+            "--no-build-isolation",
+            str(clip_zip),
+        ]
+        res = subprocess.run(fast_cmd, env=env)
+        if res.returncode != 0:
+            fallback_cmd = [
+                str(py_exe),
+                "-m",
+                "pip",
+                "install",
+                "--no-warn-script-location",
+                "--no-deps",
+                str(clip_zip),
+            ]
+            if config.pip_index_url:
+                fallback_cmd.extend(["-i", config.pip_index_url])
+            subprocess.run(fallback_cmd, env=env, check=True)
+        return
+
+    venv_sp = config.venv_dir.resolve() / "Lib" / "site-packages"
+    venv_clip = venv_sp / "clip"
+    if venv_clip.is_dir():
+        target_sp = runtime_dir / "Lib" / "site-packages"
+        _copy_tree_filtered(venv_clip, target_sp / "clip")
+        for dist_info in venv_sp.glob("clip-*.dist-info"):
+            if dist_info.is_dir():
+                _copy_tree_filtered(dist_info, target_sp / dist_info.name)
+        print("[依赖] 已从本地 .venv 离线复制纯 Python clip 包。")
+        return
+
+    raise RuntimeError(
+        "无法安装 SAM 3 必需的 ultralytics/CLIP 分词器包（GitHub 归档下载失败且本地 .venv 中不存在 clip）。"
+    )
 
 
 def _enforce_single_opencv_headless(py_exe: Path, env: dict[str, str], pip_index_url: str = "") -> None:
@@ -1077,12 +1127,12 @@ def sanitize_site_packages(site_packages_dir: Path, remove_bundled_anylabeling_c
 
 
 def write_portable_pth(site_packages_dir: Path) -> Path:
-    """在 `runtime/Lib/site-packages` 写入纯相对路径 `.pth` 文件，挂载 `app/src` 与内嵌 `X-AnyLabeling`。
+    """在 `runtime/Lib/site-packages` 写入纯相对路径 `.pth` 文件，挂载 `app/src`。
 
     设计原因：
         CPython `site.addsitedir` 以 `site-packages` 自身目录为基准解析 `.pth` 中的相对路径；
         采用此方式不仅免去了硬编码绝对路径，还能保证 Windows 下 PyTorch `DataLoader(workers>0)`
-        通过 `spawn` 启动的子进程在导入业务模块前自动挂载 `yolo_studio` 与 `anylabeling`。
+        通过 `spawn` 启动的子进程在导入业务模块前自动挂载 `yolo_studio`。
     """
     site_packages_dir.mkdir(parents=True, exist_ok=True)
     pth_file = site_packages_dir / "yolo_studio_portable.pth"
@@ -1090,7 +1140,6 @@ def write_portable_pth(site_packages_dir: Path) -> Path:
         [
             "# YoloStudio 独立便携包相对模块搜索路径（由 build_portable.py 自动生成）",
             "../../../app/src",
-            "../../../app/third_party/X-AnyLabeling",
             "",
         ]
     )
@@ -1126,7 +1175,7 @@ def bundle_msvc_runtime_dlls(runtime_dir: Path) -> list[str]:
 
 
 def copy_app_and_docs(repo_root: Path, bundle_root: Path) -> None:
-    """复制应用入口、`src/yolo_studio`、精简后的 `third_party/X-AnyLabeling`、文档与开源协议声明。"""
+    """复制应用入口、`src/yolo_studio`、文档与开源协议声明。"""
     app_dir = bundle_root / "app"
     app_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1136,19 +1185,6 @@ def copy_app_and_docs(repo_root: Path, bundle_root: Path) -> None:
             shutil.copy2(src_file, app_dir / top_script)
 
     _copy_tree_filtered(repo_root / "src" / "yolo_studio", app_dir / "src" / "yolo_studio")
-
-    xal_src = repo_root / "third_party" / "X-AnyLabeling"
-    xal_dst = app_dir / "third_party" / "X-AnyLabeling"
-    xal_dst.mkdir(parents=True, exist_ok=True)
-    for item_name in XAL_ALLOWED_ITEMS:
-        src_item = xal_src / item_name
-        if not src_item.exists():
-            continue
-        dst_item = xal_dst / item_name
-        if src_item.is_dir():
-            _copy_tree_filtered(src_item, dst_item)
-        else:
-            shutil.copy2(src_item, dst_item)
 
     for root_doc in ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "项目文档索引.md"):
         src_doc = repo_root / root_doc
@@ -1689,7 +1725,6 @@ def apply_code_protection(config: BuildConfig, bundle_root: Path) -> None:
     runtime_py = bundle_root / "runtime" / "python.exe"
     app_dir = bundle_root / "app"
     yolo_pkg_dir = app_dir / "src" / "yolo_studio"
-    xal_pkg_dir = app_dir / "third_party" / "X-AnyLabeling" / "anylabeling"
 
     if level == "pyd":
         compiled = compile_yolo_studio_to_pyd(
@@ -1705,23 +1740,12 @@ def apply_code_protection(config: BuildConfig, bundle_root: Path) -> None:
             top_init.write_text("from yolo_studio._version import __version__\n", encoding="utf-8")
         print(f"[保护] 已将 {count_core} 个核心业务模块转为无明文源码的同级 .pyc。")
 
-    if xal_pkg_dir.is_dir():
-        count_xal = strip_source_to_pyc_only(
-            xal_pkg_dir,
-            runtime_py,
-            keep_py_rel_markers=XAL_KEEP_PY_REL_MARKERS,
-        )
-        print(f"[保护] 已将内嵌 X-AnyLabeling 的 {count_xal} 个模块转为同级 .pyc 防误改。")
-
     # 替换入口为无注释极简启动桩，并移除无需在终端暴露的工程元数据文件
     (app_dir / "main.py").write_text(PROTECTED_MAIN_STUB, encoding="utf-8")
     (app_dir / "cli.py").write_text(PROTECTED_CLI_STUB, encoding="utf-8")
-    for meta_file in (
-        app_dir / "pyproject.toml",
-        app_dir / "third_party" / "X-AnyLabeling" / "pyproject.toml",
-    ):
-        if meta_file.is_file():
-            meta_file.unlink()
+    meta_file = app_dir / "pyproject.toml"
+    if meta_file.is_file():
+        meta_file.unlink()
 
 
 def cleanup_runtime_artifacts(runtime_dir: Path) -> list[str]:
@@ -1951,7 +1975,7 @@ def write_cli_and_quickstart_files(bundle_root: Path, version: str, variant: str
             "  - workspace/          : 默认用户数据工作区（抽帧图片、构建的数据集与训练结果默认保存在此）",
             "  - weights/            : 预训练模型权重存放目录（可将离线下载的 yolo26n.pt / yolo26s.pt 放入此处）",
             "  - runtime/            : 内置独立 Python 3.12 运行时与深度学习依赖库（请勿随意删除或修改）",
-            "  - app/                : YoloStudio 与内嵌 X-AnyLabeling 核心运行组件（请勿手动篡改）",
+            "  - app/                : YoloStudio 核心运行组件（含原生标注工作台，请勿手动篡改）",
             "  - docs/               : 详细图文工作流与参数使用说明",
             "",
             "【3. 显卡加速说明】",
@@ -2080,22 +2104,22 @@ def verify_portable_bundle(
     probe_code = """
 import sys
 from pathlib import Path
-import cv2, yaml, PIL, pydantic, PyQt6.QtWidgets
-import yolo_studio, anylabeling
+import cv2, yaml, PIL, pydantic, ftfy, regex, PyQt6.QtWidgets
+import yolo_studio
 import yolo_studio.app as ys_app
 import yolo_studio.cli as ys_cli
-from yolo_studio.core import mllm_reviewer
+from yolo_studio.core import annotation_io, mllm_reviewer
 from yolo_studio.gui import main_window
 
 bundle = Path(sys.argv[1]).resolve()
 protect_level = sys.argv[3]
 ys_path = Path(yolo_studio.__file__).resolve()
-al_path = Path(anylabeling.__file__).resolve()
 assert bundle in ys_path.parents, f"yolo_studio 未从便携包内加载: {ys_path}"
-assert bundle in al_path.parents, f"anylabeling 未从便携包内加载: {al_path}"
+assert (bundle / "app" / "src" / "yolo_studio" / "resources" / "logo.ico").is_file(), "便携包缺少自有 logo.ico"
+assert (bundle / "app" / "src" / "yolo_studio" / "resources" / "logo.png").is_file(), "便携包缺少自有 logo.png"
 
 if protect_level == "pyd":
-    for mod in (ys_app, ys_cli, mllm_reviewer, main_window):
+    for mod in (ys_app, ys_cli, annotation_io, mllm_reviewer, main_window):
         mod_file = Path(mod.__file__).resolve()
         assert mod_file.suffix.lower() == ".pyd", f"模块未加载自 .pyd 二进制: {mod_file}"
 
@@ -2104,13 +2128,11 @@ decision = mllm_reviewer.BoxDecision(box_id=1, action="keep")
 assert decision.box_id == 1 and decision.action == "keep"
 
 if sys.argv[2] == "1":
-    import torch, onnxruntime, ultralytics
-    from PyQt6.QtCore import QCoreApplication, Qt
+    import torch, ultralytics, timm, clip
     from PyQt6.QtWidgets import QApplication, QFileDialog
     from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
 
     ensure_cuda_dll_search_paths()
-    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication([])
     win = main_window.MainWindow(bundle / "workspace", lazy_init=True)
 
@@ -2126,10 +2148,10 @@ if sys.argv[2] == "1":
     assert len(dialog_calls) == 2, f"浏览按钮未正常触发 QFileDialog: {dialog_calls}"
     assert not slot_errors, f"Qt 信号槽在编译模块下发生异常: {slot_errors}"
 
-    assert win.labeling_tab.ensure_mounted() is True, "内嵌 X-AnyLabeling 挂载失败"
+    assert win.labeling_tab.ensure_mounted() is True, "原生标注工作台初始化失败"
     win.labeling_tab.prepare_for_close()
     win.close()
-    print(f"probe_ok protect={protect_level} torch={torch.__version__} ort={onnxruntime.__version__} ultra={ultralytics.__version__}")
+    print(f"probe_ok protect={protect_level} torch={torch.__version__} ultra={ultralytics.__version__}")
 else:
     print(f"probe_ok light protect={protect_level}")
 """
@@ -2355,21 +2377,9 @@ def create_patch_archive(
 
 
 def resolve_launcher_icon_path(repo_root: Path) -> Path | None:
-    """解析编译 `YoloStudio.exe` 时嵌入的 Windows 图标路径：优先自有 `logo.ico`，缺失时兜底 X-AnyLabeling 图标。"""
-    candidates = (
-        repo_root / "src" / "yolo_studio" / "resources" / "logo.ico",
-        repo_root
-        / "third_party"
-        / "X-AnyLabeling"
-        / "anylabeling"
-        / "resources"
-        / "images"
-        / "icon.ico",
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
+    """解析编译 `YoloStudio.exe` 时嵌入的自有 Windows 图标 `logo.ico` 路径，不存在时返回 `None`。"""
+    candidate = repo_root / "src" / "yolo_studio" / "resources" / "logo.ico"
+    return candidate if candidate.is_file() else None
 
 
 def _build_launcher_for_bundle(config: BuildConfig, bundle_root: Path, version: str) -> None:
@@ -2424,7 +2434,7 @@ def build_patch_only(config: BuildConfig) -> Path:
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         _mount_runtime_junction(src_runtime, runtime_mount)
-        print("[应用] 同步 YoloStudio 源码、精简版内嵌 X-AnyLabeling、文档与协议声明...")
+        print("[应用] 同步 YoloStudio 源码、文档与协议声明...")
         copy_app_and_docs(config.repo_root, stage_root)
         (stage_root / "workspace").mkdir(parents=True, exist_ok=True)
         (stage_root / "weights").mkdir(parents=True, exist_ok=True)
@@ -2547,7 +2557,7 @@ def build_portable_bundle(config: BuildConfig) -> tuple[Path, Path | None]:
             if bundled_dlls:
                 print(f"[运行时] 补齐 MSVC 运行库 DLL: {', '.join(bundled_dlls)}")
 
-    print("[应用] 同步 YoloStudio 源码、精简版内嵌 X-AnyLabeling、文档与协议声明...")
+    print("[应用] 同步 YoloStudio 源码、文档与协议声明...")
     copy_app_and_docs(config.repo_root, bundle_root)
 
     staged_weights = prepare_weights_and_workspace(config, bundle_root)
@@ -2657,7 +2667,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--variant",
         choices=("gpu", "cpu"),
         default="gpu",
-        help="硬件变体标识：gpu（默认，含 CUDA PyTorch 与 onnxruntime-gpu）或 cpu（轻量版）。",
+        help="硬件变体标识：gpu（默认，含 CUDA PyTorch）或 cpu（轻量版）。",
     )
     parser.add_argument(
         "--protect",
@@ -2775,7 +2785,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-heavy-imports",
         action="store_true",
-        help="冒烟自检时跳过 torch / onnxruntime / ultralytics 重型库导入以缩短测试耗时。",
+        help="冒烟自检时跳过 torch / ultralytics 重型库导入以缩短测试耗时。",
     )
     return parser
 

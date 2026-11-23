@@ -1,54 +1,79 @@
-"""标签页 2：单进程内嵌原版 X-AnyLabeling 标注工作台界面。
+"""标签页 2：原生 PyQt6 轻量标注与复核工作台界面。
 
 职责：
-    在 YoloStudio 主进程与主窗口内直接托管原版 `anylabeling.views.mainwindow.MainWindow`
-    （含完整画布、标注工具栏、标签/形状/文件面板与 AI 自动标注引擎），并提供顶部工作流联动栏，
-    与「1. 视频抽帧」「3. LLM 智能标注」「4. 数据集准备」双向衔接。
+    提供面向 YOLO 目标检测（矩形框）与 AI 复核闭环的高性能原生 PyQt6 标注工作台：
+    左侧图片文件列表（搜索/状态筛选/进度统计）、中央可缩放平移交互画布（`R/W` 画框、
+    8 控制点精修、撤销重做、AI 漏标提醒横幅）、右侧类别管理与目标框详情面板
+    （展示 LLM/SAM 审核理由与置信度，支持一键本地 SAM 像素级贴边收框），
+    并与「1. 视频抽帧」「3. LLM 智能标注」「4. 数据集准备」实现双向路径与变更信号联动。
 
 运行环境与协作边界：
-    运行于 PyQt6 主线程，依赖 `third_party/X-AnyLabeling`（`x-anylabeling-cvhub`）源码包及
-    `PyQt6` / `PyQt6-WebEngine` / `onnxruntime-gpu`。
-    初始化需先调用 `ensure_xanylabeling_runtime_initialized` 注册 Qt 资源、翻译与 CUDA DLL 搜索路径。
-    内嵌子窗口保留独立 `menuBar()` 与 `statusBar()`，但关闭生命周期由外层 `MainWindow.closeEvent`
-    通过 `prepare_for_close()` 统一调度。
+    运行于 PyQt6 主线程，仅依赖 `PyQt6`、`Pillow` 及 `core.annotation_io`；
+    完全不依赖 X-AnyLabeling 或 `PyQt6-WebEngine`。本地 SAM 贴边收框按需在后台 `QThread`
+    中延迟加载 `core.mllm_reviewer.UltralyticsSamBoxRefiner` 并遵守 `GpuTaskGuard` 互斥保护。
+    保存格式 100% 兼容标准 LabelMe / X-AnyLabeling `.json` 矩形标注协议。
 """
 
 from __future__ import annotations
 
+import copy
 import os
+import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
-from PyQt6.QtCore import QFileSystemWatcher, QLocale, QSize, Qt, QTimer, QTranslator, pyqtSignal as Signal
-from PyQt6.QtGui import QAction, QCloseEvent
+from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
+from PyQt6.QtGui import QAction, QColor, QIcon, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-_RUNTIME_INITIALIZED = False
-_INSTALLED_TRANSLATOR: QTranslator | None = None
-_LOADED_CONFIG: dict | None = None
+from yolo_studio.core.annotation_io import (
+    ImageAnnotationDoc,
+    ImageStatusSummary,
+    RectAnnotation,
+    inspect_image_status,
+    label_color_rgb,
+    load_classes_txt,
+    load_image_annotation,
+    save_classes_txt,
+    save_image_annotation,
+    scan_labeling_directory,
+)
+from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
+from yolo_studio.gui.annotation_canvas import AnnotationCanvasView, load_image_pixmap
+from yolo_studio.gui.common import GpuTaskGuard
+
 _ADDED_DLL_HANDLES: list[object] = []
+_MAX_UNDO_STEPS = 80
 
 
 def ensure_cuda_dll_search_paths() -> None:
     """在 Windows 上将 PyTorch 自带的 CUDA/cuDNN 目录加入 DLL 搜索路径。
 
     说明：
-        当进程先启动 `onnxruntime-gpu` 且未提前 `import torch` 时，Windows 可能找不到
-        `cudnn64_9.dll` 导致退回 `CPUExecutionProvider`。本函数幂等补充 `torch\\lib` 搜索目录。
+        在桌面进程提前补充 `torch\\lib` 目录，避免某些扩展库在 `import torch` 前加载 CUDA 运行时失败。
     """
     if os.name != "nt":
         return
@@ -66,214 +91,45 @@ def ensure_cuda_dll_search_paths() -> None:
                 if hasattr(os, "add_dll_directory"):
                     _ADDED_DLL_HANDLES.append(os.add_dll_directory(lib_str))
     except Exception:
-        # 找不到或仅 CPU 环境时忽略，不影响 CPU 回退运行
         pass
 
 
-def ensure_xanylabeling_runtime_initialized(app: QApplication) -> dict:
-    """幂等初始化 X-AnyLabeling 所需的配置、Qt 资源、语言翻译与主题调色板。
-
-    调用条件：
-        必须在已创建 `QApplication` 之后、构造内嵌工作台窗口之前调用；
-        重复调用时直接复用已加载的缓存配置，不重复安装 `QTranslator`。
-    """
-    global _RUNTIME_INITIALIZED, _INSTALLED_TRANSLATOR, _LOADED_CONFIG
-    if _RUNTIME_INITIALIZED and _LOADED_CONFIG is not None:
-        return _LOADED_CONFIG
-
-    ensure_cuda_dll_search_paths()
-
-    from anylabeling import config as anylabeling_config
-    from anylabeling.config import get_config, get_work_directory, set_work_directory
-    from anylabeling.resources import resources  # noqa: F401  # 注册图标与翻译 Qt 资源
-    from anylabeling.views.labeling.utils.theme import init_theme
-
-    work_dir = os.path.expanduser("~")
-    set_work_directory(work_dir)
-    rc_path = os.path.join(get_work_directory(), ".xanylabelingrc")
-    anylabeling_config.current_config_file = rc_path
-    config = get_config(rc_path, show_msg=False)
-
-    # 仅初始化内部主题字典供图标/控件查询，不覆盖 YoloStudio 顶层应用样式表
-    theme_mode = config.get("theme", "light")
-    if theme_mode not in ("light", "dark"):
-        theme_mode = "light"
-    init_theme("light" if theme_mode == "auto" else theme_mode)
-
-    # 优先加载用户配置的语言，否则按系统区域（默认尝试 zh_CN）加载内嵌翻译
-    language = config.get("language") or QLocale.system().name()
-    translator = QTranslator(app)
-    if translator.load(f":/languages/translations/{language}.qm") or translator.load(
-        ":/languages/translations/zh_CN.qm"
-    ):
-        app.installTranslator(translator)
-        _INSTALLED_TRANSLATOR = translator
-
-    _LOADED_CONFIG = config
-    _RUNTIME_INITIALIZED = True
-    return config
-
-
-def _create_embedded_window_class():
-    """延迟定义继承自原版 `MainWindow` 的内嵌宿主机类，避免模块导入阶段触发 Qt 资源依赖。"""
-    from anylabeling.views.labeling.utils.theme import get_app_stylesheet
-    from anylabeling.views.mainwindow import MainWindow as XalMainWindow
-
-    class _EmbeddedXAnyLabelingWindow(XalMainWindow):
-        """内嵌于标签页中的 X-AnyLabeling 主窗口包装类。
-
-        状态与副作用：
-            持有 `_allow_close` 关闭放行开关与 `title_changed` 信号；
-            通过 `Qt.WindowType.Widget` 嵌入外层布局，并随标签页可见状态动态切换内部 `QAction`
-            的快捷键上下文：当前页可见时启用原生 `WindowShortcut`（确保挂载在菜单/工具栏上的
-            `R`/`A`/`D` 等全部快捷键正常响应），切离隐藏时收起为 `WidgetShortcut` 防止跨页误触。
-        """
-
-        title_changed = Signal(str)
-
-        def __init__(self, app: QApplication, config: dict) -> None:
-            self._allow_close = False
-            super().__init__(app, config=config)
-            self.setWindowFlags(Qt.WindowType.Widget)
-            self.setStyleSheet(get_app_stylesheet())
-            # 初始挂载时尚未显示，先收起快捷键，待所在标签页真正进入可见态再激活
-            self.set_shortcuts_active(False)
-
-        def set_shortcuts_active(self, active: bool) -> None:
-            """按工作台标签页是否可见切换内部 `QAction` 的快捷键作用域。
-
-            原因说明：
-                X-AnyLabeling 将绝大多数快捷键 `QAction` 仅注册在 `QMenu` 与 `ToolBar` 上，
-                并未同时 `addAction` 到画布或外层容器；若强设为 `WidgetWithChildrenShortcut`，
-                当焦点位于兄弟节点 `Canvas` 时 Qt `QShortcutMap` 不会匹配，导致快捷键全部失效。
-                因此在工作台可见时恢复原生 `WindowShortcut`，隐藏时切为 `WidgetShortcut` 实现跨页隔离。
-            """
-            ctx = (
-                Qt.ShortcutContext.WindowShortcut
-                if active
-                else Qt.ShortcutContext.WidgetShortcut
-            )
-            for action in self.findChildren(QAction):
-                # 排除独立的非模态顶层子窗口（如点云/分类弹窗），但保留 QMenu（Popup 亦带 Window 标志位）
-                obj = action.parent()
-                while obj is not None and not isinstance(obj, QWidget):
-                    obj = obj.parent()
-                if (
-                    isinstance(obj, QWidget)
-                    and obj is not self
-                    and obj.isWindow()
-                    and not isinstance(obj, QMenu)
-                ):
-                    continue
-                action.setShortcutContext(ctx)
-
-        def _restore_window_geometry(self) -> None:
-            """内嵌模式下由外层标签页布局接管尺寸，忽略独立窗口位置/大小恢复。"""
-            return
-
-        def setWindowTitle(self, title: str) -> None:
-            """截获标题变更并向外层工作台栏发送通知，避免影响宿主的独立窗口状态。"""
-            super().setWindowTitle(title)
-            self.title_changed.emit(title)
-
-        def closeEvent(self, event: QCloseEvent) -> None:
-            """拦截非宿主触发的关闭（如语言/主题重启提示），仅在宿主退出阶段放行保存检查。"""
-            if not self._allow_close:
-                event.ignore()
-                QMessageBox.information(
-                    self,
-                    "提示",
-                    "内嵌标注工作台由 YoloStudio 主窗口统一托管；若刚修改语言或主题设置，请关闭并重新打开 YoloStudio 生效。",
-                )
-                return
-            super().closeEvent(event)
-
-        def prepare_for_close(self) -> bool:
-            """由宿主退出流程调用：触发未保存标注检查并持久化 X-AnyLabeling 状态。"""
-            self._allow_close = True
-            try:
-                fake_event = QCloseEvent()
-                super().closeEvent(fake_event)
-                return fake_event.isAccepted()
-            finally:
-                self._allow_close = False
-
-    return _EmbeddedXAnyLabelingWindow
-
-
-def _resolve_xal_view(xal_window: object | None) -> object | None:
-    """安全读取 X-AnyLabeling 主窗口内的核心标注画布视图（`labeling_widget.view`）。"""
-    if xal_window is None:
-        return None
-    wrapper = getattr(xal_window, "labeling_widget", None)
-    return getattr(wrapper, "view", None)
-
-
-def _apply_labels_to_xal_view(lw: object, labels: list[str]) -> bool:
-    """将类别列表注入 X-AnyLabeling 视图的配置、右侧唯一标签列表与弹窗历史补全词库。
-
-    版本耦合与防御说明：
-        对应 `third_party/X-AnyLabeling/anylabeling/views/labeling/label_widget.py` 的内部结构；
-        对 `_config`、`load_labels` 与 `label_dialog.add_label_history` 均先做属性/类型校验，
-        避免未来升级第三方源码导致未捕获的 `AttributeError` 或 `TypeError`。
-        至少成功调用 `load_labels` 时返回 `True`。
-    """
-    load_fn = getattr(lw, "load_labels", None)
-    if not callable(load_fn):
-        return False
-
-    cfg = getattr(lw, "_config", None)
-    if isinstance(cfg, dict):
-        cfg["labels"] = list(labels)
-
-    load_fn(labels, clear_existing=True)
-
-    dialog = getattr(lw, "label_dialog", None)
-    add_history = getattr(dialog, "add_label_history", None)
-    if callable(add_history):
-        for label in labels:
-            add_history(label, update_last_label=False)
-    return True
-
-
 class _ElidedStatusLabel(QLabel):
-    """固定最小宽度并自动居中省略过长路径的单行状态标签。
+    """按可用宽度自动中部省略长路径文本的状态标签，防止长文件名撑大顶层窗口。
 
-    设计原因：
-        X-AnyLabeling 切换图片时会调用 `setWindowTitle` 传入包含完整绝对路径、分辨率与序号的长标题；
-        普通 `QLabel` 的 `minimumSizeHint` 等于全文像素宽度，会把顶层主窗口动态撑宽。
-        本控件将水平策略设为 `Ignored` 并固定紧凑 `sizeHint`，超宽时自动省略中间路径且通过悬浮提示展示全文。
+    布局约束：
+        固定返回较小的最小宽度提示（`80 px`）并采用 `Ignored` 水平尺寸策略，
+        确保窗口尺寸永远由用户控制而非被动态图片路径推宽；完整文本始终保留在 `toolTip()` 中。
     """
 
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
-        super().__init__("", parent)
+        super().__init__(parent)
         self._full_text = ""
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.setMinimumWidth(80)
-        if text:
-            self.setText(text)
+        self.setText(text)
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        hint = super().minimumSizeHint()
+        return QSize(80, hint.height())
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        hint = super().sizeHint()
+        return QSize(min(hint.width(), 420), hint.height())
 
     def full_text(self) -> str:
-        """返回未经省略截断的完整状态文本。"""
         return self._full_text
 
     def setText(self, text: str) -> None:  # type: ignore[override]
-        """记录完整文本并刷新悬浮提示与省略显示（保留 type: ignore 指令）。"""
         self._full_text = text or ""
         self.setToolTip(self._full_text)
-        self._refresh_elided()
-
-    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
-        return QSize(80, super().minimumSizeHint().height())
-
-    def sizeHint(self) -> QSize:  # type: ignore[override]
-        return QSize(240, super().sizeHint().height())
+        self._apply_elided_text()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        self._refresh_elided()
+        self._apply_elided_text()
 
-    def _refresh_elided(self) -> None:
+    def _apply_elided_text(self) -> None:
         avail = max(40, self.contentsRect().width())
         elided = self.fontMetrics().elidedText(
             self._full_text, Qt.TextElideMode.ElideMiddle, avail
@@ -281,12 +137,149 @@ class _ElidedStatusLabel(QLabel):
         super().setText(elided)
 
 
+def _make_color_icon(rgb: tuple[int, int, int], size: int = 12) -> QIcon:
+    """绘制用于类别/框列表项的圆角色块图标。"""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(*rgb))
+    painter.drawRoundedRect(1, 1, size - 2, size - 2, 3, 3)
+    painter.end()
+    return QIcon(pix)
+
+
+class _LabelPickerDialog(QDialog):
+    """简洁的类别选择与新建弹窗（用于未选类别时落框或双击改类）。"""
+
+    def __init__(
+        self,
+        classes: list[str],
+        *,
+        current_label: str = "",
+        title: str = "选择或输入目标类别",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(320)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("选择已有类别，或直接输入新类别名称后回车确认："))
+
+        self.combo = QComboBox()
+        self.combo.setEditable(True)
+        self.combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for cls_name in classes:
+            self.combo.addItem(_make_color_icon(label_color_rgb(cls_name)), cls_name)
+        if current_label:
+            idx = self.combo.findText(current_label)
+            if idx >= 0:
+                self.combo.setCurrentIndex(idx)
+            else:
+                self.combo.setEditText(current_label)
+        elif classes:
+            self.combo.setCurrentIndex(0)
+        layout.addWidget(self.combo)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        if self.combo.lineEdit() is not None:
+            self.combo.lineEdit().selectAll()
+            self.combo.lineEdit().setFocus()
+
+    def _on_accept(self) -> None:
+        if not self.selected_label():
+            QMessageBox.warning(self, "提示", "类别名称不能为空。")
+            return
+        self.accept()
+
+    def selected_label(self) -> str:
+        return self.combo.currentText().strip()
+
+
+class _SamBoxRefineWorker(QThread):
+    """在后台线程中使用本地 SAM 2.1 对工作台中的指定框执行像素级轮廓收紧。"""
+
+    refined_ready = Signal(str, dict)  # 参数：(image_path_str, {box_idx: (x1, y1, x2, y2)})
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        image_path: Path,
+        target_boxes: list[tuple[int, RectAnnotation]],
+        *,
+        device: str = "0",
+        model_name: str = "sam2.1_t.pt",
+        refiner_cache: dict[tuple[str, str], Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.image_path = image_path
+        self.target_boxes = [(idx, b.clone()) for idx, b in target_boxes]
+        self.device = device
+        self.model_name = model_name
+        self._refiner_cache = refiner_cache if refiner_cache is not None else {}
+
+    def run(self) -> None:
+        try:
+            import cv2
+            import numpy as np
+
+            from yolo_studio.core.mllm_reviewer import CandidateBox, UltralyticsSamBoxRefiner
+
+            raw_bytes = np.fromfile(str(self.image_path), dtype=np.uint8)
+            img_bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                self.failed.emit(f"无法读取图像像素：{self.image_path.name}")
+                return
+
+            cache_key = (self.model_name, self.device)
+            refiner = self._refiner_cache.get(cache_key)
+            if refiner is None:
+                refiner = UltralyticsSamBoxRefiner(model_name=self.model_name, device=self.device)
+                self._refiner_cache[cache_key] = refiner
+
+            cands = [
+                CandidateBox(
+                    box_id=idx,
+                    label=box.label,
+                    x1=box.x1,
+                    y1=box.y1,
+                    x2=box.x2,
+                    y2=box.y2,
+                    confidence=box.score,
+                )
+                for idx, box in self.target_boxes
+            ]
+            refined_map = refiner.refine_boxes(img_bgr, cands)
+            valid: dict[int, tuple[float, float, float, float]] = {}
+            for idx, coords in refined_map.items():
+                if coords is not None:
+                    x1, y1, x2, y2 = coords
+                    if (x2 - x1) >= 2.0 and (y2 - y1) >= 2.0:
+                        valid[idx] = (float(x1), float(y1), float(x2), float(y2))
+            self.refined_ready.emit(str(self.image_path.resolve()), valid)
+        except Exception as exc:
+            self.failed.emit(f"本地 SAM 贴边收紧失败：{exc}")
+
+
 class LabelingStudioTab(QWidget):
-    """单进程内嵌 X-AnyLabeling 标注工作台标签页（标签页 2）。
+    """原生 PyQt6 轻量标注与复核工作台标签页（标签页 2）。
 
     内部状态与资源：
-        持有内嵌主窗口 `_xal_window`、当前跟踪的目录 `_current_dir`、最近预加载的类别文件
-        `_last_classes_file` 以及带 `400 ms` 防抖的 `QFileSystemWatcher` 目录监听器。
+        持有当前目录 `_current_dir`、全量图片清单 `_all_images`、按路径索引的轻量状态表 `_status_map`、
+        当前已加载文档 `_doc`、未保存脏标记 `_dirty`、每图撤销/重做栈 `_undo_stack` / `_redo_stack`、
+        类别列表 `_classes`、当前默认绘制类别 `_active_label`、可选后台 SAM 收框线程 `sam_worker`
+        以及带 `400 ms` 防抖的 `QFileSystemWatcher` 目录监听器。
     """
 
     send_to_dataset = Signal(str, str)  # 参数：(标注图片目录, classes.txt 路径)
@@ -298,15 +291,34 @@ class LabelingStudioTab(QWidget):
         workspace_root: Path,
         parent: QWidget | None = None,
         lazy_mount: bool = False,
+        device_info: DeviceInfo | None = None,
+        gpu_guard: GpuTaskGuard | None = None,
     ) -> None:
         super().__init__(parent)
         self.workspace_root = workspace_root
         self._lazy_mount = lazy_mount
-        self._mounting = False
-        self._mount_failed = False
-        self._xal_window = None
+        self.device_info = device_info
+        self.gpu_guard = gpu_guard
+
         self._current_dir: Path | None = None
         self._last_classes_file: Path | None = None
+        self._all_images: list[Path] = []
+        self._filtered_images: list[Path] = []
+        self._status_map: dict[Path, ImageStatusSummary] = {}
+
+        self._doc: ImageAnnotationDoc | None = None
+        self._dirty: bool = False
+        self._undo_stack: list[tuple[list[RectAnnotation], dict[str, Any]]] = []
+        self._redo_stack: list[tuple[list[RectAnnotation], dict[str, Any]]] = []
+
+        self._classes: list[str] = []
+        self._active_label: str = ""
+        self._syncing_lists: bool = False
+        self._suppress_watch_until: float = 0.0
+
+        self.sam_worker: _SamBoxRefineWorker | None = None
+        self._sam_refiner_cache: dict[tuple[str, str], Any] = {}
+        self._scoped_actions: list[QAction] = []
 
         self._watcher = QFileSystemWatcher(self)
         self._watcher.directoryChanged.connect(self._on_watched_dir_changed)
@@ -316,13 +328,19 @@ class LabelingStudioTab(QWidget):
         self._debounce_timer.timeout.connect(self._emit_annotations_changed)
 
         self._init_ui()
+        self._init_shortcuts()
+        self._set_shortcuts_active(self.isVisible())
+        self._refresh_action_states()
 
+    # ------------------------------------------------------------------
+    # 界面构建
+    # ------------------------------------------------------------------
     def _init_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
-        # 顶部紧凑联动栏：尽量节省高度，将屏幕空间留给 X-AnyLabeling 画布
+        # 1) 顶部工作流联动栏
         bar = QFrame()
         bar.setFrameShape(QFrame.Shape.StyledPanel)
         bar.setStyleSheet(
@@ -333,7 +351,7 @@ class LabelingStudioTab(QWidget):
         bar_layout.setSpacing(8)
 
         self.status_label = _ElidedStatusLabel(
-            "工作台就绪：可打开抽帧目录进行人工画框或 AI 辅助标注（快捷键 R 画框，Ctrl+S 保存）"
+            "工作台就绪：打开图片目录即可快速画框与复核（R/W 画框 · E 编辑 · A/D 切图 · 1-9 切类 · F 确认通过 · Ctrl+S 保存）"
         )
         self.status_label.setStyleSheet("border: none; color: #24292f; font-weight: 500;")
         bar_layout.addWidget(self.status_label, 1)
@@ -341,9 +359,9 @@ class LabelingStudioTab(QWidget):
         self.open_dir_btn = QPushButton("打开图片目录...")
         self.load_classes_btn = QPushButton("导入 classes.txt...")
         self.refresh_btn = QPushButton("刷新目录")
+        self.to_review_btn = QPushButton("发送到「3. LLM 智能标注」→")
         self.to_dataset_btn = QPushButton("发送到「4. 数据集准备」→")
         self.to_dataset_btn.setObjectName("primaryBtn")
-        self.to_review_btn = QPushButton("发送到「3. LLM 智能标注」→")
 
         for btn in (
             self.open_dir_btn,
@@ -352,212 +370,449 @@ class LabelingStudioTab(QWidget):
             self.to_review_btn,
             self.to_dataset_btn,
         ):
-            # 防止点击顶部联动按钮后滞留键盘焦点，避免按 Space 平移画布时误触按钮点击
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             bar_layout.addWidget(btn)
         root.addWidget(bar)
 
-        self._host_container = QVBoxLayout()
-        self._host_container.setContentsMargins(0, 0, 0, 0)
-        root.addLayout(self._host_container, 1)
+        # 2) 精简画布与复核操作工具栏
+        tools = QFrame()
+        tools.setStyleSheet(
+            "QFrame { background-color: #ffffff; border: 1px solid #d8dee4; border-radius: 6px; }"
+            "QPushButton { padding: 4px 10px; font-size: 12px; }"
+            "QPushButton:checked { background-color: #ddf4ff; border-color: #0969da; color: #0550ae; font-weight: 600; }"
+        )
+        t_lay = QHBoxLayout(tools)
+        t_lay.setContentsMargins(8, 4, 8, 4)
+        t_lay.setSpacing(6)
 
-        if self._lazy_mount:
-            self._show_lazy_placeholder()
-        else:
-            self._mount_embedded_xanylabeling()
+        self.edit_mode_btn = QPushButton("编辑 (E)")
+        self.edit_mode_btn.setCheckable(True)
+        self.edit_mode_btn.setChecked(True)
+        self.draw_mode_btn = QPushButton("画框 (R)")
+        self.draw_mode_btn.setCheckable(True)
+        self.dup_box_btn = QPushButton("复制框")
+        self.del_box_btn = QPushButton("删除框 (Del)")
+        self.undo_btn = QPushButton("撤销")
+        self.redo_btn = QPushButton("重做")
 
+        self.prev_img_btn = QPushButton("◀ 上一张 (A)")
+        self.next_img_btn = QPushButton("下一张 (D) ▶")
+        self.save_btn = QPushButton("保存 (Ctrl+S)")
+        self.verify_next_btn = QPushButton("确认通过→下张 (F)")
+        self.verify_next_btn.setToolTip("标记当前图已人工复核（0 框时保存为显式空图负样本）、清除漏标提醒并自动切换下一张")
+
+        self.sam_refine_btn = QPushButton("SAM 贴边收框")
+        self.sam_refine_btn.setToolTip("调用本地 SAM 2.1 对当前选中框（未选中时对整图全部框）执行像素级轮廓贴边收紧")
+
+        self.fit_btn = QPushButton("适应窗口 (0)")
+        self.zoom_100_btn = QPushButton("1:1")
+        self.show_labels_chk = QCheckBox("显示标签")
+        self.show_labels_chk.setChecked(True)
+        self.auto_save_chk = QCheckBox("自动保存")
+        self.auto_save_chk.setChecked(True)
+        self.auto_save_chk.setToolTip("切图或退出前自动保存已修改的 .json 标注")
+
+        for w in (
+            self.edit_mode_btn,
+            self.draw_mode_btn,
+            self.dup_box_btn,
+            self.del_box_btn,
+            self.undo_btn,
+            self.redo_btn,
+            self.prev_img_btn,
+            self.next_img_btn,
+            self.save_btn,
+            self.verify_next_btn,
+            self.sam_refine_btn,
+            self.fit_btn,
+            self.zoom_100_btn,
+            self.show_labels_chk,
+            self.auto_save_chk,
+        ):
+            w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        for w in (self.edit_mode_btn, self.draw_mode_btn, self.dup_box_btn, self.del_box_btn):
+            t_lay.addWidget(w)
+        t_lay.addWidget(self._make_vsep())
+        t_lay.addWidget(self.undo_btn)
+        t_lay.addWidget(self.redo_btn)
+        t_lay.addWidget(self._make_vsep())
+        t_lay.addWidget(self.prev_img_btn)
+        t_lay.addWidget(self.next_img_btn)
+        t_lay.addWidget(self.save_btn)
+        t_lay.addWidget(self.verify_next_btn)
+        t_lay.addWidget(self._make_vsep())
+        t_lay.addWidget(self.sam_refine_btn)
+        t_lay.addWidget(self._make_vsep())
+        t_lay.addWidget(self.fit_btn)
+        t_lay.addWidget(self.zoom_100_btn)
+        t_lay.addWidget(self.show_labels_chk)
+        t_lay.addWidget(self.auto_save_chk)
+        t_lay.addStretch(1)
+        root.addWidget(tools)
+
+        # 3) 主体三栏可调分割区
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        # --- 左栏：文件列表与筛选 ---
+        left_panel = QFrame()
+        left_panel.setMinimumWidth(210)
+        left_panel.setMaximumWidth(380)
+        left_lay = QVBoxLayout(left_panel)
+        left_lay.setContentsMargins(4, 4, 4, 4)
+        left_lay.setSpacing(5)
+
+        left_title = QLabel("图片文件列表")
+        left_title.setStyleSheet("font-weight: 600; color: #24292f;")
+        left_lay.addWidget(left_title)
+
+        self.file_search = QLineEdit()
+        self.file_search.setPlaceholderText("搜索文件名或子目录...")
+        self.file_search.setClearButtonEnabled(True)
+        left_lay.addWidget(self.file_search)
+
+        self.status_filter_combo = QComboBox()
+        self.status_filter_combo.addItem("全部图片", "all")
+        self.status_filter_combo.addItem("仅看未标注", "unlabeled")
+        self.status_filter_combo.addItem("仅看已标注", "labeled")
+        self.status_filter_combo.addItem("仅看空图 (0框)", "empty")
+        self.status_filter_combo.addItem("仅看含漏标/待复核提醒", "review")
+        self.status_filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        left_lay.addWidget(self.status_filter_combo)
+
+        self.progress_summary_label = QLabel("尚未打开图片目录")
+        self.progress_summary_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        self.progress_summary_label.setWordWrap(True)
+        left_lay.addWidget(self.progress_summary_label)
+
+        self.file_list = QListWidget()
+        self.file_list.setAlternatingRowColors(True)
+        self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_list.setStyleSheet(
+            "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
+            "QListWidget::item { padding: 3px 4px; }"
+        )
+        left_lay.addWidget(self.file_list, 1)
+        splitter.addWidget(left_panel)
+
+        # --- 中栏：AI 复核提醒横幅 + 核心画布 + 底部微状态栏 ---
+        center_panel = QWidget()
+        center_lay = QVBoxLayout(center_panel)
+        center_lay.setContentsMargins(0, 0, 0, 0)
+        center_lay.setSpacing(4)
+
+        self.review_banner = QFrame()
+        self.review_banner.setStyleSheet(
+            "QFrame { background-color: #fff8c5; border: 1px solid #d4a72c; border-radius: 5px; }"
+        )
+        banner_lay = QHBoxLayout(self.review_banner)
+        banner_lay.setContentsMargins(10, 4, 10, 4)
+        banner_lay.setSpacing(8)
+        self.review_banner_label = QLabel("")
+        self.review_banner_label.setWordWrap(True)
+        self.review_banner_label.setStyleSheet("border: none; color: #6f4e00; font-weight: 500; font-size: 12px;")
+        self.clear_hint_btn = QPushButton("已核查，清除提醒")
+        self.clear_hint_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clear_hint_btn.setStyleSheet("padding: 2px 8px; font-size: 12px;")
+        banner_lay.addWidget(self.review_banner_label, 1)
+        banner_lay.addWidget(self.clear_hint_btn)
+        self.review_banner.setVisible(False)
+        center_lay.addWidget(self.review_banner)
+
+        self.canvas = AnnotationCanvasView()
+        center_lay.addWidget(self.canvas, 1)
+
+        footer = QFrame()
+        footer.setStyleSheet(
+            "QFrame { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 4px; }"
+            "QLabel { border: none; color: #57606a; font-size: 12px; }"
+        )
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(8, 3, 8, 3)
+        f_lay.setSpacing(14)
+        self.mode_badge_label = QLabel("模式: 编辑")
+        self.mode_badge_label.setStyleSheet("border: none; color: #0969da; font-weight: 600; font-size: 12px;")
+        self.img_info_label = QLabel("分辨率: -")
+        self.cursor_info_label = QLabel("坐标: -")
+        self.zoom_info_label = QLabel("缩放: 100%")
+        self.save_state_label = QLabel("")
+        f_lay.addWidget(self.mode_badge_label)
+        f_lay.addWidget(self.img_info_label)
+        f_lay.addWidget(self.cursor_info_label)
+        f_lay.addWidget(self.zoom_info_label)
+        f_lay.addStretch(1)
+        f_lay.addWidget(self.save_state_label)
+        center_lay.addWidget(footer)
+        splitter.addWidget(center_panel)
+
+        # --- 右栏：类别清单 + 当前图目标框列表 + 框详情 ---
+        right_panel = QFrame()
+        right_panel.setMinimumWidth(240)
+        right_panel.setMaximumWidth(400)
+        right_lay = QVBoxLayout(right_panel)
+        right_lay.setContentsMargins(4, 4, 4, 4)
+        right_lay.setSpacing(6)
+
+        cls_hdr = QHBoxLayout()
+        cls_title = QLabel("类别清单 (按 1-9 速切)")
+        cls_title.setStyleSheet("font-weight: 600; color: #24292f;")
+        self.save_classes_btn = QPushButton("保存 classes.txt")
+        self.save_classes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.save_classes_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        cls_hdr.addWidget(cls_title)
+        cls_hdr.addStretch(1)
+        cls_hdr.addWidget(self.save_classes_btn)
+        right_lay.addLayout(cls_hdr)
+
+        add_cls_row = QHBoxLayout()
+        add_cls_row.setSpacing(4)
+        self.new_class_edit = QLineEdit()
+        self.new_class_edit.setPlaceholderText("输入新类别名称后回车...")
+        self.add_class_btn = QPushButton("+ 添加")
+        self.add_class_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.add_class_btn.setStyleSheet("padding: 4px 8px; font-size: 12px;")
+        add_cls_row.addWidget(self.new_class_edit, 1)
+        add_cls_row.addWidget(self.add_class_btn)
+        right_lay.addLayout(add_cls_row)
+
+        self.unique_label_list = QListWidget()
+        self.unique_label_list.setStyleSheet(
+            "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
+            "QListWidget::item { padding: 3px 4px; }"
+        )
+        right_lay.addWidget(self.unique_label_list, 2)
+
+        obj_hdr = QHBoxLayout()
+        self.obj_title_label = QLabel("当前图目标框 (0)")
+        self.obj_title_label.setStyleSheet("font-weight: 600; color: #24292f;")
+        self.clear_boxes_btn = QPushButton("清空全部框")
+        self.clear_boxes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clear_boxes_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        obj_hdr.addWidget(self.obj_title_label)
+        obj_hdr.addStretch(1)
+        obj_hdr.addWidget(self.clear_boxes_btn)
+        right_lay.addLayout(obj_hdr)
+
+        self.shape_list = QListWidget()
+        self.shape_list.setStyleSheet(
+            "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
+            "QListWidget::item { padding: 3px 4px; }"
+        )
+        right_lay.addWidget(self.shape_list, 3)
+
+        self.box_detail_label = QLabel("未选中目标框：单击画布或列表项可查看坐标、AI 置信度与审核理由。")
+        self.box_detail_label.setWordWrap(True)
+        self.box_detail_label.setStyleSheet(
+            "QLabel { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 5px; "
+            "padding: 6px; color: #24292f; font-size: 12px; }"
+        )
+        right_lay.addWidget(self.box_detail_label)
+
+        box_ops = QHBoxLayout()
+        box_ops.setSpacing(6)
+        self.change_cls_btn = QPushButton("改类别")
+        self.change_cls_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.change_cls_btn.setStyleSheet("padding: 4px 8px; font-size: 12px;")
+        self.box_del_inline_btn = QPushButton("删除选中")
+        self.box_del_inline_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.box_del_inline_btn.setStyleSheet("padding: 4px 8px; font-size: 12px;")
+        box_ops.addWidget(self.change_cls_btn, 1)
+        box_ops.addWidget(self.box_del_inline_btn, 1)
+        right_lay.addLayout(box_ops)
+
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([240, 820, 270])
+        root.addWidget(splitter, 1)
+
+        # 事件信号连接
         self.open_dir_btn.clicked.connect(self._on_pick_and_open_dir)
         self.load_classes_btn.clicked.connect(self._on_pick_and_load_classes)
         self.refresh_btn.clicked.connect(self._on_refresh_dir)
         self.to_dataset_btn.clicked.connect(self._on_send_to_dataset)
         self.to_review_btn.clicked.connect(self._on_send_to_review)
 
-    def _clear_host_container(self) -> None:
-        """清空工作台宿主容器内的占位面板或旧组件。"""
-        while self._host_container.count():
-            item = self._host_container.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
+        self.edit_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT))
+        self.draw_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW))
+        self.dup_box_btn.clicked.connect(self._duplicate_selected_box)
+        self.del_box_btn.clicked.connect(self._delete_selected_box)
+        self.box_del_inline_btn.clicked.connect(self._delete_selected_box)
+        self.change_cls_btn.clicked.connect(self._prompt_relabel_selected_box)
+        self.clear_boxes_btn.clicked.connect(self._clear_all_boxes)
+        self.undo_btn.clicked.connect(self._undo)
+        self.redo_btn.clicked.connect(self._redo)
+        self.prev_img_btn.clicked.connect(self.open_prev_image)
+        self.next_img_btn.clicked.connect(self.open_next_image)
+        self.save_btn.clicked.connect(lambda: self.save_current_annotation(force=True))
+        self.verify_next_btn.clicked.connect(self._verify_and_next)
+        self.clear_hint_btn.clicked.connect(self._clear_missing_hint)
+        self.sam_refine_btn.clicked.connect(self._on_sam_refine_clicked)
+        self.fit_btn.clicked.connect(self.canvas.fit_to_window)
+        self.zoom_100_btn.clicked.connect(lambda: self.canvas.set_zoom(1.0))
+        self.show_labels_chk.toggled.connect(self.canvas.set_show_labels)
 
-    def _show_lazy_placeholder(self) -> None:
-        """在延迟挂载模式下展示轻量占位视图，避免首屏启动时同步加载整个 X-AnyLabeling。"""
-        self._clear_host_container()
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(10)
-        hint_lbl = QLabel("正在准备内嵌 X-AnyLabeling 标注工作台...")
-        hint_lbl.setStyleSheet("color: #57606a; font-size: 14px; font-weight: 500;")
-        load_btn = QPushButton("立即加载标注工作台")
-        load_btn.clicked.connect(lambda: self.ensure_mounted())
-        layout.addWidget(hint_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(load_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-        self._host_container.addWidget(box, 1)
+        self.file_search.textChanged.connect(self._apply_file_filter)
+        self.status_filter_combo.currentIndexChanged.connect(self._apply_file_filter)
+        self.file_list.currentRowChanged.connect(self._on_file_row_changed)
+        self.file_list.customContextMenuRequested.connect(self._on_file_list_context_menu)
 
-    def ensure_mounted(self) -> bool:
-        """幂等确保内嵌 X-AnyLabeling 主窗口已完成初始化与挂载；成功返回 `True`。
+        self.add_class_btn.clicked.connect(self._on_add_class_from_input)
+        self.new_class_edit.returnPressed.connect(self._on_add_class_from_input)
+        self.save_classes_btn.clicked.connect(self._on_save_classes_txt)
+        self.unique_label_list.currentRowChanged.connect(self._on_class_row_changed)
+        self.unique_label_list.itemDoubleClicked.connect(self._on_class_double_clicked)
 
-        重入保护：
-            挂载期间设置 `_mounting=True` 并切换等待光标，防止事件刷新引发 `showEvent` 递归调用。
-        """
-        if self._xal_window is not None:
-            return True
-        if self._mounting:
-            return False
+        self.shape_list.currentRowChanged.connect(self._on_shape_row_changed)
+        self.shape_list.itemDoubleClicked.connect(lambda _item: self._prompt_relabel_selected_box())
 
-        self._mounting = True
-        self.status_label.setText("正在加载内嵌 X-AnyLabeling 标注工作台，请稍候...")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            QApplication.processEvents()
-            self._mount_embedded_xanylabeling()
-            if self._xal_window is not None:
-                self._mount_failed = False
-                is_active = self.isVisible()
-                self._xal_window.set_shortcuts_active(is_active)
-                if is_active:
-                    QTimer.singleShot(0, self._focus_canvas_if_ready)
-                self.status_label.setText(
-                    "工作台就绪：可打开抽帧目录进行人工画框或 AI 辅助标注（快捷键 R 画框，Ctrl+S 保存）"
-                )
+        self.canvas.box_drawn.connect(self._on_canvas_box_drawn)
+        self.canvas.box_geometry_committed.connect(self._on_canvas_box_geometry_committed)
+        self.canvas.selection_changed.connect(self._on_canvas_selection_changed)
+        self.canvas.mode_changed.connect(self._on_canvas_mode_changed)
+        self.canvas.zoom_changed.connect(self._on_canvas_zoom_changed)
+        self.canvas.cursor_pos_changed.connect(self._on_canvas_cursor_changed)
+        self.canvas.box_double_clicked.connect(lambda _idx: self._prompt_relabel_selected_box())
+
+        # 在主要非文本子控件上安装键盘过滤器，保证单键快捷键在画布与列表上均响应，而在输入框内绝不拦截打字
+        for target in (self.canvas, self.file_list, self.shape_list, self.unique_label_list):
+            target.installEventFilter(self)
+
+    @staticmethod
+    def _make_vsep() -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        line.setStyleSheet("color: #d0d7de;")
+        return line
+
+    def _init_shortcuts(self) -> None:
+        """注册带修饰键的组合快捷键并限定作用域于工作台内部（避免跨标签页串键）。"""
+        combos: list[tuple[str, Any]] = [
+            ("Ctrl+S", lambda: self.save_current_annotation(force=True)),
+            ("Ctrl+Z", self._undo),
+            ("Ctrl+Y", self._redo),
+            ("Ctrl+Shift+Z", self._redo),
+            ("Ctrl+D", self._duplicate_selected_box),
+        ]
+        for seq, handler in combos:
+            act = QAction(self)
+            act.setShortcut(QKeySequence(seq))
+            act.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            act.triggered.connect(handler)
+            self.addAction(act)
+            self._scoped_actions.append(act)
+
+    def _set_shortcuts_active(self, active: bool) -> None:
+        """同步工作台快捷键启停状态：切离工作台标签页时停用，防止任何情况下误触。"""
+        ctx = (
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+            if active
+            else Qt.ShortcutContext.WidgetShortcut
+        )
+        for act in self._scoped_actions:
+            act.setEnabled(active)
+            act.setShortcutContext(ctx)
+
+    def _is_text_input_focused(self) -> bool:
+        focused = QApplication.focusWidget()
+        return isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit))
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and self.isVisible()
+            and not self._is_text_input_focused()
+        ):
+            if self._handle_workbench_keypress(event):
                 return True
-            self._mount_failed = True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if self.isVisible() and not self._is_text_input_focused():
+            if self._handle_workbench_keypress(event):
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def _handle_workbench_keypress(self, event: QKeyEvent) -> bool:
+        """处理工作台单键快捷键；仅在无 Ctrl/Alt 修饰键时生效，返回 `True` 表示已消费。"""
+        mods = event.modifiers()
+        if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
             return False
-        finally:
-            QApplication.restoreOverrideCursor()
-            self._mounting = False
-
-    def _mount_embedded_xanylabeling(self) -> None:
-        """初始化并挂载原版 X-AnyLabeling 主窗口；若加载失败则在页内呈现错误说明与重试按钮。"""
-        self._clear_host_container()
-
-        app = QApplication.instance()
-        if not isinstance(app, QApplication):
-            self._mount_failed = True
-            self._show_mount_error("未检测到有效 QApplication 实例，无法挂载内嵌标注工作台。")
-            return
-
-        try:
-            config = ensure_xanylabeling_runtime_initialized(app)
-            embedded_cls = _create_embedded_window_class()
-            self._xal_window = embedded_cls(app, config)
-            self._xal_window.title_changed.connect(self._on_xal_title_changed)
-            self._host_container.addWidget(self._xal_window, 1)
-            self._xal_window.set_shortcuts_active(self.isVisible())
-            self._mount_failed = False
-        except Exception as exc:
-            self._xal_window = None
-            self._mount_failed = True
-            self._show_mount_error(f"初始化内嵌 X-AnyLabeling 失败：{exc}")
-
-    def _show_mount_error(self, message: str) -> None:
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        err_lbl = QLabel(message)
-        err_lbl.setWordWrap(True)
-        err_lbl.setStyleSheet("color: #cf222e; font-weight: 600;")
-        retry_btn = QPushButton("重试加载标注工作台")
-        retry_btn.clicked.connect(self._mount_embedded_xanylabeling)
-        layout.addWidget(err_lbl)
-        layout.addWidget(retry_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-        self._host_container.addWidget(box, 1)
-
-    def _label_widget(self):
-        return _resolve_xal_view(self._xal_window)
+        key = event.key()
+        if key in (Qt.Key.Key_R, Qt.Key.Key_W):
+            self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
+            return True
+        if key == Qt.Key.Key_E:
+            self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
+            return True
+        if key in (Qt.Key.Key_A, Qt.Key.Key_Left):
+            self.open_prev_image()
+            return True
+        if key in (Qt.Key.Key_D, Qt.Key.Key_Right):
+            self.open_next_image()
+            return True
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.canvas.selected_index() >= 0:
+                self._delete_selected_box()
+                return True
+            return False
+        if key == Qt.Key.Key_F:
+            self._verify_and_next()
+            return True
+        if key == Qt.Key.Key_0:
+            self.canvas.fit_to_window()
+            return True
+        if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            cls_idx = key - Qt.Key.Key_1
+            if cls_idx < len(self._classes):
+                self._apply_class_shortcut(cls_idx)
+                return True
+        return False
 
     def _focus_canvas_if_ready(self) -> None:
-        """在工作台可见且未聚焦于内部文本输入框时，将键盘焦点移交给画布以响应直接按键。"""
-        if not self.isVisible() or self._xal_window is None:
+        if not self.isVisible() or self._is_text_input_focused():
             return
-        focused = QApplication.focusWidget()
-        if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit)) and self._xal_window.isAncestorOf(
-            focused
-        ):
-            return
-        lw = self._label_widget()
-        if lw is None:
-            return
-        canvas = getattr(lw, "canvas", None)
-        if isinstance(canvas, QWidget) and canvas.isEnabled():
-            canvas.setFocus(Qt.FocusReason.OtherFocusReason)
-        elif isinstance(lw, QWidget):
-            lw.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
-        """切换进入工作台标签页时按需触发首次挂载，激活快捷键并将焦点移交画布（保留 type: ignore 指令）。"""
         super().showEvent(event)
-        if self._xal_window is not None:
-            self._xal_window.set_shortcuts_active(True)
-            QTimer.singleShot(0, self._focus_canvas_if_ready)
-        elif not self._mount_failed and not self._mounting:
-            QTimer.singleShot(0, self._auto_mount_on_show)
+        self._set_shortcuts_active(True)
+        QTimer.singleShot(0, self._focus_canvas_if_ready)
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
-        """切离工作台标签页时收起内部快捷键，避免在其他标签页输入或操作时误触（保留 type: ignore 指令）。"""
         super().hideEvent(event)
-        if self._xal_window is not None:
-            self._xal_window.set_shortcuts_active(False)
+        self._set_shortcuts_active(False)
 
-    def _auto_mount_on_show(self) -> None:
-        """在标签页切换绘制完成后异步完成工作台首次挂载。"""
-        if self.isVisible() and self._xal_window is None and not self._mount_failed:
-            self.ensure_mounted()
+    # ------------------------------------------------------------------
+    # 对外兼容公共接口
+    # ------------------------------------------------------------------
+    def ensure_mounted(self) -> bool:
+        """原生工作台随主窗口同步创建完成，调用本方法始终幂等返回 `True`。"""
+        return True
 
-    def _on_xal_title_changed(self, title: str) -> None:
-        if title:
-            self.status_label.setText(title)
-
-    def _watch_directory(self, dir_path: Path) -> None:
-        existing = self._watcher.directories()
-        if existing:
-            self._watcher.removePaths(existing)
-        if dir_path.is_dir():
-            self._watcher.addPath(str(dir_path))
-
-    def _on_watched_dir_changed(self, _path: str) -> None:
-        self._debounce_timer.start()
-
-    def _emit_annotations_changed(self) -> None:
-        cur = self.current_directory()
-        if cur is not None:
-            self.annotations_changed.emit(str(cur))
+    def apply_device_info(self, info: DeviceInfo) -> None:
+        """接收主窗口后台硬件探测结果，供本地 SAM 贴边收框自动选择 GPU 或 CPU。"""
+        self.device_info = info
 
     def current_directory(self) -> Path | None:
         """返回工作台当前打开的图片目录；若尚未打开任何目录则返回 `None`。"""
-        lw = self._label_widget()
-        if lw is not None:
-            if getattr(lw, "filename", None):
-                p = Path(str(lw.filename))
-                if p.exists():
-                    return p if p.is_dir() else p.parent
-            if getattr(lw, "last_open_dir", None):
-                p = Path(str(lw.last_open_dir))
-                if p.is_dir():
-                    return p
         return self._current_dir
 
-    def load_classes_file(self, classes_file: Path) -> int:
-        """从 `classes.txt` 读取类别列表并同步注入右侧标签列表与弹窗历史补全词库。
+    def current_image_path(self) -> Path | None:
+        """返回当前正在查看的图片绝对路径；尚未加载图片时返回 `None`。"""
+        return self._doc.image_path if self._doc is not None else None
 
-        返回值：
-            成功导入的非空类别数量；工作台未就绪或文件不存在时返回 `0`。
-        """
-        if self._xal_window is None:
-            self.ensure_mounted()
-        lw = self._label_widget()
-        if lw is None or not classes_file.is_file():
-            return 0
-        labels = [
-            line.strip()
-            for line in classes_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-            if line.strip()
-        ]
+    def load_classes_file(self, classes_file: Path) -> int:
+        """从 `classes.txt` 读取类别列表并同步更新右侧类别清单。"""
+        labels = load_classes_txt(classes_file)
         if not labels:
             return 0
-
-        if not _apply_labels_to_xal_view(lw, labels):
-            return 0
+        self._merge_classes(labels, replace_order=True)
         self._last_classes_file = classes_file.resolve()
         return len(labels)
 
@@ -567,45 +822,888 @@ class LabelingStudioTab(QWidget):
         classes_file: Path | None = None,
         select_image: Path | None = None,
     ) -> bool:
-        """在内嵌 X-AnyLabeling 中打开指定图片目录，并可选预载类别与定位到单张图片。
-
-        调用条件与失败/取消行为：
-            尚未挂载时自动调用 `ensure_mounted()`；切换前会调用 `may_continue()`，
-            若当前图片有未保存修改且用户取消保存弹窗，直接返回 `False` 并不覆盖当前画布状态。
-        """
-        if self._xal_window is None:
-            self.ensure_mounted()
-        lw = self._label_widget()
-        if lw is None:
-            QMessageBox.warning(self, "工作台未就绪", "内嵌 X-AnyLabeling 尚未完成初始化。")
-            return False
-
+        """打开指定图片目录（递归子目录），预载类别清单并可选直接定位到单张图片。"""
         target_dir = dir_path.resolve()
         if not target_dir.is_dir():
             QMessageBox.warning(self, "目录不存在", f"图片目录不存在：\n{target_dir}")
             return False
 
-        if not lw.may_continue():
+        if not self._may_continue():
             return False
 
-        if classes_file is not None and classes_file.is_file():
-            self.load_classes_file(classes_file)
-        elif (target_dir / "classes.txt").is_file():
-            self.load_classes_file(target_dir / "classes.txt")
+        # 已通过未保存保护校验，清空旧文档引用，确保刷新同目录同单图时强制重读磁盘最新 .json
+        self._doc = None
+        self._dirty = False
+        self._undo_stack.clear()
+        self._redo_stack.clear()
 
-        # 若传了目标单图且属于目标目录，先载入文件列表再精确定位该图片，避免重复加载首图
-        lw.import_image_folder(str(target_dir), load=(select_image is None))
-        if select_image is not None and select_image.is_file():
-            lw.load_file(str(select_image.resolve()))
-
+        images = scan_labeling_directory(target_dir, recursive=True)
         self._current_dir = target_dir
+        self._all_images = images
+        self._status_map = {}
+
+        discovered_labels: list[str] = []
+        for img_path in images:
+            summary = inspect_image_status(img_path)
+            self._status_map[img_path] = summary
+            for lbl in summary.labels:
+                if lbl not in discovered_labels:
+                    discovered_labels.append(lbl)
+
+        # 按“显式 classes_file > 目录内 classes.txt > 已有 .json 出现的类别”顺序合并类别
+        loaded_from_file: list[str] = []
+        if classes_file is not None and classes_file.is_file():
+            loaded_from_file = load_classes_txt(classes_file)
+            if loaded_from_file:
+                self._last_classes_file = classes_file.resolve()
+        elif (target_dir / "classes.txt").is_file():
+            loaded_from_file = load_classes_txt(target_dir / "classes.txt")
+            if loaded_from_file:
+                self._last_classes_file = (target_dir / "classes.txt").resolve()
+
+        if loaded_from_file:
+            merged = list(loaded_from_file)
+            for lbl in discovered_labels:
+                if lbl not in merged:
+                    merged.append(lbl)
+            self._merge_classes(merged, replace_order=True)
+        elif discovered_labels:
+            self._merge_classes(discovered_labels, replace_order=False)
+
         self._watch_directory(target_dir)
-        is_active = self.isVisible()
-        self._xal_window.set_shortcuts_active(is_active)
-        if is_active:
+
+        # 重置筛选以保证指定目标单图可见
+        self._syncing_lists = True
+        try:
+            self.file_search.clear()
+            self.status_filter_combo.setCurrentIndex(0)
+        finally:
+            self._syncing_lists = False
+        self._apply_file_filter(keep_current=False)
+
+        if not images:
+            self._doc = None
+            self._dirty = False
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self.canvas.clear_image()
+            self._refresh_shape_list()
+            self._refresh_review_banner()
+            self._refresh_footer_and_title()
+            self._refresh_action_states()
+            self.status_label.setText(f"当前目录无图片：{target_dir}")
+            return True
+
+        target_img = images[0]
+        if select_image is not None:
+            resolved_sel = select_image.resolve()
+            if resolved_sel in self._status_map:
+                target_img = resolved_sel
+            elif resolved_sel.is_file():
+                # 兜底：若目标单图不在扫描结果中，按同文件加入列表首位
+                self._all_images.insert(0, resolved_sel)
+                self._status_map[resolved_sel] = inspect_image_status(resolved_sel)
+                self._apply_file_filter(keep_current=False)
+                target_img = resolved_sel
+
+        self._select_image_in_list(target_img)
+        if self.isVisible():
             QTimer.singleShot(0, self._focus_canvas_if_ready)
-        self.status_label.setText(f"当前标注目录：{target_dir}")
         return True
+
+    def open_next_image(self) -> bool:
+        """在当前筛选文件列表中切换到下一张图片。"""
+        if not self._filtered_images:
+            return False
+        cur_row = self.file_list.currentRow()
+        if cur_row < 0:
+            self.file_list.setCurrentRow(0)
+            return True
+        if cur_row + 1 < len(self._filtered_images):
+            self.file_list.setCurrentRow(cur_row + 1)
+            return True
+        self.save_state_label.setText("已是列表最后一张")
+        return False
+
+    def open_prev_image(self) -> bool:
+        """在当前筛选文件列表中切换到上一张图片。"""
+        if not self._filtered_images:
+            return False
+        cur_row = self.file_list.currentRow()
+        if cur_row > 0:
+            self.file_list.setCurrentRow(cur_row - 1)
+            return True
+        self.save_state_label.setText("已是列表第一张")
+        return False
+
+    def save_current_annotation(self, *, force: bool = False) -> bool:
+        """保存当前图片标注到同名 `.json`；无改动且非 `force` 时直接返回 `True`。"""
+        if self._doc is None:
+            return True
+        if not self._dirty and not force:
+            return True
+
+        import time
+
+        self._suppress_watch_until = time.monotonic() + 0.8
+        try:
+            save_image_annotation(self._doc)
+        except OSError as exc:
+            QMessageBox.warning(self, "保存失败", f"无法写入标注文件：\n{self._doc.json_path}\n{exc}")
+            return False
+
+        self._dirty = False
+        self._update_single_image_status(self._doc.image_path)
+        self._refresh_footer_and_title()
+        self.save_state_label.setText(f"已保存 {self._doc.json_path.name}")
+        if self._current_dir is not None:
+            self.annotations_changed.emit(str(self._current_dir))
+        return True
+
+    def prepare_for_close(self) -> bool:
+        """在主窗口退出前处理未保存标注修改并安全停止可能运行的 SAM 收框线程。"""
+        if not self._may_continue():
+            return False
+        if self.sam_worker is not None and self.sam_worker.isRunning():
+            self.sam_worker.wait(3000)
+        return True
+
+    # ------------------------------------------------------------------
+    # 目录监听与未保存保护
+    # ------------------------------------------------------------------
+    def _watch_directory(self, dir_path: Path) -> None:
+        existing = self._watcher.directories()
+        if existing:
+            self._watcher.removePaths(existing)
+        if dir_path.is_dir():
+            self._watcher.addPath(str(dir_path))
+
+    def _on_watched_dir_changed(self, _path: str) -> None:
+        import time
+
+        if time.monotonic() < self._suppress_watch_until:
+            return
+        self._debounce_timer.start()
+
+    def _emit_annotations_changed(self) -> None:
+        if self._current_dir is not None:
+            self.annotations_changed.emit(str(self._current_dir))
+
+    def _may_continue(self) -> bool:
+        """切图、切换目录或关闭前核查未保存改动：自动保存开启时直接静默保存，否则弹出询问。"""
+        if self._doc is None or not self._dirty:
+            return True
+        if self.auto_save_chk.isChecked():
+            return self.save_current_annotation(force=True)
+        reply = QMessageBox.question(
+            self,
+            "保存标注修改",
+            f"当前图片「{self._doc.image_path.name}」的标注尚未保存，是否先保存？",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            return self.save_current_annotation(force=True)
+        if reply == QMessageBox.StandardButton.Discard:
+            self._dirty = False
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # 图片加载与文件列表渲染
+    # ------------------------------------------------------------------
+    def _format_file_item_text(self, img_path: Path, summary: ImageStatusSummary) -> str:
+        rel = img_path.name
+        if self._current_dir is not None:
+            try:
+                rel = str(img_path.relative_to(self._current_dir)).replace("\\", "/")
+            except ValueError:
+                rel = img_path.name
+
+        key = summary.status_key
+        if key == "review":
+            prefix = f"! [{summary.box_count}]"
+        elif key == "labeled":
+            prefix = f"✓ [{summary.box_count}]"
+        elif key == "empty":
+            prefix = "○ [0]"
+        else:
+            prefix = "·"
+        return f"{prefix}  {rel}"
+
+    def _style_file_item(self, item: QListWidgetItem, summary: ImageStatusSummary) -> None:
+        key = summary.status_key
+        if key == "review":
+            item.setForeground(QColor("#9a6700"))
+        elif key == "labeled":
+            item.setForeground(QColor("#1a7f37"))
+        elif key == "empty":
+            item.setForeground(QColor("#0969da"))
+        else:
+            item.setForeground(QColor("#57606a"))
+
+    def _apply_file_filter(self, *_args: Any, keep_current: bool = True) -> None:
+        if self._syncing_lists:
+            return
+        cur_img = self._doc.image_path if (keep_current and self._doc is not None) else None
+        keyword = self.file_search.text().strip().lower()
+        mode = self.status_filter_combo.currentData() or "all"
+
+        filtered: list[Path] = []
+        for img_path in self._all_images:
+            summary = self._status_map.get(img_path) or inspect_image_status(img_path)
+            if mode != "all" and summary.status_key != mode:
+                continue
+            if keyword:
+                rel_str = str(img_path).lower()
+                if self._current_dir is not None:
+                    try:
+                        rel_str = str(img_path.relative_to(self._current_dir)).lower()
+                    except ValueError:
+                        pass
+                if keyword not in rel_str:
+                    continue
+            filtered.append(img_path)
+
+        self._filtered_images = filtered
+        self._syncing_lists = True
+        try:
+            self.file_list.clear()
+            target_row = -1
+            for idx, img_path in enumerate(filtered):
+                summary = self._status_map[img_path]
+                item = QListWidgetItem(self._format_file_item_text(img_path, summary))
+                item.setData(Qt.ItemDataRole.UserRole, str(img_path))
+                item.setToolTip(str(img_path))
+                self._style_file_item(item, summary)
+                self.file_list.addItem(item)
+                if cur_img is not None and img_path == cur_img:
+                    target_row = idx
+            if target_row >= 0:
+                self.file_list.setCurrentRow(target_row)
+        finally:
+            self._syncing_lists = False
+        self._refresh_progress_summary()
+
+    def _select_image_in_list(self, img_path: Path) -> None:
+        resolved = img_path.resolve()
+        for row, p in enumerate(self._filtered_images):
+            if p == resolved:
+                if self.file_list.currentRow() == row:
+                    self._load_image(resolved)
+                else:
+                    self.file_list.setCurrentRow(row)
+                return
+        self._load_image(resolved)
+
+    def _on_file_row_changed(self, row: int) -> None:
+        if self._syncing_lists:
+            return
+        if not (0 <= row < len(self._filtered_images)):
+            return
+        target = self._filtered_images[row]
+        if self._doc is not None and self._doc.image_path == target:
+            return
+        if not self._may_continue():
+            # 取消切图：回滚文件列表选中行到当前文档
+            if self._doc is not None:
+                self._syncing_lists = True
+                try:
+                    for idx, p in enumerate(self._filtered_images):
+                        if p == self._doc.image_path:
+                            self.file_list.setCurrentRow(idx)
+                            break
+                finally:
+                    self._syncing_lists = False
+            return
+        self._load_image(target)
+
+    def _load_image(self, image_path: Path) -> None:
+        pix, w, h = load_image_pixmap(image_path)
+        doc = load_image_annotation(image_path, image_size=(w, h) if (w > 0 and h > 0) else None)
+        self._doc = doc
+        self._dirty = False
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
+        # 把当前图片新出现的类别纳入右侧清单
+        new_labels = [b.label for b in doc.boxes if b.label and b.label not in self._classes]
+        if new_labels:
+            self._merge_classes(new_labels, replace_order=False)
+
+        self.canvas.set_image(pix, doc.image_width, doc.image_height)
+        self.canvas.set_boxes(doc.boxes, selected_index=-1)
+        self._refresh_class_counts()
+        self._refresh_shape_list()
+        self._refresh_review_banner()
+        self._refresh_footer_and_title()
+        self._refresh_action_states()
+        self._refresh_progress_summary()
+
+    def _update_single_image_status(self, image_path: Path) -> None:
+        resolved = image_path.resolve()
+        summary = inspect_image_status(resolved)
+        self._status_map[resolved] = summary
+        for row, p in enumerate(self._filtered_images):
+            if p == resolved:
+                item = self.file_list.item(row)
+                if item is not None:
+                    item.setText(self._format_file_item_text(resolved, summary))
+                    self._style_file_item(item, summary)
+                break
+        self._refresh_progress_summary()
+
+    def _refresh_progress_summary(self) -> None:
+        total = len(self._all_images)
+        if total == 0:
+            self.progress_summary_label.setText(
+                "当前目录暂无图片" if self._current_dir else "尚未打开图片目录"
+            )
+            return
+        labeled = sum(1 for s in self._status_map.values() if s.status_key == "labeled")
+        empty = sum(1 for s in self._status_map.values() if s.status_key == "empty")
+        review = sum(1 for s in self._status_map.values() if s.status_key == "review")
+        unlabeled = total - labeled - empty - review
+        pos = self.file_list.currentRow() + 1 if self.file_list.currentRow() >= 0 else 0
+        shown = len(self._filtered_images)
+        parts = [f"{pos}/{shown} 张" if shown == total else f"筛选 {pos}/{shown} (共 {total})"]
+        parts.append(f"已标 {labeled}")
+        if empty:
+            parts.append(f"空图 {empty}")
+        if review:
+            parts.append(f"待复核 {review}")
+        if unlabeled:
+            parts.append(f"未标 {unlabeled}")
+        self.progress_summary_label.setText(" · ".join(parts))
+
+    def _refresh_review_banner(self) -> None:
+        if self._doc is None:
+            self.review_banner.setVisible(False)
+            return
+        if self._doc.has_missing_hint or self._doc.missing_note:
+            note = self._doc.missing_note or "上游 LLM 怀疑本图可能存在漏标或待确认目标，请人工检查。"
+            self.review_banner_label.setText(f"⚠ AI 复核提醒：{note}")
+            self.review_banner.setVisible(True)
+        else:
+            self.review_banner.setVisible(False)
+
+    def _refresh_footer_and_title(self) -> None:
+        if self._doc is None:
+            self.img_info_label.setText("分辨率: -")
+            self.save_state_label.setText("")
+            return
+        dirty_mark = " *" if self._dirty else ""
+        self.status_label.setText(f"{self._doc.image_path}{dirty_mark}")
+        self.img_info_label.setText(
+            f"分辨率: {self._doc.image_width}×{self._doc.image_height} · 目标: {len(self._doc.boxes)}"
+        )
+        if self._dirty:
+            self.save_state_label.setText("未保存*")
+            self.save_state_label.setStyleSheet("border: none; color: #cf222e; font-weight: 600; font-size: 12px;")
+        elif self._doc.has_json_file:
+            mark = "已复核 ✓" if self._doc.is_verified else "已保存"
+            self.save_state_label.setText(mark)
+            self.save_state_label.setStyleSheet("border: none; color: #1a7f37; font-size: 12px;")
+        else:
+            self.save_state_label.setText("未生成 .json")
+            self.save_state_label.setStyleSheet("border: none; color: #57606a; font-size: 12px;")
+
+    def _refresh_action_states(self) -> None:
+        has_img = self._doc is not None
+        has_sel = has_img and self.canvas.selected_index() >= 0
+        has_boxes = has_img and self._doc is not None and len(self._doc.boxes) > 0
+        sam_busy = self.sam_worker is not None and self.sam_worker.isRunning()
+
+        self.dup_box_btn.setEnabled(has_sel)
+        self.del_box_btn.setEnabled(has_sel)
+        self.box_del_inline_btn.setEnabled(has_sel)
+        self.change_cls_btn.setEnabled(has_sel)
+        self.clear_boxes_btn.setEnabled(has_boxes)
+        self.undo_btn.setEnabled(len(self._undo_stack) > 0)
+        self.redo_btn.setEnabled(len(self._redo_stack) > 0)
+        self.save_btn.setEnabled(has_img)
+        self.verify_next_btn.setEnabled(has_img)
+        self.prev_img_btn.setEnabled(len(self._filtered_images) > 1)
+        self.next_img_btn.setEnabled(len(self._filtered_images) > 1)
+        self.sam_refine_btn.setEnabled(has_boxes and not sam_busy)
+        self.sam_refine_btn.setText("SAM 收紧中..." if sam_busy else "SAM 贴边收框")
+
+    # ------------------------------------------------------------------
+    # 类别管理
+    # ------------------------------------------------------------------
+    def _merge_classes(self, labels: list[str], *, replace_order: bool = False) -> None:
+        if replace_order:
+            deduped: list[str] = []
+            seen: set[str] = set()
+            for raw in labels:
+                name = str(raw).strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    deduped.append(name)
+            self._classes = deduped
+        else:
+            for raw in labels:
+                name = str(raw).strip()
+                if name and name not in self._classes:
+                    self._classes.append(name)
+
+        if self._classes and self._active_label not in self._classes:
+            self._active_label = self._classes[0]
+        self.canvas.set_active_label(self._active_label)
+        self._refresh_class_counts()
+
+    def _refresh_class_counts(self) -> None:
+        counts: dict[str, int] = {}
+        if self._doc is not None:
+            for b in self._doc.boxes:
+                counts[b.label] = counts.get(b.label, 0) + 1
+
+        self._syncing_lists = True
+        try:
+            self.unique_label_list.clear()
+            active_row = -1
+            for idx, cls_name in enumerate(self._classes):
+                shortcut_tag = f"[{idx + 1}] " if idx < 9 else "    "
+                cnt = counts.get(cls_name, 0)
+                text = f"{shortcut_tag}{cls_name}  ({cnt})" if cnt > 0 else f"{shortcut_tag}{cls_name}"
+                item = QListWidgetItem(_make_color_icon(label_color_rgb(cls_name)), text)
+                item.setData(Qt.ItemDataRole.UserRole, cls_name)
+                self.unique_label_list.addItem(item)
+                if cls_name == self._active_label:
+                    active_row = idx
+            if active_row >= 0:
+                self.unique_label_list.setCurrentRow(active_row)
+        finally:
+            self._syncing_lists = False
+
+    def _on_add_class_from_input(self) -> None:
+        name = self.new_class_edit.text().strip()
+        if not name:
+            return
+        self.new_class_edit.clear()
+        self._merge_classes([name], replace_order=False)
+        self._set_active_class(name)
+        self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _set_active_class(self, cls_name: str) -> None:
+        if cls_name not in self._classes:
+            self._classes.append(cls_name)
+        self._active_label = cls_name
+        self.canvas.set_active_label(cls_name)
+        self._refresh_class_counts()
+
+    def _on_class_row_changed(self, row: int) -> None:
+        if self._syncing_lists:
+            return
+        if 0 <= row < len(self._classes):
+            self._active_label = self._classes[row]
+            self.canvas.set_active_label(self._active_label)
+
+    def _on_class_double_clicked(self, item: QListWidgetItem) -> None:
+        cls_name = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not cls_name:
+            return
+        self._set_active_class(cls_name)
+        sel = self.canvas.selected_index()
+        if self._doc is not None and 0 <= sel < len(self._doc.boxes):
+            self._relabel_box(sel, cls_name)
+
+    def _apply_class_shortcut(self, cls_idx: int) -> None:
+        if not (0 <= cls_idx < len(self._classes)):
+            return
+        cls_name = self._classes[cls_idx]
+        self._set_active_class(cls_name)
+        sel = self.canvas.selected_index()
+        if self._doc is not None and 0 <= sel < len(self._doc.boxes):
+            self._relabel_box(sel, cls_name)
+
+    def _on_save_classes_txt(self) -> None:
+        if not self._classes:
+            QMessageBox.information(self, "提示", "当前类别清单为空，请先添加或导入类别。")
+            return
+        default_path = (
+            (self._current_dir / "classes.txt")
+            if self._current_dir is not None
+            else (self.workspace_root / "classes.txt")
+        )
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "保存 classes.txt 类别清单", str(default_path), "文本文件 (*.txt)"
+        )
+        if not chosen:
+            return
+        saved = save_classes_txt(Path(chosen), self._classes)
+        self._last_classes_file = saved.resolve()
+        self.save_state_label.setText(f"已导出 {saved.name}")
+
+    # ------------------------------------------------------------------
+    # 撤销/重做栈与标注编辑操作
+    # ------------------------------------------------------------------
+    def _push_undo_snapshot(self) -> None:
+        if self._doc is None:
+            return
+        snap = ([b.clone() for b in self._doc.boxes], copy.deepcopy(self._doc.flags))
+        self._undo_stack.append(snap)
+        if len(self._undo_stack) > _MAX_UNDO_STEPS:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _apply_boxes_change(self, selected_idx: int = -1) -> None:
+        if self._doc is None:
+            return
+        self._dirty = True
+        self.canvas.set_boxes(self._doc.boxes, selected_index=selected_idx)
+        self._refresh_class_counts()
+        self._refresh_shape_list(selected_idx=selected_idx)
+        self._refresh_review_banner()
+        self._refresh_footer_and_title()
+        self._refresh_action_states()
+
+    def _undo(self) -> None:
+        if self._doc is None or not self._undo_stack:
+            return
+        cur_snap = ([b.clone() for b in self._doc.boxes], copy.deepcopy(self._doc.flags))
+        self._redo_stack.append(cur_snap)
+        prev_boxes, prev_flags = self._undo_stack.pop()
+        self._doc.boxes = prev_boxes
+        self._doc.flags = prev_flags
+        self._apply_boxes_change(selected_idx=-1)
+
+    def _redo(self) -> None:
+        if self._doc is None or not self._redo_stack:
+            return
+        cur_snap = ([b.clone() for b in self._doc.boxes], copy.deepcopy(self._doc.flags))
+        self._undo_stack.append(cur_snap)
+        next_boxes, next_flags = self._redo_stack.pop()
+        self._doc.boxes = next_boxes
+        self._doc.flags = next_flags
+        self._apply_boxes_change(selected_idx=-1)
+
+    def _on_canvas_box_drawn(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        if self._doc is None:
+            return
+        label = self._active_label
+        if not label:
+            dlg = _LabelPickerDialog(self._classes, title="为新标注框指定类别", parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            label = dlg.selected_label()
+            self._set_active_class(label)
+
+        self._push_undo_snapshot()
+        new_box = RectAnnotation(label=label, x1=x1, y1=y1, x2=x2, y2=y2)
+        if self._doc.image_width > 0 and self._doc.image_height > 0:
+            new_box = new_box.clamped(self._doc.image_width, self._doc.image_height)
+        self._doc.boxes.append(new_box)
+        self._apply_boxes_change(selected_idx=len(self._doc.boxes) - 1)
+
+    def _on_canvas_box_geometry_committed(
+        self, idx: int, x1: float, y1: float, x2: float, y2: float
+    ) -> None:
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        self._push_undo_snapshot()
+        old = self._doc.boxes[idx]
+        updated = RectAnnotation(
+            label=old.label,
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            score=old.score,
+            description=old.description,
+            difficult=old.difficult,
+            group_id=old.group_id,
+            flags=copy.deepcopy(old.flags),
+        )
+        if self._doc.image_width > 0 and self._doc.image_height > 0:
+            updated = updated.clamped(self._doc.image_width, self._doc.image_height)
+        self._doc.boxes[idx] = updated
+        self._apply_boxes_change(selected_idx=idx)
+
+    def _relabel_box(self, idx: int, new_label: str) -> None:
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        clean = new_label.strip()
+        if not clean or self._doc.boxes[idx].label == clean:
+            return
+        self._push_undo_snapshot()
+        self._doc.boxes[idx].label = clean
+        if clean not in self._classes:
+            self._classes.append(clean)
+        self._apply_boxes_change(selected_idx=idx)
+
+    def _prompt_relabel_selected_box(self) -> None:
+        idx = self.canvas.selected_index()
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        cur_label = self._doc.boxes[idx].label
+        dlg = _LabelPickerDialog(
+            self._classes, current_label=cur_label, title="修改选中框类别", parent=self
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            chosen = dlg.selected_label()
+            self._set_active_class(chosen)
+            self._relabel_box(idx, chosen)
+
+    def _duplicate_selected_box(self) -> None:
+        idx = self.canvas.selected_index()
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        self._push_undo_snapshot()
+        src = self._doc.boxes[idx]
+        offset = 14.0
+        bw = src.width
+        bh = src.height
+        nx1 = src.x1 + offset
+        ny1 = src.y1 + offset
+        if self._doc.image_width > 0 and nx1 + bw > self._doc.image_width:
+            nx1 = max(0.0, src.x1 - offset)
+        if self._doc.image_height > 0 and ny1 + bh > self._doc.image_height:
+            ny1 = max(0.0, src.y1 - offset)
+        dup = RectAnnotation(
+            label=src.label,
+            x1=nx1,
+            y1=ny1,
+            x2=nx1 + bw,
+            y2=ny1 + bh,
+        )
+        self._doc.boxes.append(dup)
+        self._apply_boxes_change(selected_idx=len(self._doc.boxes) - 1)
+
+    def _delete_selected_box(self) -> None:
+        idx = self.canvas.selected_index()
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        self._push_undo_snapshot()
+        self._doc.boxes.pop(idx)
+        next_sel = min(idx, len(self._doc.boxes) - 1)
+        self._apply_boxes_change(selected_idx=next_sel)
+
+    def _clear_all_boxes(self) -> None:
+        if self._doc is None or not self._doc.boxes:
+            return
+        self._push_undo_snapshot()
+        self._doc.boxes.clear()
+        self._apply_boxes_change(selected_idx=-1)
+
+    def _clear_missing_hint(self) -> None:
+        if self._doc is None:
+            return
+        self._push_undo_snapshot()
+        self._doc.flags["has_missing_hint"] = False
+        self._doc.flags["missing_note"] = ""
+        self._apply_boxes_change(selected_idx=self.canvas.selected_index())
+
+    def _verify_and_next(self) -> None:
+        """标记当前图已复核通过（自动清除漏标提醒并保存 .json，0 框时保存为显式空图负样本），再自动切下一张。"""
+        if self._doc is None:
+            return
+        self._doc.flags["verified"] = True
+        self._doc.flags["has_missing_hint"] = False
+        self._doc.flags["missing_note"] = ""
+        self._dirty = True
+        if self.save_current_annotation(force=True):
+            self._refresh_review_banner()
+            self.open_next_image()
+
+    # ------------------------------------------------------------------
+    # 本地 SAM 像素级贴边收紧
+    # ------------------------------------------------------------------
+    def _on_sam_refine_clicked(self) -> None:
+        if self._doc is None or not self._doc.boxes:
+            return
+        if self.sam_worker is not None and self.sam_worker.isRunning():
+            return
+        if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "工作台本地 SAM 收框"):
+            return
+
+        sel = self.canvas.selected_index()
+        if 0 <= sel < len(self._doc.boxes):
+            targets = [(sel, self._doc.boxes[sel])]
+        else:
+            targets = list(enumerate(self._doc.boxes))
+
+        dev_info = self.device_info
+        if dev_info is None or dev_info.probing:
+            dev_info = detect_compute_device()
+            self.device_info = dev_info
+        device = dev_info.recommended_device
+
+        self.sam_worker = _SamBoxRefineWorker(
+            self._doc.image_path,
+            targets,
+            device=device,
+            model_name="sam2.1_t.pt",
+            refiner_cache=self._sam_refiner_cache,
+        )
+        if self.gpu_guard is not None:
+            self.gpu_guard.bind(self.sam_worker, "工作台本地 SAM 收框")
+        self.sam_worker.refined_ready.connect(self._on_sam_refine_finished)
+        self.sam_worker.failed.connect(self._on_sam_refine_failed)
+        self.sam_worker.finished.connect(self._refresh_action_states)
+        self._refresh_action_states()
+        self.save_state_label.setText(f"正在用本地 SAM 2.1 收紧 {len(targets)} 个框...")
+        self.sam_worker.start()
+
+    def _on_sam_refine_finished(self, img_path_str: str, refined_map: dict) -> None:
+        if self._doc is None or str(self._doc.image_path.resolve()) != img_path_str:
+            return
+        if not refined_map:
+            self.save_state_label.setText("SAM 未检出更紧贴的有效轮廓，保持原框")
+            return
+        self._push_undo_snapshot()
+        changed = 0
+        for idx, coords in refined_map.items():
+            if 0 <= idx < len(self._doc.boxes):
+                x1, y1, x2, y2 = coords
+                old = self._doc.boxes[idx]
+                flags = copy.deepcopy(old.flags)
+                flags["box_refined"] = True
+                self._doc.boxes[idx] = RectAnnotation(
+                    label=old.label,
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    score=old.score,
+                    description=old.description,
+                    difficult=old.difficult,
+                    group_id=old.group_id,
+                    flags=flags,
+                ).clamped(self._doc.image_width, self._doc.image_height)
+                changed += 1
+        self._apply_boxes_change(selected_idx=self.canvas.selected_index())
+        self.save_state_label.setText(f"SAM 已收紧 {changed} 个框（Ctrl+Z 可一键撤回）")
+
+    def _on_sam_refine_failed(self, msg: str) -> None:
+        self.save_state_label.setText("SAM 收框失败")
+        QMessageBox.warning(self, "本地 SAM 收框失败", msg)
+
+    # ------------------------------------------------------------------
+    # 右侧目标框列表与画布双向同步
+    # ------------------------------------------------------------------
+    def _refresh_shape_list(self, selected_idx: int = -1) -> None:
+        self._syncing_lists = True
+        try:
+            self.shape_list.clear()
+            boxes = self._doc.boxes if self._doc is not None else []
+            self.obj_title_label.setText(f"当前图目标框 ({len(boxes)})")
+            for idx, b in enumerate(boxes):
+                score_part = f" · {b.score:.2f}" if b.score is not None else ""
+                size_part = f" [{int(round(b.width))}×{int(round(b.height))}]"
+                tag = f"#{idx + 1} {b.label}{score_part}{size_part}"
+                item = QListWidgetItem(_make_color_icon(label_color_rgb(b.label)), tag)
+                if b.description:
+                    item.setToolTip(b.description)
+                self.shape_list.addItem(item)
+            if 0 <= selected_idx < len(boxes):
+                self.shape_list.setCurrentRow(selected_idx)
+        finally:
+            self._syncing_lists = False
+        self._refresh_box_detail(selected_idx)
+
+    def _refresh_box_detail(self, idx: int) -> None:
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            self.box_detail_label.setText(
+                "未选中目标框：单击画布或列表项可查看坐标、AI 置信度与审核理由；按数字键 1-9 可速改类别。"
+            )
+            return
+        b = self._doc.boxes[idx]
+        lines = [
+            f"类别：{b.label}   尺寸：{int(round(b.width))} × {int(round(b.height))} px",
+            f"坐标：({b.x1:.1f}, {b.y1:.1f}) → ({b.x2:.1f}, {b.y2:.1f})",
+        ]
+        meta_tags: list[str] = []
+        if b.score is not None:
+            meta_tags.append(f"置信度 {b.score:.3f}")
+        if isinstance(b.flags, dict) and b.flags.get("llm_added"):
+            meta_tags.append("LLM 补标")
+        if isinstance(b.flags, dict) and b.flags.get("box_refined"):
+            meta_tags.append("已收框")
+        if meta_tags:
+            lines.append("标签：" + " · ".join(meta_tags))
+        if b.description:
+            lines.append(f"审核说明：{b.description}")
+        self.box_detail_label.setText("\n".join(lines))
+
+    def _on_shape_row_changed(self, row: int) -> None:
+        if self._syncing_lists:
+            return
+        self.canvas.select_box(row, emit_signal=False)
+        self._refresh_box_detail(row)
+        self._refresh_action_states()
+
+    def _on_canvas_selection_changed(self, idx: int) -> None:
+        self._syncing_lists = True
+        try:
+            if 0 <= idx < self.shape_list.count():
+                self.shape_list.setCurrentRow(idx)
+            else:
+                self.shape_list.clearSelection()
+                self.shape_list.setCurrentRow(-1)
+        finally:
+            self._syncing_lists = False
+        self._refresh_box_detail(idx)
+        self._refresh_action_states()
+
+    def _on_canvas_mode_changed(self, mode: str) -> None:
+        is_draw = mode == AnnotationCanvasView.MODE_DRAW
+        self.edit_mode_btn.setChecked(not is_draw)
+        self.draw_mode_btn.setChecked(is_draw)
+        self.mode_badge_label.setText("模式: 画矩形框 (Esc 返回编辑)" if is_draw else "模式: 编辑")
+        self.mode_badge_label.setStyleSheet(
+            "border: none; color: #cf222e; font-weight: 600; font-size: 12px;"
+            if is_draw
+            else "border: none; color: #0969da; font-weight: 600; font-size: 12px;"
+        )
+
+    def _on_canvas_zoom_changed(self, scale: float) -> None:
+        self.zoom_info_label.setText(f"缩放: {int(round(scale * 100))}%")
+
+    def _on_canvas_cursor_changed(self, x: int, y: int) -> None:
+        self.cursor_info_label.setText(f"坐标: ({x}, {y})" if x >= 0 and y >= 0 else "坐标: -")
+
+    # ------------------------------------------------------------------
+    # 文件列表右键菜单与顶部工作流按钮
+    # ------------------------------------------------------------------
+    def _on_file_list_context_menu(self, pos) -> None:
+        item = self.file_list.itemAt(pos)
+        if item is None:
+            return
+        img_path = Path(str(item.data(Qt.ItemDataRole.UserRole)))
+        menu = QMenu(self)
+        reveal_act = menu.addAction("在文件管理器中定位")
+        clear_json_act = menu.addAction("删除同名 .json 标注文件")
+        chosen = menu.exec(self.file_list.mapToGlobal(pos))
+        if chosen is reveal_act:
+            self._reveal_in_file_manager(img_path)
+        elif chosen is clear_json_act:
+            json_p = img_path.with_suffix(".json")
+            if json_p.is_file():
+                try:
+                    json_p.unlink()
+                except OSError as exc:
+                    QMessageBox.warning(self, "删除失败", str(exc))
+                    return
+                if self._doc is not None and self._doc.image_path == img_path.resolve():
+                    self._load_image(img_path)
+                self._update_single_image_status(img_path)
+                if self._current_dir is not None:
+                    self.annotations_changed.emit(str(self._current_dir))
+
+    @staticmethod
+    def _reveal_in_file_manager(path: Path) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["explorer", "/select,", str(path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path.parent)])
+        except OSError:
+            pass
 
     def _on_pick_and_open_dir(self) -> None:
         start = str(self.current_directory() or (self.workspace_root / "data" / "raw_frames"))
@@ -630,8 +1728,7 @@ class LabelingStudioTab(QWidget):
         if cur is None or not cur.is_dir():
             QMessageBox.information(self, "提示", "当前尚未打开任何图片目录。")
             return
-        lw = self._label_widget()
-        cur_file = Path(str(lw.filename)) if lw and getattr(lw, "filename", None) else None
+        cur_file = self.current_image_path()
         self.open_directory(
             cur,
             classes_file=self._last_classes_file,
@@ -642,6 +1739,8 @@ class LabelingStudioTab(QWidget):
         cur = self.current_directory()
         if cur is None:
             QMessageBox.warning(self, "提示", "请先在工作台中打开待标注的图片目录。")
+            return
+        if not self._may_continue():
             return
         cls_path = ""
         if (cur / "classes.txt").is_file():
@@ -655,10 +1754,6 @@ class LabelingStudioTab(QWidget):
         if cur is None:
             QMessageBox.warning(self, "提示", "请先在工作台中打开图片目录。")
             return
+        if not self._may_continue():
+            return
         self.send_to_review.emit(str(cur))
-
-    def prepare_for_close(self) -> bool:
-        """在主窗口退出前询问未保存的标注修改并保存 X-AnyLabeling 状态。"""
-        if self._xal_window is None:
-            return True
-        return self._xal_window.prepare_for_close()

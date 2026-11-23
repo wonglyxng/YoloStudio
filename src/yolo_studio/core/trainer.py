@@ -268,7 +268,7 @@ def ensure_torch_cpu_threads() -> None:
     """恢复 PyTorch CPU 算子的线程数。
 
     设计原因：
-        桌面入口为兼容内嵌 X-AnyLabeling 设置了 `OMP_NUM_THREADS=1` 等环境变量，
+        桌面入口为降低主线程 BLAS/OpenMP 线程争抢设置了 `OMP_NUM_THREADS=1` 等环境变量，
         导致 torch 默认只用 1 个线程，CPU 训练/推理显著变慢。本函数在当前线程数为 1 时
         把 torch 进程级线程数恢复为约等于物理核心数（逻辑核数的一半，至少 1）。
         仅影响 torch，不影响 numpy/MKL 与 onnxruntime；可重复调用。

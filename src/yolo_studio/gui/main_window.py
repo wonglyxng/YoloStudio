@@ -82,11 +82,11 @@ QWidget#metricCard {
 
 
 class MainWindow(QMainWindow):
-    """YOLO26 训练工具桌面顶层主窗口（单进程整合内嵌 X-AnyLabeling）。
+    """YOLO26 训练工具桌面顶层主窗口（内置原生 PyQt6 轻量标注与复核工作台）。
 
     状态与生命周期：
         持有 `workspace_root`、`QSettings` 及六个工作流标签页；
-        关闭时先委派内嵌 `LabelingStudioTab` 核查未保存标注再持久化主窗口状态。
+        关闭时先委派 `LabelingStudioTab` 核查未保存标注再持久化主窗口状态。
     """
 
     def __init__(
@@ -123,7 +123,12 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.extract_tab = ExtractTab(workspace_root)
-        self.labeling_tab = LabelingStudioTab(workspace_root, lazy_mount=lazy_init)
+        self.labeling_tab = LabelingStudioTab(
+            workspace_root,
+            lazy_mount=lazy_init,
+            device_info=self.device_info,
+            gpu_guard=self.gpu_guard,
+        )
         self.dataset_tab = DatasetTab(workspace_root)
         self.review_tab = MllmReviewTab(
             workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
@@ -190,6 +195,7 @@ class MainWindow(QMainWindow):
         self.device_info.gpu_devices = info.gpu_devices
         self.device_info.probing = False
 
+        self.labeling_tab.apply_device_info(self.device_info)
         self.review_tab.apply_device_info(self.device_info)
         self.train_tab.apply_device_info(self.device_info)
         self.eval_tab.apply_device_info(self.device_info)
@@ -202,7 +208,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(summary, 5000)
 
     def _on_frames_ready(self, frames_dir: str) -> None:
-        """同步抽帧输出目录至数据集页与智能标注页；用户仍停留在抽帧页时自动切至内嵌标注工作台。
+        """同步抽帧输出目录至数据集页与智能标注页；用户仍停留在抽帧页时自动切至标注工作台。
 
         抽帧完成与点击「发送到标注工作台」都会触发此槽；两种情况下用户通常都处于抽帧页。
         """
@@ -214,7 +220,7 @@ class MainWindow(QMainWindow):
     def _on_open_in_workbench(
         self, target_dir: str, classes_file: str = "", select_image: str = ""
     ) -> None:
-        """切换至「2. 标注工作台」并在内嵌 X-AnyLabeling 中打开目标目录、类别与可选指定图片。"""
+        """切换至「2. 标注工作台」并打开目标目录、类别与可选指定图片。"""
         cls_path = Path(classes_file) if classes_file else None
         img_path = Path(select_image) if select_image else None
         if self.labeling_tab.open_directory(
@@ -225,7 +231,7 @@ class MainWindow(QMainWindow):
     def _on_labeling_to_dataset(self, images_dir: str, classes_file: str) -> None:
         """将工作台当前标注目录与类别清单同步至「4. 数据集准备」并切换过去。
 
-        内嵌 X-AnyLabeling 打开目录时会递归列出子目录中的图片，因此同步时开启递归扫描，
+        标注工作台打开目录时会递归列出子目录中的图片，因此同步时开启递归扫描，
         保证数据集页统计与生成的图片范围和工作台中标注的范围一致。
         """
         self.dataset_tab.set_dataset_source(images_dir, classes_file, recursive=True)
@@ -276,6 +282,7 @@ class MainWindow(QMainWindow):
         candidates = [
             getattr(self.extract_tab, "probe_worker", None),
             getattr(self.extract_tab, "worker", None),
+            getattr(self.labeling_tab, "sam_worker", None),
             getattr(self.dataset_tab, "scan_worker", None),
             getattr(self.dataset_tab, "build_worker", None),
             getattr(self.review_tab, "worker", None),

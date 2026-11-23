@@ -260,7 +260,7 @@ class DatasetTab(QWidget):
 
         self.format_combo = QComboBox()
         self.format_combo.addItem("自动识别 (.json 或 YOLO .txt)", AnnotationFormat.AUTO)
-        self.format_combo.addItem("X-AnyLabeling 原生 .json", AnnotationFormat.XANYLABELING_JSON)
+        self.format_combo.addItem("工作台标准 .json（兼容 LabelMe / X-AnyLabeling）", AnnotationFormat.XANYLABELING_JSON)
         self.format_combo.addItem("YOLO 导出 .txt + classes.txt", AnnotationFormat.YOLO_TXT)
         form.addRow("标注格式:", self.format_combo)
 
@@ -603,7 +603,7 @@ class DatasetTab(QWidget):
         self._set_busy(False)
         self._result_revision = self._running_revision
 
-        fmt_name = "X-AnyLabeling JSON" if summary.detected_format == "json" else "YOLO TXT"
+        fmt_name = "标注 JSON" if summary.detected_format == "json" else "YOLO TXT"
         warn_count = len(summary.warnings)
         cards = self.stat_cards
         cards[0].set_value("图片总数", str(summary.total_images))

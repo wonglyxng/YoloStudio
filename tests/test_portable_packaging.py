@@ -147,21 +147,19 @@ def test_build_portable_sanitize_and_relative_pth(tmp_path: Path) -> None:
     bundle_root = tmp_path / "bundle"
     sp_dir = bundle_root / "runtime" / "Lib" / "site-packages"
     app_src = bundle_root / "app" / "src"
-    app_xal = bundle_root / "app" / "third_party" / "X-AnyLabeling"
     sp_dir.mkdir(parents=True)
     app_src.mkdir(parents=True)
-    app_xal.mkdir(parents=True)
 
     # 构造可编辑安装残留、绝对路径 direct_url.json、测试专用包及正常运行时包
-    (sp_dir / "__editable__.x_anylabeling_cvhub-4.3.3.pth").write_text(
-        r"C:\work\pyspace\YoloStudio\third_party\X-AnyLabeling", encoding="utf-8"
+    (sp_dir / "__editable__.yolo_studio-0.3.3.pth").write_text(
+        r"C:\work\pyspace\YoloStudio\src", encoding="utf-8"
     )
     (sp_dir / "easy-install.pth").write_text(
         "C:\\dev\\local_pkg\n./relative_pkg\n", encoding="utf-8"
     )
-    dist_info = sp_dir / "x_anylabeling_cvhub-4.3.3.dist-info"
+    dist_info = sp_dir / "yolo_studio-0.3.3.dist-info"
     dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Name: x-anylabeling-cvhub\nVersion: 4.3.3\n", encoding="utf-8")
+    (dist_info / "METADATA").write_text("Name: yolo-studio\nVersion: 0.3.3\n", encoding="utf-8")
     (dist_info / "direct_url.json").write_text('{"url": "file:///C:/work/repo"}', encoding="utf-8")
 
     (sp_dir / "pytest").mkdir()
@@ -171,7 +169,7 @@ def test_build_portable_sanitize_and_relative_pth(tmp_path: Path) -> None:
     bp.sanitize_site_packages(sp_dir)
     pth_path = bp.write_portable_pth(sp_dir)
 
-    assert not (sp_dir / "__editable__.x_anylabeling_cvhub-4.3.3.pth").exists()
+    assert not (sp_dir / "__editable__.yolo_studio-0.3.3.pth").exists()
     assert not (dist_info / "direct_url.json").exists()
     assert (dist_info / "METADATA").is_file()
     assert not (sp_dir / "pytest").exists()
@@ -184,7 +182,6 @@ def test_build_portable_sanitize_and_relative_pth(tmp_path: Path) -> None:
     site.addsitedir(str(sp_dir), known)
     normalized_known = {os.path.normcase(os.path.abspath(p)) for p in known}
     assert os.path.normcase(str(app_src.resolve())) in normalized_known
-    assert os.path.normcase(str(app_xal.resolve())) in normalized_known
 
 
 def test_parse_pyvenv_home_and_slim_app_copy(tmp_path: Path) -> None:
@@ -205,15 +202,14 @@ def test_parse_pyvenv_home_and_slim_app_copy(tmp_path: Path) -> None:
     bp.copy_app_and_docs(REPO_ROOT, bundle_out)
     assert (bundle_out / "app" / "main.py").is_file()
     assert (bundle_out / "app" / "src" / "yolo_studio" / "app.py").is_file()
+    assert (bundle_out / "app" / "src" / "yolo_studio" / "core" / "annotation_io.py").is_file()
+    assert (bundle_out / "app" / "src" / "yolo_studio" / "gui" / "annotation_canvas.py").is_file()
     assert (bundle_out / "app" / "src" / "yolo_studio" / "resources" / "logo.ico").is_file()
     assert (bundle_out / "app" / "src" / "yolo_studio" / "resources" / "logo.png").is_file()
-    assert (bundle_out / "app" / "third_party" / "X-AnyLabeling" / "anylabeling" / "app_info.py").is_file()
     assert (bundle_out / "LICENSE").is_file()
     assert (bundle_out / "THIRD_PARTY_NOTICES.md").is_file()
-    # 确保 70+ MB 的非运行素材与测试套件未被混入便携包
-    assert not (bundle_out / "app" / "third_party" / "X-AnyLabeling" / "assets").exists()
-    assert not (bundle_out / "app" / "third_party" / "X-AnyLabeling" / "examples").exists()
-    assert not (bundle_out / "app" / "third_party" / "X-AnyLabeling" / "tests").exists()
+    # 确认不再包含已移除的第三方 X-AnyLabeling 目录
+    assert not (bundle_out / "app" / "third_party").exists()
 
 
 def test_clone_base_python_runtime_preserves_pip_in_clean_mode_and_ensurepip(tmp_path: Path) -> None:
@@ -615,16 +611,11 @@ def test_runtime_fingerprint_ignores_version_changes_and_tracks_dependencies(tmp
 
     fake_repo = tmp_path / "repo"
     (fake_repo / "src" / "yolo_studio").mkdir(parents=True)
-    (fake_repo / "third_party" / "X-AnyLabeling").mkdir(parents=True)
     ver_file = fake_repo / "src" / "yolo_studio" / "_version.py"
     ver_file.write_text('__version__ = "0.3.3"\n', encoding="utf-8")
     (fake_repo / "requirements.txt").write_text("# comment\nnumpy>=2.0.0\n", encoding="utf-8")
     (fake_repo / "pyproject.toml").write_text(
         '[project]\nname = "yolo-studio"\nrequires-python = ">=3.11"\ndependencies = ["numpy>=2.0.0"]\n',
-        encoding="utf-8",
-    )
-    (fake_repo / "third_party" / "X-AnyLabeling" / "pyproject.toml").write_text(
-        '[project]\nname = "x-anylabeling"\ndependencies = ["PyQt6>=6.6.0"]\n',
         encoding="utf-8",
     )
 
@@ -767,13 +758,6 @@ def _create_minimal_fake_repo(repo_dir: Path, version: str = "0.3.9") -> Path:
     (repo_dir / "THIRD_PARTY_NOTICES.md").write_text("# Notices\n", encoding="utf-8")
     (repo_dir / "docs").mkdir(parents=True)
     (repo_dir / "docs" / "001.md").write_text("# Doc\n", encoding="utf-8")
-    (repo_dir / "third_party" / "X-AnyLabeling" / "anylabeling").mkdir(parents=True)
-    (repo_dir / "third_party" / "X-AnyLabeling" / "anylabeling" / "__init__.py").write_text(
-        "", encoding="utf-8"
-    )
-    (repo_dir / "third_party" / "X-AnyLabeling" / "pyproject.toml").write_text(
-        '[project]\nname = "x-anylabeling"\ndependencies = []\n', encoding="utf-8"
-    )
     launcher_dst = repo_dir / "packaging" / "launcher"
     launcher_dst.mkdir(parents=True)
     shutil.copy2(
@@ -968,26 +952,12 @@ def test_app_logo_assets_resolution_and_splash_render(tmp_path: Path) -> None:
     assert _find_app_logo_path(REPO_ROOT, REPO_ROOT, package_dir=pkg_dir) == own_png
     assert bp.resolve_launcher_icon_path(REPO_ROOT) == own_ico
 
-    # 3) 校验缺失自有图标时回退至 X-AnyLabeling 图标；均缺失时返回 None
+    # 3) 校验缺失自有图标时安全返回 None
     empty_repo = tmp_path / "empty_repo"
     empty_repo.mkdir()
     assert _find_app_icon_path(empty_repo, empty_repo) is None
     assert _find_app_logo_path(empty_repo, empty_repo) is None
     assert bp.resolve_launcher_icon_path(empty_repo) is None
-
-    fallback_ico = (
-        empty_repo
-        / "third_party"
-        / "X-AnyLabeling"
-        / "anylabeling"
-        / "resources"
-        / "images"
-        / "icon.ico"
-    )
-    fallback_ico.parent.mkdir(parents=True)
-    fallback_ico.write_bytes(own_ico.read_bytes())
-    assert _find_app_icon_path(empty_repo, empty_repo) == fallback_ico
-    assert bp.resolve_launcher_icon_path(empty_repo) == fallback_ico
 
     # 4) 校验离线 Qt 环境下 QIcon 构建与 1x/2x 高分屏启动欢迎图绘制
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
