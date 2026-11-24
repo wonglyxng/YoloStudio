@@ -664,6 +664,31 @@ def _is_response_format_bad_request(exc: BaseException) -> bool:
     )
 
 
+def _normalize_openai_model_id(model_name: str) -> str:
+    """规范化 OpenAI 兼容模型名称：提取 `openai/` 中转前缀或 `ft:` 微调前缀下的基础模型 ID（小写）。"""
+    model_id = model_name.strip().lower()
+    if "/" in model_id:
+        prefix, tail = model_id.rsplit("/", 1)
+        if prefix == "openai" or prefix.endswith("/openai"):
+            model_id = tail
+    if model_id.startswith("ft:"):
+        parts = model_id.split(":")
+        if len(parts) >= 2 and parts[1]:
+            model_id = parts[1]
+    return model_id
+
+
+def _openai_model_omits_custom_sampling(model_name: str) -> bool:
+    """事前判断模型是否属于默认不支持自定义 `temperature` 及 `max_tokens` 的 OpenAI 新系列（`o` 系列与 `gpt-5+`）。"""
+    model_id = _normalize_openai_model_id(model_name)
+    if not model_id:
+        return False
+    if re.match(r"^o[1-9](?:$|[-._])", model_id):
+        return True
+    gpt_match = re.match(r"^gpt-(\d+)(?:$|[-._])", model_id)
+    return bool(gpt_match and int(gpt_match.group(1)) >= 5)
+
+
 class OpenAICompatMllmClient:
     """OpenAI 兼容多模态审核客户端，适配通义千问 Qwen-VL、硅基流动、本地 Ollama、vLLM 与 OpenAI。
 
@@ -671,10 +696,12 @@ class OpenAICompatMllmClient:
         初始化时依次回退 `api_key`、`OPENAI_API_KEY` 与 `"ollama"`（用于本地免鉴权服务），
         `base_url` 为空时默认使用 DashScope 兼容端点，`model_name` 为空抛出 `ValueError`。
 
-    参数自动降级状态：
-        维护 `_temperature_supported` 与 `_json_mode_supported` 两个能力标志位（初始均为 `True`）；
-        仅在对应参数触发 `openai.BadRequestError` 时单调降级为 `False`。每轮请求前先对两个标志位取快照，
-        多线程并发下依据本轮实际发送的参数快照判定降级，不会互相误关且保证有限次终止。
+    参数事前预判与自动降级状态：
+        维护 `_temperature_supported` 与 `_json_mode_supported` 两个能力标志位：
+        初始化时会按模型名对 OpenAI `o` 系列及 `gpt-5+` 新系列预置 `_temperature_supported = False`
+        以避免首次 400 往返，其他模型默认开启；运行时仅在对应参数触发 `openai.BadRequestError`
+        时单调降级为 `False`。每轮请求前先对两个标志位取快照，多线程并发下依据本轮实际发送的
+        参数快照判定降级，不会互相误关且保证有限次终止。
     """
 
     def __init__(
@@ -686,15 +713,15 @@ class OpenAICompatMllmClient:
     ) -> None:
         from openai import BadRequestError, OpenAI
 
+        self.model_name = model_name.strip()
+        if not self.model_name:
+            raise ValueError("请指定 OpenAI 兼容接口的模型名称（如 qwen-vl-max-latest）。")
         resolved_key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip() or "ollama"
         resolved_url = base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         self.client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=timeout)
         self._bad_request_error = BadRequestError
-        self._temperature_supported = True
+        self._temperature_supported = not _openai_model_omits_custom_sampling(self.model_name)
         self._json_mode_supported = True
-        self.model_name = model_name.strip()
-        if not self.model_name:
-            raise ValueError("请指定 OpenAI 兼容接口的模型名称（如 qwen-vl-max-latest）。")
 
     def review_image(
         self,
@@ -817,8 +844,9 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
         if not model_name:
             return False, "请先填写模型名称（如 qwen-vl-max-latest）。"
         client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=20.0)
-        send_temperature = True
-        send_max_tokens = True
+        omit_legacy_sampling = _openai_model_omits_custom_sampling(model_name)
+        send_temperature = not omit_legacy_sampling
+        send_max_tokens = not omit_legacy_sampling
         while True:
             probe_kwargs: dict[str, object] = {
                 "model": model_name,

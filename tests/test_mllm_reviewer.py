@@ -1121,7 +1121,11 @@ def test_openai_client_downgrades_temperature_without_disabling_json_mode() -> N
                 )
             return _Resp()
 
-    client = OpenAICompatMllmClient(api_key="k", base_url="https://api.openai.com/v1", model_name="gpt-6.2-astra")
+    client = OpenAICompatMllmClient(
+        api_key="k",
+        base_url="https://api.openai.com/v1",
+        model_name="custom-reasoning-alias",
+    )
     completions = _Completions()
     client.client = type("C", (), {"chat": type("Chat", (), {"completions": completions})()})()
 
@@ -1297,7 +1301,7 @@ def test_mllm_connection_downgrades_max_tokens_and_temperature(monkeypatch) -> N
             output_dir=Path("."),
             provider=MllmProvider.OPENAI_COMPAT,
             base_url="https://api.openai.com/v1",
-            model_name="gpt-6.2-astra",
+            model_name="custom-reasoning-alias",
             api_key="test-key",
         )
     )
@@ -1374,3 +1378,117 @@ def test_error_record_summary_does_not_duplicate_error_in_missing_note(tmp_path:
     assert legacy_summary.count("Unsupported value: temperature") == 1
     assert "漏标提示" not in legacy_summary
     assert "检测到疑似漏标" not in legacy_summary
+
+
+def test_openai_nextgen_models_omit_temperature_and_max_tokens_upfront(monkeypatch) -> None:
+    """验证 OpenAI 新系列（`gpt-5+` / `o` 系列，含中转前缀与微调名，不限 Base URL）首次请求即省略采样与长度限制参数。"""
+    import openai
+
+    from yolo_studio.core.mllm_reviewer import OpenAICompatMllmClient, test_mllm_connection
+
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    class _Msg:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class _Choice:
+        def __init__(self, content: str) -> None:
+            self.message = _Msg(content)
+
+    class _Resp:
+        def __init__(self, content: str) -> None:
+            self.choices = [_Choice(content)]
+
+    nextgen_cases = [
+        ("https://api.openai.com/v1", "gpt-6.2-astra"),
+        ("https://api.openai.com/v1", "gpt-5-mini"),
+        ("https://proxy.example.com/v1", "openai/gpt-6.2-astra"),
+        ("https://api.openai.com/v1", "o3-mini"),
+        ("https://proxy.example.com/v1", "o4-mini"),
+        ("https://api.openai.com/v1", "ft:gpt-5:org::id"),
+    ]
+    for base_url, model_name in nextgen_cases:
+        calls: list[dict[str, object]] = []
+
+        class _SingleOkCompletions:
+            def create(self, **kwargs):
+                calls.append(dict(kwargs))
+                return _Resp(ok_json)
+
+        client = OpenAICompatMllmClient(api_key="k", base_url=base_url, model_name=model_name)
+        client.client = type("C", (), {"chat": type("Chat", (), {"completions": _SingleOkCompletions()})()})()
+        client.review_image(b"x", [], "s", "u")
+        assert len(calls) == 1, f"{model_name} 应单次成功，不应先触发 400"
+        assert "temperature" not in calls[0], f"{model_name} 首次请求不应传 temperature"
+        assert calls[0].get("response_format") == {"type": "json_object"}
+
+    legacy_cases = [
+        ("https://api.openai.com/v1", "gpt-4o"),
+        ("https://api.openai.com/v1", "gpt-4.1"),
+        ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-vl-max-latest"),
+        ("https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-VL-72B-Instruct"),
+    ]
+    for base_url, model_name in legacy_cases:
+        calls = []
+
+        class _LegacyCompletions:
+            def create(self, **kwargs):
+                calls.append(dict(kwargs))
+                return _Resp(ok_json)
+
+        client = OpenAICompatMllmClient(api_key="k", base_url=base_url, model_name=model_name)
+        client.client = type("C", (), {"chat": type("Chat", (), {"completions": _LegacyCompletions()})()})()
+        client.review_image(b"x", [], "s", "u")
+        assert len(calls) == 1
+        assert calls[0].get("temperature") == 0.1
+
+    probe_calls: list[dict[str, object]] = []
+
+    class _ProbeCompletions:
+        def create(self, **kwargs):
+            probe_calls.append(dict(kwargs))
+            return _Resp("OK")
+
+    class _FakeOpenAI:
+        def __init__(self, **_kwargs) -> None:
+            self.chat = type("Chat", (), {"completions": _ProbeCompletions()})()
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+
+    for base_url, model_name in (
+        ("https://api.openai.com/v1", "gpt-6.2-astra"),
+        ("https://proxy.example.com/v1", "openai/o3"),
+    ):
+        probe_calls.clear()
+        ok, msg = test_mllm_connection(
+            MllmReviewConfig(
+                images_dir=Path("."),
+                output_dir=Path("."),
+                provider=MllmProvider.OPENAI_COMPAT,
+                base_url=base_url,
+                model_name=model_name,
+                api_key="test-key",
+            )
+        )
+        assert ok is True
+        assert "连通正常" in msg
+        assert len(probe_calls) == 1
+        assert "temperature" not in probe_calls[0]
+        assert "max_tokens" not in probe_calls[0]
+
+    probe_calls.clear()
+    ok_4o, _ = test_mllm_connection(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.OPENAI_COMPAT,
+            base_url="https://api.openai.com/v1",
+            model_name="gpt-4o",
+            api_key="test-key",
+        )
+    )
+    assert ok_4o is True
+    assert len(probe_calls) == 1
+    assert probe_calls[0].get("temperature") == 0.0
+    assert probe_calls[0].get("max_tokens") == 12
