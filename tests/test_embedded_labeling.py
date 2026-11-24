@@ -1732,3 +1732,105 @@ def test_workbench_two_column_layout_file_list_jump_class_mgmt_and_hud(
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_annotation_canvas_hidpi_physical_zoom_and_anchor(
+    qt_app: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 150% 高 DPI 下物理缩放倍率、策略 A 适应窗口、1:1 点对点与滚轮锚点精确对齐。"""
+    import math
+    from PyQt6.QtCore import QPoint, QPointF
+    from PyQt6.QtGui import QColor, QPixmap, QWheelEvent
+
+    from yolo_studio.gui.annotation_canvas import AnnotationCanvasView
+
+    canvas = AnnotationCanvasView()
+    canvas.resize(1024, 725)
+    canvas.show()
+    qt_app.processEvents()
+    try:
+        monkeypatch.setattr(canvas, "_display_dpr", lambda: 1.5)
+        pix = QPixmap(1368, 800)
+        pix.fill(QColor("#334155"))
+        canvas.set_image(pix, 1368, 800)
+        qt_app.processEvents()
+
+        # 1) 策略 A：适应窗口尽量填满逻辑画布，并如实显示物理缩放倍率 (~110%)
+        expected_logical_fit = (canvas.viewport().width() - 24) / 1368.0
+        assert canvas._logical_scale() == pytest.approx(expected_logical_fit, abs=0.01)
+        assert canvas.zoom_factor() == pytest.approx(expected_logical_fit * 1.5, abs=0.02)
+        assert canvas.zoom_factor() > 1.0
+
+        # 2) 点击 1:1 (set_zoom(1.0)) 时，物理倍率为 100%，底层逻辑倍率为 1/1.5，做到真正点对点 1:1
+        canvas.set_zoom(1.0)
+        qt_app.processEvents()
+        assert canvas.zoom_factor() == pytest.approx(1.0, abs=1e-4)
+        assert canvas._logical_scale() == pytest.approx(1.0 / 1.5, abs=1e-4)
+        assert canvas._pixmap_item.transformationMode() == Qt.TransformationMode.SmoothTransformation
+
+        # 3) 物理 200% 即触发最近邻锐利像素渲染
+        canvas.set_zoom(2.0)
+        qt_app.processEvents()
+        assert canvas.zoom_factor() == pytest.approx(2.0, abs=1e-4)
+        assert canvas._logical_scale() == pytest.approx(2.0 / 1.5, abs=1e-4)
+        assert canvas._pixmap_item.transformationMode() == Qt.TransformationMode.FastTransformation
+
+        # 4) 150% DPI 下滚轮在边缘点 (1280, 720) 连续缩放 8 次，锚点保持稳定不飘移
+        canvas.fit_to_window()
+        qt_app.processEvents()
+        target_scene = QPointF(1280.0, 720.0)
+        target_vp = canvas.mapFromScene(target_scene)
+        for _ in range(8):
+            wev = QWheelEvent(
+                QPointF(target_vp),
+                QPointF(canvas.viewport().mapToGlobal(target_vp)),
+                QPoint(0, 0),
+                QPoint(0, 120),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            canvas.wheelEvent(wev)
+            qt_app.processEvents()
+        after_scene = canvas._map_view_to_scene_f(QPointF(target_vp))
+        drift = math.hypot(after_scene.x() - target_scene.x(), after_scene.y() - target_scene.y())
+        assert drift < 1.5
+    finally:
+        canvas.close()
+
+
+def test_mainwindow_uses_title_bar_status_without_bottom_statusbar(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证主窗口取消底部状态栏，并将计算设备就绪等系统提示展示到窗口标题栏上。"""
+    from PyQt6.QtWidgets import QStatusBar
+
+    from yolo_studio.core.trainer import DeviceInfo
+
+    win = _make_window(tmp_path, lazy_init=True)
+    win.show()
+    qt_app.processEvents()
+    try:
+        assert win.findChild(QStatusBar) is None
+        assert win.windowTitle() == f"YoloStudio v{__version__}"
+
+        gpu_info = DeviceInfo(
+            cuda_available=True,
+            device_count=1,
+            device_name="Mock RTX 4070",
+            vram_gb=12.0,
+            recommended_device="0",
+            probing=False,
+        )
+        win._on_device_probed(gpu_info)
+        qt_app.processEvents()
+        assert win.findChild(QStatusBar) is None
+        assert "Mock RTX 4070" in win.windowTitle()
+        assert f"YoloStudio v{__version__}" in win.windowTitle()
+
+        win._clear_title_status()
+        assert win.windowTitle() == f"YoloStudio v{__version__}"
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()

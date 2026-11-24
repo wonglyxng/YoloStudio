@@ -212,8 +212,21 @@ class AnnotationCanvasView(QGraphicsView):
     def selected_index(self) -> int:
         return self._selected_idx
 
-    def zoom_factor(self) -> float:
+    def _display_dpr(self) -> float:
+        """返回当前画布视口所在屏幕的设备像素比（最低为 1.0），用于对齐物理像素缩放倍率。"""
+        vp = self.viewport()
+        dpr = float(vp.devicePixelRatioF()) if vp is not None else float(self.devicePixelRatioF())
+        return max(1.0, dpr)
+
+    def _logical_scale(self) -> float:
+        """返回 Qt 视图变换矩阵的逻辑缩放倍率（场景像素 → 视口逻辑像素）。"""
         return float(self.transform().m11())
+
+    def zoom_factor(self) -> float:
+        """返回对外展示与控制的物理像素缩放倍率（`1.0` 表示 1 原图像素 = 1 屏幕物理像素）。"""
+        if self._image_width <= 0 or self._image_height <= 0:
+            return self._logical_scale()
+        return self._logical_scale() * self._display_dpr()
 
     def set_active_label(self, label: str) -> None:
         """设置当前默认绘制类别名称（仅影响草稿框预览颜色与角标显示）。"""
@@ -311,7 +324,7 @@ class AnnotationCanvasView(QGraphicsView):
         self._pixmap_item.setPixmap(pixmap)
         self._image_width = int(width or pixmap.width())
         self._image_height = int(height or pixmap.height())
-        self._update_scene_bounds(self.zoom_factor())
+        self._update_scene_bounds(self._logical_scale())
         if auto_fit:
             self.fit_to_window()
             self._pending_fit = self.viewport().width() <= 20 or self.viewport().height() <= 20
@@ -378,12 +391,15 @@ class AnnotationCanvasView(QGraphicsView):
             QPointF(self.viewport().width() / 2.0, self.viewport().height() / 2.0)
         )
 
-    def _update_scene_bounds(self, scale: float | None = None) -> None:
-        """按当前缩放与视口尺寸动态计算充裕的场景留白，保证图像四角皆可居中查看。"""
+    def _update_scene_bounds(self, logical_scale: float | None = None) -> None:
+        """按当前逻辑缩放与视口尺寸动态计算充裕的场景留白，保证图像四角皆可居中查看。"""
         if self._image_width <= 0 or self._image_height <= 0:
             self._scene.setSceneRect(0, 0, 1, 1)
             return
-        s = max(scale if scale is not None else self.zoom_factor(), self.MIN_ZOOM)
+        s = max(
+            logical_scale if logical_scale is not None else self._logical_scale(),
+            self.MIN_ZOOM / self._display_dpr(),
+        )
         vw_scene = max(1.0, float(self.viewport().width())) / s
         vh_scene = max(1.0, float(self.viewport().height())) / s
         pad_x = max(vw_scene, float(self._image_width) * 0.6, 200.0)
@@ -421,12 +437,14 @@ class AnnotationCanvasView(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, use_smooth)
 
     def _calc_fit_scale(self) -> float:
+        """计算适应窗口时的物理像素缩放倍率（策略 A：填满画布并如实反映物理倍率）。"""
         if self._image_width <= 0 or self._image_height <= 0:
             return 1.0
         vw = max(1, self.viewport().width() - 24)
         vh = max(1, self.viewport().height() - 24)
-        scale = min(vw / float(self._image_width), vh / float(self._image_height))
-        return max(self.MIN_ZOOM, min(self.MAX_ZOOM, scale))
+        logical_s = min(vw / float(self._image_width), vh / float(self._image_height))
+        display_zoom = logical_s * self._display_dpr()
+        return max(self.MIN_ZOOM, min(self.MAX_ZOOM, display_zoom))
 
     def _default_zoom_anchor_view(self) -> QPointF:
         """按钮/快捷键缩放的默认锚点：有可见选中框时优先以该框为中心，否则以当前视口中心为准。"""
@@ -450,7 +468,7 @@ class AnnotationCanvasView(QGraphicsView):
         return vp_center
 
     def fit_to_window(self) -> None:
-        """将当前图片按比例完整居中适配进可视视口。"""
+        """将当前图片按比例完整居中适配进可视视口，并同步发射物理像素缩放倍率。"""
         self._zoom_anchor_cache = None
         if self._image_width <= 0 or self._image_height <= 0:
             self._fit_mode = True
@@ -458,17 +476,18 @@ class AnnotationCanvasView(QGraphicsView):
             self._update_pixmap_transform_mode(1.0)
             self.zoom_changed.emit(1.0)
             return
-        scale = self._calc_fit_scale()
+        display_zoom = self._calc_fit_scale()
+        logical_s = display_zoom / self._display_dpr()
         self._fit_mode = True
-        self.setTransform(QTransform.fromScale(scale, scale))
-        self._update_pixmap_transform_mode(scale)
-        self._update_scene_bounds(scale)
+        self.setTransform(QTransform.fromScale(logical_s, logical_s))
+        self._update_pixmap_transform_mode(display_zoom)
+        self._update_scene_bounds(logical_s)
         self._set_view_center(QPointF(self._image_width / 2.0, self._image_height / 2.0), clamp=True)
         self.zoom_changed.emit(self.zoom_factor())
         self.viewport().update()
 
     def zoom_to(self, scale: float, anchor_view_pos: QPointF | None = None) -> None:
-        """缩放到指定倍率并精确保持 `anchor_view_pos` 下的场景点位置不变。"""
+        """缩放到指定物理像素倍率并精确保持 `anchor_view_pos` 下的场景点位置不变。"""
         clamped = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(scale)))
         if self._image_width <= 0 or self._image_height <= 0:
             self._zoom_anchor_cache = None
@@ -493,16 +512,17 @@ class AnnotationCanvasView(QGraphicsView):
         else:
             anchor_scene = self._map_view_to_scene_f(anchor_vp)
 
+        logical_s = clamped / self._display_dpr()
         self._fit_mode = False
-        self.setTransform(QTransform.fromScale(clamped, clamped))
+        self.setTransform(QTransform.fromScale(logical_s, logical_s))
         self._update_pixmap_transform_mode(clamped)
-        self._update_scene_bounds(clamped)
+        self._update_scene_bounds(logical_s)
 
         vp_center = QPointF(self.viewport().width() / 2.0, self.viewport().height() / 2.0)
         offset_vp = anchor_vp - vp_center
         desired_center = QPointF(
-            anchor_scene.x() - offset_vp.x() / clamped,
-            anchor_scene.y() - offset_vp.y() / clamped,
+            anchor_scene.x() - offset_vp.x() / logical_s,
+            anchor_scene.y() - offset_vp.y() / logical_s,
         )
         actual_center = self._set_view_center(desired_center, clamp=True)
         if (actual_center - desired_center).manhattanLength() < 1e-3:
@@ -534,7 +554,7 @@ class AnnotationCanvasView(QGraphicsView):
         center_scene: QPointF,
         fit_mode: bool = False,
     ) -> None:
-        """恢复之前保存的缩放与中心位置；若原处于自适应状态则按新图尺寸重新适配。"""
+        """恢复之前保存的物理缩放倍率与中心位置；若原处于自适应状态则按新图尺寸重新适配。"""
         self._zoom_anchor_cache = None
         if self._image_width <= 0 or self._image_height <= 0:
             return
@@ -542,10 +562,11 @@ class AnnotationCanvasView(QGraphicsView):
             self.fit_to_window()
             return
         clamped = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(scale)))
+        logical_s = clamped / self._display_dpr()
         self._fit_mode = False
-        self.setTransform(QTransform.fromScale(clamped, clamped))
+        self.setTransform(QTransform.fromScale(logical_s, logical_s))
         self._update_pixmap_transform_mode(clamped)
-        self._update_scene_bounds(clamped)
+        self._update_scene_bounds(logical_s)
         self._set_view_center(center_scene, clamp=True)
         self.zoom_changed.emit(self.zoom_factor())
         self.viewport().update()
@@ -586,12 +607,14 @@ class AnnotationCanvasView(QGraphicsView):
         bh = max(8.0, b.height)
         vw = max(1.0, float(self.viewport().width()))
         vh = max(1.0, float(self.viewport().height()))
-        box_scale = min((vw * 0.55) / bw, (vh * 0.55) / bh)
-        target_s = max(self._calc_fit_scale(), min(8.0, self.MAX_ZOOM, box_scale))
+        dpr = self._display_dpr()
+        box_logical = min((vw * 0.55) / bw, (vh * 0.55) / bh)
+        target_display = max(self._calc_fit_scale(), min(8.0, self.MAX_ZOOM, box_logical * dpr))
+        logical_s = target_display / dpr
         self._fit_mode = False
-        self.setTransform(QTransform.fromScale(target_s, target_s))
-        self._update_pixmap_transform_mode(target_s)
-        self._update_scene_bounds(target_s)
+        self.setTransform(QTransform.fromScale(logical_s, logical_s))
+        self._update_pixmap_transform_mode(target_display)
+        self._update_scene_bounds(logical_s)
         self._set_view_center(QPointF((b.x1 + b.x2) / 2.0, (b.y1 + b.y2) / 2.0), clamp=True)
         self.zoom_changed.emit(self.zoom_factor())
         self.viewport().update()
@@ -608,7 +631,7 @@ class AnnotationCanvasView(QGraphicsView):
         )
 
     def _inv_scale(self) -> float:
-        return 1.0 / max(self.zoom_factor(), 1e-4)
+        return 1.0 / max(self._logical_scale(), 1e-4)
 
     def _visible_handles_for_box(
         self, x1: float, y1: float, x2: float, y2: float
@@ -616,7 +639,7 @@ class AnnotationCanvasView(QGraphicsView):
         """根据当前屏幕渲染尺寸动态返回可用手柄，避免极小框的边中点挤占内部拖动热区。"""
         mx = (x1 + x2) / 2.0
         my = (y1 + y2) / 2.0
-        scale = max(self.zoom_factor(), 1e-4)
+        scale = max(self._logical_scale(), 1e-4)
         sw = (x2 - x1) * scale
         sh = (y2 - y1) * scale
         handles: dict[str, QPointF] = {
@@ -637,7 +660,7 @@ class AnnotationCanvasView(QGraphicsView):
         if self._mode != self.MODE_EDIT or not (0 <= self._selected_idx < len(self._boxes)):
             return None
         b = self._boxes[self._selected_idx]
-        scale = max(self.zoom_factor(), 1e-4)
+        scale = max(self._logical_scale(), 1e-4)
         min_dim_px = min(b.width * scale, b.height * scale)
         tol = (6.0 if min_dim_px < 22.0 else 8.5) * self._inv_scale()
         best_name: str | None = None
@@ -682,7 +705,7 @@ class AnnotationCanvasView(QGraphicsView):
         self._update_cursor_for_hover()
 
     def _update_pan(self, view_pos: QPointF) -> None:
-        scale = max(self.zoom_factor(), 1e-4)
+        scale = max(self._logical_scale(), 1e-4)
         delta_vp = QPointF(view_pos) - self._pan_start_view_pos
         target_center = QPointF(
             self._pan_start_center_scene.x() - delta_vp.x() / scale,
@@ -757,7 +780,7 @@ class AnnotationCanvasView(QGraphicsView):
             self._stop_edge_scroll()
             return
 
-        scale = max(self.zoom_factor(), 1e-4)
+        scale = max(self._logical_scale(), 1e-4)
         cur_center = self._get_view_center_scene()
         self._zoom_anchor_cache = None
         self._fit_mode = False
@@ -877,8 +900,9 @@ class AnnotationCanvasView(QGraphicsView):
             self._pending_fit = False
             self.fit_to_window()
         else:
-            self._update_scene_bounds(self.zoom_factor())
+            self._update_scene_bounds(self._logical_scale())
             self._set_view_center(old_center, clamp=True)
+            self.zoom_changed.emit(self.zoom_factor())
 
     def focusOutEvent(self, event: QFocusEvent) -> None:  # type: ignore[override]
         # 失焦时自动复位空格按住态并停止拖拽按压，防止切窗后粘滞
@@ -1470,7 +1494,7 @@ class AnnotationCanvasView(QGraphicsView):
 
         # 仅在编辑模式下渲染选中框控制手柄，避免画框/抓手模式下误导拖动
         if is_sel and self._mode == self.MODE_EDIT:
-            scale = max(self.zoom_factor(), 1e-4)
+            scale = max(self._logical_scale(), 1e-4)
             min_dim_px = min((x2 - x1) * scale, (y2 - y1) * scale)
             hs = (3.4 if min_dim_px < 22.0 else 4.6) * inv
             painter.setBrush(QBrush(QColor(255, 255, 255)))

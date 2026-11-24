@@ -150,7 +150,11 @@ class MainWindow(QMainWindow):
         self._lazy_init = lazy_init
         self._device_probe_worker: DeviceProbeWorker | None = None
         self.settings = settings or QSettings("YOLO26Studio", "VideoToYOLO26")
-        self.setWindowTitle(f"YoloStudio v{__version__}")
+        self._base_window_title = f"YoloStudio v{__version__}"
+        self.setWindowTitle(self._base_window_title)
+        self._title_status_timer = QTimer(self)
+        self._title_status_timer.setSingleShot(True)
+        self._title_status_timer.timeout.connect(self._clear_title_status)
         self.resize(1380, 860)
         self.setStyleSheet(APP_STYLESHEET)
 
@@ -256,7 +260,23 @@ class MainWindow(QMainWindow):
             if info.cuda_available
             else "计算设备就绪: CPU 模式"
         )
-        self.statusBar().showMessage(summary, 5000)
+        self._show_title_status(summary, timeout_ms=5000)
+
+    def _show_title_status(self, message: str, timeout_ms: int = 0) -> None:
+        """在窗口标题栏展示临时系统状态（替代底部状态栏），可选超时自动恢复基础标题。"""
+        clean = (message or "").strip()
+        if not clean:
+            self._clear_title_status()
+            return
+        self.setWindowTitle(f"{self._base_window_title} — {clean}")
+        if timeout_ms > 0:
+            self._title_status_timer.start(int(timeout_ms))
+        else:
+            self._title_status_timer.stop()
+
+    def _clear_title_status(self) -> None:
+        self._title_status_timer.stop()
+        self.setWindowTitle(self._base_window_title)
 
     def _on_frames_ready(self, frames_dir: str) -> None:
         """同步抽帧输出目录至数据集页与智能标注页；用户仍停留在抽帧页时自动切至标注工作台。
@@ -370,10 +390,10 @@ class MainWindow(QMainWindow):
         running = self._running_workers()
         probes = self._running_readonly_probes()
         if running:
-            self.statusBar().showMessage(f"正在等待 {len(running)} 个后台任务安全停止后退出...")
+            self._show_title_status(f"正在等待 {len(running)} 个后台任务安全停止后退出...")
             return
         if probes:
-            self.statusBar().showMessage("正在等待后台只读探测收尾后退出...")
+            self._show_title_status("正在等待后台只读探测收尾后退出...")
             return
         self._close_wait_timer.stop()
         self.close()
@@ -413,14 +433,14 @@ class MainWindow(QMainWindow):
                 if callable(cancel):
                     cancel()
             self.tabs.setEnabled(False)
-            self.statusBar().showMessage("正在等待后台任务安全停止后退出...")
+            self._show_title_status("正在等待后台任务安全停止后退出...")
             self._close_wait_timer.start()
             return
 
         if self._running_readonly_probes():
             event.ignore()
             self.tabs.setEnabled(False)
-            self.statusBar().showMessage("正在等待后台只读探测收尾后退出...")
+            self._show_title_status("正在等待后台只读探测收尾后退出...")
             self._close_wait_timer.start()
             return
 
