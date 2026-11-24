@@ -2,9 +2,10 @@
 
 职责：
     提供面向 YOLO 目标检测（矩形框）与 AI 复核闭环的高性能原生 PyQt6 标注工作台：
-    左侧图片文件列表（搜索/状态筛选/进度统计）、中央可缩放平移交互画布（`R/W` 画框、
-    8 控制点精修、撤销重做、AI 漏标提醒横幅）、右侧类别管理与目标框详情面板
-    （展示 LLM/SAM 审核理由与置信度，支持一键本地 SAM 像素级贴边收框），
+    左侧图片文件列表（搜索/状态筛选/进度统计）、中央可精准锚点缩放与自由平移交互画布
+    （`R/W` 拖拽或两点画框、`H` 抓手平移、`E` 编辑与 8 控制点精修、方向键微调、`Tab` 轮选、
+    `Ctrl+C/V` 跨图粘贴、撤销重做、AI 漏标提醒横幅、切图保持视野与图片内存缓存）、
+    右侧类别管理与目标框详情面板（展示 LLM/SAM 审核理由与置信度，支持一键本地 SAM 像素级贴边收框），
     并与「1. 视频抽帧」「3. LLM 智能标注」「4. 数据集准备」实现双向路径与变更信号联动。
 
 运行环境与协作边界：
@@ -16,14 +17,16 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import copy
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
+from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QAction, QColor, QIcon, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -67,6 +70,7 @@ from yolo_studio.gui.common import GpuTaskGuard
 
 _ADDED_DLL_HANDLES: list[object] = []
 _MAX_UNDO_STEPS = 80
+_PIXMAP_CACHE_MAX = 8
 
 
 def ensure_cuda_dll_search_paths() -> None:
@@ -319,6 +323,11 @@ class LabelingStudioTab(QWidget):
         self.sam_worker: _SamBoxRefineWorker | None = None
         self._sam_refiner_cache: dict[tuple[str, str], Any] = {}
         self._scoped_actions: list[QAction] = []
+        self._clipboard_boxes: list[RectAnnotation] = []
+        self._clipboard_source_image: Path | None = None
+        self._pixmap_cache: OrderedDict[tuple[Path, int, int], tuple[QPixmap, int, int]] = OrderedDict()
+        self._last_nudge_key: tuple[Path, int] | None = None
+        self._last_nudge_ts: float = 0.0
 
         self._watcher = QFileSystemWatcher(self)
         self._watcher.directoryChanged.connect(self._on_watched_dir_changed)
@@ -351,7 +360,7 @@ class LabelingStudioTab(QWidget):
         bar_layout.setSpacing(8)
 
         self.status_label = _ElidedStatusLabel(
-            "工作台就绪：打开图片目录即可快速画框与复核（R/W 画框 · E 编辑 · A/D 切图 · 1-9 切类 · F 确认通过 · Ctrl+S 保存）"
+            "工作台就绪：打开图片目录即可快速标注与复核（R/W 拖或两点画框 · E 编辑 · H 抓手 · A/D 切图 · 方向键微调 · F 通过）"
         )
         self.status_label.setStyleSheet("border: none; color: #24292f; font-weight: 500;")
         bar_layout.addWidget(self.status_label, 1)
@@ -390,23 +399,27 @@ class LabelingStudioTab(QWidget):
         self.edit_mode_btn.setChecked(True)
         self.draw_mode_btn = QPushButton("画框 (R)")
         self.draw_mode_btn.setCheckable(True)
-        self.dup_box_btn = QPushButton("复制框")
-        self.del_box_btn = QPushButton("删除框 (Del)")
+        self.pan_mode_btn = QPushButton("抓手 (H)")
+        self.pan_mode_btn.setCheckable(True)
+        self.pan_mode_btn.setToolTip("抓手平移模式：左键直接拖动画布，不误碰目标框（亦可随时拖动空白处、右键或空格+左键平移）")
+        self.dup_box_btn = QPushButton("复制")
+        self.del_box_btn = QPushButton("删除 (Del)")
         self.undo_btn = QPushButton("撤销")
         self.redo_btn = QPushButton("重做")
 
-        self.prev_img_btn = QPushButton("◀ 上一张 (A)")
-        self.next_img_btn = QPushButton("下一张 (D) ▶")
+        self.prev_img_btn = QPushButton("◀ 上张 (A)")
+        self.next_img_btn = QPushButton("下张 (D) ▶")
         self.save_btn = QPushButton("保存 (Ctrl+S)")
-        self.verify_next_btn = QPushButton("确认通过→下张 (F)")
+        self.verify_next_btn = QPushButton("通过→下张 (F)")
         self.verify_next_btn.setToolTip("标记当前图已人工复核（0 框时保存为显式空图负样本）、清除漏标提醒并自动切换下一张")
 
-        self.sam_refine_btn = QPushButton("SAM 贴边收框")
+        self.sam_refine_btn = QPushButton("SAM 收框")
         self.sam_refine_btn.setToolTip("调用本地 SAM 2.1 对当前选中框（未选中时对整图全部框）执行像素级轮廓贴边收紧")
 
-        self.fit_btn = QPushButton("适应窗口 (0)")
-        self.zoom_100_btn = QPushButton("1:1")
-        self.show_labels_chk = QCheckBox("显示标签")
+        self.keep_view_chk = QCheckBox("保持视野")
+        self.keep_view_chk.setChecked(False)
+        self.keep_view_chk.setToolTip("切图时保留当前的缩放倍率与局部观察位置（适合固定机位连续帧局部精修）")
+        self.show_labels_chk = QCheckBox("标签 (L)")
         self.show_labels_chk.setChecked(True)
         self.auto_save_chk = QCheckBox("自动保存")
         self.auto_save_chk.setChecked(True)
@@ -415,6 +428,7 @@ class LabelingStudioTab(QWidget):
         for w in (
             self.edit_mode_btn,
             self.draw_mode_btn,
+            self.pan_mode_btn,
             self.dup_box_btn,
             self.del_box_btn,
             self.undo_btn,
@@ -424,14 +438,19 @@ class LabelingStudioTab(QWidget):
             self.save_btn,
             self.verify_next_btn,
             self.sam_refine_btn,
-            self.fit_btn,
-            self.zoom_100_btn,
+            self.keep_view_chk,
             self.show_labels_chk,
             self.auto_save_chk,
         ):
             w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        for w in (self.edit_mode_btn, self.draw_mode_btn, self.dup_box_btn, self.del_box_btn):
+        for w in (
+            self.edit_mode_btn,
+            self.draw_mode_btn,
+            self.pan_mode_btn,
+            self.dup_box_btn,
+            self.del_box_btn,
+        ):
             t_lay.addWidget(w)
         t_lay.addWidget(self._make_vsep())
         t_lay.addWidget(self.undo_btn)
@@ -444,8 +463,7 @@ class LabelingStudioTab(QWidget):
         t_lay.addWidget(self._make_vsep())
         t_lay.addWidget(self.sam_refine_btn)
         t_lay.addWidget(self._make_vsep())
-        t_lay.addWidget(self.fit_btn)
-        t_lay.addWidget(self.zoom_100_btn)
+        t_lay.addWidget(self.keep_view_chk)
         t_lay.addWidget(self.show_labels_chk)
         t_lay.addWidget(self.auto_save_chk)
         t_lay.addStretch(1)
@@ -527,22 +545,55 @@ class LabelingStudioTab(QWidget):
         footer.setStyleSheet(
             "QFrame { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 4px; }"
             "QLabel { border: none; color: #57606a; font-size: 12px; }"
+            "QPushButton { padding: 2px 7px; font-size: 11px; min-height: 20px; }"
         )
         f_lay = QHBoxLayout(footer)
         f_lay.setContentsMargins(8, 3, 8, 3)
-        f_lay.setSpacing(14)
+        f_lay.setSpacing(8)
         self.mode_badge_label = QLabel("模式: 编辑")
         self.mode_badge_label.setStyleSheet("border: none; color: #0969da; font-weight: 600; font-size: 12px;")
         self.img_info_label = QLabel("分辨率: -")
         self.cursor_info_label = QLabel("坐标: -")
-        self.zoom_info_label = QLabel("缩放: 100%")
+        self.hint_info_label = _ElidedStatusLabel(
+            "滚轮缩放 · 拖空白/右键/空格平移 · 方向键微调选中框"
+        )
+        self.hint_info_label.setStyleSheet("border: none; color: #8c959f; font-size: 11px;")
+        self.zoom_info_label = QLabel("缩放: 100%", self)
+        self.zoom_info_label.setVisible(False)
         self.save_state_label = QLabel("")
+
+        self.zoom_out_btn = QPushButton("−")
+        self.zoom_out_btn.setFixedWidth(26)
+        self.zoom_out_btn.setToolTip("缩小画布 (- / Ctrl+-)")
+        self.zoom_menu_btn = QPushButton("100% ▾")
+        self.zoom_menu_btn.setToolTip("点击选择预设缩放倍率")
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setFixedWidth(26)
+        self.zoom_in_btn.setToolTip("放大画布 (+ / Ctrl+=)")
+        self.fit_btn = QPushButton("适应 (0)")
+        self.fit_btn.setToolTip("将整张图片居中适配到画布可视区域 (0 / Ctrl+0 / 双击空白)")
+        self.zoom_100_btn = QPushButton("1:1")
+        self.zoom_100_btn.setToolTip("切换至 100% 原始像素比例 (Ctrl+1)")
+        for zb in (
+            self.zoom_out_btn,
+            self.zoom_menu_btn,
+            self.zoom_in_btn,
+            self.fit_btn,
+            self.zoom_100_btn,
+        ):
+            zb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
         f_lay.addWidget(self.mode_badge_label)
         f_lay.addWidget(self.img_info_label)
         f_lay.addWidget(self.cursor_info_label)
-        f_lay.addWidget(self.zoom_info_label)
-        f_lay.addStretch(1)
+        f_lay.addWidget(self.hint_info_label, 1)
         f_lay.addWidget(self.save_state_label)
+        f_lay.addWidget(self._make_vsep())
+        f_lay.addWidget(self.zoom_out_btn)
+        f_lay.addWidget(self.zoom_menu_btn)
+        f_lay.addWidget(self.zoom_in_btn)
+        f_lay.addWidget(self.fit_btn)
+        f_lay.addWidget(self.zoom_100_btn)
         center_lay.addWidget(footer)
         splitter.addWidget(center_panel)
 
@@ -595,6 +646,7 @@ class LabelingStudioTab(QWidget):
         right_lay.addLayout(obj_hdr)
 
         self.shape_list = QListWidget()
+        self.shape_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.shape_list.setStyleSheet(
             "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
             "QListWidget::item { padding: 3px 4px; }"
@@ -637,6 +689,7 @@ class LabelingStudioTab(QWidget):
 
         self.edit_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT))
         self.draw_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW))
+        self.pan_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_PAN))
         self.dup_box_btn.clicked.connect(self._duplicate_selected_box)
         self.del_box_btn.clicked.connect(self._delete_selected_box)
         self.box_del_inline_btn.clicked.connect(self._delete_selected_box)
@@ -650,6 +703,9 @@ class LabelingStudioTab(QWidget):
         self.verify_next_btn.clicked.connect(self._verify_and_next)
         self.clear_hint_btn.clicked.connect(self._clear_missing_hint)
         self.sam_refine_btn.clicked.connect(self._on_sam_refine_clicked)
+        self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_by(1.0 / 1.25))
+        self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom_by(1.25))
+        self.zoom_menu_btn.clicked.connect(self._on_zoom_menu_clicked)
         self.fit_btn.clicked.connect(self.canvas.fit_to_window)
         self.zoom_100_btn.clicked.connect(lambda: self.canvas.set_zoom(1.0))
         self.show_labels_chk.toggled.connect(self.canvas.set_show_labels)
@@ -666,7 +722,8 @@ class LabelingStudioTab(QWidget):
         self.unique_label_list.itemDoubleClicked.connect(self._on_class_double_clicked)
 
         self.shape_list.currentRowChanged.connect(self._on_shape_row_changed)
-        self.shape_list.itemDoubleClicked.connect(lambda _item: self._prompt_relabel_selected_box())
+        self.shape_list.itemDoubleClicked.connect(self._on_shape_double_clicked)
+        self.shape_list.customContextMenuRequested.connect(self._on_shape_list_context_menu)
 
         self.canvas.box_drawn.connect(self._on_canvas_box_drawn)
         self.canvas.box_geometry_committed.connect(self._on_canvas_box_geometry_committed)
@@ -675,9 +732,10 @@ class LabelingStudioTab(QWidget):
         self.canvas.zoom_changed.connect(self._on_canvas_zoom_changed)
         self.canvas.cursor_pos_changed.connect(self._on_canvas_cursor_changed)
         self.canvas.box_double_clicked.connect(lambda _idx: self._prompt_relabel_selected_box())
+        self.canvas.context_menu_requested.connect(self._on_canvas_context_menu)
 
-        # 在主要非文本子控件上安装键盘过滤器，保证单键快捷键在画布与列表上均响应，而在输入框内绝不拦截打字
-        for target in (self.canvas, self.file_list, self.shape_list, self.unique_label_list):
+        # 在工作台自身与主要非文本子控件上安装键盘过滤器，保证全局空格平移与单键快捷键响应且绝不拦截文本输入
+        for target in (self, self.canvas, self.file_list, self.shape_list, self.unique_label_list):
             target.installEventFilter(self)
 
     @staticmethod
@@ -696,6 +754,13 @@ class LabelingStudioTab(QWidget):
             ("Ctrl+Y", self._redo),
             ("Ctrl+Shift+Z", self._redo),
             ("Ctrl+D", self._duplicate_selected_box),
+            ("Ctrl+C", self._copy_boxes_to_clipboard),
+            ("Ctrl+V", self._paste_boxes_from_clipboard),
+            ("Ctrl+=", lambda: self.canvas.zoom_by(1.25)),
+            ("Ctrl++", lambda: self.canvas.zoom_by(1.25)),
+            ("Ctrl+-", lambda: self.canvas.zoom_by(1.0 / 1.25)),
+            ("Ctrl+0", self.canvas.fit_to_window),
+            ("Ctrl+1", lambda: self.canvas.set_zoom(1.0)),
         ]
         for seq, handler in combos:
             act = QAction(self)
@@ -720,28 +785,93 @@ class LabelingStudioTab(QWidget):
         focused = QApplication.focusWidget()
         return isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit))
 
+    def _is_list_navigation_widget(self, obj: QObject) -> bool:
+        return obj in (
+            self.file_list,
+            self.shape_list,
+            self.unique_label_list,
+            self.status_filter_combo,
+        )
+
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # type: ignore[override]
-        if (
-            event.type() == QEvent.Type.KeyPress
-            and isinstance(event, QKeyEvent)
-            and self.isVisible()
-            and not self._is_text_input_focused()
-        ):
-            if self._handle_workbench_keypress(event):
+        if not self.isVisible() or self._is_text_input_focused():
+            return super().eventFilter(obj, event)
+
+        if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+            mods = event.modifiers()
+            key = event.key()
+            has_cmd = bool(
+                mods
+                & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.AltModifier
+                    | Qt.KeyboardModifier.MetaModifier
+                )
+            )
+            if key == Qt.Key.Key_Space and not has_cmd:
+                if not event.isAutoRepeat():
+                    self.canvas.set_space_pressed(True)
                 return True
+            if key == Qt.Key.Key_Escape and not has_cmd:
+                if self.canvas.cancel_active_draft():
+                    return True
+                if not self.canvas.editing():
+                    self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
+                    return True
+                if self.canvas.selected_index() >= 0:
+                    self.canvas.select_box(-1, emit_signal=True)
+                    return True
+            if (
+                key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)
+                and not has_cmd
+                and not self._is_list_navigation_widget(obj)
+                and self._doc is not None
+                and self._doc.boxes
+            ):
+                reverse = key == Qt.Key.Key_Backtab or bool(
+                    mods & Qt.KeyboardModifier.ShiftModifier
+                )
+                self._cycle_selected_box(reverse=reverse)
+                return True
+            if self._handle_workbench_keypress(event, target_obj=obj):
+                return True
+
+        elif event.type() == QEvent.Type.KeyRelease and isinstance(event, QKeyEvent):
+            if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+                self.canvas.set_space_pressed(False)
+                return True
+
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         if self.isVisible() and not self._is_text_input_focused():
-            if self._handle_workbench_keypress(event):
+            if self._handle_workbench_keypress(event, target_obj=self):
                 event.accept()
                 return
         super().keyPressEvent(event)
 
-    def _handle_workbench_keypress(self, event: QKeyEvent) -> bool:
-        """处理工作台单键快捷键；仅在无 Ctrl/Alt 修饰键时生效，返回 `True` 表示已消费。"""
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if (
+            self.isVisible()
+            and not self._is_text_input_focused()
+            and event.key() == Qt.Key.Key_Space
+            and not event.isAutoRepeat()
+        ):
+            self.canvas.set_space_pressed(False)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def _handle_workbench_keypress(
+        self, event: QKeyEvent, *, target_obj: QObject | None = None
+    ) -> bool:
+        """处理工作台单键与方向微调快捷键；仅在无 Ctrl/Alt/Meta 修饰键时生效，返回 `True` 表示已消费。"""
         mods = event.modifiers()
-        if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
+        if mods & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        ):
             return False
         key = event.key()
         if key in (Qt.Key.Key_R, Qt.Key.Key_W):
@@ -750,10 +880,38 @@ class LabelingStudioTab(QWidget):
         if key == Qt.Key.Key_E:
             self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
             return True
-        if key in (Qt.Key.Key_A, Qt.Key.Key_Left):
+        if key == Qt.Key.Key_H:
+            self.canvas.set_mode(AnnotationCanvasView.MODE_PAN)
+            return True
+        if key == Qt.Key.Key_L:
+            self.show_labels_chk.toggle()
+            return True
+        if key == Qt.Key.Key_A:
             self.open_prev_image()
             return True
-        if key in (Qt.Key.Key_D, Qt.Key.Key_Right):
+        if key == Qt.Key.Key_D:
+            self.open_next_image()
+            return True
+
+        allow_box_nudge = (
+            target_obj is None or not self._is_list_navigation_widget(target_obj)
+        ) and self.canvas.selected_index() >= 0
+        if allow_box_nudge and key in (
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        ):
+            step = 10 if (mods & Qt.KeyboardModifier.ShiftModifier) else 1
+            dx = -step if key == Qt.Key.Key_Left else (step if key == Qt.Key.Key_Right else 0)
+            dy = -step if key == Qt.Key.Key_Up else (step if key == Qt.Key.Key_Down else 0)
+            self._nudge_selected_box(dx, dy)
+            return True
+
+        if key == Qt.Key.Key_Left:
+            self.open_prev_image()
+            return True
+        if key == Qt.Key.Key_Right:
             self.open_next_image()
             return True
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
@@ -764,10 +922,18 @@ class LabelingStudioTab(QWidget):
         if key == Qt.Key.Key_F:
             self._verify_and_next()
             return True
+        if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.canvas.zoom_by(1.25)
+            return True
+        if key == Qt.Key.Key_Minus:
+            self.canvas.zoom_by(1.0 / 1.25)
+            return True
         if key == Qt.Key.Key_0:
             self.canvas.fit_to_window()
             return True
-        if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+        if Qt.Key.Key_1 <= key <= Qt.Key.Key_9 and not (
+            mods & Qt.KeyboardModifier.ShiftModifier
+        ):
             cls_idx = key - Qt.Key.Key_1
             if cls_idx < len(self._classes):
                 self._apply_class_shortcut(cls_idx)
@@ -786,6 +952,7 @@ class LabelingStudioTab(QWidget):
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         super().hideEvent(event)
+        self.canvas.set_space_pressed(False)
         self._set_shortcuts_active(False)
 
     # ------------------------------------------------------------------
@@ -832,8 +999,11 @@ class LabelingStudioTab(QWidget):
             return False
 
         # 已通过未保存保护校验，清空旧文档引用，确保刷新同目录同单图时强制重读磁盘最新 .json
+        if self._current_dir != target_dir:
+            self._pixmap_cache.clear()
         self._doc = None
         self._dirty = False
+        self._last_nudge_key = None
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -943,8 +1113,6 @@ class LabelingStudioTab(QWidget):
         if not self._dirty and not force:
             return True
 
-        import time
-
         self._suppress_watch_until = time.monotonic() + 0.8
         try:
             save_image_annotation(self._doc)
@@ -979,8 +1147,6 @@ class LabelingStudioTab(QWidget):
             self._watcher.addPath(str(dir_path))
 
     def _on_watched_dir_changed(self, _path: str) -> None:
-        import time
-
         if time.monotonic() < self._suppress_watch_until:
             return
         self._debounce_timer.start()
@@ -1120,11 +1286,46 @@ class LabelingStudioTab(QWidget):
             return
         self._load_image(target)
 
+    def _load_image_pixmap_cached(self, image_path: Path) -> tuple[QPixmap, int, int]:
+        """按路径与文件修改时间缓存近期浏览图片，减少往返切图解码延迟（最多保留 8 张）。"""
+        resolved = image_path.resolve()
+        try:
+            st = resolved.stat()
+            cache_key = (resolved, int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            return load_image_pixmap(resolved)
+
+        cached = self._pixmap_cache.get(cache_key)
+        if cached is not None:
+            self._pixmap_cache.move_to_end(cache_key)
+            return cached
+
+        loaded = load_image_pixmap(resolved)
+        if not loaded[0].isNull():
+            self._pixmap_cache[cache_key] = loaded
+            while len(self._pixmap_cache) > _PIXMAP_CACHE_MAX:
+                self._pixmap_cache.popitem(last=False)
+        return loaded
+
     def _load_image(self, image_path: Path) -> None:
-        pix, w, h = load_image_pixmap(image_path)
+        preserve_view = (
+            self.keep_view_chk.isChecked()
+            and self.canvas.image_width > 0
+            and self.canvas.image_height > 0
+        )
+        prev_scale = 1.0
+        prev_center = QPointF()
+        prev_fit = True
+        prev_size = (0, 0)
+        if preserve_view:
+            prev_scale, prev_center, prev_fit = self.canvas.get_view_state()
+            prev_size = (self.canvas.image_width, self.canvas.image_height)
+
+        pix, w, h = self._load_image_pixmap_cached(image_path)
         doc = load_image_annotation(image_path, image_size=(w, h) if (w > 0 and h > 0) else None)
         self._doc = doc
         self._dirty = False
+        self._last_nudge_key = None
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -1133,7 +1334,30 @@ class LabelingStudioTab(QWidget):
         if new_labels:
             self._merge_classes(new_labels, replace_order=False)
 
-        self.canvas.set_image(pix, doc.image_width, doc.image_height)
+        self.canvas.set_image(
+            pix,
+            doc.image_width,
+            doc.image_height,
+            auto_fit=not preserve_view,
+        )
+        if (
+            preserve_view
+            and not pix.isNull()
+            and doc.image_width > 0
+            and doc.image_height > 0
+        ):
+            if prev_fit:
+                self.canvas.fit_to_window()
+            else:
+                if (doc.image_width, doc.image_height) == prev_size:
+                    target_center = prev_center
+                else:
+                    target_center = QPointF(
+                        prev_center.x() * float(doc.image_width) / max(1, prev_size[0]),
+                        prev_center.y() * float(doc.image_height) / max(1, prev_size[1]),
+                    )
+                self.canvas.restore_view_state(prev_scale, target_center, fit_mode=False)
+
         self.canvas.set_boxes(doc.boxes, selected_index=-1)
         self._refresh_class_counts()
         self._refresh_shape_list()
@@ -1228,7 +1452,7 @@ class LabelingStudioTab(QWidget):
         self.prev_img_btn.setEnabled(len(self._filtered_images) > 1)
         self.next_img_btn.setEnabled(len(self._filtered_images) > 1)
         self.sam_refine_btn.setEnabled(has_boxes and not sam_busy)
-        self.sam_refine_btn.setText("SAM 收紧中..." if sam_busy else "SAM 贴边收框")
+        self.sam_refine_btn.setText("SAM 收紧中..." if sam_busy else "SAM 收框")
 
     # ------------------------------------------------------------------
     # 类别管理
@@ -1343,6 +1567,7 @@ class LabelingStudioTab(QWidget):
     def _push_undo_snapshot(self) -> None:
         if self._doc is None:
             return
+        self._last_nudge_key = None
         snap = ([b.clone() for b in self._doc.boxes], copy.deepcopy(self._doc.flags))
         self._undo_stack.append(snap)
         if len(self._undo_stack) > _MAX_UNDO_STEPS:
@@ -1363,6 +1588,7 @@ class LabelingStudioTab(QWidget):
     def _undo(self) -> None:
         if self._doc is None or not self._undo_stack:
             return
+        self._last_nudge_key = None
         cur_snap = ([b.clone() for b in self._doc.boxes], copy.deepcopy(self._doc.flags))
         self._redo_stack.append(cur_snap)
         prev_boxes, prev_flags = self._undo_stack.pop()
@@ -1373,12 +1599,145 @@ class LabelingStudioTab(QWidget):
     def _redo(self) -> None:
         if self._doc is None or not self._redo_stack:
             return
+        self._last_nudge_key = None
         cur_snap = ([b.clone() for b in self._doc.boxes], copy.deepcopy(self._doc.flags))
         self._undo_stack.append(cur_snap)
         next_boxes, next_flags = self._redo_stack.pop()
         self._doc.boxes = next_boxes
         self._doc.flags = next_flags
         self._apply_boxes_change(selected_idx=-1)
+
+    def _cycle_selected_box(self, *, reverse: bool = False) -> None:
+        """按 Tab / Shift+Tab 在当前图目标框间循环切换选中并确保新选中框处于可视区。"""
+        if self._doc is None or not self._doc.boxes:
+            return
+        total = len(self._doc.boxes)
+        cur = self.canvas.selected_index()
+        if not (0 <= cur < total):
+            next_idx = total - 1 if reverse else 0
+        else:
+            next_idx = (cur - 1) % total if reverse else (cur + 1) % total
+        self.canvas.select_box(next_idx, emit_signal=True)
+        self.canvas.ensure_box_visible(next_idx)
+
+    def _nudge_selected_box(self, dx: int, dy: int) -> None:
+        """使用方向键对选中框执行像素级平移（600 ms 内连续微调同一框合并为单次撤销记录）。"""
+        idx = self.canvas.selected_index()
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        old = self._doc.boxes[idx]
+        bw = old.width
+        bh = old.height
+        nx1 = old.x1 + float(dx)
+        ny1 = old.y1 + float(dy)
+        if self._doc.image_width > 0:
+            nx1 = max(0.0, min(float(self._doc.image_width) - bw, nx1))
+        else:
+            nx1 = max(0.0, nx1)
+        if self._doc.image_height > 0:
+            ny1 = max(0.0, min(float(self._doc.image_height) - bh, ny1))
+        else:
+            ny1 = max(0.0, ny1)
+
+        if abs(nx1 - old.x1) < 1e-6 and abs(ny1 - old.y1) < 1e-6:
+            return
+
+        now = time.monotonic()
+        nudge_key = (self._doc.image_path, idx)
+        if (
+            self._last_nudge_key != nudge_key
+            or (now - self._last_nudge_ts) > 0.6
+            or not self._undo_stack
+        ):
+            self._push_undo_snapshot()
+        self._last_nudge_key = nudge_key
+        self._last_nudge_ts = now
+
+        self._doc.boxes[idx] = RectAnnotation(
+            label=old.label,
+            x1=nx1,
+            y1=ny1,
+            x2=nx1 + bw,
+            y2=ny1 + bh,
+            score=old.score,
+            description=old.description,
+            difficult=old.difficult,
+            group_id=old.group_id,
+            flags=copy.deepcopy(old.flags),
+        )
+        self._apply_boxes_change(selected_idx=idx)
+        self.canvas.ensure_box_visible(idx)
+
+    def _copy_boxes_to_clipboard(self) -> None:
+        """复制当前选中框（无选中时复制整图全部框）到工作台剪贴板，支持跨图粘贴。"""
+        if self._doc is None or not self._doc.boxes:
+            self.save_state_label.setText("当前图无可复制目标框")
+            return
+        sel = self.canvas.selected_index()
+        if 0 <= sel < len(self._doc.boxes):
+            self._clipboard_boxes = [self._doc.boxes[sel].clone()]
+            msg = f"已复制 1 个「{self._doc.boxes[sel].label}」框"
+        else:
+            self._clipboard_boxes = [b.clone() for b in self._doc.boxes]
+            msg = f"已复制整图 {len(self._clipboard_boxes)} 个框"
+        self._clipboard_source_image = self._doc.image_path
+        self.save_state_label.setText(msg)
+
+    def _paste_boxes_from_clipboard(self) -> None:
+        """将剪贴板中的目标框粘贴到当前图片（同图偏移 14px，跨图原位保留并裁剪边界）。"""
+        if self._doc is None or not self._clipboard_boxes:
+            self.save_state_label.setText("剪贴板暂无可粘贴目标框")
+            return
+
+        same_image = self._clipboard_source_image == self._doc.image_path
+        offset = 14.0
+        pasted: list[RectAnnotation] = []
+        unseen_labels: list[str] = []
+
+        for src in self._clipboard_boxes:
+            bw = src.width
+            bh = src.height
+            if same_image:
+                nx1 = src.x1 + offset
+                ny1 = src.y1 + offset
+                if self._doc.image_width > 0 and nx1 + bw > self._doc.image_width:
+                    nx1 = max(0.0, src.x1 - offset)
+                if self._doc.image_height > 0 and ny1 + bh > self._doc.image_height:
+                    ny1 = max(0.0, src.y1 - offset)
+                candidate = RectAnnotation(
+                    label=src.label,
+                    x1=nx1,
+                    y1=ny1,
+                    x2=nx1 + bw,
+                    y2=ny1 + bh,
+                )
+            else:
+                candidate = RectAnnotation(
+                    label=src.label,
+                    x1=src.x1,
+                    y1=src.y1,
+                    x2=src.x2,
+                    y2=src.y2,
+                )
+            if self._doc.image_width > 0 and self._doc.image_height > 0:
+                candidate = candidate.clamped(self._doc.image_width, self._doc.image_height)
+            if candidate.width < AnnotationCanvasView.MIN_BOX_SIZE_PX or candidate.height < AnnotationCanvasView.MIN_BOX_SIZE_PX:
+                continue
+            pasted.append(candidate)
+            if candidate.label and candidate.label not in self._classes and candidate.label not in unseen_labels:
+                unseen_labels.append(candidate.label)
+
+        if not pasted:
+            self.save_state_label.setText("粘贴框超出当前图像有效区域")
+            return
+
+        self._push_undo_snapshot()
+        if unseen_labels:
+            self._merge_classes(unseen_labels, replace_order=False)
+        self._doc.boxes.extend(pasted)
+        self._apply_boxes_change(selected_idx=len(self._doc.boxes) - 1)
+        self.canvas.ensure_box_visible(len(self._doc.boxes) - 1)
+        self.save_state_label.setText(f"已粘贴 {len(pasted)} 个目标框")
 
     def _on_canvas_box_drawn(self, x1: float, y1: float, x2: float, y2: float) -> None:
         if self._doc is None:
@@ -1607,7 +1966,7 @@ class LabelingStudioTab(QWidget):
     def _refresh_box_detail(self, idx: int) -> None:
         if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
             self.box_detail_label.setText(
-                "未选中目标框：单击画布或列表项可查看坐标、AI 置信度与审核理由；按数字键 1-9 可速改类别。"
+                "未选中目标框：单击画布或列表项可定位查看；按 Tab 轮选框，方向键微调，1-9 速改类别。"
             )
             return
         b = self._doc.boxes[idx]
@@ -1632,8 +1991,139 @@ class LabelingStudioTab(QWidget):
         if self._syncing_lists:
             return
         self.canvas.select_box(row, emit_signal=False)
+        if row >= 0:
+            self.canvas.ensure_box_visible(row)
         self._refresh_box_detail(row)
         self._refresh_action_states()
+
+    def _on_shape_double_clicked(self, _item: QListWidgetItem) -> None:
+        row = self.shape_list.currentRow()
+        if row >= 0:
+            self.canvas.focus_box(row)
+            self._prompt_relabel_selected_box()
+
+    def _on_shape_list_context_menu(self, pos: QPoint) -> None:
+        item = self.shape_list.itemAt(pos)
+        if item is None or self._doc is None:
+            return
+        row = self.shape_list.row(item)
+        if not (0 <= row < len(self._doc.boxes)):
+            return
+        self.shape_list.setCurrentRow(row)
+        menu = QMenu(self)
+        focus_act = menu.addAction("聚焦居中查看")
+        relabel_act = menu.addAction("修改类别...")
+        menu.addSeparator()
+        dup_act = menu.addAction("复制框 (Ctrl+D)")
+        copy_act = menu.addAction("复制到剪贴板 (Ctrl+C)")
+        sam_act = menu.addAction("SAM 贴边收框")
+        sam_busy = self.sam_worker is not None and self.sam_worker.isRunning()
+        sam_act.setEnabled(not sam_busy)
+        menu.addSeparator()
+        del_act = menu.addAction("删除框 (Del)")
+        chosen = menu.exec(self.shape_list.mapToGlobal(pos))
+        if chosen is focus_act:
+            self.canvas.focus_box(row)
+        elif chosen is relabel_act:
+            self._prompt_relabel_selected_box()
+        elif chosen is dup_act:
+            self._duplicate_selected_box()
+        elif chosen is copy_act:
+            self._copy_boxes_to_clipboard()
+        elif chosen is sam_act:
+            self._on_sam_refine_clicked()
+        elif chosen is del_act:
+            self._delete_selected_box()
+
+    def _on_canvas_context_menu(self, global_pos: QPoint, hit_idx: int) -> None:
+        if self._doc is None:
+            return
+        menu = QMenu(self)
+        if 0 <= hit_idx < len(self._doc.boxes):
+            self.canvas.select_box(hit_idx, emit_signal=True)
+            relabel_act = menu.addAction("修改类别...")
+            focus_act = menu.addAction("聚焦居中查看")
+            menu.addSeparator()
+            dup_act = menu.addAction("复制框 (Ctrl+D)")
+            copy_act = menu.addAction("复制到剪贴板 (Ctrl+C)")
+            sam_act = menu.addAction("SAM 贴边收框")
+            sam_busy = self.sam_worker is not None and self.sam_worker.isRunning()
+            sam_act.setEnabled(not sam_busy)
+            menu.addSeparator()
+            del_act = menu.addAction("删除框 (Del)")
+            chosen = menu.exec(global_pos)
+            if chosen is relabel_act:
+                self._prompt_relabel_selected_box()
+            elif chosen is focus_act:
+                self.canvas.focus_box(hit_idx)
+            elif chosen is dup_act:
+                self._duplicate_selected_box()
+            elif chosen is copy_act:
+                self._copy_boxes_to_clipboard()
+            elif chosen is sam_act:
+                self._on_sam_refine_clicked()
+            elif chosen is del_act:
+                self._delete_selected_box()
+            return
+
+        edit_act = menu.addAction("编辑模式 (E)")
+        edit_act.setCheckable(True)
+        edit_act.setChecked(self.canvas.editing())
+        draw_act = menu.addAction("画矩形框 (R)")
+        draw_act.setCheckable(True)
+        draw_act.setChecked(self.canvas.drawing())
+        pan_act = menu.addAction("抓手平移 (H)")
+        pan_act.setCheckable(True)
+        pan_act.setChecked(self.canvas.panning_mode())
+        menu.addSeparator()
+        paste_act = menu.addAction("粘贴目标框 (Ctrl+V)")
+        paste_act.setEnabled(bool(self._clipboard_boxes))
+        copy_all_act = menu.addAction("复制整图所有框 (Ctrl+C)")
+        copy_all_act.setEnabled(bool(self._doc.boxes))
+        menu.addSeparator()
+        fit_act = menu.addAction("适应窗口 (0)")
+        zoom_100_act = menu.addAction("1:1 原始像素")
+        toggle_lbl_act = menu.addAction("显示目标标签 (L)")
+        toggle_lbl_act.setCheckable(True)
+        toggle_lbl_act.setChecked(self.show_labels_chk.isChecked())
+
+        chosen = menu.exec(global_pos)
+        if chosen is edit_act:
+            self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
+        elif chosen is draw_act:
+            self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
+        elif chosen is pan_act:
+            self.canvas.set_mode(AnnotationCanvasView.MODE_PAN)
+        elif chosen is paste_act:
+            self._paste_boxes_from_clipboard()
+        elif chosen is copy_all_act:
+            self.canvas.select_box(-1, emit_signal=True)
+            self._copy_boxes_to_clipboard()
+        elif chosen is fit_act:
+            self.canvas.fit_to_window()
+        elif chosen is zoom_100_act:
+            self.canvas.set_zoom(1.0)
+        elif chosen is toggle_lbl_act:
+            self.show_labels_chk.toggle()
+
+    def _on_zoom_menu_clicked(self) -> None:
+        menu = QMenu(self)
+        fit_act = menu.addAction("适应窗口 (0)")
+        menu.addSeparator()
+        presets: list[tuple[QAction, float]] = []
+        for pct in (50, 100, 200, 400, 800):
+            label = "100% (1:1)" if pct == 100 else f"{pct}%"
+            presets.append((menu.addAction(label), pct / 100.0))
+        chosen = menu.exec(self.zoom_menu_btn.mapToGlobal(QPoint(0, 0)))
+        if chosen is None:
+            return
+        if chosen is fit_act:
+            self.canvas.fit_to_window()
+            return
+        for act, scale in presets:
+            if chosen is act:
+                self.canvas.set_zoom(scale)
+                return
 
     def _on_canvas_selection_changed(self, idx: int) -> None:
         self._syncing_lists = True
@@ -1650,17 +2140,31 @@ class LabelingStudioTab(QWidget):
 
     def _on_canvas_mode_changed(self, mode: str) -> None:
         is_draw = mode == AnnotationCanvasView.MODE_DRAW
-        self.edit_mode_btn.setChecked(not is_draw)
+        is_pan = mode == AnnotationCanvasView.MODE_PAN
+        is_edit = not is_draw and not is_pan
+        self.edit_mode_btn.setChecked(is_edit)
         self.draw_mode_btn.setChecked(is_draw)
-        self.mode_badge_label.setText("模式: 画矩形框 (Esc 返回编辑)" if is_draw else "模式: 编辑")
-        self.mode_badge_label.setStyleSheet(
-            "border: none; color: #cf222e; font-weight: 600; font-size: 12px;"
-            if is_draw
-            else "border: none; color: #0969da; font-weight: 600; font-size: 12px;"
-        )
+        self.pan_mode_btn.setChecked(is_pan)
+        if is_draw:
+            self.mode_badge_label.setText("模式: 画框 (拖/两点 · Esc退出)")
+            self.mode_badge_label.setStyleSheet(
+                "border: none; color: #cf222e; font-weight: 600; font-size: 12px;"
+            )
+        elif is_pan:
+            self.mode_badge_label.setText("模式: 抓手平移 (Esc返回)")
+            self.mode_badge_label.setStyleSheet(
+                "border: none; color: #9a6700; font-weight: 600; font-size: 12px;"
+            )
+        else:
+            self.mode_badge_label.setText("模式: 编辑")
+            self.mode_badge_label.setStyleSheet(
+                "border: none; color: #0969da; font-weight: 600; font-size: 12px;"
+            )
 
     def _on_canvas_zoom_changed(self, scale: float) -> None:
-        self.zoom_info_label.setText(f"缩放: {int(round(scale * 100))}%")
+        pct = int(round(scale * 100))
+        self.zoom_info_label.setText(f"缩放: {pct}%")
+        self.zoom_menu_btn.setText(f"{pct}% ▾")
 
     def _on_canvas_cursor_changed(self, x: int, y: int) -> None:
         self.cursor_info_label.setText(f"坐标: ({x}, {y})" if x >= 0 and y >= 0 else "坐标: -")

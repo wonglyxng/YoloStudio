@@ -1238,3 +1238,373 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         assert tab2.api_key_edit.text() == ""  # 明文 API Key 绝不持久化
     finally:
         tab2.close()
+
+
+def test_annotation_canvas_anchor_zoom_bounds_sharpness_and_pan_channels(
+    qt_app: QApplication,
+) -> None:
+    """验证鼠标锚点缩放、高倍像素锐化、软边界防拖丢、多通道平移、防抖阈值与小框自适应手柄。"""
+    import math
+    from PyQt6.QtCore import QPoint, QPointF
+    from PyQt6.QtGui import QColor, QPixmap, QWheelEvent
+
+    from yolo_studio.core.annotation_io import RectAnnotation
+    from yolo_studio.gui.annotation_canvas import AnnotationCanvasView
+
+    canvas = AnnotationCanvasView()
+    canvas.resize(900, 600)
+    canvas.show()
+    qt_app.processEvents()
+    try:
+        pix = QPixmap(1920, 1080)
+        pix.fill(QColor("#334155"))
+        canvas.set_image(pix, 1920, 1080)
+        qt_app.processEvents()
+
+        # 1) 在图像右上角边缘点 (1850, 60) 连续滚轮放大 10 次，目标始终留在指针下方（误差 < 1.5px）
+        target_scene = QPointF(1850.0, 60.0)
+        target_vp = canvas.mapFromScene(target_scene)
+        for _ in range(10):
+            wev = QWheelEvent(
+                QPointF(target_vp),
+                QPointF(canvas.viewport().mapToGlobal(target_vp)),
+                QPoint(0, 0),
+                QPoint(0, 120),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            canvas.wheelEvent(wev)
+            qt_app.processEvents()
+        after_scene = canvas._map_view_to_scene_f(QPointF(target_vp))
+        drift = math.hypot(after_scene.x() - target_scene.x(), after_scene.y() - target_scene.y())
+        assert canvas.zoom_factor() >= AnnotationCanvasView.PIXEL_SHARP_ZOOM
+        assert drift < 1.5
+        # 高倍自动切换最近邻清晰像素渲染，缩回低倍后恢复平滑抗锯齿
+        assert canvas._pixmap_item.transformationMode() == Qt.TransformationMode.FastTransformation
+        canvas.set_zoom(1.0)
+        qt_app.processEvents()
+        assert canvas._pixmap_item.transformationMode() == Qt.TransformationMode.SmoothTransformation
+
+        # 2) 充裕画布留白允许把右下角拖至视口中心，且过界平移受软边界保护不会拖丢图像
+        canvas.set_zoom(2.0)
+        qt_app.processEvents()
+        canvas._set_view_center(QPointF(1920.0, 1080.0), clamp=True)
+        qt_app.processEvents()
+        center_corner = canvas._get_view_center_scene()
+        assert center_corner.x() == pytest.approx(1920.0, abs=2.0)
+        assert center_corner.y() == pytest.approx(1080.0, abs=2.0)
+        canvas._set_view_center(QPointF(9999.0, 9999.0), clamp=True)
+        qt_app.processEvents()
+        assert canvas._get_view_center_scene().x() <= 1922.0
+        assert canvas._get_view_center_scene().y() <= 1082.0
+
+        # 3) 编辑模式拖拽空白 >=4px 平移画布且保留选中框；轻点空白 <4px 才取消选中
+        box = RectAnnotation("person", 200.0, 200.0, 420.0, 420.0)
+        small_box = RectAnnotation("dot", 600.0, 250.0, 616.0, 266.0)
+        canvas.set_boxes([box, small_box], selected_index=0)
+        canvas.set_zoom(1.0)
+        canvas._set_view_center(QPointF(960.0, 540.0), clamp=True)
+        qt_app.processEvents()
+        before_center = canvas._get_view_center_scene()
+
+        blank_p1 = QPoint(80, 80)
+        blank_p2 = QPoint(180, 160)
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, blank_p1)
+        QTest.mouseMove(canvas.viewport(), blank_p2)
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, blank_p2)
+        qt_app.processEvents()
+        after_pan_center = canvas._get_view_center_scene()
+        assert canvas.selected_index() == 0
+        assert math.hypot(after_pan_center.x() - before_center.x(), after_pan_center.y() - before_center.y()) > 80.0
+
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(80, 80))
+        qt_app.processEvents()
+        assert canvas.selected_index() == -1
+
+        # 4) 抓手模式 (MODE_PAN) 下即使按在目标框上拖动，也是平移画布而不误移框
+        canvas.select_box(0, emit_signal=False)
+        canvas.set_mode(AnnotationCanvasView.MODE_PAN)
+        assert canvas.panning_mode() is True
+        committed: list[tuple[int, float, float, float, float]] = []
+        canvas.box_geometry_committed.connect(lambda *a: committed.append(a))
+        box_vp = canvas.mapFromScene(QPointF(300.0, 300.0))
+        box_vp_end = QPoint(box_vp.x() + 60, box_vp.y() + 40)
+        center_before_pan = canvas._get_view_center_scene()
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, box_vp)
+        QTest.mouseMove(canvas.viewport(), box_vp_end)
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, box_vp_end)
+        qt_app.processEvents()
+        assert committed == []
+        assert (canvas._get_view_center_scene() - center_before_pan).manhattanLength() > 50.0
+
+        # 5) 右键拖动平移 vs 右键轻点发上下文菜单信号
+        menu_requests: list[tuple[QPoint, int]] = []
+        canvas.context_menu_requested.connect(lambda gp, idx: menu_requests.append((gp, idx)))
+        canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
+        center_before_rpan = canvas._get_view_center_scene()
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, QPoint(400, 300))
+        QTest.mouseMove(canvas.viewport(), QPoint(320, 240))
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, QPoint(320, 240))
+        qt_app.processEvents()
+        assert (canvas._get_view_center_scene() - center_before_rpan).manhattanLength() > 50.0
+        assert menu_requests == []
+
+        box0_vp = canvas.mapFromScene(QPointF(310.0, 310.0))
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, box0_vp)
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, box0_vp)
+        qt_app.processEvents()
+        assert len(menu_requests) == 1 and menu_requests[0][1] == 0
+
+        # 6) 编辑模式轻点框产生 2px 手抖不触发坐标修改；极小框隐藏四边中点手柄；画框模式屏蔽手柄命中
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, box0_vp)
+        QTest.mouseMove(canvas.viewport(), QPoint(box0_vp.x() + 2, box0_vp.y() + 1))
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(box0_vp.x() + 2, box0_vp.y() + 1))
+        qt_app.processEvents()
+        assert committed == []
+
+        handles_small = canvas._visible_handles_for_box(small_box.x1, small_box.y1, small_box.x2, small_box.y2)
+        assert set(handles_small.keys()) == {"nw", "ne", "se", "sw"}
+        canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
+        assert canvas._hit_test_handle(QPointF(box.x1, box.y1)) is None
+    finally:
+        canvas.close()
+
+
+def test_annotation_canvas_two_click_draw_and_edge_scroll(
+    qt_app: QApplication,
+) -> None:
+    """验证两点点击画框（含中途滚轮缩放与中键平移）、右键/Esc 取消草稿及边缘自动滚屏。"""
+    from PyQt6.QtCore import QPoint, QPointF
+    from PyQt6.QtGui import QColor, QPixmap, QWheelEvent
+
+    from yolo_studio.gui.annotation_canvas import AnnotationCanvasView
+
+    canvas = AnnotationCanvasView()
+    canvas.resize(640, 480)
+    canvas.show()
+    qt_app.processEvents()
+    try:
+        pix = QPixmap(1600, 1200)
+        pix.fill(QColor("#1e293b"))
+        canvas.set_image(pix, 1600, 1200)
+        canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
+        qt_app.processEvents()
+
+        drawn: list[tuple[float, float, float, float]] = []
+        canvas.box_drawn.connect(lambda *a: drawn.append(a))
+
+        # 1) 两点点击画框：点击第一点进入 waiting_second，中途滚轮放大并中键平移后点击第二点完成成框
+        p1_vp = canvas.mapFromScene(QPointF(200.0, 200.0))
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, p1_vp)
+        qt_app.processEvents()
+        assert canvas._draw_state == "waiting_second"
+
+        zoom_vp = canvas.mapFromScene(QPointF(600.0, 500.0))
+        wev = QWheelEvent(
+            QPointF(zoom_vp),
+            QPointF(canvas.viewport().mapToGlobal(zoom_vp)),
+            QPoint(0, 0),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        canvas.wheelEvent(wev)
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.MiddleButton, Qt.KeyboardModifier.NoModifier, QPoint(320, 240))
+        QTest.mouseMove(canvas.viewport(), QPoint(260, 200))
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.MiddleButton, Qt.KeyboardModifier.NoModifier, QPoint(260, 200))
+        qt_app.processEvents()
+        assert canvas._draw_state == "waiting_second"
+
+        p2_vp = canvas.mapFromScene(QPointF(700.0, 620.0))
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, p2_vp)
+        qt_app.processEvents()
+        assert canvas._draw_state == "idle"
+        assert len(drawn) == 1
+        assert drawn[0][0] == pytest.approx(200.0, abs=3.0)
+        assert drawn[0][2] == pytest.approx(700.0, abs=3.0)
+
+        # 2) 右键轻点直接取消尚未完成的两点草稿，不发射 box_drawn
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(200, 200))
+        assert canvas._draw_state == "waiting_second"
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, QPoint(240, 240))
+        qt_app.processEvents()
+        assert canvas._draw_state == "idle"
+        assert len(drawn) == 1
+
+        # 3) 拖拽画框接近右下边缘时触发自动滚屏并扩展视野
+        canvas.set_zoom(1.5)
+        canvas._set_view_center(QPointF(500.0, 400.0), clamp=True)
+        qt_app.processEvents()
+        start_vp = QPoint(300, 240)
+        edge_vp = QPoint(canvas.viewport().width() - 4, canvas.viewport().height() - 4)
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start_vp)
+        QTest.mouseMove(canvas.viewport(), edge_vp)
+        center_before_scroll = canvas._get_view_center_scene()
+        canvas._on_edge_scroll_tick()
+        qt_app.processEvents()
+        center_after_scroll = canvas._get_view_center_scene()
+        assert center_after_scroll.x() > center_before_scroll.x()
+        assert center_after_scroll.y() > center_before_scroll.y()
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, edge_vp)
+    finally:
+        canvas.close()
+
+
+def test_workbench_global_space_pan_nudge_tab_clipboard_keep_view_and_cache(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证全局 Space 平移与防粘滞、H/L/+/- 快捷键、列表定位、Tab 轮选、方向键微调、跨图粘贴、保持视野及图片缓存。"""
+    import yolo_studio.gui.tab_labeling as tab_labeling_mod
+    from PyQt6.QtCore import QPoint, QPointF
+    from PyQt6.QtGui import QFocusEvent
+    from PyQt6.QtCore import QEvent
+
+    frames_dir = tmp_path / "pro_frames"
+    f1 = frames_dir / "frame_001.jpg"
+    f2 = frames_dir / "frame_002.jpg"
+    _write_sample_frame(f1, size=(800, 600))
+    _write_sample_frame(f2, size=(800, 600))
+    f1.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.4.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "worker",
+                        "points": [[40.0, 50.0], [180.0, 220.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "helmet",
+                        "points": [[620.0, 440.0], [740.0, 560.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                ],
+                "imagePath": f1.name,
+                "imageData": None,
+                "imageHeight": 600,
+                "imageWidth": 800,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    classes_file = tmp_path / "classes.txt"
+    classes_file.write_text("worker\nhelmet\n", encoding="utf-8")
+
+    load_calls: list[str] = []
+    orig_loader = tab_labeling_mod.load_image_pixmap
+
+    def _counting_loader(path: Path):
+        load_calls.append(path.name)
+        return orig_loader(path)
+
+    monkeypatch.setattr(tab_labeling_mod, "load_image_pixmap", _counting_loader)
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    win.activateWindow()
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir, classes_file=classes_file) is True
+        qt_app.processEvents()
+        assert load_calls == ["frame_001.jpg"]
+
+        # 1) 即使焦点在左侧文件列表，按住 Space + 左键仍可拖动画布，且失焦自动复位防粘滞
+        tab.canvas.set_zoom(2.0)
+        tab.canvas._set_view_center(QPointF(400.0, 300.0), clamp=True)
+        tab.file_list.setFocus()
+        qt_app.processEvents()
+        QTest.keyPress(tab.file_list, Qt.Key.Key_Space)
+        qt_app.processEvents()
+        assert tab.canvas._space_pressed is True
+        c_before = tab.canvas._get_view_center_scene()
+        QTest.mousePress(tab.canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(300, 220))
+        QTest.mouseMove(tab.canvas.viewport(), QPoint(220, 160))
+        QTest.mouseRelease(tab.canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(220, 160))
+        qt_app.processEvents()
+        assert (tab.canvas._get_view_center_scene() - c_before).manhattanLength() > 30.0
+        tab.canvas.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+        assert tab.canvas._space_pressed is False
+
+        # 2) H 抓手模式、L 显隐标签、+/- 缩放与 0 适应窗口
+        QTest.keyClick(tab.canvas, Qt.Key.Key_H)
+        assert tab.canvas.panning_mode() is True
+        assert tab.pan_mode_btn.isChecked() is True
+        QTest.keyClick(tab.canvas, Qt.Key.Key_E)
+        assert tab.canvas.editing() is True
+
+        QTest.keyClick(tab.canvas, Qt.Key.Key_L)
+        assert tab.show_labels_chk.isChecked() is False
+        QTest.keyClick(tab.canvas, Qt.Key.Key_L)
+        assert tab.show_labels_chk.isChecked() is True
+
+        z0 = tab.canvas.zoom_factor()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Equal)
+        assert tab.canvas.zoom_factor() > z0
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Minus)
+        assert tab.canvas.zoom_factor() == pytest.approx(z0, abs=0.05)
+
+        # 3) 放大后点击右侧目标列表第二项，画布自动将该远端框移入视口中心安全区
+        tab.canvas.set_zoom(2.5)
+        tab.canvas._set_view_center(QPointF(100.0, 120.0), clamp=True)
+        qt_app.processEvents()
+        tab.shape_list.setCurrentRow(1)
+        qt_app.processEvents()
+        vis_center = tab.canvas._get_view_center_scene()
+        assert vis_center.x() == pytest.approx(680.0, abs=15.0)
+        assert vis_center.y() == pytest.approx(500.0, abs=15.0)
+
+        # 4) Tab / Shift+Tab 轮选框与方向键 1px / Shift+方向键 10px 微调（连续微调合并撤回）
+        tab.canvas.setFocus()
+        qt_app.processEvents()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Tab)
+        qt_app.processEvents()
+        assert tab.canvas.selected_index() == 0
+        assert tab._doc is not None
+        orig_x1 = tab._doc.boxes[0].x1
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Right)
+        assert tab._doc.boxes[0].x1 == pytest.approx(orig_x1 + 1.0)
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier)
+        assert tab._doc.boxes[0].x1 == pytest.approx(orig_x1 + 11.0)
+        tab._undo()
+        assert tab._doc.boxes[0].x1 == pytest.approx(orig_x1)
+
+        # 5) 选中第 0 个框 Ctrl+C 复制，按 D 切下一张，Ctrl+V 原位跨图粘贴
+        tab.canvas.select_box(0, emit_signal=True)
+        tab._copy_boxes_to_clipboard()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_D)
+        qt_app.processEvents()
+        assert tab.current_image_path() == f2.resolve()
+        assert load_calls == ["frame_001.jpg", "frame_002.jpg"]
+        tab._paste_boxes_from_clipboard()
+        assert len(tab._doc.boxes) == 1
+        assert tab._doc.boxes[0].label == "worker"
+        assert tab._doc.boxes[0].x1 == pytest.approx(orig_x1)
+
+        # 6) 开启「保持视野」切回第 1 张：保留缩放与观察中心，且命中图片缓存不重复解码
+        tab.keep_view_chk.setChecked(True)
+        tab.canvas.set_zoom(2.2)
+        tab.canvas._set_view_center(QPointF(620.0, 460.0), clamp=True)
+        qt_app.processEvents()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_A)
+        qt_app.processEvents()
+        assert tab.current_image_path() == f1.resolve()
+        assert tab.canvas.zoom_factor() == pytest.approx(2.2, abs=0.05)
+        assert tab.canvas._get_view_center_scene().x() == pytest.approx(620.0, abs=3.0)
+        assert tab.canvas._get_view_center_scene().y() == pytest.approx(460.0, abs=3.0)
+        assert load_calls == ["frame_001.jpg", "frame_002.jpg"]
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
