@@ -196,6 +196,66 @@ def probe_video(video_path: Path) -> VideoInfo:
         cap.release()
 
 
+def format_duration_hms(seconds: float) -> str:
+    """将秒数格式化为可读时长（`< 1 小时` 为 `MM:SS`，`>= 1 小时` 为 `H:MM:SS`）。
+
+    非有限值或非正数统一安全回退为 `"00:00"`。
+    """
+    if not math.isfinite(seconds) or seconds <= 0.0:
+        return "00:00"
+    total_sec = max(0, int(round(seconds)))
+    if total_sec < 3600:
+        return f"{total_sec // 60:02d}:{total_sec % 60:02d}"
+    hours = total_sec // 3600
+    rem = total_sec % 3600
+    return f"{hours}:{rem // 60:02d}:{rem % 60:02d}"
+
+
+def read_video_preview_frame(
+    video_path: Path,
+    timestamp_sec: float = 0.0,
+    max_dimension: int = 960,
+) -> tuple[np.ndarray, float] | None:
+    """只读抓取视频指定时间点的预览帧（BGR `ndarray`）及实际时间戳秒数。
+
+    定位与回退规则：
+        当 `timestamp_sec > 0` 时换算目标帧号并尝试定位读取（越界自动夹紧至末帧）；
+        若非零位置定位或解码失败则回退读取第 0 帧；文件无法打开或无有效画面返回 `None`。
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if fps <= 0.0 or not math.isfinite(fps):
+            fps = 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        target_frame = 0
+        if math.isfinite(timestamp_sec) and timestamp_sec > 0.0:
+            target_frame = max(0, int(round(timestamp_sec * fps)))
+            if frame_count > 0:
+                target_frame = min(target_frame, frame_count - 1)
+
+        actual_idx = target_frame
+        if target_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame = cap.read()
+        if (not ret or frame is None) and target_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            actual_idx = 0
+
+        if not ret or frame is None:
+            return None
+
+        actual_sec = _resolve_frame_timestamp_ms(cap, actual_idx, fps) / 1000.0
+        processed = _resize_if_needed(frame, max_dimension)
+        return processed, actual_sec
+    finally:
+        cap.release()
+
+
 def _resize_if_needed(frame: np.ndarray, max_dimension: int) -> np.ndarray:
     if max_dimension <= 0:
         return frame
@@ -248,6 +308,47 @@ def _compute_step_frames(info: VideoInfo, config: ExtractionConfig, start_frame:
             return 1.0
         return span / float(target)
     return 1.0
+
+
+def estimate_video_frames(info: VideoInfo, config: ExtractionConfig) -> int:
+    """按当前抽帧策略与截取时间段预估单个视频的预计抽取帧数（未计相似帧去重）。
+
+    复用与 `extract_frames` 相同的起止帧裁剪及步进推进规则，视频总帧数无效或时间范围为空时返回 `0`。
+    """
+    total_frames = info.frame_count if info.frame_count > 0 else 0
+    if total_frames <= 0:
+        return 0
+
+    fps = info.fps if info.fps > 0 else 30.0
+    start_frame = max(0, int(round(max(0.0, config.start_sec) * fps)))
+    if config.end_sec is not None and config.end_sec > 0:
+        end_frame = min(total_frames, int(round(config.end_sec * fps)))
+    else:
+        end_frame = total_frames
+    if end_frame <= start_frame:
+        return 0
+
+    step = _compute_step_frames(info, config, start_frame, end_frame)
+    if step <= 1.0 + 1e-9:
+        return end_frame - start_frame
+
+    span = end_frame - start_frame
+    # 采样点数量在可控范围内时直接模拟步进循环，确保与 extract_frames 的浮点累积和整数取整完全一致
+    if span / step <= 100_000:
+        count = 0
+        frame_idx = start_frame
+        next_sample_at = float(start_frame)
+        while frame_idx < end_frame:
+            target = max(frame_idx, int(math.ceil(next_sample_at - 1e-6)))
+            if target >= end_frame:
+                break
+            count += 1
+            while next_sample_at <= target + 1e-6:
+                next_sample_at += step
+            frame_idx = target + 1
+        return count
+
+    return max(1, int(math.ceil(span / step)))
 
 
 # 距下一个采样点超过该帧数时才使用 `CAP_PROP_POS_FRAMES` 跳转；更近时用 `grab()` 顺序跳帧。
@@ -429,20 +530,23 @@ def preview_naming_rule(
     prefix: str = "",
     image_format: str = "jpg",
     sample_video: str = "demo",
+    create_video_subfolder: bool = False,
 ) -> str:
-    """根据当前命名规则与图片格式生成示例文件名（供界面实时预览；规则非法时抛出 `ValueError`）。"""
+    """根据当前命名规则、图片格式与子目录开关生成示例输出路径（规则非法时抛出 `ValueError`）。"""
     compiled = compile_naming_rule(naming_rule=naming_rule, prefix=prefix)
     ext = ".png" if image_format.strip().lower() == "png" else ".jpg"
     if compiled.is_default:
-        return f"vc<32位视频SHA256>_f0000001500{ext}"
-    stem = compiled.render(
-        video=sample_video,
-        video_hash_full=_SAMPLE_VIDEO_HASH_FULL,
-        timestamp_ms=1500,
-        frame_idx=15,
-        seq=1,
-    )
-    return f"{stem}{ext}"
+        filename = f"vc<32位视频SHA256>_f0000001500{ext}"
+    else:
+        stem = compiled.render(
+            video=sample_video,
+            video_hash_full=_SAMPLE_VIDEO_HASH_FULL,
+            timestamp_ms=1500,
+            frame_idx=15,
+            seq=1,
+        )
+        filename = f"{stem}{ext}"
+    return f"{sample_video}/{filename}" if create_video_subfolder else filename
 
 
 def _resolve_frame_timestamp_ms(cap: cv2.VideoCapture, frame_idx: int, fps: float) -> int:

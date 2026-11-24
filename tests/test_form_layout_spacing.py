@@ -199,6 +199,7 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
         # 验证此前被 QHBoxLayout 均分拉宽的行内「标签 ↔ 下拉框/微调框」均已恢复紧凑间距
         win.tabs.setCurrentIndex(0)
         qt_app.processEvents()
+        assert 2 <= _find_inline_pair_gap(win.extract_tab, "间隔:", win.extract_tab.strategy_param_stack) <= 12
         assert 2 <= _find_inline_pair_gap(win.extract_tab, "起:", win.extract_tab.start_sec_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.extract_tab, "止:", win.extract_tab.end_sec_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.extract_tab, "格式:", win.extract_tab.format_combo) <= 12

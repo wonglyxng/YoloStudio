@@ -15,7 +15,10 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event
 
+import cv2
+import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal as Signal
+from PyQt6.QtGui import QImage
 
 from yolo_studio.core.dataset_converter import (
     DatasetBuildConfig,
@@ -27,9 +30,12 @@ from yolo_studio.core.dataset_converter import (
 from yolo_studio.core.frame_extractor import (
     ExtractionConfig,
     ExtractionResult,
+    VideoInfo,
     collect_videos,
     extract_frames,
+    format_duration_hms,
     probe_video,
+    read_video_preview_frame,
 )
 from yolo_studio.core.mllm_reviewer import (
     MllmReviewConfig,
@@ -81,11 +87,13 @@ class VideoProbeWorker(QThread):
     """在后台线程扫描目录并逐个读取视频头元信息，避免添加大量视频时卡住主界面。
 
     信号契约：
-        `item_probed(Path, str)`：每探测完一个新视频发射一次，携带视频路径与列表展示文本。
-        `finished_probing(int)`：全部探测完成或响应取消后发射本次新增的视频数量。
+        `item_info_probed(Path, VideoInfo | None, str)`：携带视频路径、元数据对象及列表摘要文本；
+        `item_probed(Path, str)`：兼容旧版信号，每探测完一个新视频发射一次；
+        `finished_probing(int)`：全部探测完成或响应取消后发射本次新增的视频数量；
         `failed(str)`：发生意外未捕获异常时发射错误消息。
     """
 
+    item_info_probed = Signal(object, object, str)
     item_probed = Signal(object, str)
     finished_probing = Signal(int)
     failed = Signal(str)
@@ -112,21 +120,69 @@ class VideoProbeWorker(QThread):
                 if resolved in seen:
                     continue
                 seen.add(resolved)
+                info: VideoInfo | None = None
                 try:
                     info = probe_video(vp)
                     text = (
                         f"{vp.name}  [{info.width}x{info.height}, {info.fps:.1f}fps, "
-                        f"{info.duration_sec:.1f}s, {info.frame_count}帧]"
+                        f"{format_duration_hms(info.duration_sec)}, {info.frame_count:,}帧]"
                     )
                 except Exception:
                     text = f"{vp.name}  [读取元信息失败]"
                 if self.cancel_event.is_set():
                     break
                 added += 1
+                self.item_info_probed.emit(vp, info, text)
                 self.item_probed.emit(vp, text)
             self.finished_probing.emit(added)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class VideoFramePreviewWorker(QThread):
+    """在后台只读抓取单个视频指定时间点的预览帧并转换为线程安全 `QImage`。
+
+    信号契约：
+        `preview_ready(request_id, video_path, actual_sec, QImage)`：解码并缩放成功后回传；
+        `preview_failed(request_id, error_text)`：文件无法打开、无有效帧或解码异常时回传。
+    """
+
+    preview_ready = Signal(int, object, float, object)
+    preview_failed = Signal(int, str)
+
+    def __init__(
+        self,
+        video_path: Path,
+        timestamp_sec: float = 0.0,
+        request_id: int = 0,
+        max_dimension: int = 960,
+    ) -> None:
+        super().__init__()
+        self.video_path = video_path
+        self.timestamp_sec = float(timestamp_sec)
+        self.request_id = int(request_id)
+        self.max_dimension = int(max_dimension)
+
+    def run(self) -> None:
+        """线程入口：调用 `read_video_preview_frame` 读取预览帧并深拷贝为 `QImage`。"""
+        try:
+            res = read_video_preview_frame(
+                self.video_path,
+                timestamp_sec=self.timestamp_sec,
+                max_dimension=self.max_dimension,
+            )
+            if res is None:
+                self.preview_failed.emit(self.request_id, f"无法读取视频预览帧: {self.video_path.name}")
+                return
+            frame_bgr, actual_sec = res
+            rgb = np.ascontiguousarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            h, w = rgb.shape[:2]
+            bytes_per_line = int(rgb.strides[0])
+            # 必须执行 copy()，脱离底层 numpy 缓冲区生命周期后再跨线程发射信号
+            qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+            self.preview_ready.emit(self.request_id, self.video_path, float(actual_sec), qimg)
+        except Exception as exc:
+            self.preview_failed.emit(self.request_id, str(exc))
 
 
 class FrameExtractWorker(QThread):

@@ -25,12 +25,16 @@ import pytest
 from yolo_studio.core.frame_extractor import (
     ExtractionConfig,
     ExtractionMode,
+    VideoInfo,
     _resolve_frame_timestamp_ms,
     compile_naming_rule,
     compute_video_hash,
+    estimate_video_frames,
     extract_frames,
+    format_duration_hms,
     preview_naming_rule,
     probe_video,
+    read_video_preview_frame,
 )
 
 
@@ -315,3 +319,85 @@ def test_large_step_seek_and_cancel(tmp_path: Path) -> None:
     assert compute_video_hash(video, cancel_event=cancel) is None
     res2 = extract_frames([video], ExtractionConfig(output_dir=tmp_path / "cancel"), cancel_event=cancel)
     assert res2.cancelled and res2.videos_processed == 0
+
+
+def test_format_duration_estimate_frames_preview_and_subfolder_rule(tmp_path: Path) -> None:
+    """验证可读时长格式化、预估抽帧数与实际一致性、只读预览抓帧与子目录命名示例。"""
+    # 1) 时长格式化边界与小时进制
+    assert format_duration_hms(0.0) == "00:00"
+    assert format_duration_hms(-5.0) == "00:00"
+    assert format_duration_hms(math.nan) == "00:00"
+    assert format_duration_hms(math.inf) == "00:00"
+    assert format_duration_hms(411.1) == "06:51"
+    assert format_duration_hms(3661.0) == "1:01:01"
+
+    # 2) 三种抽帧策略与起止裁剪预估帧数与实际 extract_frames(dedup=0) 严格一致
+    video = _create_synthetic_video(tmp_path / "est.mp4", num_frames=45, fps=15.0)
+    info = probe_video(video)
+    assert info.frame_count == 45
+
+    configs = [
+        ExtractionConfig(
+            output_dir=tmp_path / "e_sec",
+            mode=ExtractionMode.INTERVAL_SECONDS,
+            interval_seconds=0.5,
+            start_sec=0.4,
+            end_sec=2.6,
+            dedup_threshold=0.0,
+        ),
+        ExtractionConfig(
+            output_dir=tmp_path / "e_step",
+            mode=ExtractionMode.EVERY_N_FRAMES,
+            every_n_frames=7,
+            start_sec=0.0,
+            end_sec=None,
+            dedup_threshold=0.0,
+        ),
+        ExtractionConfig(
+            output_dir=tmp_path / "e_cnt",
+            mode=ExtractionMode.TARGET_COUNT,
+            target_count=8,
+            start_sec=0.2,
+            end_sec=2.2,
+            dedup_threshold=0.0,
+        ),
+    ]
+    for cfg in configs:
+        estimated = estimate_video_frames(info, cfg)
+        real = extract_frames([video], cfg)
+        assert estimated == real.frames_saved
+
+    # 无效帧数或空时间范围返回 0
+    assert estimate_video_frames(
+        VideoInfo(path=video, fps=15.0, frame_count=0, width=160, height=120, duration_sec=0.0),
+        configs[0],
+    ) == 0
+    assert estimate_video_frames(
+        info,
+        ExtractionConfig(output_dir=tmp_path / "bad_span", start_sec=2.0, end_sec=1.0),
+    ) == 0
+
+    # 3) 只读预览抓帧（首帧、指定时间、超界时间夹紧与不存在文件）
+    f0 = read_video_preview_frame(video, timestamp_sec=0.0, max_dimension=80)
+    assert f0 is not None
+    img0, sec0 = f0
+    assert max(img0.shape[:2]) == 80
+    assert sec0 >= 0.0
+
+    f_mid = read_video_preview_frame(video, timestamp_sec=1.5, max_dimension=160)
+    assert f_mid is not None
+    img_mid, sec_mid = f_mid
+    assert img_mid.shape[:2] == (120, 160)
+    assert sec_mid >= 1.0
+
+    f_over = read_video_preview_frame(video, timestamp_sec=999.0, max_dimension=160)
+    assert f_over is not None
+    assert read_video_preview_frame(tmp_path / "missing.mp4") is None
+
+    # 4) 命名规则示例支持分建子目录前缀
+    assert preview_naming_rule("", image_format="jpg", create_video_subfolder=True) == (
+        "demo/vc<32位视频SHA256>_f0000001500.jpg"
+    )
+    assert preview_naming_rule("{video}_{seq:04d}", image_format="png", create_video_subfolder=True) == (
+        "demo/demo_0001.png"
+    )

@@ -73,6 +73,56 @@ QPushButton#primaryBtn:disabled {
     background-color: #8bb8ee;
     border-color: #8bb8ee;
 }
+QPushButton#dangerBtn {
+    color: #57606a;
+    background-color: #f6f8fa;
+    border: 1px solid #c6cdd5;
+}
+QPushButton#dangerBtn:hover {
+    color: #cf222e;
+    background-color: #fff1f0;
+    border-color: #f1b0b7;
+}
+QPushButton#dangerBtn:disabled {
+    color: #999999;
+    background-color: #f2f2f2;
+    border-color: #c6cdd5;
+}
+QPushButton#accentActionBtn {
+    background-color: #eaf5ff;
+    color: #0969da;
+    border: 1px solid #0969da;
+    font-weight: 600;
+}
+QPushButton#accentActionBtn:hover {
+    background-color: #dbeeff;
+}
+QPushButton#accentActionBtn:disabled {
+    color: #999999;
+    background-color: #f2f2f2;
+    border-color: #c6cdd5;
+}
+QProgressBar {
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    background-color: #eef2f6;
+    text-align: center;
+    color: #24292f;
+    font-weight: 600;
+    font-size: 12px;
+}
+QProgressBar::chunk {
+    background-color: #0969da;
+    border-radius: 5px;
+}
+QSplitter::handle:horizontal {
+    width: 6px;
+    background-color: transparent;
+    border-radius: 3px;
+}
+QSplitter::handle:horizontal:hover {
+    background-color: #d0d7de;
+}
 QWidget#metricCard {
     border: 1px solid #d8dee4;
     border-radius: 6px;
@@ -154,6 +204,7 @@ class MainWindow(QMainWindow):
 
         # 跨标签页工作流信号连接
         self.extract_tab.send_frames_dir.connect(self._on_frames_ready)
+        self.extract_tab.frames_dir_synced.connect(self._on_frames_dir_synced)
         self.labeling_tab.send_to_dataset.connect(self._on_labeling_to_dataset)
         self.labeling_tab.send_to_review.connect(self._on_labeling_to_review)
         self.labeling_tab.annotations_changed.connect(self._on_annotations_changed)
@@ -210,12 +261,16 @@ class MainWindow(QMainWindow):
     def _on_frames_ready(self, frames_dir: str) -> None:
         """同步抽帧输出目录至数据集页与智能标注页；用户仍停留在抽帧页时自动切至标注工作台。
 
-        抽帧完成与点击「发送到标注工作台」都会触发此槽；两种情况下用户通常都处于抽帧页。
+        点击「发送到标注工作台」或勾选完成后自动跳转时触发此槽。
         """
-        self.dataset_tab.set_frames_dir(frames_dir)
-        self.review_tab.set_images_dir(frames_dir)
+        self._on_frames_dir_synced(frames_dir)
         if self.tabs.currentWidget() is self.extract_tab:
             self._on_open_in_workbench(frames_dir, "", "")
+
+    def _on_frames_dir_synced(self, frames_dir: str) -> None:
+        """抽帧产出新帧目录后静默同步至数据集页与智能标注页，不主动打断当前标签页浏览。"""
+        self.dataset_tab.set_frames_dir(frames_dir)
+        self.review_tab.set_images_dir(frames_dir)
 
     def _on_open_in_workbench(
         self, target_dir: str, classes_file: str = "", select_image: str = ""
@@ -295,15 +350,19 @@ class MainWindow(QMainWindow):
         return [w for w in candidates if isinstance(w, QThread) and w.isRunning()]
 
     def _running_readonly_probes(self) -> list[QThread]:
-        """收集仍在收尾的只读后台探测线程（硬件探测与 `.pt` 权重元数据读取）。"""
+        """收集仍在收尾的只读后台探测线程（硬件探测、视频预览解码与 `.pt` 权重元数据读取）。"""
         probes: list[QThread] = []
         if self._device_probe_worker is not None and self._device_probe_worker.isRunning():
             probes.append(self._device_probe_worker)
-        get_inspect = getattr(self.eval_tab, "running_inspect_workers", None)
-        if callable(get_inspect):
-            probes.extend(
-                w for w in get_inspect() if isinstance(w, QThread) and w.isRunning()
-            )
+        for tab, method_name in (
+            (self.extract_tab, "running_preview_workers"),
+            (self.eval_tab, "running_inspect_workers"),
+        ):
+            get_workers = getattr(tab, method_name, None)
+            if callable(get_workers):
+                probes.extend(
+                    w for w in get_workers() if isinstance(w, QThread) and w.isRunning()
+                )
         return probes
 
     def _poll_workers_then_close(self) -> None:

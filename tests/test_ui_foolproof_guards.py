@@ -18,14 +18,19 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 from PyQt6.QtCore import QCoreApplication, QSettings, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QListWidgetItem, QMessageBox
 
 import yolo_studio.gui.tab_extract as tab_extract_mod
 import yolo_studio.gui.tab_review as tab_review_mod
+from yolo_studio.core.frame_extractor import ExtractionMode, ExtractionProgress, ExtractionResult
 from yolo_studio.core.mllm_reviewer import BoxRefineMode, MllmReviewResult
 from yolo_studio.core.trainer import DeviceInfo
 from yolo_studio.gui.tab_dataset import DatasetTab
@@ -94,9 +99,10 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
         tab.dedup_spin.setValue(0.0)
         assert tab.dedup_spin.text() == "0.00 (不去重)"
 
-        # 3) 空列表时移除选中与清空列表置灰；添加条目后清空启用、选中后移除启用
+        # 3) 空列表时移除选中、清空列表与开始抽帧均置灰；添加条目后清空与开始启用、选中后移除启用
         assert tab.remove_btn.isEnabled() is False
         assert tab.clear_btn.isEnabled() is False
+        assert tab.start_btn.isEnabled() is False
 
         fake_video = tmp_path / "demo.mp4"
         fake_video.write_bytes(b"")
@@ -107,11 +113,34 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
         tab._refresh_list_action_states()
 
         assert tab.clear_btn.isEnabled() is True
+        assert tab.start_btn.isEnabled() is True
         assert tab.remove_btn.isEnabled() is False
 
         tab.video_list.setCurrentRow(0)
         qt_app.processEvents()
         assert tab.remove_btn.isEnabled() is True
+
+        # 3.5) 切换抽帧策略时同步切换策略参数栈页、行内参数标签及三个微调框启用状态
+        assert tab.strategy_param_stack.currentIndex() == 0
+        assert tab.strategy_param_label.text() == "间隔:"
+        assert tab.interval_spin.isEnabled() is True
+        assert tab.frame_step_spin.isEnabled() is False
+        assert tab.target_count_spin.isEnabled() is False
+
+        tab.mode_combo.setCurrentIndex(tab.mode_combo.findData(ExtractionMode.EVERY_N_FRAMES))
+        qt_app.processEvents()
+        assert tab.strategy_param_stack.currentIndex() == 1
+        assert tab.strategy_param_label.text() == "步长:"
+        assert tab.frame_step_spin.isEnabled() is True
+        assert tab.interval_spin.isEnabled() is False
+
+        tab.mode_combo.setCurrentIndex(tab.mode_combo.findData(ExtractionMode.TARGET_COUNT))
+        qt_app.processEvents()
+        assert tab.strategy_param_stack.currentIndex() == 2
+        assert tab.strategy_param_label.text() == "目标:"
+        assert tab.target_count_spin.isEnabled() is True
+        tab.mode_combo.setCurrentIndex(tab.mode_combo.findData(ExtractionMode.INTERVAL_SECONDS))
+        qt_app.processEvents()
 
         # 4) 截取结束时间 <= 开始时间（且 > 0）时提前拦截，不启动后台线程
         tab.start_sec_spin.setValue(10.0)
@@ -120,7 +149,7 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
         assert len(started_workers) == 0
         assert any("结束时间必须大于开始时间" in m for m in warnings)
 
-        # 5) 命名规则实时预览（含默认规则、格式联动、普通前缀、占位符模板）及非法规则前置拦截
+        # 5) 命名规则实时预览（含默认规则、格式联动、子目录联动、预设模板、普通前缀与非法规则前置拦截）
         tab.start_sec_spin.setValue(0.0)
         tab.end_sec_spin.setValue(0.0)
         assert "vc<32位视频SHA256>_f0000001500.jpg" in tab.naming_preview_label.text()
@@ -128,6 +157,19 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
         tab.format_combo.setCurrentText("png")
         qt_app.processEvents()
         assert "vc<32位视频SHA256>_f0000001500.png" in tab.naming_preview_label.text()
+
+        tab.subfolder_chk.setChecked(True)
+        qt_app.processEvents()
+        assert "demo/vc<32位视频SHA256>_f0000001500.png" in tab.naming_preview_label.text()
+        tab.subfolder_chk.setChecked(False)
+        qt_app.processEvents()
+
+        preset_menu = tab.naming_preset_btn.menu()
+        assert preset_menu is not None and len(preset_menu.actions()) >= 2
+        preset_menu.actions()[1].trigger()
+        qt_app.processEvents()
+        assert tab.naming_rule_edit.text() == "{video}_{seq:06d}"
+        assert "demo_000001.png" in tab.naming_preview_label.text()
 
         tab.naming_rule_edit.setText("cam1_")
         qt_app.processEvents()
@@ -145,13 +187,163 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
         assert len(started_workers) == 0
         assert any("不支持的占位符" in m for m in warnings)
 
-        # 移除选中条目后列表再次为空，按钮恢复置灰
+        # 移除选中条目后列表再次为空，移除/清空/开始抽帧按钮均恢复置灰
         tab._on_remove_selected()
         qt_app.processEvents()
         assert len(tab._video_paths) == 0
         assert tab.remove_btn.isEnabled() is False
         assert tab.clear_btn.isEnabled() is False
+        assert tab.start_btn.isEnabled() is False
     finally:
+        tab.close()
+
+
+def test_extract_tab_multiselect_preview_overall_progress_and_completion_flow(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证抽帧页多选与 Delete 删除、选中视频异步预览、多视频单调总进度及非打断式完成流转。"""
+    def _write_mp4(path: Path, frames: int = 12) -> Path:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(path), fourcc, 10.0, (160, 120))
+        assert writer.isOpened()
+        for i in range(frames):
+            img = np.full((120, 160, 3), (i * 15, 180, 60), dtype=np.uint8)
+            writer.write(img)
+        writer.release()
+        return path
+
+    v1 = _write_mp4(tmp_path / "clip1.mp4", frames=15)
+    v2 = _write_mp4(tmp_path / "clip2.mp4", frames=15)
+    v3 = _write_mp4(tmp_path / "clip3.mp4", frames=15)
+
+    class _NoopSignal:
+        def connect(self, _slot) -> None:
+            pass
+
+    class _FakeExtractWorker:
+        def __init__(self, paths, cfg) -> None:
+            self.paths = paths
+            self.cfg = cfg
+            self.progress = _NoopSignal()
+            self.finished_result = _NoopSignal()
+            self.failed = _NoopSignal()
+
+        def start(self) -> None:
+            pass
+
+        def isRunning(self) -> bool:
+            return False
+
+    monkeypatch.setattr(tab_extract_mod, "FrameExtractWorker", _FakeExtractWorker)
+
+    tab = ExtractTab(workspace_root=tmp_path)
+    synced_dirs: list[str] = []
+    sent_dirs: list[str] = []
+    tab.frames_dir_synced.connect(synced_dirs.append)
+    tab.send_frames_dir.connect(sent_dirs.append)
+
+    try:
+        tab.resize(1280, 760)
+        tab.show()
+        tab._add_video_paths([v1, v2, v3])
+        deadline = time.monotonic() + 5.0
+        while tab.probe_worker and tab.probe_worker.isRunning() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+        qt_app.processEvents()
+
+        assert tab.video_list.count() == 3
+        assert "共 3 个" in tab.video_group.title()
+
+        # 选中视频后异步解码预览帧并写入画布（非空 pixmap）
+        deadline = time.monotonic() + 5.0
+        while not tab.preview_label.has_preview_image() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+        qt_app.processEvents()
+        assert tab.preview_label.has_preview_image() is True
+        assert tab.preview_label.pixmap() is not None and not tab.preview_label.pixmap().isNull()
+
+        # 多选前两项后按 Delete 键批量移除
+        tab.video_list.item(0).setSelected(True)
+        tab.video_list.item(1).setSelected(True)
+        QTest.keyClick(tab.video_list, Qt.Key.Key_Delete)
+        qt_app.processEvents()
+        assert tab.video_list.count() == 1
+        assert len(tab._video_paths) == 1
+
+        # 多视频进度条按全局帧数权重单调推进，第 2 个视频不会归零
+        tab._add_video_paths([v1])
+        deadline = time.monotonic() + 5.0
+        while tab.probe_worker and tab.probe_worker.isRunning() and time.monotonic() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+        qt_app.processEvents()
+        assert tab.video_list.count() == 2
+
+        tab._on_start()
+        tab._on_progress(
+            ExtractionProgress(
+                video_index=1,
+                total_videos=2,
+                video_name="clip3.mp4",
+                current_frame=15,
+                total_frames=15,
+                saved_total=3,
+                skipped_similar=1,
+            )
+        )
+        pct_after_v1 = tab.progress_bar.value()
+        assert pct_after_v1 == 50
+
+        tab._on_progress(
+            ExtractionProgress(
+                video_index=2,
+                total_videos=2,
+                video_name="clip1.mp4",
+                current_frame=3,
+                total_frames=15,
+                saved_total=4,
+                skipped_similar=1,
+            )
+        )
+        assert tab.progress_bar.value() >= pct_after_v1
+        assert tab.progress_bar.value() == 60
+
+        # 默认完成后仅静默同步并高亮发送按钮，不强行切页，且多行完成状态完整展示不裁切
+        out_dir = tmp_path / "out_frames"
+        tab._extract_started_at = 0.0
+        tab._on_finished(
+            ExtractionResult(
+                output_dir=out_dir,
+                videos_processed=2,
+                frames_saved=8,
+                frames_skipped_similar=2,
+            )
+        )
+        qt_app.processEvents()
+        assert synced_dirs == [str(out_dir)]
+        assert sent_dirs == []
+        assert tab.send_next_btn.objectName() == "accentActionBtn"
+        assert tab._card_output.value_label.text() == "00:00"
+        assert tab.status_label.height() >= tab.status_label.heightForWidth(tab.status_label.width())
+
+        # 勾选「抽帧完成后自动进入标注工作台」后，无错完成会发射 send_frames_dir
+        tab.auto_open_workbench_chk.setChecked(True)
+        tab._on_finished(
+            ExtractionResult(
+                output_dir=out_dir,
+                videos_processed=2,
+                frames_saved=8,
+                frames_skipped_similar=2,
+            )
+        )
+        assert len(synced_dirs) == 2
+        assert sent_dirs == [str(out_dir)]
+    finally:
+        if tab.probe_worker and tab.probe_worker.isRunning():
+            tab.probe_worker.cancel()
+            tab.probe_worker.wait(2000)
         tab.close()
 
 
