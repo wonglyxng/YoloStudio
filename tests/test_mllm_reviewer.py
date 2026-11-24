@@ -4,7 +4,7 @@
     使用确定性桩客户端 `_FakeMllmClient` 离线验证 JSON 围栏解析、保留/改类/删误检/补漏与
     高重叠去重合并、三分类目录分流、对比图渲染及与 `dataset_converter` 的闭环衔接；
     并覆盖重复标注跨桶去重、异常与损坏标注兜底写报告、非法改类强制复核、
-    递归同名输出消歧、空结果跳过调用以及 OpenAI 兼容客户端仅在 400 时降级等回归场景。
+    递归同名输出消歧、空结果跳过调用、OpenAI 兼容参数精确降级以及错误摘要去重等回归场景。
 
 运行环境与协作边界：
     通过 `pytest` 在临时目录（`tmp_path`）中离线运行，不发起真实网络 API 调用
@@ -1080,3 +1080,297 @@ def test_sam3_text_pure_local_and_with_llm_review(tmp_path: Path, monkeypatch) -
     sam30.write_bytes(b"fake-sam30")
     assert resolve_sam3_weights(None, workspace_root=ws) == sam30.resolve()
     assert resolve_sam3_weights(tmp_path / "definitely_missing.pt", workspace_root=ws) is None
+
+
+def test_openai_client_downgrades_temperature_without_disabling_json_mode() -> None:
+    """验证 OpenAI 兼容接口仅拒绝 `temperature` 时只省略 `temperature` 并保留 `json_object` 模式。"""
+    import httpx
+    import openai
+
+    from yolo_studio.core.mllm_reviewer import OpenAICompatMllmClient
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    class _Msg:
+        content = ok_json
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Completions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "temperature" in kwargs:
+                raise openai.BadRequestError(
+                    "Error code: 400 - Unsupported value: 'temperature' does not support 0.1 with this model. "
+                    "Only the default (1) value is supported.",
+                    response=httpx.Response(400, request=request),
+                    body={
+                        "message": "Unsupported value: 'temperature' does not support 0.1 with this model.",
+                        "type": "invalid_request_error",
+                        "param": "temperature",
+                        "code": "unsupported_value",
+                    },
+                )
+            return _Resp()
+
+    client = OpenAICompatMllmClient(api_key="k", base_url="https://api.openai.com/v1", model_name="gpt-6.2-astra")
+    completions = _Completions()
+    client.client = type("C", (), {"chat": type("Chat", (), {"completions": completions})()})()
+
+    client.review_image(b"x", [], "s", "u")
+    client.review_image(b"x", [], "s", "u")
+
+    # 第 1 轮先带 temperature+response_format 失败，随即省略 temperature 并保留 response_format 重试成功；
+    # 第 2 轮直接省略 temperature 且保留 response_format 一次成功
+    assert len(completions.calls) == 3
+    assert "temperature" in completions.calls[0]
+    assert completions.calls[0].get("response_format") == {"type": "json_object"}
+    assert "temperature" not in completions.calls[1]
+    assert completions.calls[1].get("response_format") == {"type": "json_object"}
+    assert "temperature" not in completions.calls[2]
+    assert completions.calls[2].get("response_format") == {"type": "json_object"}
+
+
+def test_openai_client_downgrades_both_temperature_and_json_mode_and_raises_unrelated_400() -> None:
+    """验证依次拒绝 `temperature` 与 `response_format`、并发降级竞争及无关 400 时的行为。"""
+    import httpx
+    import openai
+
+    from yolo_studio.core.mllm_reviewer import OpenAICompatMllmClient
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    class _Msg:
+        content = ok_json
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    # 1) 先后拒绝 temperature 与 response_format，最终降级至纯模型+消息参数
+    class _RejectBothCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "temperature" in kwargs:
+                raise openai.BadRequestError(
+                    "Unsupported parameter: temperature",
+                    response=httpx.Response(400, request=request),
+                    body={"error": {"param": "temperature", "message": "Unsupported value"}},
+                )
+            if "response_format" in kwargs:
+                raise openai.BadRequestError(
+                    "response_format json_object is not supported",
+                    response=httpx.Response(400, request=request),
+                    body={"error": {"param": "response_format", "message": "not supported"}},
+                )
+            return _Resp()
+
+    client = OpenAICompatMllmClient(api_key="k", base_url="http://localhost/v1", model_name="m")
+    both = _RejectBothCompletions()
+    client.client = type("C", (), {"chat": type("Chat", (), {"completions": both})()})()
+    client.review_image(b"x", [], "s", "u")
+    client.review_image(b"x", [], "s", "u")
+
+    assert [
+        ("temperature" in c, "response_format" in c) for c in both.calls
+    ] == [(True, True), (False, True), (False, False), (False, False)]
+
+    # 2) 并发竞争场景：本轮已携带 temperature=0.1 发出，但返回前另一线程已将 _temperature_supported 置为 False；
+    #    本轮必须仍识别到自己发出过 temperature，重试时保留 json_mode 不误关
+    race_client = OpenAICompatMllmClient(api_key="k", base_url="http://localhost/v1", model_name="m")
+
+    class _RaceCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "temperature" in kwargs:
+                race_client._temperature_supported = False
+                raise openai.BadRequestError(
+                    "Unsupported value: 'temperature'",
+                    response=httpx.Response(400, request=request),
+                    body={"param": "temperature"},
+                )
+            return _Resp()
+
+    race_comp = _RaceCompletions()
+    race_client.client = type("C", (), {"chat": type("Chat", (), {"completions": race_comp})()})()
+    race_client.review_image(b"x", [], "s", "u")
+    assert race_client._json_mode_supported is True
+    assert len(race_comp.calls) == 2
+    assert race_comp.calls[1].get("response_format") == {"type": "json_object"}
+
+    # 3) 降级穷尽后，与参数降级无关的 400（如上下文超限）必须直接向上抛出
+    class _ContextErrorCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            raise openai.BadRequestError(
+                "This model's maximum context length is 128000 tokens.",
+                response=httpx.Response(400, request=request),
+                body={"error": {"code": "context_length_exceeded", "param": "messages"}},
+            )
+
+    err_client = OpenAICompatMllmClient(api_key="k", base_url="http://localhost/v1", model_name="m")
+    err_comp = _ContextErrorCompletions()
+    err_client.client = type("C", (), {"chat": type("Chat", (), {"completions": err_comp})()})()
+    try:
+        err_client.review_image(b"x", [], "s", "u")
+    except openai.BadRequestError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("无关 400 错误应向上抛出")
+    assert len(err_comp.calls) == 2
+
+
+def test_mllm_connection_downgrades_max_tokens_and_temperature(monkeypatch) -> None:
+    """验证 `test_mllm_connection` 在遇到不支持 `max_tokens` 与 `temperature` 时依次自动降级并在无关 400 时失败。"""
+    import httpx
+    import openai
+
+    from yolo_studio.core.mllm_reviewer import test_mllm_connection
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    class _Msg:
+        content = "OK"
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    recorded_calls: list[dict[str, object]] = []
+    mode = {"fail_unrelated": False}
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            recorded_calls.append(dict(kwargs))
+            if mode["fail_unrelated"]:
+                raise openai.BadRequestError(
+                    "The model `missing-model` does not exist",
+                    response=httpx.Response(400, request=request),
+                    body={"error": {"code": "model_not_found", "param": "model"}},
+                )
+            if "max_tokens" in kwargs:
+                raise openai.BadRequestError(
+                    "Unsupported parameter: 'max_tokens' is not supported with this model. "
+                    "Use 'max_completion_tokens' instead.",
+                    response=httpx.Response(400, request=request),
+                    body={"param": "max_tokens"},
+                )
+            if "temperature" in kwargs:
+                raise openai.BadRequestError(
+                    "Unsupported value: 'temperature' does not support 0.0 with this model.",
+                    response=httpx.Response(400, request=request),
+                    body={"param": "temperature"},
+                )
+            return _Resp()
+
+    class _FakeOpenAI:
+        def __init__(self, **_kwargs) -> None:
+            self.chat = type("Chat", (), {"completions": _FakeCompletions()})()
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+
+    ok, msg = test_mllm_connection(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.OPENAI_COMPAT,
+            base_url="https://api.openai.com/v1",
+            model_name="gpt-6.2-astra",
+            api_key="test-key",
+        )
+    )
+    assert ok is True
+    assert "连通正常" in msg
+    assert [
+        ("max_tokens" in c, "temperature" in c, "max_completion_tokens" in c)
+        for c in recorded_calls
+    ] == [(True, True, False), (False, True, False), (False, False, False)]
+
+    recorded_calls.clear()
+    mode["fail_unrelated"] = True
+    ok_bad, msg_bad = test_mllm_connection(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.OPENAI_COMPAT,
+            base_url="https://api.openai.com/v1",
+            model_name="missing-model",
+            api_key="test-key",
+        )
+    )
+    assert ok_bad is False
+    assert "model_not_found" in msg_bad or "does not exist" in msg_bad
+    assert len(recorded_calls) == 1
+
+
+def test_error_record_summary_does_not_duplicate_error_in_missing_note(tmp_path: Path) -> None:
+    """验证单图异常记录的详情摘要不再把同一报错作为漏标提示重复拼接，同时 JSON 文件仍保留异常注释。"""
+    from yolo_studio.core.mllm_reviewer import ImageReviewRecord, format_record_detail_summary
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    _write_img(in_dir / "err.png", (320, 180))
+
+    class _FailClient:
+        def review_image(self, *_args):
+            raise RuntimeError("Error code: 400 - Unsupported value: temperature")
+
+    res = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+        ),
+        client_override=_FailClient(),
+    )
+    assert res.error_count == 1
+    rec = res.records[0]
+    assert rec.error == "Error code: 400 - Unsupported value: temperature"
+    assert rec.missing_note == ""
+    summary = format_record_detail_summary(rec)
+    assert summary.count("Unsupported value: temperature") == 1
+    assert "漏标提示" not in summary
+    assert "检测到疑似漏标" not in summary
+
+    assert rec.output_json_path is not None and rec.output_json_path.is_file()
+    json_payload = json.loads(rec.output_json_path.read_text(encoding="utf-8"))
+    assert "LLM 处理异常:" in json_payload["flags"]["missing_note"]
+
+    # 兼容加载旧版历史报告（missing_note 仍含 "处理出错: <error>"）时同样不重复显示
+    legacy_rec = ImageReviewRecord(
+        image_path=in_dir / "err.png",
+        output_image_path=rec.output_image_path,
+        output_json_path=rec.output_json_path,
+        triage_bucket="need_review",
+        has_missing=True,
+        missing_note="处理出错: Error code: 400 - Unsupported value: temperature",
+        error="Error code: 400 - Unsupported value: temperature",
+    )
+    legacy_summary = format_record_detail_summary(legacy_rec)
+    assert legacy_summary.count("Unsupported value: temperature") == 1
+    assert "漏标提示" not in legacy_summary
+    assert "检测到疑似漏标" not in legacy_summary

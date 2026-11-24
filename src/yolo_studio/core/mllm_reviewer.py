@@ -622,6 +622,48 @@ class GeminiMllmClient:
         return parse_review_response_text(output_text)
 
 
+def _extract_openai_bad_request_info(exc: BaseException) -> tuple[str, str]:
+    """提取 OpenAI 兼容接口 400 异常中的报错参数名与小写描述文本，用于精确判定不兼容参数。"""
+    param = str(getattr(exc, "param", None) or "").strip().lower()
+    parts: list[str] = []
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err_obj = body.get("error")
+        payload = err_obj if isinstance(err_obj, dict) else body
+        if not param:
+            param = str(payload.get("param") or "").strip().lower()
+        for key in ("message", "detail", "code"):
+            val = payload.get(key)
+            if val:
+                parts.append(str(val))
+    elif body is not None:
+        parts.append(str(body))
+    parts.append(str(exc))
+    return param, " ".join(parts).lower()
+
+
+def _is_temperature_bad_request(exc: BaseException) -> bool:
+    """判断 400 异常是否因模型拒绝自定义 `temperature` 参数（仅支持默认值）所致。"""
+    param, text = _extract_openai_bad_request_info(exc)
+    return param == "temperature" or bool(re.search(r"(?<![a-z0-9_])temperature(?![a-z0-9_])", text))
+
+
+def _is_max_tokens_bad_request(exc: BaseException) -> bool:
+    """判断 400 异常是否因模型或接口拒绝 `max_tokens` 参数所致。"""
+    param, text = _extract_openai_bad_request_info(exc)
+    return param == "max_tokens" or bool(re.search(r"(?<![a-z0-9_])max_tokens(?![a-z0-9_])", text))
+
+
+def _is_response_format_bad_request(exc: BaseException) -> bool:
+    """判断 400 异常是否因后端不支持 `response_format` / `json_object` 结构化输出所致。"""
+    param, text = _extract_openai_bad_request_info(exc)
+    if param == "response_format" or param.startswith("response_format."):
+        return True
+    return bool(
+        re.search(r"(?<![a-z0-9_])(?:response_format|json_object|json[\s_-]*mode)(?![a-z0-9_])", text)
+    )
+
+
 class OpenAICompatMllmClient:
     """OpenAI 兼容多模态审核客户端，适配通义千问 Qwen-VL、硅基流动、本地 Ollama、vLLM 与 OpenAI。
 
@@ -629,9 +671,10 @@ class OpenAICompatMllmClient:
         初始化时依次回退 `api_key`、`OPENAI_API_KEY` 与 `"ollama"`（用于本地免鉴权服务），
         `base_url` 为空时默认使用 DashScope 兼容端点，`model_name` 为空抛出 `ValueError`。
 
-    JSON 模式降级状态：
-        `_json_mode_supported` 初始为 `True`；首次请求因 `openai.BadRequestError` 被拒后置为 `False`，
-        此后该实例的所有请求直接使用纯文本约束。多线程并发下最多多出几次失败尝试，结论一致，无需加锁。
+    参数自动降级状态：
+        维护 `_temperature_supported` 与 `_json_mode_supported` 两个能力标志位（初始均为 `True`）；
+        仅在对应参数触发 `openai.BadRequestError` 时单调降级为 `False`。每轮请求前先对两个标志位取快照，
+        多线程并发下依据本轮实际发送的参数快照判定降级，不会互相误关且保证有限次终止。
     """
 
     def __init__(
@@ -647,6 +690,7 @@ class OpenAICompatMllmClient:
         resolved_url = base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         self.client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=timeout)
         self._bad_request_error = BadRequestError
+        self._temperature_supported = True
         self._json_mode_supported = True
         self.model_name = model_name.strip()
         if not self.model_name:
@@ -659,7 +703,7 @@ class OpenAICompatMllmClient:
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse:
-        """发送多模态对话请求并解析 JSON 审核结果；若后端不支持 `json_object` 格式则自动回退重试。"""
+        """发送多模态对话请求并解析 JSON 审核结果；若后端拒绝 `temperature` 或 `json_object` 则自动降级重试。"""
         user_content: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt},
             {
@@ -690,28 +734,40 @@ class OpenAICompatMllmClient:
             {"role": "user", "content": user_content},
         ]
 
-        resp = None
-        if self._json_mode_supported:
+        while True:
+            # 先快照本轮实际发送的可选参数，防止并发线程修改标志位后漏判当前请求触发的 400
+            sent_temperature = self._temperature_supported
+            sent_json_mode = self._json_mode_supported
+            req_kwargs: dict[str, object] = {
+                "model": self.model_name,
+                "messages": messages,
+            }
+            if sent_temperature:
+                req_kwargs["temperature"] = 0.1
+            if sent_json_mode:
+                req_kwargs["response_format"] = {"type": "json_object"}
             try:
-                # 保留 type: ignore 指令供静态类型检查器识别兼容接口动态构造的列表消息
-                resp = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,  # type: ignore[arg-type]
-                    temperature=0.1,
-                    response_format={"type": "json_object"},
-                )
-            except self._bad_request_error:
-                # 仅当后端以 400 拒绝请求（通常是不支持 response_format）时降级为纯文本约束重试，
-                # 并记住该结论避免后续每张图都重复失败一次；鉴权、超时、限流等错误直接向上抛出
-                self._json_mode_supported = False
-        if resp is None:
-            resp = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=0.1,
-            )
+                # 保留 type: ignore 指令供静态类型检查器识别兼容接口动态构造的参数字典
+                resp = self.client.chat.completions.create(**req_kwargs)  # type: ignore[arg-type]
+                break
+            except self._bad_request_error as exc:
+                downgraded = False
+                if sent_temperature and _is_temperature_bad_request(exc):
+                    self._temperature_supported = False
+                    downgraded = True
+                if sent_json_mode and _is_response_format_bad_request(exc):
+                    self._json_mode_supported = False
+                    downgraded = True
+                if not downgraded and sent_json_mode:
+                    # 兼容部分第三方 OpenAI 兼容服务端在不支持 response_format 时仅返回笼统 400 文案
+                    self._json_mode_supported = False
+                    downgraded = True
+                if not downgraded:
+                    raise
 
-        content = resp.choices[0].message.content or ""
+        content = (resp.choices[0].message.content or "") if resp.choices else ""
+        if not content.strip():
+            raise RuntimeError("OpenAI 兼容接口返回为空，未包含文本输出。")
         return parse_review_response_text(content)
 
 
@@ -753,7 +809,7 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
             preview = reply[:40].replace("\n", " ") if reply else "(空响应)"
             return True, f"Gemini 接口连通正常（模型: {model_name}，耗时 {elapsed:.2f}s，回复: {preview}）"
 
-        from openai import OpenAI
+        from openai import BadRequestError, OpenAI
 
         resolved_key = config.api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip() or "ollama"
         resolved_url = config.base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -761,12 +817,32 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
         if not model_name:
             return False, "请先填写模型名称（如 qwen-vl-max-latest）。"
         client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=20.0)
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": "Reply OK."}],
-            max_tokens=12,
-            temperature=0.0,
-        )
+        send_temperature = True
+        send_max_tokens = True
+        while True:
+            probe_kwargs: dict[str, object] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": "Reply OK."}],
+            }
+            if send_max_tokens:
+                probe_kwargs["max_tokens"] = 12
+            if send_temperature:
+                probe_kwargs["temperature"] = 0.0
+            try:
+                # 保留 type: ignore 指令供静态类型检查器识别动态构造的探针参数字典
+                resp = client.chat.completions.create(**probe_kwargs)  # type: ignore[arg-type]
+                break
+            except BadRequestError as exc:
+                downgraded = False
+                if send_temperature and _is_temperature_bad_request(exc):
+                    send_temperature = False
+                    downgraded = True
+                if send_max_tokens and _is_max_tokens_bad_request(exc):
+                    # 部分新模型拒绝 max_tokens；直接省略限制而非改传极小 max_completion_tokens，避免思考模型返回空文本
+                    send_max_tokens = False
+                    downgraded = True
+                if not downgraded:
+                    raise
         reply = (resp.choices[0].message.content or "").strip() if resp.choices else ""
         elapsed = time.perf_counter() - t0
         preview = reply[:40].replace("\n", " ") if reply else "(空响应)"
@@ -1870,6 +1946,13 @@ def count_review_images(
         return 0
 
 
+def _is_redundant_error_note(error: str, note: str) -> bool:
+    """判断 `missing_note` 是否仅是对 `error` 的重复包装（兼容历史报告中的 `处理出错: <error>`）。"""
+    err = error.strip()
+    txt = note.strip()
+    return bool(err and txt and err in txt)
+
+
 def format_record_detail_summary(record: ImageReviewRecord) -> str:
     """将单张标注记录的逐框删改/收框/补漏理由整理为界面可读的简明中文摘要。"""
     parts: list[str] = []
@@ -1900,9 +1983,9 @@ def format_record_detail_summary(record: ImageReviewRecord) -> str:
         elif b.refined or b.status == "refined":
             parts.append(f"已收框 #{b.box_id}[{b.label}]{reason}")
 
-    if record.missing_note:
+    if record.missing_note and not _is_redundant_error_note(record.error, record.missing_note):
         parts.append(f"漏标提示：{record.missing_note}")
-    elif record.has_missing and not any(b.status == "llm_added" for b in record.after_boxes):
+    elif record.has_missing and not record.error and not any(b.status == "llm_added" for b in record.after_boxes):
         parts.append("检测到疑似漏标，请人工核查")
 
     if not parts:
@@ -2194,7 +2277,7 @@ def run_mllm_review(
             before_boxes=before_boxes,
             after_boxes=before_boxes,
             has_missing=True,
-            missing_note=f"处理出错: {message}",
+            missing_note="",
             error=message,
         )
 
@@ -2469,7 +2552,7 @@ def run_mllm_review(
                     output_json_path=None,
                     triage_bucket=BUCKET_NEED_REVIEW,
                     has_missing=True,
-                    missing_note=f"处理出错: {exc}",
+                    missing_note="",
                     error=str(exc),
                 )
             if rec is None:

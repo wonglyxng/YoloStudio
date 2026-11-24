@@ -1637,7 +1637,10 @@ class MllmReviewTab(QWidget):
             note_parts.append(rec.error)
         if rec.loose_flagged_count:
             note_parts.append(f"{rec.loose_flagged_count} 框过松/超门禁")
-        if rec.missing_note and rec.missing_note not in note_parts:
+        is_redundant_error_note = bool(
+            rec.error and rec.error.strip() and rec.missing_note and rec.error.strip() in rec.missing_note
+        )
+        if rec.missing_note and rec.missing_note not in note_parts and not is_redundant_error_note:
             note_parts.append(rec.missing_note)
         if not note_parts:
             note_parts.append(format_record_detail_summary(rec))
