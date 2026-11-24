@@ -123,6 +123,7 @@ class AnnotationCanvasView(QGraphicsView):
         self._fit_mode: bool = True
         self._pending_fit: bool = False
         self._zoom_anchor_cache: tuple[QPointF, QPointF] | None = None
+        self._cached_center_scene: QPointF | None = None
 
         # 平移状态（统一基于起点差值计算，避免累积漂移）
         self._space_pressed: bool = False
@@ -156,6 +157,13 @@ class AnnotationCanvasView(QGraphicsView):
         self._edge_scroll_timer = QTimer(self)
         self._edge_scroll_timer.setInterval(25)
         self._edge_scroll_timer.timeout.connect(self._on_edge_scroll_tick)
+
+        # 轻量顶部悬浮胶囊提示状态
+        self._hud_message: str = ""
+        self._hud_accent: QColor = QColor("#0969da")
+        self._hud_timer = QTimer(self)
+        self._hud_timer.setSingleShot(True)
+        self._hud_timer.timeout.connect(self._clear_hud_message)
 
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
@@ -217,6 +225,28 @@ class AnnotationCanvasView(QGraphicsView):
         """切换是否渲染矩形框左上角标签与置信度角标。"""
         self._show_labels = bool(visible)
         self.viewport().update()
+
+    def show_hud_message(
+        self,
+        text: str,
+        *,
+        color: str = "#0969da",
+        duration_ms: int = 1600,
+    ) -> None:
+        """在画布顶部中央展示轻量悬浮胶囊提示；传入空文本可立即关闭。"""
+        clean = (text or "").strip()
+        self._hud_message = clean
+        self._hud_accent = QColor(color)
+        if clean:
+            self._hud_timer.start(max(300, int(duration_ms)))
+        else:
+            self._hud_timer.stop()
+        self.viewport().update()
+
+    def _clear_hud_message(self) -> None:
+        if self._hud_message:
+            self._hud_message = ""
+            self.viewport().update()
 
     def set_space_pressed(self, pressed: bool) -> None:
         """由工作台或画布同步空格键按住状态，支持任意焦点位置按住空格拖动画布。"""
@@ -294,6 +324,9 @@ class AnnotationCanvasView(QGraphicsView):
         """清空当前画布图像与全部矩形框。"""
         self._cancel_transient_interactions()
         self._zoom_anchor_cache = None
+        self._cached_center_scene = None
+        self._hud_timer.stop()
+        self._hud_message = ""
         self._pixmap_item.setPixmap(QPixmap())
         self._image_width = 0
         self._image_height = 0
@@ -371,6 +404,7 @@ class AnnotationCanvasView(QGraphicsView):
             )
         else:
             target = QPointF(scene_pt)
+        self._cached_center_scene = QPointF(target)
         self.centerOn(target)
         return target
 
@@ -829,7 +863,11 @@ class AnnotationCanvasView(QGraphicsView):
     # ------------------------------------------------------------------
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         self._zoom_anchor_cache = None
-        old_center = self._get_view_center_scene()
+        old_center = (
+            QPointF(self._cached_center_scene)
+            if self._cached_center_scene is not None
+            else self._get_view_center_scene()
+        )
         super().resizeEvent(event)
         if self._image_width <= 0 or self._image_height <= 0:
             return
@@ -1260,11 +1298,13 @@ class AnnotationCanvasView(QGraphicsView):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        # 绘制图像浅灰细边轮廓（深色图片与深色背景之间更易识别边界）
-        border_pen = QPen(QColor(255, 255, 255, 55), 1.0 * inv)
-        painter.setPen(border_pen)
+        # 绘制图像双层精致边界（外层微阴影 + 内层浅灰细边），兼顾白底截图与暗底画面
+        img_rect = QRectF(0.0, 0.0, float(self._image_width), float(self._image_height))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(QRectF(0.0, 0.0, float(self._image_width), float(self._image_height)))
+        painter.setPen(QPen(QColor(0, 0, 0, 95), 2.4 * inv))
+        painter.drawRect(img_rect)
+        painter.setPen(QPen(QColor(255, 255, 255, 78), 1.0 * inv))
+        painter.drawRect(img_rect)
 
         # 绘制全部已有矩形框（选中框置顶后绘，确保手柄与高亮不被覆盖）
         order = [i for i in range(len(self._boxes)) if i != self._selected_idx]
@@ -1329,6 +1369,58 @@ class AnnotationCanvasView(QGraphicsView):
                     size_tip = f"{self._active_label}  {size_tip}"
                 self._paint_tag_pill(painter, dx1, dy1, size_tip, QColor(r, g, b, 230), inv)
 
+        painter.restore()
+        self._paint_hud_overlay(painter)
+
+    def _paint_hud_overlay(self, painter: QPainter) -> None:
+        """在画布视口顶部中央按需绘制轻量悬浮提示胶囊（不遮挡目标且不拦截鼠标事件）。"""
+        if self._mode == self.MODE_DRAW and self._draw_state == "waiting_second":
+            text = "已定起点 · 点击第二角点完成（滚轮缩放 / 中键平移，右键或 Esc 取消）"
+            dot_color = QColor("#f85149")
+        elif self._hud_message:
+            text = self._hud_message
+            dot_color = QColor(self._hud_accent)
+        else:
+            return
+
+        vw = self.viewport().width()
+        if vw < 120:
+            return
+
+        painter.save()
+        painter.setWorldMatrixEnabled(False)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        font = QFont("Microsoft YaHei UI", 9, QFont.Weight.Medium)
+        painter.setFont(font)
+        fm = QFontMetricsF(font)
+        max_text_w = max(80.0, float(vw) - 56.0)
+        display_text = fm.elidedText(text, Qt.TextElideMode.ElideRight, max_text_w)
+        tw = fm.horizontalAdvance(display_text)
+        th = fm.height()
+        pill_w = tw + 30.0
+        pill_h = th + 10.0
+        px = (float(vw) - pill_w) / 2.0
+        py = 10.0
+        pill = QRectF(px, py, pill_w, pill_h)
+
+        painter.setBrush(QBrush(QColor(22, 27, 34, 212)))
+        painter.setPen(QPen(QColor(255, 255, 255, 42), 1.0))
+        painter.drawRoundedRect(pill, pill_h / 2.0, pill_h / 2.0)
+
+        dot_r = 3.5
+        dot_cx = px + 12.0
+        dot_cy = py + pill_h / 2.0
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(dot_color))
+        painter.drawEllipse(QPointF(dot_cx, dot_cy), dot_r, dot_r)
+
+        painter.setPen(QPen(QColor(240, 246, 252)))
+        text_rect = QRectF(px + 20.0, py, tw + 6.0, pill_h)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            display_text,
+        )
         painter.restore()
 
     def _paint_box(

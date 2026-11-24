@@ -26,8 +26,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
-from PyQt6.QtGui import QAction, QColor, QIcon, QKeyEvent, QKeySequence, QPainter, QPixmap
+from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QIntValidator, QKeyEvent, QKeySequence, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -44,6 +45,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -106,16 +108,23 @@ class _ElidedStatusLabel(QLabel):
         确保窗口尺寸永远由用户控制而非被动态图片路径推宽；完整文本始终保留在 `toolTip()` 中。
     """
 
-    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        text: str = "",
+        parent: QWidget | None = None,
+        *,
+        min_width: int = 80,
+    ) -> None:
         super().__init__(parent)
         self._full_text = ""
+        self._fixed_min_w = max(0, int(min_width))
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.setMinimumWidth(80)
+        self.setMinimumWidth(self._fixed_min_w)
         self.setText(text)
 
     def minimumSizeHint(self) -> QSize:  # type: ignore[override]
         hint = super().minimumSizeHint()
-        return QSize(80, hint.height())
+        return QSize(self._fixed_min_w, hint.height())
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
         hint = super().sizeHint()
@@ -141,6 +150,25 @@ class _ElidedStatusLabel(QLabel):
         super().setText(elided)
 
 
+class _CompactFooterLabel(QLabel):
+    """展示完整底栏状态文案但不随文本长度撑大窗口最小宽度的标签。"""
+
+    def __init__(
+        self,
+        text: str = "",
+        *,
+        min_width: int = 40,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(text, parent)
+        self._fixed_min_w = max(0, int(min_width))
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        hint = super().minimumSizeHint()
+        return QSize(min(self._fixed_min_w, hint.width()), hint.height())
+
+
 def _make_color_icon(rgb: tuple[int, int, int], size: int = 12) -> QIcon:
     """绘制用于类别/框列表项的圆角色块图标。"""
     pix = QPixmap(size, size)
@@ -152,6 +180,71 @@ def _make_color_icon(rgb: tuple[int, int, int], size: int = 12) -> QIcon:
     painter.drawRoundedRect(1, 1, size - 2, size - 2, 3, 3)
     painter.end()
     return QIcon(pix)
+
+
+def _make_status_dot_icon(
+    status_key: str, *, verified: bool = False, size: int = 12
+) -> QIcon:
+    """绘制用于图片文件列表项的彩色状态圆点图标，清晰区分已标/待复核/空图/未标。"""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    cx = size / 2.0
+    if status_key == "labeled":
+        if verified:
+            painter.setPen(QPen(QColor("#2da44e"), 1.2))
+            painter.setBrush(QColor("#1a7f37"))
+            painter.drawEllipse(QPointF(cx, cx), 4.0, 4.0)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#1a7f37"))
+            painter.drawEllipse(QPointF(cx, cx), 3.6, 3.6)
+    elif status_key == "review":
+        painter.setPen(QPen(QColor("#9a6700"), 1.0))
+        painter.setBrush(QColor("#d4a72c"))
+        painter.drawEllipse(QPointF(cx, cx), 3.8, 3.8)
+    elif status_key == "empty":
+        painter.setPen(QPen(QColor("#0969da"), 1.7))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cx), 3.4, 3.4)
+    else:
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#afb8c1"))
+        painter.drawEllipse(QPointF(cx, cx), 2.8, 2.8)
+    painter.end()
+    return QIcon(pix)
+
+
+class _EmptyHintListWidget(QListWidget):
+    """在列表为空时居中绘制浅灰引导提示的 `QListWidget`，消除大面积空白呆板感。"""
+
+    def __init__(self, empty_text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._empty_text = empty_text
+
+    def set_empty_text(self, text: str) -> None:
+        if text != self._empty_text:
+            self._empty_text = text
+            self.viewport().update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self.count() > 0 or not self._empty_text:
+            return
+        vp = self.viewport()
+        painter = QPainter(vp)
+        painter.setPen(QColor("#8c959f"))
+        font = QFont(self.font())
+        font.setPointSize(9)
+        painter.setFont(font)
+        rect = QRect(12, 12, max(40, vp.width() - 24), max(24, vp.height() - 24))
+        painter.drawText(
+            rect,
+            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+            self._empty_text,
+        )
+        painter.end()
 
 
 class _LabelPickerDialog(QDialog):
@@ -349,83 +442,94 @@ class LabelingStudioTab(QWidget):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
-        # 1) 顶部工作流联动栏
-        bar = QFrame()
-        bar.setFrameShape(QFrame.Shape.StyledPanel)
-        bar.setStyleSheet(
-            "QFrame { background-color: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; }"
-        )
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(10, 5, 10, 5)
-        bar_layout.setSpacing(8)
-
-        self.status_label = _ElidedStatusLabel(
-            "工作台就绪：打开图片目录即可快速标注与复核（R/W 拖或两点画框 · E 编辑 · H 抓手 · A/D 切图 · 方向键微调 · F 通过）"
-        )
-        self.status_label.setStyleSheet("border: none; color: #24292f; font-weight: 500;")
-        bar_layout.addWidget(self.status_label, 1)
-
-        self.open_dir_btn = QPushButton("打开图片目录...")
-        self.load_classes_btn = QPushButton("导入 classes.txt...")
-        self.refresh_btn = QPushButton("刷新目录")
-        self.to_review_btn = QPushButton("发送到「3. LLM 智能标注」→")
-        self.to_dataset_btn = QPushButton("发送到「4. 数据集准备」→")
-        self.to_dataset_btn.setObjectName("primaryBtn")
-
-        for btn in (
-            self.open_dir_btn,
-            self.load_classes_btn,
-            self.refresh_btn,
-            self.to_review_btn,
-            self.to_dataset_btn,
-        ):
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            bar_layout.addWidget(btn)
-        root.addWidget(bar)
-
-        # 2) 精简画布与复核操作工具栏
+        # 1) 单行精简主工具栏（模式分段胶囊 + 框操作 + 翻页/通过 + 视图偏好 + 右端工作流出口）
         tools = QFrame()
+        tools.setObjectName("workbenchTools")
         tools.setStyleSheet(
-            "QFrame { background-color: #ffffff; border: 1px solid #d8dee4; border-radius: 6px; }"
-            "QPushButton { padding: 4px 10px; font-size: 12px; }"
-            "QPushButton:checked { background-color: #ddf4ff; border-color: #0969da; color: #0550ae; font-weight: 600; }"
+            "QFrame#workbenchTools { background-color: #ffffff; border: 1px solid #d8dee4; border-radius: 6px; }"
+            "QPushButton { padding: 3px 7px; font-size: 12px; }"
+            "QCheckBox { font-size: 12px; spacing: 3px; }"
+            "QPushButton#segEditBtn { border-top-right-radius: 0px; border-bottom-right-radius: 0px; }"
+            "QPushButton#segDrawBtn { border-radius: 0px; border-left: none; border-right: none; }"
+            "QPushButton#segPanBtn { border-top-left-radius: 0px; border-bottom-left-radius: 0px; }"
+            "QPushButton#segEditBtn:checked { background-color: #ddf4ff; border-color: #0969da; color: #0550ae; font-weight: 600; }"
+            "QPushButton#segDrawBtn:checked { background-color: #ffebe9; border-color: #cf222e; color: #a40e26; font-weight: 600; }"
+            "QPushButton#segPanBtn:checked { background-color: #fff8c5; border-color: #bf8700; color: #7d4e00; font-weight: 600; }"
+            "QPushButton#verifyNextBtn { background-color: #eafaf1; border-color: #2da44e; color: #1a7f37; font-weight: 600; }"
+            "QPushButton#verifyNextBtn:hover { background-color: #dafbe1; }"
+            "QPushButton#verifyNextBtn:disabled { background-color: #f2f2f2; border-color: #d0d7de; color: #999999; }"
+            "QPushButton#accentActionBtn { padding: 3px 8px; font-size: 12px; }"
         )
         t_lay = QHBoxLayout(tools)
-        t_lay.setContentsMargins(8, 4, 8, 4)
-        t_lay.setSpacing(6)
+        t_lay.setContentsMargins(6, 4, 6, 4)
+        t_lay.setSpacing(4)
 
-        self.edit_mode_btn = QPushButton("编辑 (E)")
+        self.open_dir_btn = QPushButton("打开目录")
+        self.open_dir_btn.setToolTip("打开待标注图片目录（自动递归加载子目录与已有 .json）")
+
+        mode_seg = QWidget()
+        mode_seg_lay = QHBoxLayout(mode_seg)
+        mode_seg_lay.setContentsMargins(0, 0, 0, 0)
+        mode_seg_lay.setSpacing(0)
+        self.edit_mode_btn = QPushButton("编辑(E)")
+        self.edit_mode_btn.setObjectName("segEditBtn")
         self.edit_mode_btn.setCheckable(True)
         self.edit_mode_btn.setChecked(True)
-        self.draw_mode_btn = QPushButton("画框 (R)")
+        self.edit_mode_btn.setToolTip("编辑模式 (E)：点选/移动框、拖拽控制点、方向键微调，拖拽空白处可平移")
+        self.draw_mode_btn = QPushButton("画框(R)")
+        self.draw_mode_btn.setObjectName("segDrawBtn")
         self.draw_mode_btn.setCheckable(True)
-        self.pan_mode_btn = QPushButton("抓手 (H)")
+        self.draw_mode_btn.setToolTip("画矩形框模式 (R / W)：支持按住拖拽成框或轻点起点+终点两点画框")
+        self.pan_mode_btn = QPushButton("抓手(H)")
+        self.pan_mode_btn.setObjectName("segPanBtn")
         self.pan_mode_btn.setCheckable(True)
-        self.pan_mode_btn.setToolTip("抓手平移模式：左键直接拖动画布，不误碰目标框（亦可随时拖动空白处、右键或空格+左键平移）")
+        self.pan_mode_btn.setToolTip("抓手平移模式 (H)：左键直接拖动画布，不误碰目标框（也可随时右键/中键/空格+左键平移）")
+        mode_seg_lay.addWidget(self.edit_mode_btn)
+        mode_seg_lay.addWidget(self.draw_mode_btn)
+        mode_seg_lay.addWidget(self.pan_mode_btn)
+
         self.dup_box_btn = QPushButton("复制")
-        self.del_box_btn = QPushButton("删除 (Del)")
+        self.dup_box_btn.setToolTip("复制当前选中框 (Ctrl+D)")
+        self.del_box_btn = QPushButton("删除")
+        self.del_box_btn.setToolTip("删除当前选中框 (Del / Backspace)")
         self.undo_btn = QPushButton("撤销")
+        self.undo_btn.setToolTip("撤销上一步修改 (Ctrl+Z)")
         self.redo_btn = QPushButton("重做")
+        self.redo_btn.setToolTip("重做修改 (Ctrl+Y)")
 
-        self.prev_img_btn = QPushButton("◀ 上张 (A)")
-        self.next_img_btn = QPushButton("下张 (D) ▶")
-        self.save_btn = QPushButton("保存 (Ctrl+S)")
-        self.verify_next_btn = QPushButton("通过→下张 (F)")
-        self.verify_next_btn.setToolTip("标记当前图已人工复核（0 框时保存为显式空图负样本）、清除漏标提醒并自动切换下一张")
+        self.prev_img_btn = QPushButton("◀")
+        self.prev_img_btn.setFixedWidth(26)
+        self.prev_img_btn.setToolTip("上一张图片 (A)")
+        self.next_img_btn = QPushButton("▶")
+        self.next_img_btn.setFixedWidth(26)
+        self.next_img_btn.setToolTip("下一张图片 (D)")
+        self.save_btn = QPushButton("保存")
+        self.save_btn.setToolTip("立即保存当前图片标注到同名 .json (Ctrl+S)")
+        self.verify_next_btn = QPushButton("✓ 通过(F)")
+        self.verify_next_btn.setObjectName("verifyNextBtn")
+        self.verify_next_btn.setToolTip("标记当前图已人工复核（0 框时保存为显式空图负样本）、清除漏标提醒并自动切换下一张 (F)")
 
-        self.sam_refine_btn = QPushButton("SAM 收框")
+        self.sam_refine_btn = QPushButton("SAM收框")
         self.sam_refine_btn.setToolTip("调用本地 SAM 2.1 对当前选中框（未选中时对整图全部框）执行像素级轮廓贴边收紧")
 
         self.keep_view_chk = QCheckBox("保持视野")
         self.keep_view_chk.setChecked(False)
         self.keep_view_chk.setToolTip("切图时保留当前的缩放倍率与局部观察位置（适合固定机位连续帧局部精修）")
-        self.show_labels_chk = QCheckBox("标签 (L)")
+        self.show_labels_chk = QCheckBox("标签")
         self.show_labels_chk.setChecked(True)
+        self.show_labels_chk.setToolTip("显示/隐藏目标框类别与置信度角标 (快捷键 L)")
         self.auto_save_chk = QCheckBox("自动保存")
         self.auto_save_chk.setChecked(True)
         self.auto_save_chk.setToolTip("切图或退出前自动保存已修改的 .json 标注")
 
+        self.to_review_btn = QPushButton("→智能标注")
+        self.to_review_btn.setToolTip("将当前图片目录发送到「3. LLM 智能标注」")
+        self.to_dataset_btn = QPushButton("→数据集")
+        self.to_dataset_btn.setObjectName("accentActionBtn")
+        self.to_dataset_btn.setToolTip("将当前图片目录与类别清单发送到「4. 数据集准备」")
+
         for w in (
+            self.open_dir_btn,
             self.edit_mode_btn,
             self.draw_mode_btn,
             self.pan_mode_btn,
@@ -441,18 +545,17 @@ class LabelingStudioTab(QWidget):
             self.keep_view_chk,
             self.show_labels_chk,
             self.auto_save_chk,
+            self.to_review_btn,
+            self.to_dataset_btn,
         ):
             w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        for w in (
-            self.edit_mode_btn,
-            self.draw_mode_btn,
-            self.pan_mode_btn,
-            self.dup_box_btn,
-            self.del_box_btn,
-        ):
-            t_lay.addWidget(w)
+        t_lay.addWidget(self.open_dir_btn)
         t_lay.addWidget(self._make_vsep())
+        t_lay.addWidget(mode_seg)
+        t_lay.addWidget(self._make_vsep())
+        t_lay.addWidget(self.dup_box_btn)
+        t_lay.addWidget(self.del_box_btn)
         t_lay.addWidget(self.undo_btn)
         t_lay.addWidget(self.redo_btn)
         t_lay.addWidget(self._make_vsep())
@@ -467,54 +570,15 @@ class LabelingStudioTab(QWidget):
         t_lay.addWidget(self.show_labels_chk)
         t_lay.addWidget(self.auto_save_chk)
         t_lay.addStretch(1)
+        t_lay.addWidget(self.to_review_btn)
+        t_lay.addWidget(self.to_dataset_btn)
         root.addWidget(tools)
 
-        # 3) 主体三栏可调分割区
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        # 2) 两栏主分割区：左侧超大标注画布 + 右侧三段可调卡片栏
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
 
-        # --- 左栏：文件列表与筛选 ---
-        left_panel = QFrame()
-        left_panel.setMinimumWidth(210)
-        left_panel.setMaximumWidth(380)
-        left_lay = QVBoxLayout(left_panel)
-        left_lay.setContentsMargins(4, 4, 4, 4)
-        left_lay.setSpacing(5)
-
-        left_title = QLabel("图片文件列表")
-        left_title.setStyleSheet("font-weight: 600; color: #24292f;")
-        left_lay.addWidget(left_title)
-
-        self.file_search = QLineEdit()
-        self.file_search.setPlaceholderText("搜索文件名或子目录...")
-        self.file_search.setClearButtonEnabled(True)
-        left_lay.addWidget(self.file_search)
-
-        self.status_filter_combo = QComboBox()
-        self.status_filter_combo.addItem("全部图片", "all")
-        self.status_filter_combo.addItem("仅看未标注", "unlabeled")
-        self.status_filter_combo.addItem("仅看已标注", "labeled")
-        self.status_filter_combo.addItem("仅看空图 (0框)", "empty")
-        self.status_filter_combo.addItem("仅看含漏标/待复核提醒", "review")
-        self.status_filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        left_lay.addWidget(self.status_filter_combo)
-
-        self.progress_summary_label = QLabel("尚未打开图片目录")
-        self.progress_summary_label.setStyleSheet("color: #57606a; font-size: 12px;")
-        self.progress_summary_label.setWordWrap(True)
-        left_lay.addWidget(self.progress_summary_label)
-
-        self.file_list = QListWidget()
-        self.file_list.setAlternatingRowColors(True)
-        self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.file_list.setStyleSheet(
-            "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
-            "QListWidget::item { padding: 3px 4px; }"
-        )
-        left_lay.addWidget(self.file_list, 1)
-        splitter.addWidget(left_panel)
-
-        # --- 中栏：AI 复核提醒横幅 + 核心画布 + 底部微状态栏 ---
+        # --- 左栏：AI 复核提醒横幅 + 核心画布 + 底部栏（保持原有底栏不变） ---
         center_panel = QWidget()
         center_lay = QVBoxLayout(center_panel)
         center_lay.setContentsMargins(0, 0, 0, 0)
@@ -550,17 +614,18 @@ class LabelingStudioTab(QWidget):
         f_lay = QHBoxLayout(footer)
         f_lay.setContentsMargins(8, 3, 8, 3)
         f_lay.setSpacing(8)
-        self.mode_badge_label = QLabel("模式: 编辑")
+        self.mode_badge_label = _CompactFooterLabel("模式: 编辑", min_width=64)
         self.mode_badge_label.setStyleSheet("border: none; color: #0969da; font-weight: 600; font-size: 12px;")
-        self.img_info_label = QLabel("分辨率: -")
-        self.cursor_info_label = QLabel("坐标: -")
+        self.img_info_label = _CompactFooterLabel("分辨率: -", min_width=64)
+        self.cursor_info_label = _CompactFooterLabel("坐标: -", min_width=52)
         self.hint_info_label = _ElidedStatusLabel(
-            "滚轮缩放 · 拖空白/右键/空格平移 · 方向键微调选中框"
+            "滚轮缩放 · 拖空白/右键/空格平移 · 方向键微调选中框",
+            min_width=0,
         )
         self.hint_info_label.setStyleSheet("border: none; color: #8c959f; font-size: 11px;")
         self.zoom_info_label = QLabel("缩放: 100%", self)
         self.zoom_info_label.setVisible(False)
-        self.save_state_label = QLabel("")
+        self.save_state_label = _CompactFooterLabel("", min_width=32)
 
         self.zoom_out_btn = QPushButton("−")
         self.zoom_out_btn.setFixedWidth(26)
@@ -595,26 +660,45 @@ class LabelingStudioTab(QWidget):
         f_lay.addWidget(self.fit_btn)
         f_lay.addWidget(self.zoom_100_btn)
         center_lay.addWidget(footer)
-        splitter.addWidget(center_panel)
+        self.main_splitter.addWidget(center_panel)
 
-        # --- 右栏：类别清单 + 当前图目标框列表 + 框详情 ---
-        right_panel = QFrame()
-        right_panel.setMinimumWidth(240)
-        right_panel.setMaximumWidth(400)
-        right_lay = QVBoxLayout(right_panel)
-        right_lay.setContentsMargins(4, 4, 4, 4)
-        right_lay.setSpacing(6)
+        # --- 右栏：三段可调白底圆角卡片（类别清单 / 当前图目标框 / 图片文件列表） ---
+        right_panel = QWidget()
+        right_panel.setMinimumWidth(270)
+        right_panel.setMaximumWidth(440)
+        right_panel.setStyleSheet(
+            "QFrame#sideCard { background-color: #ffffff; border: 1px solid #d8dee4; border-radius: 6px; }"
+        )
+        right_outer = QVBoxLayout(right_panel)
+        right_outer.setContentsMargins(0, 0, 0, 0)
+        right_outer.setSpacing(0)
+
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.setChildrenCollapsible(False)
+
+        # 卡片 1：类别清单（导入/保存/添加/右键重命名与移除）
+        cls_card = QFrame()
+        cls_card.setObjectName("sideCard")
+        cls_lay = QVBoxLayout(cls_card)
+        cls_lay.setContentsMargins(8, 6, 8, 6)
+        cls_lay.setSpacing(5)
 
         cls_hdr = QHBoxLayout()
-        cls_title = QLabel("类别清单 (按 1-9 速切)")
+        cls_hdr.setSpacing(4)
+        cls_title = QLabel("类别清单 (1-9)")
         cls_title.setStyleSheet("font-weight: 600; color: #24292f;")
-        self.save_classes_btn = QPushButton("保存 classes.txt")
-        self.save_classes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.save_classes_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.load_classes_btn = QPushButton("导入")
+        self.load_classes_btn.setToolTip("导入外部 classes.txt 类别清单...")
+        self.save_classes_btn = QPushButton("保存")
+        self.save_classes_btn.setToolTip("导出保存为 classes.txt...")
+        for btn in (self.load_classes_btn, self.save_classes_btn):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
         cls_hdr.addWidget(cls_title)
         cls_hdr.addStretch(1)
+        cls_hdr.addWidget(self.load_classes_btn)
         cls_hdr.addWidget(self.save_classes_btn)
-        right_lay.addLayout(cls_hdr)
+        cls_lay.addLayout(cls_hdr)
 
         add_cls_row = QHBoxLayout()
         add_cls_row.setSpacing(4)
@@ -622,63 +706,173 @@ class LabelingStudioTab(QWidget):
         self.new_class_edit.setPlaceholderText("输入新类别名称后回车...")
         self.add_class_btn = QPushButton("+ 添加")
         self.add_class_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.add_class_btn.setStyleSheet("padding: 4px 8px; font-size: 12px;")
+        self.add_class_btn.setStyleSheet("padding: 3px 8px; font-size: 12px;")
         add_cls_row.addWidget(self.new_class_edit, 1)
         add_cls_row.addWidget(self.add_class_btn)
-        right_lay.addLayout(add_cls_row)
+        cls_lay.addLayout(add_cls_row)
 
-        self.unique_label_list = QListWidget()
+        self.unique_label_list = _EmptyHintListWidget(
+            "暂无类别\n在上方输入名称回车添加，或点击「导入」"
+        )
+        self.unique_label_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.unique_label_list.setStyleSheet(
             "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
             "QListWidget::item { padding: 3px 4px; }"
         )
-        right_lay.addWidget(self.unique_label_list, 2)
+        cls_lay.addWidget(self.unique_label_list, 1)
+        self.right_splitter.addWidget(cls_card)
+
+        # 卡片 2：当前图目标框 + 按需展开的紧凑详情卡
+        obj_card = QFrame()
+        obj_card.setObjectName("sideCard")
+        obj_lay = QVBoxLayout(obj_card)
+        obj_lay.setContentsMargins(8, 6, 8, 6)
+        obj_lay.setSpacing(5)
 
         obj_hdr = QHBoxLayout()
         self.obj_title_label = QLabel("当前图目标框 (0)")
         self.obj_title_label.setStyleSheet("font-weight: 600; color: #24292f;")
-        self.clear_boxes_btn = QPushButton("清空全部框")
+        self.clear_boxes_btn = QPushButton("清空")
+        self.clear_boxes_btn.setToolTip("清空当前图片全部目标框")
         self.clear_boxes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.clear_boxes_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
         obj_hdr.addWidget(self.obj_title_label)
         obj_hdr.addStretch(1)
         obj_hdr.addWidget(self.clear_boxes_btn)
-        right_lay.addLayout(obj_hdr)
+        obj_lay.addLayout(obj_hdr)
 
-        self.shape_list = QListWidget()
+        self.shape_list = _EmptyHintListWidget(
+            "当前图暂无目标框\n按 R 进入画框模式，拖拽或两点点击即可标注"
+        )
         self.shape_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.shape_list.setStyleSheet(
             "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
             "QListWidget::item { padding: 3px 4px; }"
         )
-        right_lay.addWidget(self.shape_list, 3)
+        obj_lay.addWidget(self.shape_list, 1)
 
-        self.box_detail_label = QLabel("未选中目标框：单击画布或列表项可查看坐标、AI 置信度与审核理由。")
-        self.box_detail_label.setWordWrap(True)
-        self.box_detail_label.setStyleSheet(
-            "QLabel { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 5px; "
-            "padding: 6px; color: #24292f; font-size: 12px; }"
+        self.box_detail_panel = QFrame()
+        self.box_detail_panel.setStyleSheet(
+            "QFrame { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 5px; }"
         )
-        right_lay.addWidget(self.box_detail_label)
+        detail_lay = QVBoxLayout(self.box_detail_panel)
+        detail_lay.setContentsMargins(6, 5, 6, 5)
+        detail_lay.setSpacing(4)
+        self.box_detail_label = QLabel("")
+        self.box_detail_label.setWordWrap(True)
+        self.box_detail_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.box_detail_label.setMinimumWidth(60)
+        self.box_detail_label.setStyleSheet("border: none; color: #24292f; font-size: 11px;")
+        detail_lay.addWidget(self.box_detail_label)
 
         box_ops = QHBoxLayout()
-        box_ops.setSpacing(6)
+        box_ops.setSpacing(4)
         self.change_cls_btn = QPushButton("改类别")
-        self.change_cls_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.change_cls_btn.setStyleSheet("padding: 4px 8px; font-size: 12px;")
-        self.box_del_inline_btn = QPushButton("删除选中")
-        self.box_del_inline_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.box_del_inline_btn.setStyleSheet("padding: 4px 8px; font-size: 12px;")
-        box_ops.addWidget(self.change_cls_btn, 1)
-        box_ops.addWidget(self.box_del_inline_btn, 1)
-        right_lay.addLayout(box_ops)
+        self.focus_box_btn = QPushButton("聚焦")
+        self.focus_box_btn.setToolTip("在画布中放大并居中查看当前选中框")
+        self.box_del_inline_btn = QPushButton("删除")
+        for btn in (self.change_cls_btn, self.focus_box_btn, self.box_del_inline_btn):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setStyleSheet("padding: 3px 6px; font-size: 11px;")
+            box_ops.addWidget(btn, 1)
+        detail_lay.addLayout(box_ops)
+        self.box_detail_panel.setVisible(False)
+        obj_lay.addWidget(self.box_detail_panel)
+        self.right_splitter.addWidget(obj_card)
 
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
-        splitter.setSizes([240, 820, 270])
-        root.addWidget(splitter, 1)
+        # 卡片 3：图片文件列表（中部省略文件名 + 彩色圆点 + 进度条 + 页码直达 + 下一未标）
+        file_card = QFrame()
+        file_card.setObjectName("sideCard")
+        file_lay = QVBoxLayout(file_card)
+        file_lay.setContentsMargins(8, 6, 8, 6)
+        file_lay.setSpacing(5)
+
+        file_hdr = QHBoxLayout()
+        file_hdr.setSpacing(5)
+        file_title = QLabel("图片列表")
+        file_title.setStyleSheet("font-weight: 600; color: #24292f;")
+        self.status_label = _ElidedStatusLabel("未打开目录")
+        self.status_label.setStyleSheet("border: none; color: #57606a; font-size: 11px;")
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setToolTip("重新扫描当前目录中的图片与 .json 标注状态")
+        self.refresh_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.refresh_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
+        file_hdr.addWidget(file_title)
+        file_hdr.addWidget(self.status_label, 1)
+        file_hdr.addWidget(self.refresh_btn)
+        file_lay.addLayout(file_hdr)
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(4)
+        self.file_search = QLineEdit()
+        self.file_search.setPlaceholderText("搜索文件名...")
+        self.file_search.setClearButtonEnabled(True)
+        self.status_filter_combo = QComboBox()
+        self.status_filter_combo.addItem("全部", "all")
+        self.status_filter_combo.addItem("未标注", "unlabeled")
+        self.status_filter_combo.addItem("已标注", "labeled")
+        self.status_filter_combo.addItem("空图 (0框)", "empty")
+        self.status_filter_combo.addItem("待复核", "review")
+        self.status_filter_combo.setMinimumWidth(88)
+        self.status_filter_combo.setMaximumWidth(112)
+        self.status_filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        filter_row.addWidget(self.file_search, 1)
+        filter_row.addWidget(self.status_filter_combo)
+        file_lay.addLayout(filter_row)
+
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(4)
+        self.progress_summary_label = _CompactFooterLabel("尚未打开目录", min_width=60)
+        self.progress_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.progress_summary_label.setStyleSheet("color: #57606a; font-size: 11px;")
+        self.jump_index_edit = QLineEdit()
+        self.jump_index_edit.setFixedWidth(48)
+        self.jump_index_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.jump_index_edit.setPlaceholderText("跳页")
+        self.jump_index_edit.setValidator(QIntValidator(1, 999999, self))
+        self.jump_index_edit.setToolTip("输入当前列表序号 (1..N) 后回车快速跳转")
+        self.jump_index_edit.setStyleSheet("padding: 1px 4px; font-size: 11px;")
+        self.next_unlabeled_btn = QPushButton("下未标")
+        self.next_unlabeled_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.next_unlabeled_btn.setToolTip("跳转到下一张未标注或待复核图片（支持循环查找）")
+        self.next_unlabeled_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+        progress_row.addWidget(self.progress_summary_label, 1)
+        progress_row.addWidget(self.jump_index_edit)
+        progress_row.addWidget(self.next_unlabeled_btn)
+        file_lay.addLayout(progress_row)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setStyleSheet(
+            "QProgressBar { border: none; border-radius: 2px; background-color: #eaeef2; }"
+            "QProgressBar::chunk { background-color: #2da44e; border-radius: 2px; }"
+        )
+        file_lay.addWidget(self.progress_bar)
+
+        self.file_list = _EmptyHintListWidget(
+            "尚未打开图片目录\n点击左上角「打开目录」选择图片文件夹"
+        )
+        self.file_list.setAlternatingRowColors(True)
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_list.setStyleSheet(
+            "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
+            "QListWidget::item { padding: 3px 4px; }"
+        )
+        file_lay.addWidget(self.file_list, 1)
+        self.right_splitter.addWidget(file_card)
+        self.right_splitter.setSizes([155, 200, 330])
+
+        right_outer.addWidget(self.right_splitter)
+        self.main_splitter.addWidget(right_panel)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setSizes([1040, 310])
+        root.addWidget(self.main_splitter, 1)
 
         # 事件信号连接
         self.open_dir_btn.clicked.connect(self._on_pick_and_open_dir)
@@ -694,6 +888,7 @@ class LabelingStudioTab(QWidget):
         self.del_box_btn.clicked.connect(self._delete_selected_box)
         self.box_del_inline_btn.clicked.connect(self._delete_selected_box)
         self.change_cls_btn.clicked.connect(self._prompt_relabel_selected_box)
+        self.focus_box_btn.clicked.connect(self._focus_selected_box)
         self.clear_boxes_btn.clicked.connect(self._clear_all_boxes)
         self.undo_btn.clicked.connect(self._undo)
         self.redo_btn.clicked.connect(self._redo)
@@ -703,6 +898,7 @@ class LabelingStudioTab(QWidget):
         self.verify_next_btn.clicked.connect(self._verify_and_next)
         self.clear_hint_btn.clicked.connect(self._clear_missing_hint)
         self.sam_refine_btn.clicked.connect(self._on_sam_refine_clicked)
+        self.keep_view_chk.toggled.connect(self._on_keep_view_toggled)
         self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_by(1.0 / 1.25))
         self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom_by(1.25))
         self.zoom_menu_btn.clicked.connect(self._on_zoom_menu_clicked)
@@ -712,6 +908,8 @@ class LabelingStudioTab(QWidget):
 
         self.file_search.textChanged.connect(self._apply_file_filter)
         self.status_filter_combo.currentIndexChanged.connect(self._apply_file_filter)
+        self.jump_index_edit.returnPressed.connect(self._on_jump_to_index)
+        self.next_unlabeled_btn.clicked.connect(self.open_next_unlabeled_image)
         self.file_list.currentRowChanged.connect(self._on_file_row_changed)
         self.file_list.customContextMenuRequested.connect(self._on_file_list_context_menu)
 
@@ -720,6 +918,7 @@ class LabelingStudioTab(QWidget):
         self.save_classes_btn.clicked.connect(self._on_save_classes_txt)
         self.unique_label_list.currentRowChanged.connect(self._on_class_row_changed)
         self.unique_label_list.itemDoubleClicked.connect(self._on_class_double_clicked)
+        self.unique_label_list.customContextMenuRequested.connect(self._on_class_list_context_menu)
 
         self.shape_list.currentRowChanged.connect(self._on_shape_row_changed)
         self.shape_list.itemDoubleClicked.connect(self._on_shape_double_clicked)
@@ -1106,6 +1305,45 @@ class LabelingStudioTab(QWidget):
         self.save_state_label.setText("已是列表第一张")
         return False
 
+    def open_next_unlabeled_image(self) -> bool:
+        """循环跳转到当前筛选列表中的下一张未标注或待复核图片。"""
+        total = len(self._filtered_images)
+        if total == 0:
+            return False
+        cur_row = self.file_list.currentRow()
+        start = 0 if cur_row < 0 else (cur_row + 1) % total
+        for step in range(total):
+            idx = (start + step) % total
+            img_path = self._filtered_images[idx]
+            summary = self._status_map.get(img_path) or inspect_image_status(img_path)
+            if summary.status_key in ("unlabeled", "review"):
+                if idx == cur_row:
+                    self.save_state_label.setText("当前已是唯一未标注/待复核图片")
+                else:
+                    self.file_list.setCurrentRow(idx)
+                self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+                return True
+        self.save_state_label.setText("当前列表已全部标注完成 ✓")
+        self.canvas.show_hud_message("当前列表已全部标注完成 ✓", color="#2da44e")
+        return False
+
+    def _on_jump_to_index(self) -> None:
+        raw = self.jump_index_edit.text().strip()
+        if not raw or not self._filtered_images:
+            self.jump_index_edit.clear()
+            self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        try:
+            num = int(raw)
+        except ValueError:
+            self.jump_index_edit.clear()
+            self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        target_row = max(0, min(len(self._filtered_images) - 1, num - 1))
+        self.jump_index_edit.clear()
+        self.file_list.setCurrentRow(target_row)
+        self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def save_current_annotation(self, *, force: bool = False) -> bool:
         """保存当前图片标注到同名 `.json`；无改动且非 `force` 时直接返回 `True`。"""
         if self._doc is None:
@@ -1189,15 +1427,11 @@ class LabelingStudioTab(QWidget):
                 rel = img_path.name
 
         key = summary.status_key
-        if key == "review":
-            prefix = f"! [{summary.box_count}]"
-        elif key == "labeled":
-            prefix = f"✓ [{summary.box_count}]"
-        elif key == "empty":
-            prefix = "○ [0]"
-        else:
-            prefix = "·"
-        return f"{prefix}  {rel}"
+        if key in ("labeled", "review"):
+            return f"{rel}  [{summary.box_count}]"
+        if key == "empty":
+            return f"{rel}  [0]"
+        return rel
 
     def _style_file_item(self, item: QListWidgetItem, summary: ImageStatusSummary) -> None:
         key = summary.status_key
@@ -1234,13 +1468,27 @@ class LabelingStudioTab(QWidget):
             filtered.append(img_path)
 
         self._filtered_images = filtered
+        if not self._all_images:
+            if self._current_dir is None:
+                self.file_list.set_empty_text(
+                    "尚未打开图片目录\n点击左上角「打开目录」选择图片文件夹"
+                )
+            else:
+                self.file_list.set_empty_text(
+                    "当前目录暂无支持的图片\n支持 jpg / png / bmp / webp 等格式"
+                )
+        elif not filtered:
+            self.file_list.set_empty_text("当前筛选条件下无匹配图片\n请调整搜索词或状态筛选")
         self._syncing_lists = True
         try:
             self.file_list.clear()
             target_row = -1
             for idx, img_path in enumerate(filtered):
                 summary = self._status_map[img_path]
-                item = QListWidgetItem(self._format_file_item_text(img_path, summary))
+                item = QListWidgetItem(
+                    _make_status_dot_icon(summary.status_key, verified=summary.is_verified),
+                    self._format_file_item_text(img_path, summary),
+                )
                 item.setData(Qt.ItemDataRole.UserRole, str(img_path))
                 item.setToolTip(str(img_path))
                 self._style_file_item(item, summary)
@@ -1374,6 +1622,9 @@ class LabelingStudioTab(QWidget):
             if p == resolved:
                 item = self.file_list.item(row)
                 if item is not None:
+                    item.setIcon(
+                        _make_status_dot_icon(summary.status_key, verified=summary.is_verified)
+                    )
                     item.setText(self._format_file_item_text(resolved, summary))
                     self._style_file_item(item, summary)
                 break
@@ -1383,21 +1634,30 @@ class LabelingStudioTab(QWidget):
         total = len(self._all_images)
         if total == 0:
             self.progress_summary_label.setText(
-                "当前目录暂无图片" if self._current_dir else "尚未打开图片目录"
+                "当前目录无图片" if self._current_dir else "尚未打开目录"
             )
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setToolTip("")
             return
         labeled = sum(1 for s in self._status_map.values() if s.status_key == "labeled")
         empty = sum(1 for s in self._status_map.values() if s.status_key == "empty")
         review = sum(1 for s in self._status_map.values() if s.status_key == "review")
         unlabeled = total - labeled - empty - review
+        done_count = labeled + empty
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done_count)
+        pct = int(round(done_count * 100.0 / total))
+        self.progress_bar.setToolTip(f"标注完成度：{done_count}/{total} ({pct}%)")
+
         pos = self.file_list.currentRow() + 1 if self.file_list.currentRow() >= 0 else 0
         shown = len(self._filtered_images)
-        parts = [f"{pos}/{shown} 张" if shown == total else f"筛选 {pos}/{shown} (共 {total})"]
+        parts = [f"{pos}/{shown}" if shown == total else f"筛 {pos}/{shown} (共{total})"]
         parts.append(f"已标 {labeled}")
         if empty:
-            parts.append(f"空图 {empty}")
+            parts.append(f"空 {empty}")
         if review:
-            parts.append(f"待复核 {review}")
+            parts.append(f"待核 {review}")
         if unlabeled:
             parts.append(f"未标 {unlabeled}")
         self.progress_summary_label.setText(" · ".join(parts))
@@ -1444,6 +1704,7 @@ class LabelingStudioTab(QWidget):
         self.del_box_btn.setEnabled(has_sel)
         self.box_del_inline_btn.setEnabled(has_sel)
         self.change_cls_btn.setEnabled(has_sel)
+        self.focus_box_btn.setEnabled(has_sel)
         self.clear_boxes_btn.setEnabled(has_boxes)
         self.undo_btn.setEnabled(len(self._undo_stack) > 0)
         self.redo_btn.setEnabled(len(self._redo_stack) > 0)
@@ -1451,8 +1712,10 @@ class LabelingStudioTab(QWidget):
         self.verify_next_btn.setEnabled(has_img)
         self.prev_img_btn.setEnabled(len(self._filtered_images) > 1)
         self.next_img_btn.setEnabled(len(self._filtered_images) > 1)
+        self.jump_index_edit.setEnabled(len(self._filtered_images) > 0)
+        self.next_unlabeled_btn.setEnabled(len(self._filtered_images) > 0)
         self.sam_refine_btn.setEnabled(has_boxes and not sam_busy)
-        self.sam_refine_btn.setText("SAM 收紧中..." if sam_busy else "SAM 收框")
+        self.sam_refine_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
 
     # ------------------------------------------------------------------
     # 类别管理
@@ -1560,6 +1823,83 @@ class LabelingStudioTab(QWidget):
         saved = save_classes_txt(Path(chosen), self._classes)
         self._last_classes_file = saved.resolve()
         self.save_state_label.setText(f"已导出 {saved.name}")
+
+    def _on_class_list_context_menu(self, pos: QPoint) -> None:
+        item = self.unique_label_list.itemAt(pos)
+        if item is None:
+            return
+        cls_name = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not cls_name:
+            return
+        menu = QMenu(self)
+        use_act = menu.addAction(f"设为当前绘制类别「{cls_name}」")
+        rename_act = menu.addAction("重命名类别...")
+        menu.addSeparator()
+        remove_act = menu.addAction("从清单移除")
+        chosen = menu.exec(self.unique_label_list.mapToGlobal(pos))
+        if chosen is use_act:
+            self._set_active_class(cls_name)
+        elif chosen is rename_act:
+            self._prompt_rename_class(cls_name)
+        elif chosen is remove_act:
+            self._remove_class_from_list(cls_name)
+
+    def _prompt_rename_class(self, old_name: str) -> None:
+        new_name, ok = QInputDialog.getText(
+            self, "重命名类别", f"将类别「{old_name}」重命名为：", text=old_name
+        )
+        if ok:
+            self._rename_class(old_name, new_name)
+
+    def _rename_class(self, old_name: str, new_name: str) -> bool:
+        """重命名右侧类别并同步更新当前图片同名框（支持 Ctrl+Z 撤回）。"""
+        clean = new_name.strip()
+        if not clean or clean == old_name or old_name not in self._classes:
+            return False
+        if clean in self._classes:
+            QMessageBox.warning(self, "重命名冲突", f"类别「{clean}」已存在。")
+            return False
+
+        idx = self._classes.index(old_name)
+        self._classes[idx] = clean
+        if self._active_label == old_name:
+            self._active_label = clean
+            self.canvas.set_active_label(clean)
+
+        if self._doc is not None and any(b.label == old_name for b in self._doc.boxes):
+            self._push_undo_snapshot()
+            for box in self._doc.boxes:
+                if box.label == old_name:
+                    box.label = clean
+            self._apply_boxes_change(selected_idx=self.canvas.selected_index())
+        else:
+            self._refresh_class_counts()
+        self.save_state_label.setText(f"已重命名类别为「{clean}」")
+        return True
+
+    def _remove_class_from_list(self, cls_name: str) -> bool:
+        """从右侧快捷类别清单移除指定类别（不删除画布已有目标框）。"""
+        if cls_name not in self._classes:
+            return False
+        in_cur_doc = self._doc is not None and any(b.label == cls_name for b in self._doc.boxes)
+        if in_cur_doc:
+            reply = QMessageBox.question(
+                self,
+                "移除类别确认",
+                f"当前图片中仍有目标使用类别「{cls_name}」。\n"
+                "是否仅将其从右侧快捷清单移除？（画面已有框会保留）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+
+        self._classes.remove(cls_name)
+        if self._active_label == cls_name:
+            self._active_label = self._classes[0] if self._classes else ""
+            self.canvas.set_active_label(self._active_label)
+        self._refresh_class_counts()
+        return True
 
     # ------------------------------------------------------------------
     # 撤销/重做栈与标注编辑操作
@@ -1965,9 +2305,8 @@ class LabelingStudioTab(QWidget):
 
     def _refresh_box_detail(self, idx: int) -> None:
         if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
-            self.box_detail_label.setText(
-                "未选中目标框：单击画布或列表项可定位查看；按 Tab 轮选框，方向键微调，1-9 速改类别。"
-            )
+            self.box_detail_label.setText("")
+            self.box_detail_panel.setVisible(False)
             return
         b = self._doc.boxes[idx]
         lines = [
@@ -1986,6 +2325,12 @@ class LabelingStudioTab(QWidget):
         if b.description:
             lines.append(f"审核说明：{b.description}")
         self.box_detail_label.setText("\n".join(lines))
+        self.box_detail_panel.setVisible(True)
+
+    def _focus_selected_box(self) -> None:
+        idx = self.canvas.selected_index()
+        if idx >= 0:
+            self.canvas.focus_box(idx)
 
     def _on_shape_row_changed(self, row: int) -> None:
         if self._syncing_lists:
@@ -2138,6 +2483,16 @@ class LabelingStudioTab(QWidget):
         self._refresh_box_detail(idx)
         self._refresh_action_states()
 
+    def _on_keep_view_toggled(self, checked: bool) -> None:
+        if not (self.isVisible() and self._doc is not None):
+            return
+        if checked:
+            self.canvas.show_hud_message("已开启「保持视野」：切图将保留缩放与观察位置", color="#0969da")
+        else:
+            self.canvas.show_hud_message(
+                "已关闭「保持视野」：切图将自动适应窗口", color="#57606a", duration_ms=1200
+            )
+
     def _on_canvas_mode_changed(self, mode: str) -> None:
         is_draw = mode == AnnotationCanvasView.MODE_DRAW
         is_pan = mode == AnnotationCanvasView.MODE_PAN
@@ -2150,16 +2505,30 @@ class LabelingStudioTab(QWidget):
             self.mode_badge_label.setStyleSheet(
                 "border: none; color: #cf222e; font-weight: 600; font-size: 12px;"
             )
+            if self.isVisible() and self._doc is not None:
+                self.canvas.show_hud_message(
+                    "画框模式：按住拖拽，或轻点起点+终点成框（Esc 退出）", color="#cf222e"
+                )
         elif is_pan:
             self.mode_badge_label.setText("模式: 抓手平移 (Esc返回)")
             self.mode_badge_label.setStyleSheet(
                 "border: none; color: #9a6700; font-weight: 600; font-size: 12px;"
             )
+            if self.isVisible() and self._doc is not None:
+                self.canvas.show_hud_message(
+                    "抓手模式：左键直接拖动画布，不误碰目标框", color="#d4a72c"
+                )
         else:
             self.mode_badge_label.setText("模式: 编辑")
             self.mode_badge_label.setStyleSheet(
                 "border: none; color: #0969da; font-weight: 600; font-size: 12px;"
             )
+            if self.isVisible() and self._doc is not None:
+                self.canvas.show_hud_message(
+                    "编辑模式：点选/调框，拖拽空白处平移，方向键微调",
+                    color="#0969da",
+                    duration_ms=1200,
+                )
 
     def _on_canvas_zoom_changed(self, scale: float) -> None:
         pct = int(round(scale * 100))

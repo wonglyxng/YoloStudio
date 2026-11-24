@@ -69,7 +69,8 @@ def test_mainwindow_mounts_native_workbench_and_scopes_shortcuts(
         assert win.tabs.count() == 6
         assert win.tabs.tabText(1) == "2. 标注工作台"
         assert win.tabs.tabText(2) == "3. LLM 智能标注"
-        assert win.labeling_tab.to_review_btn.text() == "发送到「3. LLM 智能标注」→"
+        assert win.labeling_tab.to_review_btn.text() == "→智能标注"
+        assert "3. LLM 智能标注" in win.labeling_tab.to_review_btn.toolTip()
         review_group_titles = [
             box.title() for box in win.review_tab.findChildren(QGroupBox)
         ]
@@ -1605,6 +1606,129 @@ def test_workbench_global_space_pan_nudge_tab_clipboard_keep_view_and_cache(
         assert tab.canvas._get_view_center_scene().x() == pytest.approx(620.0, abs=3.0)
         assert tab.canvas._get_view_center_scene().y() == pytest.approx(460.0, abs=3.0)
         assert load_calls == ["frame_001.jpg", "frame_002.jpg"]
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+def test_workbench_two_column_layout_file_list_jump_class_mgmt_and_hud(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证单行顶栏、两栏大画布与三段右栏布局、文件列表省略/进度条/跳页/下未标、按需详情卡、类别重命名移除及轻量 HUD。"""
+    frames_dir = tmp_path / "batch_frames"
+    imgs = [
+        frames_dir / ("vcd411ba60735d5c3ab3620b8e77c507be_f0000000000.png"),
+        frames_dir / ("vcd411ba60735d5c3ab3620b8e77c507be_f0000000060.png"),
+        frames_dir / ("vcd411ba60735d5c3ab3620b8e77c507be_f0000000120.png"),
+    ]
+    for p in imgs:
+        _write_sample_frame(p, size=(1280, 720))
+
+    # 第 1 张已标注（含框），第 2 张显式空图负样本，第 3 张未标注
+    imgs[0].with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.4.4",
+                "flags": {"verified": True},
+                "shapes": [
+                    {
+                        "label": "hero",
+                        "points": [[100.0, 120.0], [260.0, 320.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    }
+                ],
+                "imagePath": imgs[0].name,
+                "imageData": None,
+                "imageHeight": 720,
+                "imageWidth": 1280,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    imgs[1].with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.4.4",
+                "flags": {},
+                "shapes": [],
+                "imagePath": imgs[1].name,
+                "imageData": None,
+                "imageHeight": 720,
+                "imageWidth": 1280,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    win = _make_window(tmp_path)
+    win.show()
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        qt_app.processEvents()
+
+        # 1) 两栏主布局 + 右栏三段垂直分割 + 原底栏缩放控制条完整保留 + 未选框时详情卡隐藏
+        assert tab.main_splitter.count() == 2
+        assert tab.right_splitter.count() == 3
+        assert win.minimumSizeHint().width() <= 1380
+        assert tab.fit_btn.isVisible() is True
+        assert tab.zoom_100_btn.isVisible() is True
+        assert tab.zoom_menu_btn.isVisible() is True
+        assert tab.hint_info_label.isVisible() is True
+        assert tab.box_detail_panel.isHidden() is True
+
+        # 2) 打开目录后：文件列表启用中部省略、无横向滚动条、状态圆点与尾部框数、进度条更新
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+        assert tab.file_list.textElideMode() == Qt.TextElideMode.ElideMiddle
+        assert tab.file_list.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        assert tab.file_list.count() == 3
+        assert tab.file_list.item(0).text().endswith("[1]")
+        assert tab.file_list.item(1).text().endswith("[0]")
+        assert not tab.file_list.item(0).icon().isNull()
+        assert tab.progress_bar.maximum() == 3
+        assert tab.progress_bar.value() == 2  # 已标(1) + 空图(1)
+
+        # 3) 「下未标」自动跳过已标第1张和空图第2张，直达未标第3张
+        assert tab.current_image_path() == imgs[0].resolve()
+        assert tab.open_next_unlabeled_image() is True
+        qt_app.processEvents()
+        assert tab.current_image_path() == imgs[2].resolve()
+
+        # 4) 页码输入「1」回车跳回第 1 张，不触发数字键 1 改类且焦点自动交还画布
+        tab.jump_index_edit.setFocus()
+        QTest.keyClicks(tab.jump_index_edit, "1")
+        QTest.keyClick(tab.jump_index_edit, Qt.Key.Key_Return)
+        qt_app.processEvents()
+        assert tab.current_image_path() == imgs[0].resolve()
+        assert tab.jump_index_edit.text() == ""
+        assert qt_app.focusWidget() is tab.canvas
+
+        # 5) 选中框后详情卡按需展开；重命名类别同步更新当前图框且支持 Ctrl+Z 撤回；支持移除类别
+        tab.canvas.select_box(0, emit_signal=True)
+        qt_app.processEvents()
+        assert tab.box_detail_panel.isHidden() is False
+        assert tab._rename_class("hero", "player") is True
+        assert tab._doc is not None and tab._doc.boxes[0].label == "player"
+        assert "player" in tab._classes
+        tab._undo()
+        assert tab._doc.boxes[0].label == "hero"
+
+        tab._merge_classes(["unused_cls"], replace_order=False)
+        assert "unused_cls" in tab._classes
+        assert tab._remove_class_from_list("unused_cls") is True
+        assert "unused_cls" not in tab._classes
+
+        # 6) 模式切换触发画布轻量 HUD 悬浮提示，两点画框提示可正常渲染而不异常
+        QTest.keyClick(tab.canvas, Qt.Key.Key_R)
+        qt_app.processEvents()
+        assert "画框模式" in tab.canvas._hud_message
+        tab.canvas.show_hud_message("")
+        assert tab.canvas._hud_message == ""
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
