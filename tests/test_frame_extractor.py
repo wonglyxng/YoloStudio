@@ -27,8 +27,10 @@ from yolo_studio.core.frame_extractor import (
     ExtractionMode,
     VideoInfo,
     _resolve_frame_timestamp_ms,
+    allocate_total_frame_quotas,
     compile_naming_rule,
     compute_video_hash,
+    estimate_batch_video_frames,
     estimate_video_frames,
     extract_frames,
     format_duration_hms,
@@ -401,3 +403,119 @@ def test_format_duration_estimate_frames_preview_and_subfolder_rule(tmp_path: Pa
     assert preview_naming_rule("{video}_{seq:04d}", image_format="png", create_video_subfolder=True) == (
         "demo/demo_0001.png"
     )
+
+
+def test_random_total_count_stratified_sampling_and_quotas(tmp_path: Path) -> None:
+    """验证合计总帧数分层随机抽帧的时长配额分配、容量回流、桶内覆盖及默认自动随机性。"""
+    # 1) 配额分配：按有效时长权重分配 + 同长不同帧率公平分配 + 超短视频触顶回流
+    v_short = VideoInfo(path=tmp_path / "s.mp4", fps=10.0, frame_count=50, width=160, height=120, duration_sec=5.0)
+    v_long = VideoInfo(path=tmp_path / "l.mp4", fps=20.0, frame_count=300, width=160, height=120, duration_sec=15.0)
+    cfg_40 = ExtractionConfig(
+        output_dir=tmp_path / "q1", mode=ExtractionMode.RANDOM_TOTAL_COUNT, target_count=40
+    )
+    assert allocate_total_frame_quotas([v_short, v_long], cfg_40) == [10, 30]
+    assert estimate_batch_video_frames([v_short, v_long], cfg_40) == [10, 30]
+
+    # 同为 10 秒但帧率分别为 10fps 与 30fps，按时长权重应平分 20 帧
+    v_fps10 = VideoInfo(path=tmp_path / "f10.mp4", fps=10.0, frame_count=100, width=160, height=120, duration_sec=10.0)
+    v_fps30 = VideoInfo(path=tmp_path / "f30.mp4", fps=30.0, frame_count=300, width=160, height=120, duration_sec=10.0)
+    assert allocate_total_frame_quotas(
+        [v_fps10, v_fps30],
+        ExtractionConfig(output_dir=tmp_path / "q2", mode=ExtractionMode.RANDOM_TOTAL_COUNT, target_count=20),
+    ) == [10, 10]
+
+    # 同有效时长 1s，但容量分别为 5 帧与 100 帧；目标 30 帧时前者触顶 5 帧，余量回流给后者 -> [5, 25]
+    v_cap5 = VideoInfo(path=tmp_path / "c5.mp4", fps=5.0, frame_count=5, width=160, height=120, duration_sec=1.0)
+    v_cap100 = VideoInfo(path=tmp_path / "c100.mp4", fps=100.0, frame_count=100, width=160, height=120, duration_sec=1.0)
+    assert allocate_total_frame_quotas(
+        [v_cap5, v_cap100],
+        ExtractionConfig(output_dir=tmp_path / "q3", mode=ExtractionMode.RANDOM_TOTAL_COUNT, target_count=30),
+    ) == [5, 25]
+
+    # 目标小于视频个数，以及目标超出全部总容量时的边界钳制
+    v_2s = VideoInfo(path=tmp_path / "t2.mp4", fps=10.0, frame_count=20, width=160, height=120, duration_sec=2.0)
+    assert allocate_total_frame_quotas(
+        [v_2s, v_2s, v_2s],
+        ExtractionConfig(output_dir=tmp_path / "q4", mode=ExtractionMode.RANDOM_TOTAL_COUNT, target_count=2),
+    ) == [1, 1, 0]
+    assert allocate_total_frame_quotas(
+        [v_short, v_long],
+        ExtractionConfig(output_dir=tmp_path / "q5", mode=ExtractionMode.RANDOM_TOTAL_COUNT, target_count=9999),
+    ) == [50, 300]
+
+    # 2) 真实分层随机抽帧：结合起止裁剪，验证总帧数精确、各帧分别落在对应分层桶内
+    va = _create_synthetic_video(tmp_path / "va.mp4", num_frames=40, fps=10.0)
+    vb = _create_synthetic_video(tmp_path / "vb.mp4", num_frames=120, fps=20.0)
+    cfg_run = ExtractionConfig(
+        output_dir=tmp_path / "rand_out",
+        mode=ExtractionMode.RANDOM_TOTAL_COUNT,
+        target_count=10,
+        start_sec=1.0,
+        end_sec=3.0,
+        dedup_threshold=0.0,
+        naming_rule="{video}_{frame:06d}",
+        random_seed=1234,
+    )
+    est_list = estimate_batch_video_frames([probe_video(va), probe_video(vb)], cfg_run)
+    assert est_list == [5, 5]
+
+    res1 = extract_frames([va, vb], cfg_run)
+    assert not res1.errors
+    assert res1.videos_processed == 2
+    assert res1.frames_saved == 10
+
+    va_frames = sorted(int(p.stem.split("_")[-1]) for p in res1.saved_files if p.name.startswith("va_"))
+    vb_frames = sorted(int(p.stem.split("_")[-1]) for p in res1.saved_files if p.name.startswith("vb_"))
+    assert len(va_frames) == 5 and len(vb_frames) == 5
+    for idx, frame_no in enumerate(va_frames):
+        lo, hi = 10 + (idx * 20) // 5, 10 + ((idx + 1) * 20) // 5
+        assert lo <= frame_no < hi
+    for idx, frame_no in enumerate(vb_frames):
+        lo, hi = 20 + (idx * 40) // 5, 20 + ((idx + 1) * 40) // 5
+        assert lo <= frame_no < hi
+
+    # 相同 seed 可复现
+    cfg_run_dup = ExtractionConfig(
+        output_dir=tmp_path / "rand_out_dup",
+        mode=ExtractionMode.RANDOM_TOTAL_COUNT,
+        target_count=10,
+        start_sec=1.0,
+        end_sec=3.0,
+        dedup_threshold=0.0,
+        naming_rule="{video}_{frame:06d}",
+        random_seed=1234,
+    )
+    res_dup = extract_frames([va, vb], cfg_run_dup)
+    assert [p.name for p in res_dup.saved_files] == [p.name for p in res1.saved_files]
+
+    # 3) 目标总帧数 < 视频数时，配额为 0 的视频无错跳过但计入已处理视频数
+    res_one = extract_frames(
+        [va, vb],
+        ExtractionConfig(
+            output_dir=tmp_path / "rand_one",
+            mode=ExtractionMode.RANDOM_TOTAL_COUNT,
+            target_count=1,
+            dedup_threshold=0.0,
+            random_seed=7,
+        ),
+    )
+    assert not res_one.errors
+    assert res_one.videos_processed == 2
+    assert res_one.frames_saved == 1
+
+    # 4) 默认 random_seed=None 每次自动随机，多次抽样在大采样空间上产生差异化结果
+    observed_sets: set[tuple[str, ...]] = set()
+    for run_i in range(5):
+        res_auto = extract_frames(
+            [vb],
+            ExtractionConfig(
+                output_dir=tmp_path / f"rand_auto_{run_i}",
+                mode=ExtractionMode.RANDOM_TOTAL_COUNT,
+                target_count=6,
+                dedup_threshold=0.0,
+                naming_rule="{video}_{frame:06d}",
+            ),
+        )
+        assert res_auto.frames_saved == 6
+        observed_sets.add(tuple(p.name for p in res_auto.saved_files))
+    assert len(observed_sets) >= 2

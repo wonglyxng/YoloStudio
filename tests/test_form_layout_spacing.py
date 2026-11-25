@@ -208,6 +208,16 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
         assert 2 <= _find_inline_pair_gap(win.extract_tab, "格式:", win.extract_tab.format_combo) <= 12
         assert 2 <= _find_inline_pair_gap(win.extract_tab, "JPG质量:", win.extract_tab.quality_spin) <= 12
 
+        # 切换到「分层随机·合计」策略后策略行依然对齐且行内标签间距紧凑
+        win.extract_tab.mode_combo.setCurrentIndex(3)
+        qt_app.processEvents()
+        assert 2 <= _find_inline_pair_gap(win.extract_tab, "目标:", win.extract_tab.strategy_param_stack) <= 12
+        extract_form = win.extract_tab.findChild(QFormLayout)
+        assert extract_form is not None
+        assert extract_form.itemAt(1, QFormLayout.ItemRole.FieldRole).geometry().x() == (
+            extract_form.itemAt(0, QFormLayout.ItemRole.FieldRole).geometry().x()
+        )
+
         win.tabs.setCurrentIndex(2)
         qt_app.processEvents()
         assert 2 <= _find_inline_pair_gap(win.review_tab, "低阈值Conf:", win.review_tab.yolo_conf_spin) <= 12

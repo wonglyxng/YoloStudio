@@ -145,7 +145,21 @@ def test_extract_tab_png_disables_quality_time_range_and_list_buttons(
         qt_app.processEvents()
         assert tab.strategy_param_stack.currentIndex() == 2
         assert tab.strategy_param_label.text() == "目标:"
+        assert tab.target_count_spin.suffix() == " 张/视频"
         assert tab.target_count_spin.isEnabled() is True
+
+        tab.mode_combo.setCurrentIndex(tab.mode_combo.findData(ExtractionMode.RANDOM_TOTAL_COUNT))
+        qt_app.processEvents()
+        assert tab.strategy_param_stack.currentIndex() == 2
+        assert tab.strategy_param_label.text() == "目标:"
+        assert tab.target_count_spin.suffix() == " 张(合计)"
+        assert tab.target_count_spin.isEnabled() is True
+        assert tab.interval_spin.isEnabled() is False
+
+        tab.mode_combo.setCurrentIndex(tab.mode_combo.findData(ExtractionMode.TARGET_COUNT))
+        qt_app.processEvents()
+        assert tab.target_count_spin.suffix() == " 张/视频"
+
         tab.mode_combo.setCurrentIndex(tab.mode_combo.findData(ExtractionMode.INTERVAL_SECONDS))
         qt_app.processEvents()
 
@@ -280,13 +294,27 @@ def test_extract_tab_multiselect_preview_overall_progress_and_completion_flow(
         assert len(tab._video_paths) == 1
 
         # 多视频进度条按全局帧数权重单调推进，第 2 个视频不会归零
-        tab._add_video_paths([v1])
+        v_long = _write_mp4(tmp_path / "clip_long.mp4", frames=30)
+        tab._add_video_paths([v_long])
         deadline = time.monotonic() + 5.0
         while tab.probe_worker and tab.probe_worker.isRunning() and time.monotonic() < deadline:
             qt_app.processEvents()
             time.sleep(0.02)
         qt_app.processEvents()
         assert tab.video_list.count() == 2
+
+        # 切换到「按目标总帧数随机抽帧 (分层随机·合计)」后，列表两行分摊预估之和与右侧卡片一致
+        tab.mode_combo.setCurrentIndex(tab.mode_combo.findData(ExtractionMode.RANDOM_TOTAL_COUNT))
+        tab.target_count_spin.setValue(9)
+        qt_app.processEvents()
+        row_ests = [
+            tab.video_list.item(i).data(tab_extract_mod._ROLE_EST_FRAMES)
+            for i in range(tab.video_list.count())
+        ]
+        assert sum(row_ests) == 9
+        assert row_ests == [3, 6]
+        assert tab._card_frames.value_label.text() == "≈ 9 张"
+        assert "分层随机" in tab._card_frames.detail_label.text()
 
         tab._on_start()
         tab._on_progress(
@@ -301,21 +329,21 @@ def test_extract_tab_multiselect_preview_overall_progress_and_completion_flow(
             )
         )
         pct_after_v1 = tab.progress_bar.value()
-        assert pct_after_v1 == 50
+        assert pct_after_v1 == 33
 
         tab._on_progress(
             ExtractionProgress(
                 video_index=2,
                 total_videos=2,
-                video_name="clip1.mp4",
-                current_frame=3,
-                total_frames=15,
+                video_name="clip_long.mp4",
+                current_frame=9,
+                total_frames=30,
                 saved_total=4,
                 skipped_similar=1,
             )
         )
         assert tab.progress_bar.value() >= pct_after_v1
-        assert tab.progress_bar.value() == 60
+        assert tab.progress_bar.value() == 53
 
         # 默认完成后仅静默同步并高亮发送按钮，不强行切页，且多行完成状态完整展示不裁切
         out_dir = tmp_path / "out_frames"

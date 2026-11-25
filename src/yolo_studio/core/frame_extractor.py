@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import math
+import random
 import string
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from threading import Event
-from typing import Callable
 
 import cv2
 import numpy as np
@@ -51,6 +52,7 @@ class ExtractionMode(str, Enum):
     INTERVAL_SECONDS = "interval_seconds"
     EVERY_N_FRAMES = "every_n_frames"
     TARGET_COUNT = "target_count"
+    RANDOM_TOTAL_COUNT = "random_total_count"
 
 
 @dataclass
@@ -76,7 +78,9 @@ class ExtractionConfig:
 
     关键字段说明：
         `interval_seconds`：按秒抽帧间隔（秒，运行时最小夹紧为 `0.01`）。
-        `every_n_frames` / `target_count`：帧步长或每视频目标抽取帧数（均至少为 `1`）。
+        `every_n_frames` / `target_count`：帧步长或目标抽取帧数（均至少为 `1`；在
+            `TARGET_COUNT` 下表示每视频目标帧数，在 `RANDOM_TOTAL_COUNT` 下表示所有有效视频合计总帧数）。
+        `random_seed`：`RANDOM_TOTAL_COUNT` 分层随机抽帧的可选随机种子；`None` 表示每次自动随机。
         `start_sec` / `end_sec`：截取起止时间（秒）；`end_sec` 为 `None` 或 `<= 0` 表示抽到结尾。
         `dedup_threshold`：相似帧灰度缩略图平均绝对像素差阈值（`[0, 255]`），`<= 0` 关闭去重
             （编程接口默认 `0.0` 以保证确定性采样；GUI 与 CLI 入口默认设为 `2.0` 以过滤录制静止帧）。
@@ -104,6 +108,7 @@ class ExtractionConfig:
     prefix: str = ""
     naming_rule: str = ""
     create_video_subfolder: bool = False
+    random_seed: int | None = None
 
 
 @dataclass
@@ -310,29 +315,128 @@ def _compute_step_frames(info: VideoInfo, config: ExtractionConfig, start_frame:
     return 1.0
 
 
-def estimate_video_frames(info: VideoInfo, config: ExtractionConfig) -> int:
-    """按当前抽帧策略与截取时间段预估单个视频的预计抽取帧数（未计相似帧去重）。
-
-    复用与 `extract_frames` 相同的起止帧裁剪及步进推进规则，视频总帧数无效或时间范围为空时返回 `0`。
-    """
+def _resolve_video_frame_window(info: VideoInfo, config: ExtractionConfig) -> tuple[int, int]:
+    """计算单个视频在 `start_sec` / `end_sec` 裁剪下的有限帧索引半开区间 `[start_frame, end_frame)`。"""
     total_frames = info.frame_count if info.frame_count > 0 else 0
     if total_frames <= 0:
-        return 0
-
-    fps = info.fps if info.fps > 0 else 30.0
+        return 0, 0
+    fps = info.fps if info.fps > 0 and math.isfinite(info.fps) else 30.0
     start_frame = max(0, int(round(max(0.0, config.start_sec) * fps)))
     if config.end_sec is not None and config.end_sec > 0:
         end_frame = min(total_frames, int(round(config.end_sec * fps)))
     else:
         end_frame = total_frames
-    if end_frame <= start_frame:
+    return start_frame, max(start_frame, end_frame)
+
+
+def allocate_total_frame_quotas(
+    infos: Sequence[VideoInfo], config: ExtractionConfig
+) -> list[int]:
+    """在 `RANDOM_TOTAL_COUNT` 模式下按有效时长权重将合计目标总帧数分配给各视频。
+
+    分配规则（带容量上限的水填充 + 最大余额法）：
+        1. 有效容量 `cap_i = max(0, end_i - start_i)`，有效权重 `weight_i = cap_i / fps_i`；
+        2. 总分配帧数严格等于 `min(max(1, target_count), sum(caps))`，单个视频分配值不超过其 `cap_i`；
+        3. 极短视频触顶后的多余配额会迭代回流给其余仍有容量的视频，余数按最大余额、权重降序、原序号升序确定性分配。
+    """
+    if not infos:
+        return []
+
+    caps: list[int] = []
+    weights: list[float] = []
+    for info in infos:
+        start_frame, end_frame = _resolve_video_frame_window(info, config)
+        cap = max(0, end_frame - start_frame)
+        fps = info.fps if info.fps > 0 and math.isfinite(info.fps) else 30.0
+        caps.append(cap)
+        weights.append(cap / fps if cap > 0 else 0.0)
+
+    total_capacity = sum(caps)
+    if total_capacity <= 0:
+        return [0] * len(infos)
+
+    target_total = min(max(1, int(config.target_count)), total_capacity)
+    if target_total == total_capacity:
+        return list(caps)
+
+    quotas = [0] * len(infos)
+    remaining = target_total
+    active = [i for i, cap in enumerate(caps) if cap > 0 and weights[i] > 0.0]
+
+    while remaining > 0 and active:
+        total_w = sum(weights[i] for i in active)
+        if total_w <= 0.0:
+            break
+        saturated = False
+        next_active: list[int] = []
+        exact_shares: dict[int, float] = {}
+        for i in active:
+            exact = remaining * (weights[i] / total_w)
+            avail = caps[i] - quotas[i]
+            if exact >= avail:
+                take = min(avail, remaining)
+                quotas[i] += take
+                remaining -= take
+                saturated = True
+            else:
+                exact_shares[i] = exact
+                next_active.append(i)
+        if not saturated:
+            remainders: list[tuple[float, float, int]] = []
+            for i in active:
+                fl = min(caps[i] - quotas[i], int(math.floor(exact_shares[i])))
+                quotas[i] += fl
+                remaining -= fl
+                rem = exact_shares[i] - fl
+                remainders.append((-rem, -weights[i], i))
+            remainders.sort()
+            for _, _, i in remainders:
+                if remaining <= 0:
+                    break
+                if quotas[i] < caps[i]:
+                    quotas[i] += 1
+                    remaining -= 1
+            break
+        active = next_active
+
+    return quotas
+
+
+def _sample_stratified_frame_indices(
+    start_frame: int, end_frame: int, count: int, rng: random.Random
+) -> list[int]:
+    """在 `[start_frame, end_frame)` 内分为 `count` 个等宽时间桶，每桶随机选 1 帧返回升序列表。"""
+    span = end_frame - start_frame
+    if span <= 0 or count <= 0:
+        return []
+    if count >= span:
+        return list(range(start_frame, end_frame))
+
+    indices: list[int] = []
+    for bucket in range(count):
+        lo = start_frame + (bucket * span) // count
+        hi = start_frame + ((bucket + 1) * span) // count
+        indices.append(rng.randrange(lo, hi))
+    return indices
+
+
+def estimate_video_frames(info: VideoInfo, config: ExtractionConfig) -> int:
+    """按当前抽帧策略与截取时间段预估单个视频的预计抽取帧数（未计相似帧去重）。
+
+    复用与 `extract_frames` 相同的起止帧裁剪及步进推进规则，视频总帧数无效或时间范围为空时返回 `0`。
+    """
+    start_frame, end_frame = _resolve_video_frame_window(info, config)
+    span = end_frame - start_frame
+    if span <= 0:
         return 0
+
+    if config.mode == ExtractionMode.RANDOM_TOTAL_COUNT:
+        return min(max(1, int(config.target_count)), span)
 
     step = _compute_step_frames(info, config, start_frame, end_frame)
     if step <= 1.0 + 1e-9:
-        return end_frame - start_frame
+        return span
 
-    span = end_frame - start_frame
     # 采样点数量在可控范围内时直接模拟步进循环，确保与 extract_frames 的浮点累积和整数取整完全一致
     if span / step <= 100_000:
         count = 0
@@ -349,6 +453,17 @@ def estimate_video_frames(info: VideoInfo, config: ExtractionConfig) -> int:
         return count
 
     return max(1, int(math.ceil(span / step)))
+
+
+def estimate_batch_video_frames(
+    infos: Sequence[VideoInfo], config: ExtractionConfig
+) -> list[int]:
+    """批量预估多视频列表中每个视频的预计抽取帧数（未计相似帧去重）。"""
+    if not infos:
+        return []
+    if config.mode == ExtractionMode.RANDOM_TOTAL_COUNT:
+        return allocate_total_frame_quotas(infos, config)
+    return [estimate_video_frames(info, config) for info in infos]
 
 
 # 距下一个采样点超过该帧数时才使用 `CAP_PROP_POS_FRAMES` 跳转；更近时用 `grab()` 顺序跳帧。
@@ -660,17 +775,36 @@ def extract_frames(
     def _cancelled() -> bool:
         return bool(cancel_event and cancel_event.is_set())
 
-    for vid_idx, video_path in enumerate(videos, start=1):
-        if _cancelled():
-            result.cancelled = True
-            break
+    def _make_progress_emitter(
+        vid_idx: int, video_name: str, total_frames: int
+    ) -> Callable[[int, Path | None], None]:
+        def _emit(frame_idx: int, last_saved: Path | None) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(
+                ExtractionProgress(
+                    video_index=vid_idx,
+                    total_videos=total_videos,
+                    video_name=video_name,
+                    current_frame=frame_idx + 1,
+                    total_frames=total_frames if total_frames > 0 else frame_idx + 1,
+                    saved_total=result.frames_saved,
+                    skipped_similar=result.frames_skipped_similar,
+                    last_saved_path=last_saved,
+                )
+            )
 
-        try:
-            info = probe_video(video_path)
-        except Exception as exc:
-            result.errors.append(str(exc))
-            continue
+        return _emit
 
+    def _extract_single_video(
+        vid_idx: int,
+        video_path: Path,
+        info: VideoInfo,
+        start_frame: int,
+        end_frame: int,
+        planned_targets: list[int] | None,
+    ) -> bool:
+        """抽取单个视频并返回是否因取消请求中断；单视频级错误记入 `result.errors`。"""
         video_hash_full = ""
         if compiled_rule.needs_video_hash:
             try:
@@ -679,59 +813,37 @@ def extract_frames(
                 )
             except OSError as exc:
                 result.errors.append(f"计算视频哈希失败 ({video_path.name}): {exc}")
-                continue
+                return False
             if computed_hash is None:
-                result.cancelled = True
-                break
+                return True
             video_hash_full = computed_hash
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             result.errors.append(f"无法打开视频: {video_path}")
-            continue
+            return False
 
         try:
             total_frames = info.frame_count if info.frame_count > 0 else 0
-            start_frame = max(0, int(round(max(0.0, config.start_sec) * info.fps)))
-            if config.end_sec is not None and config.end_sec > 0:
-                end_frame = int(round(config.end_sec * info.fps))
-                if total_frames > 0:
-                    end_frame = min(total_frames, end_frame)
-            else:
-                end_frame = total_frames if total_frames > 0 else 10**9
-
-            if end_frame <= start_frame and total_frames > 0:
-                result.errors.append(f"视频时间范围无效: {video_path.name}")
-                continue
-
-            step = _compute_step_frames(info, config, start_frame, end_frame)
+            step = (
+                1.0
+                if planned_targets is not None
+                else _compute_step_frames(info, config, start_frame, end_frame)
+            )
             name_key = name_keys[video_path]
             target_dir = (
                 config.output_dir / name_key if config.create_video_subfolder else config.output_dir
             )
+            emit_progress = _make_progress_emitter(vid_idx, video_path.name, total_frames)
 
-            def _emit_progress(frame_idx: int, last_saved: Path | None) -> None:
-                if progress_callback is None:
-                    return
-                progress_callback(
-                    ExtractionProgress(
-                        video_index=vid_idx,
-                        total_videos=total_videos,
-                        video_name=video_path.name,
-                        current_frame=frame_idx + 1,
-                        total_frames=total_frames if total_frames > 0 else frame_idx + 1,
-                        saved_total=result.frames_saved,
-                        skipped_similar=result.frames_skipped_similar,
-                        last_saved_path=last_saved,
-                    )
-                )
-
-            if start_frame > 0:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            initial_seek = planned_targets[0] if planned_targets else start_frame
+            if initial_seek > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, initial_seek)
 
             # frame_idx 始终表示下一次 grab/read 将得到的帧序号
-            frame_idx = start_frame
+            frame_idx = initial_seek
             next_sample_at = float(start_frame)
+            target_cursor = 0
             saved_for_video = 0
             prev_small: np.ndarray | None = None
             interrupted = False
@@ -741,7 +853,16 @@ def extract_frames(
                     interrupted = True
                     break
 
-                target = max(frame_idx, int(math.ceil(next_sample_at - 1e-6)))
+                if planned_targets is not None:
+                    if target_cursor >= len(planned_targets):
+                        break
+                    target = planned_targets[target_cursor]
+                    target_cursor += 1
+                    if target < frame_idx:
+                        continue
+                else:
+                    target = max(frame_idx, int(math.ceil(next_sample_at - 1e-6)))
+
                 if target >= end_frame:
                     break
 
@@ -759,7 +880,7 @@ def extract_frames(
                             break
                         frame_idx += 1
                         if frame_idx % 30 == 0:
-                            _emit_progress(frame_idx, None)
+                            emit_progress(frame_idx, None)
                     if interrupted or stream_ended:
                         break
 
@@ -768,8 +889,9 @@ def extract_frames(
                     break
                 timestamp_ms = _resolve_frame_timestamp_ms(cap, frame_idx, info.fps)
 
-                while next_sample_at <= frame_idx + 1e-6:
-                    next_sample_at += step
+                if planned_targets is None:
+                    while next_sample_at <= frame_idx + 1e-6:
+                        next_sample_at += step
 
                 is_duplicate = False
                 if config.dedup_threshold > 0:
@@ -798,17 +920,88 @@ def extract_frames(
                     )
                     result.frames_saved += 1
                     result.saved_files.append(out_path)
-                    _emit_progress(frame_idx, out_path)
+                    emit_progress(frame_idx, out_path)
                 else:
-                    _emit_progress(frame_idx, None)
+                    emit_progress(frame_idx, None)
 
                 frame_idx += 1
 
             if interrupted:
-                result.cancelled = True
-                break
+                return True
             result.videos_processed += 1
+            return False
         finally:
             cap.release()
+
+    if config.mode == ExtractionMode.RANDOM_TOTAL_COUNT:
+        # 合计随机模式需先汇总全部有效视频容量并按有效时长比例分配目标配额
+        valid_entries: list[tuple[int, Path, VideoInfo, int, int]] = []
+        for vid_idx, video_path in enumerate(videos, start=1):
+            if _cancelled():
+                result.cancelled = True
+                return result
+            try:
+                info = probe_video(video_path)
+            except Exception as exc:
+                result.errors.append(str(exc))
+                continue
+
+            if info.frame_count <= 0:
+                result.errors.append(f"无法确定视频总帧数以进行随机抽帧: {video_path.name}")
+                continue
+            start_frame, end_frame = _resolve_video_frame_window(info, config)
+            if end_frame <= start_frame:
+                result.errors.append(f"视频时间范围无效: {video_path.name}")
+                continue
+            valid_entries.append((vid_idx, video_path, info, start_frame, end_frame))
+
+        quotas = allocate_total_frame_quotas([entry[2] for entry in valid_entries], config)
+        rng = random.Random(config.random_seed)
+        for (vid_idx, video_path, info, start_frame, end_frame), quota in zip(
+            valid_entries, quotas, strict=True
+        ):
+            if _cancelled():
+                result.cancelled = True
+                break
+            if quota <= 0:
+                result.videos_processed += 1
+                total_frames = info.frame_count if info.frame_count > 0 else 0
+                if total_frames > 0:
+                    _make_progress_emitter(vid_idx, video_path.name, total_frames)(
+                        total_frames - 1, None
+                    )
+                continue
+            targets = _sample_stratified_frame_indices(start_frame, end_frame, quota, rng)
+            if _extract_single_video(vid_idx, video_path, info, start_frame, end_frame, targets):
+                result.cancelled = True
+                break
+        return result
+
+    for vid_idx, video_path in enumerate(videos, start=1):
+        if _cancelled():
+            result.cancelled = True
+            break
+        try:
+            info = probe_video(video_path)
+        except Exception as exc:
+            result.errors.append(str(exc))
+            continue
+
+        total_frames = info.frame_count if info.frame_count > 0 else 0
+        start_frame = max(0, int(round(max(0.0, config.start_sec) * info.fps)))
+        if config.end_sec is not None and config.end_sec > 0:
+            end_frame = int(round(config.end_sec * info.fps))
+            if total_frames > 0:
+                end_frame = min(total_frames, end_frame)
+        else:
+            end_frame = total_frames if total_frames > 0 else 10**9
+
+        if end_frame <= start_frame and total_frames > 0:
+            result.errors.append(f"视频时间范围无效: {video_path.name}")
+            continue
+
+        if _extract_single_video(vid_idx, video_path, info, start_frame, end_frame, None):
+            result.cancelled = True
+            break
 
     return result

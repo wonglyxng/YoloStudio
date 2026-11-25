@@ -74,7 +74,7 @@ from yolo_studio.core.frame_extractor import (
     ExtractionResult,
     VideoInfo,
     compile_naming_rule,
-    estimate_video_frames,
+    estimate_batch_video_frames,
     format_duration_hms,
     preview_naming_rule,
 )
@@ -661,11 +661,14 @@ class ExtractTab(QWidget):
         self.mode_combo.addItem("按时间间隔抽帧 (每隔 N 秒)", ExtractionMode.INTERVAL_SECONDS)
         self.mode_combo.addItem("按固定帧步长抽帧 (每隔 N 帧)", ExtractionMode.EVERY_N_FRAMES)
         self.mode_combo.addItem("按目标总帧数均匀抽帧", ExtractionMode.TARGET_COUNT)
-        self.mode_combo.setMinimumWidth(210)
+        self.mode_combo.addItem(
+            "按目标总帧数随机抽帧 (分层随机·合计)", ExtractionMode.RANDOM_TOTAL_COUNT
+        )
+        self.mode_combo.setMinimumWidth(258)
 
         self.strategy_param_label = QLabel("间隔:")
         self.strategy_param_stack = QStackedWidget()
-        self.strategy_param_stack.setFixedWidth(136)
+        self.strategy_param_stack.setFixedWidth(148)
         self.strategy_param_stack.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         self.interval_spin = QDoubleSpinBox()
@@ -1011,7 +1014,7 @@ class ExtractTab(QWidget):
     # ------------------------------------------------------------------ 参数与联动响应
 
     def _on_mode_changed(self) -> None:
-        """切换抽帧策略时原地切换数值控件页并更新各独立 SpinBox 启用态。"""
+        """切换抽帧策略时原地切换数值控件页、参数单位后缀与独立 SpinBox 启用态。"""
         mode = self.mode_combo.currentData()
         if mode == ExtractionMode.INTERVAL_SECONDS:
             self.strategy_param_stack.setCurrentIndex(0)
@@ -1019,13 +1022,24 @@ class ExtractTab(QWidget):
         elif mode == ExtractionMode.EVERY_N_FRAMES:
             self.strategy_param_stack.setCurrentIndex(1)
             self.strategy_param_label.setText("步长:")
+        elif mode == ExtractionMode.RANDOM_TOTAL_COUNT:
+            self.strategy_param_stack.setCurrentIndex(2)
+            self.strategy_param_label.setText("目标:")
+            self.target_count_spin.setSuffix(" 张(合计)")
+            self.target_count_spin.setToolTip(
+                "所有视频按有效时长占比分配配额，单视频内分层随机抽取，每次自动随机"
+            )
         else:
             self.strategy_param_stack.setCurrentIndex(2)
             self.strategy_param_label.setText("目标:")
+            self.target_count_spin.setSuffix(" 张/视频")
+            self.target_count_spin.setToolTip("每个视频均匀抽取的目标帧数")
 
         self.interval_spin.setEnabled(mode == ExtractionMode.INTERVAL_SECONDS)
         self.frame_step_spin.setEnabled(mode == ExtractionMode.EVERY_N_FRAMES)
-        self.target_count_spin.setEnabled(mode == ExtractionMode.TARGET_COUNT)
+        self.target_count_spin.setEnabled(
+            mode in (ExtractionMode.TARGET_COUNT, ExtractionMode.RANDOM_TOTAL_COUNT)
+        )
         self._on_sampling_param_changed()
 
     def _on_format_changed(self) -> None:
@@ -1111,9 +1125,8 @@ class ExtractTab(QWidget):
     def _refresh_estimates(self) -> None:
         """同步刷新列表分组标题统计、各行预估抽取帧数与右侧抽帧前预估卡片。"""
         cfg = self._build_estimation_config()
-        total_est = 0
+        valid_rows: list[tuple[QListWidgetItem, VideoInfo]] = []
         total_duration = 0.0
-        known_info_count = 0
 
         for row in range(self.video_list.count()):
             item = self.video_list.item(row)
@@ -1121,13 +1134,17 @@ class ExtractTab(QWidget):
                 continue
             info = item.data(_ROLE_VIDEO_INFO)
             if isinstance(info, VideoInfo):
-                est = estimate_video_frames(info, cfg)
-                item.setData(_ROLE_EST_FRAMES, est)
-                total_est += est
+                valid_rows.append((item, info))
                 total_duration += max(0.0, info.duration_sec)
-                known_info_count += 1
             else:
                 item.setData(_ROLE_EST_FRAMES, None)
+
+        batch_ests = estimate_batch_video_frames([info for _, info in valid_rows], cfg)
+        total_est = 0
+        for (item, _), est in zip(valid_rows, batch_ests, strict=True):
+            item.setData(_ROLE_EST_FRAMES, est)
+            total_est += est
+        known_info_count = len(valid_rows)
 
         self.video_list.viewport().update()
 
@@ -1159,15 +1176,15 @@ class ExtractTab(QWidget):
         count = len(self._video_paths)
         if known_info_count is None or total_duration is None or total_est is None:
             cfg = self._build_estimation_config()
-            known_info_count = 0
+            valid_infos: list[VideoInfo] = []
             total_duration = 0.0
-            total_est = 0
             for vp in self._video_paths:
                 info = self._video_info_map.get(vp.resolve())
                 if info is not None:
-                    known_info_count += 1
+                    valid_infos.append(info)
                     total_duration += max(0.0, info.duration_sec)
-                    total_est += estimate_video_frames(info, cfg)
+            known_info_count = len(valid_infos)
+            total_est = sum(estimate_batch_video_frames(valid_infos, cfg))
 
         if count <= 0:
             self._card_videos.set_content("待处理视频", "0 个", "请先添加录制视频")
@@ -1188,10 +1205,16 @@ class ExtractTab(QWidget):
                         "预估抽取", "时间段无效", "结束时间需大于开始时间", color="#cf222e"
                     )
                 else:
+                    mode = self.mode_combo.currentData()
+                    est_detail = (
+                        "分层随机·合计（未计去重）"
+                        if mode == ExtractionMode.RANDOM_TOTAL_COUNT
+                        else "未计入相似帧去重"
+                    )
                     self._card_frames.set_content(
                         "预估抽取",
                         f"≈ {total_est:,} 张",
-                        "未计入相似帧去重",
+                        est_detail,
                         color="#1f7a1f" if total_est > 0 else "#b25900",
                     )
             else:

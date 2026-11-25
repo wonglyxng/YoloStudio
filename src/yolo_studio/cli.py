@@ -355,12 +355,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ext.add_argument("-o", "--output", default="data/raw_frames", help="输出目录")
     p_ext.add_argument(
         "--mode",
-        choices=["interval_seconds", "every_n_frames", "target_count"],
+        choices=["interval_seconds", "every_n_frames", "target_count", "random_total_count"],
         default="interval_seconds",
     )
     p_ext.add_argument("--interval", type=float, default=1.0, help="按秒抽帧间隔")
     p_ext.add_argument("--step", type=int, default=30, help="按帧步长")
-    p_ext.add_argument("--count", type=int, default=100, help="每个视频目标帧数")
+    p_ext.add_argument(
+        "--count",
+        type=int,
+        default=100,
+        help="目标帧数（target_count 为每视频帧数，random_total_count 为所有视频合计总帧数）",
+    )
     p_ext.add_argument("--start", type=float, default=0.0, help="截取起始时间（秒）")
     p_ext.add_argument("--end", type=float, default=0.0, help="截取结束时间（秒，0=到视频结尾）")
     # 交互式 CLI 与桌面 GUI 默认开启 2.0 静止帧去重，底层 ExtractionConfig API 默认 0.0
