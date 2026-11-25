@@ -37,7 +37,7 @@ from typing import Callable, Literal, Protocol
 import cv2
 import numpy as np
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from yolo_studio.core.dataset_converter import (
     find_images,
@@ -322,6 +322,45 @@ GEMINI_MODELS: list[tuple[str, str]] = [
 ]
 
 
+# 常见模型输出同义词映射：OpenAI 兼容接口仅开 json_object 时可能产生非枚举评价词，前置归并为合法枚举
+_LOOSE_QUALITY_ALIASES = frozenset(
+    {"oversized", "too_large", "too_big", "too_loose", "wide", "loose_fit"}
+)
+_PARTIAL_QUALITY_ALIASES = frozenset(
+    {"clipped", "cropped", "truncated", "cut_off", "cutoff", "incomplete", "too_small", "too_tight", "undersized"}
+)
+_ACTION_ALIASES = {
+    "retain": "keep",
+    "remove": "delete",
+    "drop": "delete",
+    "discard": "delete",
+    "rename": "relabel",
+    "change_label": "relabel",
+}
+
+
+def _coerce_box_2d_ints(value: object) -> object:
+    """将归一化坐标列表中的浮点数或数字字符串四舍五入转为整数，非预期结构保留原值交由 Pydantic 拦截。"""
+    if not isinstance(value, (list, tuple)):
+        return value
+    coerced: list[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            return value
+        if isinstance(item, int):
+            coerced.append(item)
+        elif isinstance(item, float):
+            coerced.append(int(round(item)))
+        elif isinstance(item, str):
+            try:
+                coerced.append(int(round(float(item.strip()))))
+            except ValueError:
+                return value
+        else:
+            return value
+    return coerced
+
+
 class BoxDecision(BaseModel):
     """针对单个已有候选框的质检与边框紧贴评估决策。"""
 
@@ -346,6 +385,58 @@ class BoxDecision(BaseModel):
     )
     reason: str = Field(default="", description="Brief explanation in Chinese or English.")
 
+    @field_validator("box_id", mode="before")
+    @classmethod
+    def _normalize_box_id(cls, value: object) -> object:
+        """清理模型在 `box_id` 字符串中附带的方括号或 `#` 前缀（如 `"[0]"`、`"#0"`）。"""
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned.startswith("[") and cleaned.endswith("]"):
+                cleaned = cleaned[1:-1].strip()
+            cleaned = cleaned.lstrip("#").strip()
+            return cleaned
+        return value
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _normalize_action(cls, value: object) -> object:
+        """规范化大小写与常见动作同义词，明显非法取值仍交由 `Literal` 校验拦截。"""
+        if isinstance(value, str):
+            normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+            return _ACTION_ALIASES.get(normalized, normalized)
+        return value
+
+    @field_validator("box_quality", mode="before")
+    @classmethod
+    def _normalize_box_quality(cls, value: object) -> str:
+        """将自由文本评价词或 `null` 前置映射为 `tight`/`loose`/`partial`，避免整图质检因次要评价词报错中断。"""
+        if not isinstance(value, str):
+            return "tight"
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"tight", "loose", "partial"}:
+            return normalized
+        if normalized in _LOOSE_QUALITY_ALIASES:
+            return "loose"
+        if normalized in _PARTIAL_QUALITY_ALIASES:
+            return "partial"
+        return "tight"
+
+    @field_validator("refined_box_2d", mode="before")
+    @classmethod
+    def _normalize_refined_box_2d(cls, value: object) -> object:
+        """把空列表视为 `None`，并将局部精修坐标中的浮点数四舍五入转为整数。"""
+        if value is None or value == []:
+            return None
+        return _coerce_box_2d_ints(value)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _normalize_reason(cls, value: object) -> str:
+        """将缺失或 `null` 原因安全转换为空字符串。"""
+        if value is None:
+            return ""
+        return value if isinstance(value, str) else str(value)
+
 
 class MissingBox(BaseModel):
     """LLM 检出的漏标目标框（`box_2d` 为 `[ymin, xmin, ymax, xmax]`，归一化至 `0..1000`）。"""
@@ -355,6 +446,20 @@ class MissingBox(BaseModel):
         description="2D bounding box [ymin, xmin, ymax, xmax] normalized to 0-1000."
     )
     reason: str = Field(default="", description="Why this object was missed.")
+
+    @field_validator("box_2d", mode="before")
+    @classmethod
+    def _normalize_box_2d(cls, value: object) -> object:
+        """将漏标框坐标中的浮点数或数字字符串四舍五入转为整数。"""
+        return _coerce_box_2d_ints(value)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _normalize_reason(cls, value: object) -> str:
+        """将缺失或 `null` 原因安全转换为空字符串。"""
+        if value is None:
+            return ""
+        return value if isinstance(value, str) else str(value)
 
 
 class MllmReviewResponse(BaseModel):
@@ -370,6 +475,26 @@ class MllmReviewResponse(BaseModel):
         description="Description of any missed objects or locations when has_missing is True.",
     )
     added_boxes: list[MissingBox] = Field(default_factory=list)
+
+    @field_validator("box_reviews", "added_boxes", mode="before")
+    @classmethod
+    def _normalize_list_fields(cls, value: object) -> object:
+        """兼容模型显式返回 `null` 的列表字段并归一为空列表。"""
+        return [] if value is None else value
+
+    @field_validator("has_missing", mode="before")
+    @classmethod
+    def _normalize_has_missing(cls, value: object) -> object:
+        """兼容模型显式返回 `null` 的漏标布尔字段并归一为 `False`。"""
+        return False if value is None else value
+
+    @field_validator("missing_note", mode="before")
+    @classmethod
+    def _normalize_missing_note(cls, value: object) -> str:
+        """将缺失或 `null` 漏标说明安全转换为空字符串。"""
+        if value is None:
+            return ""
+        return value if isinstance(value, str) else str(value)
 
 
 @dataclass
@@ -1188,9 +1313,14 @@ def _build_prompts(
 
     refine_rule_sys = ""
     refine_rule_user = ""
-    if refine_mode != BoxRefineMode.OFF:
+    if refine_mode == BoxRefineMode.OFF:
+        refine_rule_user = (
+            "Set `box_quality` to 'tight' and `refined_box_2d` to null for every item in `box_reviews`.\n"
+        )
+    else:
         refine_rule_sys = (
-            "\n3. Evaluate bounding box tightness (`box_quality`) for every kept/relabeled box:\n"
+            "\n3. Evaluate bounding box tightness (`box_quality`) for every kept/relabeled box — "
+            "`box_quality` MUST ONLY be one of 'tight', 'loose', or 'partial' (for 'delete', set `box_quality` to 'tight' and `refined_box_2d` to null):\n"
             "   - 'tight': box closely hugs the target object boundary according to YOLO standards.\n"
             "   - 'loose': box is noticeably too large and includes excessive background margin.\n"
             "   - 'partial': box cuts off a significant part of the target object."
@@ -1208,7 +1338,7 @@ def _build_prompts(
         else:
             refine_rule_user = (
                 "Also set `box_quality` ('tight', 'loose', or 'partial') for each kept/relabeled box; "
-                "leave `refined_box_2d` as null.\n"
+                "for 'delete' set `box_quality` to 'tight', and leave `refined_box_2d` as null for all boxes.\n"
             )
 
     system_prompt = (
@@ -1255,7 +1385,9 @@ def _build_prompts(
         f"Candidate boxes:\n{boxes_summary}\n\n"
         f"{refine_rule_user}"
         f"{missing_instr}\n\n"
-        "Return strict JSON with keys: box_reviews (list of {box_id, action, new_label, box_quality, refined_box_2d, reason}), "
+        "Return strict JSON with keys: box_reviews (list of {box_id (int), "
+        "action ('keep'|'relabel'|'delete'), new_label (str|null), "
+        "box_quality ('tight'|'loose'|'partial'), refined_box_2d ([ymin,xmin,ymax,xmax]|null), reason (str)}), "
         "has_missing (bool), missing_note (str), added_boxes (list of {label, box_2d, reason})."
     )
     return system_prompt, user_prompt

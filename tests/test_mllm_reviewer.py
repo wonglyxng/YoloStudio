@@ -1492,3 +1492,117 @@ def test_openai_nextgen_models_omit_temperature_and_max_tokens_upfront(monkeypat
     assert len(probe_calls) == 1
     assert probe_calls[0].get("temperature") == 0.0
     assert probe_calls[0].get("max_tokens") == 12
+
+
+def test_parse_review_response_normalizes_nonstandard_box_quality_and_null_fields() -> None:
+    """验证结构化响应解析对非标准 `box_quality`、`null` 字段、浮点坐标及 `box_id` 字符串格式的前置宽容规范化。"""
+    import pytest
+    from pydantic import ValidationError
+
+    # 覆盖线上实际出现过的全部非标准评价词及常见边界形态
+    nonstandard_qualities = [
+        "good",
+        "fair",
+        "poor",
+        "wrong_class",
+        "invalid",
+        "mixed",
+        "duplicate",
+        "non_object",
+        "overlapping_instances",
+        "oversized",
+        "cropped",
+        None,
+    ]
+    box_reviews_payload = [
+        {
+            "box_id": f"[{idx}]" if idx == 1 else (f"#{idx}" if idx == 2 else idx),
+            "action": "KEEP" if idx % 3 == 0 else ("rename" if idx % 3 == 1 else "discard"),
+            "new_label": "monster" if idx % 3 == 1 else None,
+            "box_quality": quality,
+            "refined_box_2d": [100.4, 200.6, 800.2, 900.8] if quality == "oversized" else [],
+            "reason": None if idx % 2 == 0 else "check",
+        }
+        for idx, quality in enumerate(nonstandard_qualities)
+    ]
+    raw_payload = json.dumps(
+        {
+            "box_reviews": box_reviews_payload,
+            "has_missing": None,
+            "missing_note": None,
+            "added_boxes": [
+                {"label": "loot", "box_2d": [120.2, 340.7, 450.9, 660.1], "reason": None}
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    parsed = parse_review_response_text(raw_payload)
+    assert len(parsed.box_reviews) == len(nonstandard_qualities)
+    assert parsed.box_reviews[1].box_id == 1
+    assert parsed.box_reviews[2].box_id == 2
+    assert parsed.box_reviews[1].action == "relabel"
+    assert parsed.box_reviews[2].action == "delete"
+    assert parsed.has_missing is False
+    assert parsed.missing_note == ""
+    assert parsed.added_boxes[0].box_2d == [120, 341, 451, 660]
+    assert parsed.added_boxes[0].reason == ""
+
+    qualities_out = [item.box_quality for item in parsed.box_reviews]
+    oversized_idx = nonstandard_qualities.index("oversized")
+    cropped_idx = nonstandard_qualities.index("cropped")
+    assert qualities_out[oversized_idx] == "loose"
+    assert parsed.box_reviews[oversized_idx].refined_box_2d == [100, 201, 800, 901]
+    assert qualities_out[cropped_idx] == "partial"
+    for idx, q_out in enumerate(qualities_out):
+        if idx not in (oversized_idx, cropped_idx):
+            assert q_out == "tight"
+            assert parsed.box_reviews[idx].refined_box_2d is None
+
+    # 校验 null 列表字段同样安全回退为空列表
+    parsed_null_lists = parse_review_response_text(
+        '{"box_reviews": null, "has_missing": true, "missing_note": null, "added_boxes": null}'
+    )
+    assert parsed_null_lists.box_reviews == []
+    assert parsed_null_lists.added_boxes == []
+    assert parsed_null_lists.has_missing is True
+    assert parsed_null_lists.missing_note == ""
+
+    # 校验真正非法的 action 仍会被严格拦截
+    with pytest.raises(ValidationError):
+        parse_review_response_text(
+            '{"box_reviews": [{"box_id": 0, "action": "unknown_action"}]}'
+        )
+
+    # 校验 JSON Schema 仍完整保留枚举定义，确保 Gemini Interactions API 契约不受影响
+    schema = MllmReviewResponse.model_json_schema()
+    box_props = schema["$defs"]["BoxDecision"]["properties"]
+    assert box_props["box_quality"]["enum"] == ["tight", "loose", "partial"]
+    assert box_props["action"]["enum"] == ["keep", "relabel", "delete"]
+
+
+def test_build_prompts_specifies_box_quality_enum_in_all_refine_modes() -> None:
+    """验证四种边框修正模式下提示词均明确写出 `box_quality` 允许枚举值及关闭/删框时的默认取值。"""
+    from yolo_studio.core.mllm_reviewer import BoxRefineMode, _build_prompts
+
+    boxes = [CandidateBox(box_id=0, label="player", x1=10.0, y1=20.0, x2=100.0, y2=120.0, confidence=0.75)]
+    for mode in (
+        BoxRefineMode.OFF,
+        BoxRefineMode.FLAG_LOOSE,
+        BoxRefineMode.MLLM_CROP,
+        BoxRefineMode.SAM_LOCAL,
+    ):
+        cfg = MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            allowed_classes=["player", "monster"],
+            box_refine_mode=mode,
+        )
+        sys_prompt, user_prompt = _build_prompts(boxes, ["player", "monster"], cfg)
+        assert "'tight'|'loose'|'partial'" in user_prompt
+        if mode == BoxRefineMode.OFF:
+            assert "Set `box_quality` to 'tight'" in user_prompt
+        else:
+            assert "MUST ONLY be one of 'tight', 'loose', or 'partial'" in sys_prompt
+            assert "for 'delete'" in sys_prompt
+
