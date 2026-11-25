@@ -86,6 +86,7 @@ from yolo_studio.gui.common import (
     GpuTaskGuard,
     PathPickerRow,
     align_form_labels,
+    append_timestamped_log,
     configure_form_layout,
     open_local_path,
 )
@@ -1199,9 +1200,9 @@ class EvalTab(QWidget):
             )
             self.weights_info_label.setToolTip("\n".join(tooltip_lines))
 
-            self.log_box.appendPlainText(format_weights_metadata_log(meta))
+            self._append_log(format_weights_metadata_log(meta))
             if meta.export_dynamic is False and meta.train_imgsz is not None:
-                self.log_box.appendPlainText(
+                self._append_log(
                     f"  [自动锁定] 该静态 {meta.model_format.upper()} 模型固定按 {size_text} 与其固化输出头运行验证/推理。"
                 )
         else:
@@ -1242,18 +1243,18 @@ class EvalTab(QWidget):
             ]
             self.weights_info_label.setToolTip("\n".join(tooltip_lines))
 
-            self.log_box.appendPlainText(format_weights_metadata_log(meta))
+            self._append_log(format_weights_metadata_log(meta))
             if meta.train_imgsz is not None:
                 if preserve_export:
-                    self.log_box.appendPlainText(
+                    self._append_log(
                         f"  [切回权重] 已保留下方自定义导出尺寸；验证/推理尺寸同步为: {format_imgsz_text(meta.train_imgsz)}"
                     )
                 else:
-                    self.log_box.appendPlainText(
+                    self._append_log(
                         f"  [自动同步] 已将验证/推理尺寸与导出尺寸同步为权重训练尺寸: {format_imgsz_text(meta.train_imgsz)}"
                     )
             else:
-                self.log_box.appendPlainText(
+                self._append_log(
                     "  [提示] 该权重未记录训练输入尺寸，请手动确认验证与导出尺寸。"
                 )
 
@@ -1264,7 +1265,7 @@ class EvalTab(QWidget):
         if request_id != self._inspect_request_id:
             return
         self._clear_weights_metadata(f"未能自动解析模型元数据：{err}", color="#b25900")
-        self.log_box.appendPlainText(f"[提示] 读取模型元数据失败: {err}")
+        self._append_log(f"[提示] 读取模型元数据失败: {err}")
 
     def _on_view_classes(self) -> None:
         if self._weights_metadata is not None:
@@ -1737,7 +1738,7 @@ class EvalTab(QWidget):
         )
         head_label = "end2end (one2one 无 NMS)" if params["nms"] is False else "one2many (外部 NMS)"
         pad_label = "最小矩形 (rect=True)" if params["rect"] else "固定尺寸填充 (rect=False)"
-        self.log_box.appendPlainText(
+        self._append_log(
             f"[对齐导出] 推理测试已同步下方导出配置：检测头={head_label}，"
             f"输入={format_imgsz_text(size_pair)}，{pad_label}。"
         )
@@ -2038,6 +2039,10 @@ class EvalTab(QWidget):
         if self.switch_model_btn.isVisible():
             self.switch_model_btn.setEnabled(not busy)
 
+    def _append_log(self, message: str) -> None:
+        """向评估与导出日志框追加带标准日期时间戳的日志行。"""
+        append_timestamped_log(self.log_box, message)
+
     def _on_validate(self) -> None:
         """校验模型文件与 `data.yaml` 后在后台启动 `ValidateWorker`。"""
         if self.device_info.probing:
@@ -2076,7 +2081,7 @@ class EvalTab(QWidget):
 
         self._set_busy(True)
         self.log_box.clear()
-        self.log_box.appendPlainText("开始执行模型验证...")
+        self._append_log("开始执行模型验证...")
 
         self.val_worker = ValidateWorker(
             Path(w),
@@ -2087,16 +2092,16 @@ class EvalTab(QWidget):
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.val_worker, "模型验证 (Val)")
-        self.val_worker.log_line.connect(self.log_box.appendPlainText)
+        self.val_worker.log_line.connect(self._append_log)
         self.val_worker.finished_metrics.connect(self._on_val_done)
         self.val_worker.failed.connect(self._on_failed)
         self.val_worker.start()
 
     def _on_val_done(self, metrics: dict[str, float]) -> None:
         self._set_busy(False)
-        self.log_box.appendPlainText("\n=== 验证完成 ===")
+        self._append_log("\n=== 验证完成 ===")
         for k, v in metrics.items():
-            self.log_box.appendPlainText(f"{k}: {v:.4f}")
+            self._append_log(f"{k}: {v:.4f}")
 
     def _on_predict(self) -> None:
         """校验模型文件与测试输入路径后在后台启动 `PredictWorker`。"""
@@ -2126,7 +2131,7 @@ class EvalTab(QWidget):
         out_dir = Path(self.pred_out_picker.text() or (self.workspace_root / "runs" / "predict_preview"))
         self._set_busy(True)
         self.log_box.clear()
-        self.log_box.appendPlainText("开始推理测试...")
+        self._append_log("开始推理测试...")
 
         self.pred_worker = PredictWorker(
             weights_path=Path(w),
@@ -2153,16 +2158,16 @@ class EvalTab(QWidget):
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.pred_worker, "模型推理预览")
-        self.pred_worker.log_line.connect(self.log_box.appendPlainText)
+        self.pred_worker.log_line.connect(self._append_log)
         self.pred_worker.finished_outputs.connect(self._on_predict_done)
         self.pred_worker.failed.connect(self._on_failed)
         self.pred_worker.start()
 
     def _on_predict_done(self, outputs: list[Path]) -> None:
         self._set_busy(False)
-        self.log_box.appendPlainText(f"\n推理完成，共生成 {len(outputs)} 个结果文件。")
+        self._append_log(f"\n推理完成，共生成 {len(outputs)} 个结果文件。")
         for p in outputs[:20]:
-            self.log_box.appendPlainText(f"- {p}")
+            self._append_log(f"- {p}")
         for p in outputs:
             if p.suffix.lower() in IMAGE_EXTENSIONS:
                 if self.preview_label.set_preview_image(p):
@@ -2208,12 +2213,12 @@ class EvalTab(QWidget):
         self._last_pt_weights_path = cfg.weights_path
         self._set_busy(True)
         self.log_box.clear()
-        self.log_box.appendPlainText(f"开始导出为 {cfg.export_format} 格式...")
+        self._append_log(f"开始导出为 {cfg.export_format} 格式...")
 
         self.export_worker = ExportWorker(cfg)
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.export_worker, f"模型导出 ({cfg.export_format})")
-        self.export_worker.log_line.connect(self.log_box.appendPlainText)
+        self.export_worker.log_line.connect(self._append_log)
         self.export_worker.finished_path.connect(self._on_export_done)
         self.export_worker.failed.connect(self._on_failed)
         self.export_worker.start()
@@ -2224,13 +2229,13 @@ class EvalTab(QWidget):
             self._last_exported_path = exp_path
         self._set_busy(False)
         self._refresh_eval_controls_state()
-        self.log_box.appendPlainText(f"\n=== 导出成功 ===\n文件路径: {exported_path}")
-        self.log_box.appendPlainText(
+        self._append_log(f"\n=== 导出成功 ===\n文件路径: {exported_path}")
+        self._append_log(
             "[提示] 可点击「2. 推理效果测试」中的「测刚导出模型」一键切换并实测该导出模型的推理效果。"
         )
         QMessageBox.information(self, "导出成功", f"模型已导出到:\n{exported_path}")
 
     def _on_failed(self, err: str) -> None:
         self._set_busy(False)
-        self.log_box.appendPlainText(f"\n[错误] {err}")
+        self._append_log(f"\n[错误] {err}")
         QMessageBox.critical(self, "执行错误", err)

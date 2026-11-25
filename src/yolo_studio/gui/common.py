@@ -1,9 +1,9 @@
-"""PyQt6 界面共享辅助控件、跨页计算任务互斥协调器与本地路径/图像工具函数。
+"""PyQt6 界面共享辅助控件、跨页计算任务互斥协调器与本地路径/图像/日志工具函数。
 
 职责：
     提供路径选择器行控件、友好型 GPU/CPU 计算设备切换控件、表单标签对齐与间距规范工具、
-    系统文件管理器跳转、等比缩略图加载、紧凑型指标卡片构建，
-    以及防止多标签页同时启动本地模型任务争抢显存的 `GpuTaskGuard`。
+    系统文件管理器跳转、等比缩略图加载、紧凑型指标卡片构建、统一 `[YYYY-MM-DD HH:MM:SS]`
+    运行日志格式化与追加辅助函数，以及防止多标签页同时启动本地模型任务争抢显存的 `GpuTaskGuard`。
 
 运行环境与协作边界：
     Python >= 3.11 + `PyQt6`；供 `gui` 各标签页与 `MainWindow` 复用，不持有模块级可变全局状态，也不自行创建后台线程。
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
@@ -29,8 +30,10 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QTextEdit,
     QWidget,
 )
 
@@ -40,6 +43,8 @@ if TYPE_CHECKING:
 # 长任务日志框（`QPlainTextEdit.setMaximumBlockCount`）保留的最大行数；超出后自动丢弃最早的行，
 # 避免长时间训练日志无限增长拖慢界面
 LOG_MAX_LINES = 5000
+LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+_LOG_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]")
 
 # 表单最长标签与右侧字段控件（下拉框、输入框、微调框等）之间的默认水平间距（像素）
 FORM_LABEL_SPACING = 8
@@ -234,6 +239,42 @@ def open_local_path(path: Path) -> None:
     target = path if path.exists() else path.parent
     if target.exists():
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.resolve())))
+
+
+def format_timestamped_log(message: str, *, now: datetime | None = None) -> str:
+    """为运行日志的每个非空行统一添加 `[YYYY-MM-DD HH:MM:SS]` 前缀（幂等防重复）。
+
+    格式规则：
+        - 空字符串直接返回空字符串；多行消息中的空行或纯空白行保留为 `""`，不附加孤立时间戳；
+        - 已包含 `[YYYY-MM-DD HH:MM:SS]` 前缀的行保持原样，避免嵌套转发时重复打标。
+    """
+    if message == "":
+        return ""
+    stamp = (now or datetime.now()).strftime(LOG_TIMESTAMP_FORMAT)
+    formatted_lines: list[str] = []
+    for line in message.splitlines():
+        if not line.strip():
+            formatted_lines.append("")
+        elif _LOG_TIMESTAMP_PREFIX_RE.match(line):
+            formatted_lines.append(line)
+        else:
+            formatted_lines.append(f"[{stamp}] {line}")
+    return "\n".join(formatted_lines)
+
+
+def append_timestamped_log(
+    log_widget: QPlainTextEdit | QTextEdit,
+    message: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """将日志文本按统一 `[YYYY-MM-DD HH:MM:SS]` 格式追加至 `QPlainTextEdit` 或 `QTextEdit`，并返回格式化结果。"""
+    formatted = format_timestamped_log(message, now=now)
+    if isinstance(log_widget, QPlainTextEdit):
+        log_widget.appendPlainText(formatted)
+    else:
+        log_widget.append(formatted)
+    return formatted
 
 
 def load_pixmap_scaled(image_path: Path, max_w: int, max_h: int) -> QPixmap | None:

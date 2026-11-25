@@ -582,6 +582,7 @@ class ImageReviewRecord:
     missing_note: str = ""
     skipped_mllm: bool = False
     error: str = ""
+    elapsed_sec: float | None = None  # 单张图片处理耗时（秒，仅在有实测记录时填充）
 
 
 @dataclass
@@ -2730,6 +2731,13 @@ def load_review_report(report_or_dir: Path) -> MllmReviewResult:
             except Exception:
                 pass
 
+        elapsed_raw = item.get("elapsed_sec")
+        elapsed_sec: float | None
+        try:
+            elapsed_sec = float(elapsed_raw) if elapsed_raw is not None else None
+        except (TypeError, ValueError):
+            elapsed_sec = None
+
         records.append(
             ImageReviewRecord(
                 image_path=src_path,
@@ -2747,6 +2755,7 @@ def load_review_report(report_or_dir: Path) -> MllmReviewResult:
                 has_missing=bool(item.get("has_missing", False)),
                 missing_note=str(item.get("missing_note") or ""),
                 error=str(item.get("error") or ""),
+                elapsed_sec=elapsed_sec,
             )
         )
 
@@ -2932,7 +2941,11 @@ def run_mllm_review(
         return out_img_path
 
     def _write_error_record(
-        img_path: Path, before_boxes: list[CandidateBox], exc: BaseException
+        img_path: Path,
+        before_boxes: list[CandidateBox],
+        exc: BaseException,
+        *,
+        elapsed_sec: float | None = None,
     ) -> ImageReviewRecord:
         """把出错图片连同原始候选框写入 `need_review`；写出过程再失败时仅记录错误，不向外抛出。"""
         message = _format_exception_detail(exc)
@@ -2970,11 +2983,13 @@ def run_mllm_review(
             has_missing=True,
             missing_note="",
             error=message,
+            elapsed_sec=elapsed_sec,
         )
 
     def _process_one(img_path: Path) -> ImageReviewRecord | None:
         if cancel_event and cancel_event.is_set():
             return None
+        img_t0 = time.perf_counter()
         before_boxes = candidates_map.get(img_path, [])
         try:
             if img_path in load_errors:
@@ -3217,12 +3232,18 @@ def run_mllm_review(
                 has_missing=has_missing,
                 missing_note=missing_note,
                 skipped_mllm=skipped_mllm,
+                elapsed_sec=round(max(0.0, time.perf_counter() - img_t0), 2),
             )
         except Exception as exc:
             # 用户取消时主动关闭客户端会触发 socket 断开异常，此时按取消收尾而非记为单图出错
             if cancel_event and cancel_event.is_set():
                 return None
-            return _write_error_record(img_path, before_boxes, exc)
+            return _write_error_record(
+                img_path,
+                before_boxes,
+                exc,
+                elapsed_sec=round(max(0.0, time.perf_counter() - img_t0), 2),
+            )
 
     records: list[ImageReviewRecord] = []
     total = len(images)
@@ -3299,9 +3320,10 @@ def run_mllm_review(
                 if progress_callback:
                     progress_callback(completed_count, total, rec)
                 if log_callback:
+                    elapsed_part = f", 耗时:{rec.elapsed_sec:.2f}s" if rec.elapsed_sec is not None else ""
                     if rec.error:
                         log_callback(
-                            f"[{completed_count}/{total}] {rec.image_path.name} -> 处理出错 ({rec.triage_bucket}): {rec.error}"
+                            f"[{completed_count}/{total}] {rec.image_path.name} -> 处理出错 ({rec.triage_bucket}{elapsed_part}): {rec.error}"
                         )
                     else:
                         refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
@@ -3309,13 +3331,13 @@ def run_mllm_review(
                         if is_zero_shot or sam3_pure_local:
                             log_callback(
                                 f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                                f"(检出:{rec.added_count}{refine_part}{loose_part})"
+                                f"(检出:{rec.added_count}{refine_part}{loose_part}{elapsed_part})"
                             )
                         else:
                             log_callback(
                                 f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
                                 f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
-                                f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
+                                f"{refine_part}{loose_part}, 补漏:{rec.added_count}{elapsed_part})"
                             )
     finally:
         if cancel_event and cancel_event.is_set():
@@ -3363,6 +3385,7 @@ def run_mllm_review(
                 "has_missing": r.has_missing,
                 "missing_note": r.missing_note,
                 "error": r.error,
+                "elapsed_sec": round(r.elapsed_sec, 2) if r.elapsed_sec is not None else None,
                 "output_image": str(r.output_image_path) if r.output_image_path else "",
                 "output_json": str(r.output_json_path) if r.output_json_path else "",
                 "before_boxes": [_serialize_candidate_box(b) for b in r.before_boxes],

@@ -2473,6 +2473,132 @@ def test_run_mllm_review_cancel_exits_promptly_even_with_non_closeable_client(tm
     assert calls == [0, 1]
 
 
+def test_run_mllm_review_records_and_logs_per_image_elapsed_time(tmp_path: Path) -> None:
+    """验证正常与失败图片均记录单图耗时并在日志与 `review_report.json` 往返中保留，同时兼容无该字段的旧报告。"""
+    from yolo_studio.core.mllm_reviewer import load_review_report
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    _write_img(in_dir / "01_ok.png", (200, 120))
+    _write_img(in_dir / "02_err.png", (200, 120))
+
+    class _MixedClient:
+        def __init__(self) -> None:
+            self.idx = 0
+
+        def review_image(self, *_args) -> MllmReviewResponse:
+            self.idx += 1
+            if self.idx == 1:
+                return MllmReviewResponse(
+                    added_boxes=[MissingBox(label="player", box_2d=[100, 100, 500, 500])],
+                    has_missing=False,
+                )
+            raise RuntimeError("模拟单图失败")
+
+    logs: list[str] = []
+    res = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+        ),
+        client_override=_MixedClient(),
+        log_callback=logs.append,
+    )
+
+    assert len(res.records) == 2
+    for rec in res.records:
+        assert rec.elapsed_sec is not None and rec.elapsed_sec >= 0.0
+
+    item_logs = [line for line in logs if line.startswith("[1/2]") or line.startswith("[2/2]")]
+    assert len(item_logs) == 2
+    assert all("耗时:" in line and line.endswith("s)") or "耗时:" in line for line in item_logs)
+    assert any("01_ok.png" in line and "耗时:" in line for line in item_logs)
+    assert any("02_err.png" in line and "处理出错" in line and "耗时:" in line for line in item_logs)
+
+    loaded = load_review_report(out_dir)
+    assert all(r.elapsed_sec is not None and r.elapsed_sec >= 0.0 for r in loaded.records)
+
+    # 兼容不含 elapsed_sec 的旧版报告
+    assert res.report_path is not None
+    raw_report = json.loads(res.report_path.read_text(encoding="utf-8"))
+    for item in raw_report["items"]:
+        item.pop("elapsed_sec", None)
+    res.report_path.write_text(json.dumps(raw_report, ensure_ascii=False, indent=2), encoding="utf-8")
+    legacy_loaded = load_review_report(out_dir)
+    assert all(r.elapsed_sec is None for r in legacy_loaded.records)
+
+
+def test_timestamped_log_formatting_and_all_tabs_emit_timestamps(tmp_path: Path) -> None:
+    """验证统一时间戳格式化函数及 4 个带日志标签页输出均以 `[YYYY-MM-DD HH:MM:SS]` 开头。"""
+    import os
+    import re
+    from datetime import datetime
+
+    from PyQt6.QtCore import QCoreApplication, Qt
+    from PyQt6.QtWidgets import QApplication, QPlainTextEdit, QTextEdit
+
+    from yolo_studio.core.trainer import DeviceInfo
+    from yolo_studio.gui.common import append_timestamped_log, format_timestamped_log
+    from yolo_studio.gui.tab_dataset import DatasetTab
+    from yolo_studio.gui.tab_eval import EvalTab
+    from yolo_studio.gui.tab_review import MllmReviewTab
+    from yolo_studio.gui.tab_train import TrainTab
+
+    fixed_dt = datetime(2026, 11, 25, 19, 45, 30)
+    assert format_timestamped_log("", now=fixed_dt) == ""
+    assert format_timestamped_log("单行日志", now=fixed_dt) == "[2026-11-25 19:45:30] 单行日志"
+    assert (
+        format_timestamped_log("\n=== 阶段标题 ===\n  \n内容行", now=fixed_dt)
+        == "\n[2026-11-25 19:45:30] === 阶段标题 ===\n\n[2026-11-25 19:45:30] 内容行"
+    )
+    already = "[2026-01-01 00:00:00] 已有时间戳"
+    assert format_timestamped_log(already, now=fixed_dt) == already
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance()
+    if app is None:
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+        app = QApplication([])
+
+    plain = QPlainTextEdit()
+    rich = QTextEdit()
+    append_timestamped_log(plain, "plain 行", now=fixed_dt)
+    append_timestamped_log(rich, "rich 行", now=fixed_dt)
+    assert plain.toPlainText().strip() == "[2026-11-25 19:45:30] plain 行"
+    assert rich.toPlainText().strip() == "[2026-11-25 19:45:30] rich 行"
+
+    cpu_info = DeviceInfo(
+        cuda_available=False,
+        device_count=0,
+        device_name="Mock CPU",
+        vram_gb=0.0,
+        recommended_device="cpu",
+        probing=False,
+        gpu_devices=(),
+    )
+    ts_line_re = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] .+")
+
+    review_tab = MllmReviewTab(tmp_path, device_info=cpu_info)
+    review_tab._append_log("自动标注测试行")
+    assert ts_line_re.match(review_tab.log_box.toPlainText().strip())
+
+    dataset_tab = DatasetTab(tmp_path)
+    dataset_tab._append_log("数据集测试行")
+    assert ts_line_re.match(dataset_tab.log_box.toPlainText().strip())
+
+    train_tab = TrainTab(tmp_path, device_info=cpu_info)
+    train_tab._on_log_line("训练测试行")
+    assert ts_line_re.match(train_tab.log_box.toPlainText().strip())
+
+    eval_tab = EvalTab(tmp_path, device_info=cpu_info)
+    eval_tab._append_log("评估导出测试行")
+    assert ts_line_re.match(eval_tab.log_box.toPlainText().strip())
+
+
+
 
 
 

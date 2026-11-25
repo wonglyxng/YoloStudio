@@ -56,6 +56,7 @@ from yolo_studio.core.mllm_reviewer import BUCKET_NEED_REVIEW
 from yolo_studio.gui.common import (
     PathPickerRow,
     align_form_labels,
+    append_timestamped_log,
     configure_form_layout,
     open_local_path,
 )
@@ -591,6 +592,7 @@ class DatasetTab(QWidget):
 
         self._set_busy(True)
         self.log_box.clear()
+        self._append_log("开始扫描图片和标注文件...")
         self._set_status("正在扫描图片和标注文件...", "busy")
 
         self.scan_worker = DatasetScanWorker(cfg)
@@ -627,10 +629,10 @@ class DatasetTab(QWidget):
         self._finish_status(status, "warn" if warn_count else "ok")
 
         if summary.warnings:
-            self.log_box.append("发现以下告警：")
+            self._append_log("发现以下告警：")
             self._append_warnings(summary.warnings, prefix="- ")
         else:
-            self.log_box.append("扫描完成，未发现异常。")
+            self._append_log("扫描完成，未发现异常。")
 
     def _on_build(self) -> None:
         """校验参数、确认覆盖已有划分目录后，在后台线程执行转换、划分与 `data.yaml` 写出。"""
@@ -644,6 +646,7 @@ class DatasetTab(QWidget):
 
         self._set_busy(True)
         self.log_box.clear()
+        self._append_log("开始转换标注并生成 YOLO26 数据集...")
         self._set_status("正在转换标注并生成 YOLO26 数据集...", "busy")
 
         self.build_worker = DatasetBuildWorker(cfg)
@@ -699,13 +702,13 @@ class DatasetTab(QWidget):
             with_test=result.test_count > 0,
         )
 
-        self.log_box.append(f"data.yaml 已生成: {result.data_yaml_path}")
-        self.log_box.append(f"classes.txt 已生成: {result.classes_txt_path}")
-        self.log_box.append("data.yaml 路径已自动同步到「5. YOLO26 训练」。")
+        self._append_log(f"data.yaml 已生成: {result.data_yaml_path}")
+        self._append_log(f"classes.txt 已生成: {result.classes_txt_path}")
+        self._append_log("data.yaml 路径已自动同步到「5. YOLO26 训练」。")
         if not result.val_count:
-            self.log_box.append("[警告] 验证集为空，data.yaml 的 val 已指向训练集，验证指标不能反映泛化效果。")
+            self._append_log("[警告] 验证集为空，data.yaml 的 val 已指向训练集，验证指标不能反映泛化效果。")
         if missing_val:
-            self.log_box.append(
+            self._append_log(
                 f"[警告] 验证集中缺少以下类别，无法评估其精度: {', '.join(missing_val)}；"
                 "可调大 Val 比例或更换 Seed 后重新生成。"
             )
@@ -725,6 +728,7 @@ class DatasetTab(QWidget):
 
     def _on_worker_failed(self, err: str) -> None:
         self._set_busy(False)
+        self._append_log(f"[错误] {err}")
         self._set_status(f"处理失败: {err}", "error")
         QMessageBox.critical(self, "数据集处理错误", err)
 
@@ -754,12 +758,16 @@ class DatasetTab(QWidget):
         else:
             self._set_status(text + "。", level)
 
+    def _append_log(self, message: str) -> None:
+        """向数据集日志框追加带标准日期时间戳的日志行。"""
+        append_timestamped_log(self.log_box, message)
+
     def _append_warnings(self, warnings: list[str], prefix: str) -> None:
         for w in warnings[:MAX_WARNINGS_SHOWN]:
-            self.log_box.append(f"{prefix}{w}")
+            self._append_log(f"{prefix}{w}")
         hidden = len(warnings) - MAX_WARNINGS_SHOWN
         if hidden > 0:
-            self.log_box.append(f"……另有 {hidden} 条告警未显示。")
+            self._append_log(f"……另有 {hidden} 条告警未显示。")
 
     def _reset_stats_view(self) -> None:
         for card, title in zip(self.stat_cards, ("图片总数", "已标注", "未标注", "总框数", "类别数", "告警")):

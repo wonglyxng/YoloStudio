@@ -89,6 +89,7 @@ from yolo_studio.gui.common import (
     GpuTaskGuard,
     PathPickerRow,
     align_form_labels,
+    append_timestamped_log,
     configure_form_layout,
     open_local_path,
 )
@@ -1490,13 +1491,17 @@ class MllmReviewTab(QWidget):
         self.conn_test_worker.finished_test.connect(self._on_test_connection_done)
         self.conn_test_worker.start()
 
+    def _append_log(self, message: str) -> None:
+        """向运行日志框追加带标准日期时间戳的日志行。"""
+        append_timestamped_log(self.log_box, message)
+
     def _on_test_connection_done(self, ok: bool, message: str) -> None:
         self.test_conn_btn.setEnabled(True)
         self.test_conn_btn.setText("测试连接")
         color = "#1a7f37" if ok else "#cf222e"
         self.api_key_status_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 500;")
         self.api_key_status_label.setText(message)
-        self.log_box.appendPlainText(f"[连接测试] {message}")
+        self._append_log(f"[连接测试] {message}")
         if not ok:
             self.result_tabs.setCurrentWidget(self.log_box)
             QMessageBox.warning(self, "LLM 连接测试失败", message)
@@ -1808,7 +1813,7 @@ class MllmReviewTab(QWidget):
         if uses_local_gpu_model and self.gpu_guard is not None:
             self.gpu_guard.bind(self.worker, task_label)
         self.worker.progress.connect(self._on_progress)
-        self.worker.log_line.connect(self.log_box.appendPlainText)
+        self.worker.log_line.connect(self._append_log)
         self.worker.finished_result.connect(self._on_finished)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
@@ -1819,7 +1824,7 @@ class MllmReviewTab(QWidget):
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
             self.summary_label.setText("正在停止任务并中断在途请求，请稍候...")
-            self.log_box.appendPlainText("正在停止自动智能标注任务，正在中断在途请求...")
+            self._append_log("正在停止自动智能标注任务，正在中断在途请求...")
 
     def _record_matches_filter(self, rec: ImageReviewRecord, filter_key: str) -> bool:
         if filter_key == "all":
@@ -1939,7 +1944,7 @@ class MllmReviewTab(QWidget):
             f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
             f"待人工复核 {res.need_review_count} | 出错 {res.error_count}"
         )
-        self.log_box.appendPlainText(f"[历史报告] 已加载: {res.report_path}")
+        self._append_log(f"[历史报告] 已加载: {res.report_path}")
         return res
 
     def _on_load_report_dialog(self) -> None:
@@ -2016,13 +2021,14 @@ class MllmReviewTab(QWidget):
         )
         self._refresh_filter_counts()
         if res.report_path:
-            self.log_box.appendPlainText(f"\n标注报告已保存: {res.report_path}")
+            self._append_log(f"\n标注报告已保存: {res.report_path}")
 
     def _on_failed(self, err: str) -> None:
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.load_report_btn.setEnabled(True)
         self.summary_label.setText(f"执行失败: {err}")
+        self._append_log(f"[错误] {err}")
         # 日志与结果列表共用页签区域，失败时自动切到“运行日志”便于直接查看出错上下文
         self.result_tabs.setCurrentWidget(self.log_box)
         QMessageBox.critical(self, "自动智能标注失败", err)

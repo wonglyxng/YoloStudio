@@ -68,6 +68,7 @@ from yolo_studio.gui.common import (
     GpuTaskGuard,
     PathPickerRow,
     align_form_labels,
+    append_timestamped_log,
     configure_form_layout,
     make_metric_card,
     open_local_path,
@@ -1918,7 +1919,7 @@ class TrainTab(QWidget):
         )
         self._start_elapsed_timer()
         self.log_box.clear()
-        self.log_box.appendPlainText("正在启动 YOLO26 训练任务...")
+        self._on_log_line("正在启动 YOLO26 训练任务...")
 
         self.worker = TrainWorker(cfg)
         if self.gpu_guard is not None:
@@ -1934,7 +1935,7 @@ class TrainTab(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
-            self.log_box.appendPlainText("正在请求停止训练，请等待当前 Epoch 完成保存...")
+            self._on_log_line("正在请求停止训练，请等待当前 Epoch 完成保存...")
 
     def _on_send_to_eval(self) -> None:
         """将最近训练产出的 `best.pt` 与当前 `data.yaml` 再次同步至下游页并请求主窗口切换至标签页 6。
@@ -1971,7 +1972,8 @@ class TrainTab(QWidget):
         self.val_map50_95.setText(f"{m.map50_95:.4f}")
 
     def _on_log_line(self, line: str) -> None:
-        self.log_box.appendPlainText(line)
+        """向训练日志框追加带标准日期时间戳的日志行。"""
+        append_timestamped_log(self.log_box, line)
 
     def _on_finished(self, res: TrainResult) -> None:
         """恢复界面状态、停表定格训练时长、兜底补齐 `best.pt` 评估指标并通知下游标签页。"""
@@ -1996,25 +1998,25 @@ class TrainTab(QWidget):
             )
 
         status_text = "训练已提前停止" if res.stopped_early else "训练完成"
-        self.log_box.appendPlainText(f"\n=== {status_text} ===")
+        self._on_log_line(f"\n=== {status_text} ===")
         if elapsed_text is not None:
-            self.log_box.appendPlainText(f"训练时长: {elapsed_text}")
+            self._on_log_line(f"训练时长: {elapsed_text}")
         if self._has_best_eval_metrics:
-            self.log_box.appendPlainText(
+            self._on_log_line(
                 "best.pt 最终评估: "
                 f"P={self.val_best_precision.text()}, "
                 f"R={self.val_best_recall.text()}, "
                 f"mAP50={self.val_best_map50.text()}, "
                 f"mAP50-95={self.val_best_map50_95.text()}"
             )
-        self.log_box.appendPlainText(f"结果目录: {res.save_dir}")
+        self._on_log_line(f"结果目录: {res.save_dir}")
         if res.best_weights:
             self._last_best_pt = str(res.best_weights)
             self.send_eval_btn.setEnabled(True)
-            self.log_box.appendPlainText(f"最佳权重: {res.best_weights}")
+            self._on_log_line(f"最佳权重: {res.best_weights}")
             self.send_best_weights.emit(self._last_best_pt, self.yaml_picker.text())
         if res.last_weights:
-            self.log_box.appendPlainText(f"最新权重: {res.last_weights}")
+            self._on_log_line(f"最新权重: {res.last_weights}")
 
     def _on_failed(self, err: str) -> None:
         """训练异常退出时停表定格训练时长、恢复按钮状态并弹窗提示错误。"""
@@ -2022,8 +2024,8 @@ class TrainTab(QWidget):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         if elapsed_text is not None:
-            self.log_box.appendPlainText(f"\n训练时长: {elapsed_text}")
-            self.log_box.appendPlainText(f"[错误] {err}")
+            self._on_log_line(f"\n训练时长: {elapsed_text}")
+            self._on_log_line(f"[错误] {err}")
         else:
-            self.log_box.appendPlainText(f"\n[错误] {err}")
+            self._on_log_line(f"\n[错误] {err}")
         QMessageBox.critical(self, "训练错误", err)
