@@ -78,7 +78,9 @@ from yolo_studio.core.mllm_reviewer import (
     format_record_detail_summary,
     load_review_report,
     render_review_comparison,
+    resolve_effective_reasoning_effort,
     resolve_sam3_weights,
+    supported_reasoning_efforts,
 )
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.common import (
@@ -196,6 +198,7 @@ class MllmReviewTab(QWidget):
         self._selected_row: int = -1
         self._restoring_state: bool = False
         self._settings_dirty: bool = False
+        self._effort_fallback_notice: str = ""
         self._last_output_dir: Path = workspace_root / "data" / "smart_labeled"
         self._last_classes_txt: str = ""
         self._last_yolo_weights: str = ""
@@ -787,8 +790,10 @@ class MllmReviewTab(QWidget):
         self.open_selected_btn.clicked.connect(self._on_open_selected_in_xal)
         self.api_key_edit.textChanged.connect(self._refresh_api_key_status)
         self.base_url_edit.textChanged.connect(self._refresh_api_key_status)
-        self.model_edit.textChanged.connect(self._refresh_reasoning_effort_hint)
-        self.reasoning_effort_combo.currentIndexChanged.connect(self._refresh_reasoning_effort_hint)
+        self.model_edit.textChanged.connect(self._sync_reasoning_effort_guard)
+        self.reasoning_effort_combo.currentIndexChanged.connect(
+            lambda *_args: self._sync_reasoning_effort_guard(clear_notice=True)
+        )
         self.refine_mode_combo.currentIndexChanged.connect(self._sync_strategy_states)
         self.sam_refine_all_chk.toggled.connect(self._sync_strategy_states)
         self.sam3_llm_review_chk.toggled.connect(self._sync_strategy_states)
@@ -1011,7 +1016,7 @@ class MllmReviewTab(QWidget):
         self._llm_form.setRowVisible(self.base_url_edit, is_compat)
         self.preset_combo.blockSignals(False)
         self._refresh_api_key_status()
-        self._refresh_reasoning_effort_hint()
+        self._sync_reasoning_effort_guard()
 
     def _on_preset_changed(self) -> None:
         data = self.preset_combo.currentData()
@@ -1022,49 +1027,89 @@ class MllmReviewTab(QWidget):
         if url:
             self.base_url_edit.setText(url)
         self._refresh_api_key_status()
+        self._sync_reasoning_effort_guard()
+
+    def _sync_reasoning_effort_guard(self, *_args: object, clear_notice: bool = False) -> None:
+        """按当前模型能力置灰不支持的思考级别，并在已选中项不再受支持时自动平滑回退。"""
+        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
+        model_name = self.model_edit.text().strip()
+        supported = supported_reasoning_efforts(provider, model_name)
+        supported_set = set(supported)
+
+        combo_model = self.reasoning_effort_combo.model()
+        if isinstance(combo_model, QStandardItemModel):
+            for idx in range(self.reasoning_effort_combo.count()):
+                effort_data = self.reasoning_effort_combo.itemData(idx)
+                item = combo_model.item(idx)
+                if item is not None and isinstance(effort_data, ReasoningEffort):
+                    item.setEnabled(effort_data in supported_set)
+
+        self.reasoning_effort_combo.setEnabled(len(supported) > 1)
+
+        cur_effort: ReasoningEffort = self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
+        if cur_effort not in supported_set:
+            effective, notice = resolve_effective_reasoning_effort(provider, model_name, cur_effort)
+            target_idx = self.reasoning_effort_combo.findData(effective)
+            if target_idx >= 0:
+                prev_restore = self._restoring_state
+                self._restoring_state = True
+                self.reasoning_effort_combo.blockSignals(True)
+                try:
+                    self.reasoning_effort_combo.setCurrentIndex(target_idx)
+                finally:
+                    self.reasoning_effort_combo.blockSignals(False)
+                    self._restoring_state = prev_restore
+            self._effort_fallback_notice = "" if self._restoring_state else (notice or "")
+        elif clear_notice:
+            self._effort_fallback_notice = ""
+
         self._refresh_reasoning_effort_hint()
 
     def _refresh_reasoning_effort_hint(self, *_args: object) -> None:
-        """结合当前接口、模型名称与思考级别实时展示服务端默认行为或自动映射提示。"""
+        """结合当前接口、模型名称、受支持范围与自动纠偏提示实时更新说明文案。"""
         effort: ReasoningEffort = self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
         provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-        model_lower = self.model_edit.text().strip().lower()
+        model_name = self.model_edit.text().strip()
+        model_lower = model_name.lower()
+        supported = supported_reasoning_efforts(provider, model_name)
 
-        if effort == ReasoningEffort.AUTO:
+        if supported == (ReasoningEffort.AUTO,):
+            base_text = "当前为非思考直出模型，不支持思考/推理级别调节（已自动锁定为模型默认）。"
+        elif effort == ReasoningEffort.AUTO:
             if provider == MllmProvider.GEMINI:
                 if "flash-lite" in model_lower:
-                    detail = "当前 Gemini 模型默认处于 minimal 极简思考（高吞吐低延迟）。"
+                    base_text = "当前 Gemini 模型默认处于 minimal 极简思考（高吞吐低延迟）。"
                 elif "gemini-4-hydrogen" in model_lower or "gemini-4-neon" in model_lower:
-                    detail = "当前 Gemini 4 模型服务端默认思考级别为 high（追求更快速度可调至 low / medium）。"
+                    base_text = "当前 Gemini 4 模型服务端默认思考级别为 high（追求更快速度可调至 low / medium）。"
                 elif "gemini-3.8" in model_lower or "gemini-4" in model_lower:
-                    detail = "当前 Gemini 模型服务端默认思考级别为 medium（均衡模式）。"
+                    base_text = "当前 Gemini 模型服务端默认思考级别为 medium（均衡模式）。"
                 else:
-                    detail = "不显式传入 thinking_level，遵循 Gemini 服务端模型默认思考级别。"
+                    base_text = "不显式传入 thinking_level，遵循 Gemini 服务端模型默认思考级别。"
             else:
-                if model_lower.startswith(("gpt-4o", "gpt-4.1", "chatgpt-4o")):
-                    detail = "当前为非思考直出模型，将直接输出标注结果（无长思考消耗）。"
-                elif model_lower.startswith(("o1", "o3", "o4")):
-                    detail = "当前 OpenAI o 系列模型服务端默认推理级别为 medium。"
+                if model_lower.startswith(("o1", "o3", "o4")):
+                    base_text = "当前 OpenAI o 系列模型服务端默认推理级别为 medium。"
                 elif model_lower.startswith("gpt-6"):
-                    detail = "当前 GPT-6.2 原生推理模型遵循服务端默认推理配置（最低可手动调至 low，不支持 none）。"
+                    base_text = "当前 GPT-6.2 原生推理模型遵循服务端默认推理配置（最低可手动调至 low，不支持 none）。"
                 elif model_lower.startswith("gpt-5.1") or model_lower.startswith("gpt-5.2"):
-                    detail = "当前模型服务端默认推理级别为 none（低延迟直出，需思考可手动调高）。"
+                    base_text = "当前模型服务端默认推理级别为 none（低延迟直出，需思考可手动调高）。"
                 elif model_lower.startswith("gpt-5"):
-                    detail = "遵循当前模型服务端默认推理配置（通常为 medium 或模型默认）。"
+                    base_text = "遵循当前模型服务端默认推理配置（通常为 medium 或模型默认）。"
                 else:
-                    detail = REASONING_EFFORT_HINTS[ReasoningEffort.AUTO]
-            self.reasoning_effort_hint_label.setText(detail)
-            return
+                    base_text = REASONING_EFFORT_HINTS[ReasoningEffort.AUTO]
+        else:
+            base_text = REASONING_EFFORT_HINTS.get(effort, "")
 
-        hint = REASONING_EFFORT_HINTS.get(effort, "")
-        if provider != MllmProvider.GEMINI and model_lower.startswith(("gpt-4o", "gpt-4.1", "chatgpt-4o")):
-            hint = f"{hint}（当前为非思考直出模型，运行时将自动省略推理参数）"
-        elif effort == ReasoningEffort.OFF:
-            if provider == MllmProvider.GEMINI and ("gemini-3.8" in model_lower or "gemini-4" in model_lower):
-                hint = f"{hint}（当前模型不支持 minimal，将自动映射至最低可用档 low）"
-            elif provider != MllmProvider.GEMINI and model_lower.startswith(("o1", "o3", "o4", "gpt-6")):
-                hint = f"{hint}（当前模型不支持关闭思考，将自动映射至最低可用档 low）"
-        self.reasoning_effort_hint_label.setText(hint)
+        if len(supported) > 1 and len(supported) < len(REASONING_EFFORT_ITEMS):
+            names = [
+                "默认" if item == ReasoningEffort.AUTO else ("极简" if item == ReasoningEffort.OFF else item.value)
+                for item in supported
+            ]
+            base_text = f"{base_text} 支持：{' / '.join(names)}。"
+
+        if self._effort_fallback_notice:
+            self.reasoning_effort_hint_label.setText(f"{self._effort_fallback_notice}；{base_text}")
+        else:
+            self.reasoning_effort_hint_label.setText(base_text)
 
     def _refresh_api_key_status(self, *_args: object) -> None:
         """实时检测手动 Key 或系统环境变量是否已就绪，减少启动任务后才报鉴权失败的挫败感。"""
@@ -1530,6 +1575,7 @@ class MllmReviewTab(QWidget):
                 self.sam_refine_all_chk.setChecked(bool(state["sam_refine_all"]))
             if "sam3_enable_llm_review" in state:
                 self.sam3_llm_review_chk.setChecked(bool(state["sam3_enable_llm_review"]))
+            self._sync_reasoning_effort_guard()
         except Exception:
             pass
         finally:
@@ -1538,7 +1584,7 @@ class MllmReviewTab(QWidget):
         self._on_source_mode_changed()
         self._sync_strategy_states()
         self._refresh_api_key_status()
-        self._refresh_reasoning_effort_hint()
+        self._sync_reasoning_effort_guard()
         self._refresh_images_count()
 
     def _on_start(self) -> None:

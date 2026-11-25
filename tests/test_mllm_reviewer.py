@@ -1744,9 +1744,11 @@ def test_gemini_thinking_level_mapping_and_bad_request_downgrade(monkeypatch) ->
     c_flash_off.review_image(b"x", [], "s", "u")
     assert calls_log[-1]["generation_config"] == {"thinking_level": "low"}
 
-    # 2) XHIGH 遇 400 依次从 xhigh -> high -> 省略，并在后续调用记住最终可用档位
+    # 2) gemini-4-neon 支持 xhigh：遇 400 依次从 xhigh -> high -> 省略，并在后续调用记住最终可用档位；
+    #    gemini-4-carbon / gemini-4-argon 不支持 xhigh：事前直降为 high，不先发 xhigh 撞 400；
+    #    gemini-4-hydrogen 支持 xhigh：直接下发 xhigh
     calls_log.clear()
-    c_xhigh = GeminiMllmClient(api_key="k", model_name="gemini-4-argon", reasoning_effort=ReasoningEffort.XHIGH)
+    c_xhigh = GeminiMllmClient(api_key="k", model_name="gemini-4-neon", reasoning_effort=ReasoningEffort.XHIGH)
     c_xhigh.client = type("C", (), {"interactions": _FakeInteractions(reject_levels={"xhigh", "high"})})()
     c_xhigh.review_image(b"x", [], "s", "u")
     c_xhigh.review_image(b"x", [], "s", "u")
@@ -1754,6 +1756,18 @@ def test_gemini_thinking_level_mapping_and_bad_request_downgrade(monkeypatch) ->
         (c.get("generation_config") or {}).get("thinking_level") if isinstance(c.get("generation_config"), dict) else None
         for c in calls_log
     ] == ["xhigh", "high", None, None]
+
+    calls_log.clear()
+    for no_xhigh_model in ("gemini-4-carbon", "gemini-4-argon"):
+        c_no_x = GeminiMllmClient(api_key="k", model_name=no_xhigh_model, reasoning_effort=ReasoningEffort.XHIGH)
+        c_no_x.client = type("C", (), {"interactions": _FakeInteractions()})()
+        c_no_x.review_image(b"x", [], "s", "u")
+        assert calls_log[-1]["generation_config"] == {"thinking_level": "high"}
+
+    c_hydro = GeminiMllmClient(api_key="k", model_name="gemini-4-hydrogen", reasoning_effort=ReasoningEffort.XHIGH)
+    c_hydro.client = type("C", (), {"interactions": _FakeInteractions()})()
+    c_hydro.review_image(b"x", [], "s", "u")
+    assert calls_log[-1]["generation_config"] == {"thinking_level": "xhigh"}
 
     # 3) 非 400 鉴权异常不得被吞掉
     c_auth = GeminiMllmClient(api_key="k", model_name="gemini-3.8-flash", reasoning_effort=ReasoningEffort.HIGH)
@@ -1914,5 +1928,132 @@ def test_openai_reasoning_effort_mapping_and_bad_request_downgrade() -> None:
     assert parsed.provider == "openai"
     assert parsed.model == "gpt-6.2-sol"
     assert parsed.reasoning_effort == "medium"
+
+
+def test_reasoning_effort_capability_matrix_and_guard(tmp_path: Path) -> None:
+    """验证各模型思考级别能力矩阵、事前回退提示以及 `run_mllm_review` 日志与报告落地一致性。"""
+    from yolo_studio.core.mllm_reviewer import (
+        ReasoningEffort,
+        resolve_effective_reasoning_effort,
+        supported_reasoning_efforts,
+    )
+
+    # 1) Gemini 系列能力矩阵
+    for m in ("gemini-4-carbon", "gemini-4-argon"):
+        assert supported_reasoning_efforts(MllmProvider.GEMINI, m) == (
+            ReasoningEffort.AUTO,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+        )
+        eff_x, msg_x = resolve_effective_reasoning_effort(MllmProvider.GEMINI, m, ReasoningEffort.XHIGH)
+        assert eff_x == ReasoningEffort.HIGH
+        assert msg_x and "xhigh" in msg_x
+        eff_off, msg_off = resolve_effective_reasoning_effort(MllmProvider.GEMINI, m, ReasoningEffort.OFF)
+        assert eff_off == ReasoningEffort.LOW
+        assert msg_off and "low" in msg_off
+
+    for m in ("gemini-4-hydrogen", "gemini-4-neon"):
+        assert supported_reasoning_efforts(MllmProvider.GEMINI, m) == (
+            ReasoningEffort.AUTO,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+            ReasoningEffort.XHIGH,
+        )
+        assert resolve_effective_reasoning_effort(MllmProvider.GEMINI, m, ReasoningEffort.XHIGH) == (
+            ReasoningEffort.XHIGH,
+            None,
+        )
+
+    assert supported_reasoning_efforts(MllmProvider.GEMINI, "gemini-3.5-flash-lite") == (
+        ReasoningEffort.AUTO,
+        ReasoningEffort.OFF,
+        ReasoningEffort.LOW,
+        ReasoningEffort.MEDIUM,
+        ReasoningEffort.HIGH,
+    )
+
+    # 2) OpenAI 官方与兼容系列能力矩阵
+    for m in ("gpt-6.2-sol", "gpt-6.2-astra"):
+        assert supported_reasoning_efforts(MllmProvider.OPENAI, m) == (
+            ReasoningEffort.AUTO,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+            ReasoningEffort.XHIGH,
+        )
+        eff_off, msg_off = resolve_effective_reasoning_effort(MllmProvider.OPENAI, m, ReasoningEffort.OFF)
+        assert eff_off == ReasoningEffort.LOW
+        assert msg_off and "low" in msg_off
+
+    assert supported_reasoning_efforts(MllmProvider.OPENAI, "o4-mini") == (
+        ReasoningEffort.AUTO,
+        ReasoningEffort.LOW,
+        ReasoningEffort.MEDIUM,
+        ReasoningEffort.HIGH,
+    )
+    assert supported_reasoning_efforts(MllmProvider.OPENAI, "gpt-5.4") == (
+        ReasoningEffort.AUTO,
+        ReasoningEffort.OFF,
+        ReasoningEffort.LOW,
+        ReasoningEffort.MEDIUM,
+        ReasoningEffort.HIGH,
+        ReasoningEffort.XHIGH,
+    )
+    assert supported_reasoning_efforts(MllmProvider.OPENAI, "gpt-5-mini") == (
+        ReasoningEffort.AUTO,
+        ReasoningEffort.OFF,
+        ReasoningEffort.LOW,
+        ReasoningEffort.MEDIUM,
+        ReasoningEffort.HIGH,
+    )
+    for non_r_provider, non_r_model in (
+        (MllmProvider.OPENAI, "gpt-4o"),
+        (MllmProvider.OPENAI_COMPAT, "Qwen/Qwen2.5-VL-72B-Instruct"),
+    ):
+        assert supported_reasoning_efforts(non_r_provider, non_r_model) == (ReasoningEffort.AUTO,)
+        eff_nr, msg_nr = resolve_effective_reasoning_effort(non_r_provider, non_r_model, ReasoningEffort.HIGH)
+        assert eff_nr == ReasoningEffort.AUTO
+        assert msg_nr and "非推理直出" in msg_nr
+
+    assert supported_reasoning_efforts(MllmProvider.OPENAI_COMPAT, "qwen-vl-max-latest") == (
+        ReasoningEffort.AUTO,
+        ReasoningEffort.OFF,
+        ReasoningEffort.LOW,
+        ReasoningEffort.MEDIUM,
+        ReasoningEffort.HIGH,
+        ReasoningEffort.XHIGH,
+    )
+
+    # 3) run_mllm_review 执行 gemini-4-carbon + XHIGH 时输出中文降级提示且报告记录实际生效级别 high
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    _write_img(in_dir / "sample.jpg", (200, 120))
+    _person_json(in_dir / "sample.jpg")
+
+    logs: list[str] = []
+    res = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.EXISTING_JSON,
+            provider=MllmProvider.GEMINI,
+            model_name="gemini-4-carbon",
+            reasoning_effort=ReasoningEffort.XHIGH,
+            allowed_classes=["person"],
+            max_workers=1,
+        ),
+        client_override=_FakeMllmClient(
+            [MllmReviewResponse(box_reviews=[BoxDecision(box_id=0, action="keep")], has_missing=False)]
+        ),
+        log_callback=logs.append,
+    )
+    assert any("不支持 xhigh" in line for line in logs)
+    assert any("推理级别: high" in line for line in logs)
+    assert res.report_path is not None
+    report = json.loads(res.report_path.read_text(encoding="utf-8"))
+    assert report["reasoning_effort"] == "high"
+
 
 

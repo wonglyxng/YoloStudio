@@ -729,29 +729,189 @@ def parse_review_response_text(raw_text: str) -> MllmReviewResponse:
     return MllmReviewResponse.model_validate_json(cleaned)
 
 
-def _gemini_model_supports_minimal(model_name: str) -> bool:
-    """判断 Gemini 模型是否支持 `thinking_level='minimal'`（`gemini-3.8-*` / `gemini-4-*` 不支持 `minimal`）。"""
-    lower = model_name.strip().lower()
-    if "flash-lite" in lower:
-        return True
-    if "gemini-3.8" in lower or "gemini-4" in lower:
+def _normalize_gemini_model_id(model_name: str) -> str:
+    """规范化 Gemini 模型名称：去除 `models/` 前缀并转为小写。"""
+    return model_name.strip().lower().removeprefix("models/")
+
+
+def _openai_model_is_o_series(model_name: str) -> bool:
+    """判断规范化后的 OpenAI 模型名是否属于 `o` 系列推理模型（如 `o1` / `o3` / `o4-mini`）。"""
+    model_id = _normalize_openai_model_id(model_name)
+    return bool(model_id and re.match(r"^o[1-9](?:$|[-._])", model_id))
+
+
+def _openai_model_is_non_reasoning(model_name: str) -> bool:
+    """事前判断模型是否属于已知非推理直出模型（如 `gpt-4o` / `gpt-4.1` / `gpt-3.5`）。"""
+    model_id = _normalize_openai_model_id(model_name)
+    if not model_id:
         return False
-    return True
+    return bool(
+        re.match(r"^(?:gpt-4o|gpt-4\.1|gpt-4-|gpt-4$|gpt-3\.5|chatgpt-4o)(?:$|[-._])", model_id)
+    )
+
+
+def _compat_model_is_non_reasoning(model_name: str) -> bool:
+    """判断第三方 OpenAI 兼容模型名是否属于已知非思考视觉架构（如 `Qwen2.5-VL` / `Qwen2-VL` / `LLaVA`）。"""
+    model_id = _normalize_openai_model_id(model_name)
+    if not model_id:
+        return False
+    return bool(
+        re.search(r"(?:^|[/:_-])(?:qwen2\.?5[-_]?vl|qwen2[-_]?vl|llava)(?:$|[^a-z0-9])", model_id)
+    )
+
+
+def supported_reasoning_efforts(
+    provider: MllmProvider, model_name: str
+) -> tuple[ReasoningEffort, ...]:
+    """返回指定模型提供方与模型名称在界面及管线中受支持的统一思考/推理级别有序元组。"""
+    if provider == MllmProvider.GEMINI:
+        m = _normalize_gemini_model_id(model_name)
+        if "gemini-4-hydrogen" in m or "gemini-4-neon" in m:
+            return (
+                ReasoningEffort.AUTO,
+                ReasoningEffort.LOW,
+                ReasoningEffort.MEDIUM,
+                ReasoningEffort.HIGH,
+                ReasoningEffort.XHIGH,
+            )
+        if "gemini-4-carbon" in m or "gemini-4-argon" in m:
+            return (
+                ReasoningEffort.AUTO,
+                ReasoningEffort.LOW,
+                ReasoningEffort.MEDIUM,
+                ReasoningEffort.HIGH,
+            )
+        if m.startswith("gemini-4"):
+            # 用户手输未完成前缀（如 `gemini-4-`）时暂保留 `xhigh`，避免输入中途误清除
+            return (
+                ReasoningEffort.AUTO,
+                ReasoningEffort.LOW,
+                ReasoningEffort.MEDIUM,
+                ReasoningEffort.HIGH,
+                ReasoningEffort.XHIGH,
+            )
+        if "gemini-3.8" in m:
+            return (
+                ReasoningEffort.AUTO,
+                ReasoningEffort.LOW,
+                ReasoningEffort.MEDIUM,
+                ReasoningEffort.HIGH,
+            )
+        if "flash-lite" in m or m.startswith("gemini-3."):
+            return (
+                ReasoningEffort.AUTO,
+                ReasoningEffort.OFF,
+                ReasoningEffort.LOW,
+                ReasoningEffort.MEDIUM,
+                ReasoningEffort.HIGH,
+            )
+        return (
+            ReasoningEffort.AUTO,
+            ReasoningEffort.OFF,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+            ReasoningEffort.XHIGH,
+        )
+
+    if _openai_model_is_non_reasoning(model_name) or _compat_model_is_non_reasoning(model_name):
+        return (ReasoningEffort.AUTO,)
+
+    model_id = _normalize_openai_model_id(model_name)
+    gpt_match = re.match(r"^gpt-(\d+)(?:$|[-._])", model_id)
+    if gpt_match and int(gpt_match.group(1)) >= 6:
+        return (
+            ReasoningEffort.AUTO,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+            ReasoningEffort.XHIGH,
+        )
+    if _openai_model_is_o_series(model_name):
+        return (
+            ReasoningEffort.AUTO,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+        )
+    if gpt_match and int(gpt_match.group(1)) == 5:
+        if re.match(r"^gpt-5\.4(?:$|[-._])", model_id):
+            return (
+                ReasoningEffort.AUTO,
+                ReasoningEffort.OFF,
+                ReasoningEffort.LOW,
+                ReasoningEffort.MEDIUM,
+                ReasoningEffort.HIGH,
+                ReasoningEffort.XHIGH,
+            )
+        return (
+            ReasoningEffort.AUTO,
+            ReasoningEffort.OFF,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+        )
+    return (
+        ReasoningEffort.AUTO,
+        ReasoningEffort.OFF,
+        ReasoningEffort.LOW,
+        ReasoningEffort.MEDIUM,
+        ReasoningEffort.HIGH,
+        ReasoningEffort.XHIGH,
+    )
+
+
+def resolve_effective_reasoning_effort(
+    provider: MllmProvider,
+    model_name: str,
+    effort: ReasoningEffort,
+) -> tuple[ReasoningEffort, str | None]:
+    """依据模型能力矩阵将请求的思考级别校正为最近似受支持级别，并返回可选中文提示。"""
+    supported = supported_reasoning_efforts(provider, model_name)
+    if effort in supported:
+        return effort, None
+
+    label_display = model_name.strip() or provider.value
+    if supported == (ReasoningEffort.AUTO,):
+        return (
+            ReasoningEffort.AUTO,
+            f"模型 '{label_display}' 为非推理直出模型，不支持思考级别调节，已切回模型默认",
+        )
+    if effort == ReasoningEffort.XHIGH and ReasoningEffort.HIGH in supported:
+        return (
+            ReasoningEffort.HIGH,
+            f"模型 '{label_display}' 不支持 xhigh，已自动降级为最高可用档 high",
+        )
+    if effort == ReasoningEffort.OFF and ReasoningEffort.LOW in supported:
+        return (
+            ReasoningEffort.LOW,
+            f"模型 '{label_display}' 不支持关闭思考/极简，已自动切换为最低可用档 low",
+        )
+    return (
+        ReasoningEffort.AUTO,
+        f"模型 '{label_display}' 不支持思考级别 {effort.value}，已切回模型默认",
+    )
+
+
+def _gemini_model_supports_minimal(model_name: str) -> bool:
+    """判断 Gemini 模型是否支持 `thinking_level='minimal'`。"""
+    return ReasoningEffort.OFF in supported_reasoning_efforts(MllmProvider.GEMINI, model_name)
 
 
 def _build_gemini_thinking_candidates(
     effort: ReasoningEffort, model_name: str
 ) -> tuple[str | None, ...]:
-    """将统一思考级别映射为 Gemini `thinking_level` 有序降级候选链（`None` 表示省略参数）。"""
-    if effort == ReasoningEffort.AUTO:
+    """将统一思考级别先经能力矩阵校正，再映射为 Gemini `thinking_level` 有序降级候选链（`None` 表示省略参数）。"""
+    effective, _ = resolve_effective_reasoning_effort(MllmProvider.GEMINI, model_name, effort)
+    if effective == ReasoningEffort.AUTO:
         return (None,)
-    if effort == ReasoningEffort.OFF:
-        return ("minimal", "low", None) if _gemini_model_supports_minimal(model_name) else ("low", None)
-    if effort == ReasoningEffort.LOW:
+    if effective == ReasoningEffort.OFF:
+        return ("minimal", "low", None)
+    if effective == ReasoningEffort.LOW:
         return ("low", None)
-    if effort == ReasoningEffort.MEDIUM:
+    if effective == ReasoningEffort.MEDIUM:
         return ("medium", None)
-    if effort == ReasoningEffort.HIGH:
+    if effective == ReasoningEffort.HIGH:
         return ("high", None)
     return ("xhigh", "high", None)
 
@@ -918,31 +1078,6 @@ def _normalize_openai_model_id(model_name: str) -> str:
     return model_id
 
 
-def _openai_model_is_o_series(model_name: str) -> bool:
-    """判断规范化后的 OpenAI 模型名是否属于 `o` 系列推理模型（如 `o1` / `o3` / `o4-mini`）。"""
-    model_id = _normalize_openai_model_id(model_name)
-    return bool(model_id and re.match(r"^o[1-9](?:$|[-._])", model_id))
-
-
-def _openai_model_requires_min_low_reasoning(model_name: str) -> bool:
-    """判断 OpenAI 推理模型是否不支持 `none`/`minimal`（`o` 系列及 `gpt-6+` 原生推理模型最低支持 `low`）。"""
-    if _openai_model_is_o_series(model_name):
-        return True
-    model_id = _normalize_openai_model_id(model_name)
-    gpt_match = re.match(r"^gpt-(\d+)(?:$|[-._])", model_id)
-    return bool(gpt_match and int(gpt_match.group(1)) >= 6)
-
-
-def _openai_model_is_non_reasoning(model_name: str) -> bool:
-    """事前判断模型是否属于已知非推理直出模型（如 `gpt-4o` / `gpt-4.1` / `gpt-3.5`）。"""
-    model_id = _normalize_openai_model_id(model_name)
-    if not model_id:
-        return False
-    return bool(
-        re.match(r"^(?:gpt-4o|gpt-4\.1|gpt-4-|gpt-4$|gpt-3\.5|chatgpt-4o)(?:$|[-._])", model_id)
-    )
-
-
 def _openai_model_omits_custom_sampling(model_name: str) -> bool:
     """事前判断模型是否属于默认不支持自定义 `temperature` 及 `max_tokens` 的 OpenAI 新系列（`o` 系列与 `gpt-5+`）。"""
     model_id = _normalize_openai_model_id(model_name)
@@ -957,18 +1092,17 @@ def _openai_model_omits_custom_sampling(model_name: str) -> bool:
 def _build_openai_reasoning_candidates(
     effort: ReasoningEffort, model_name: str
 ) -> tuple[str | None, ...]:
-    """将统一思考级别映射为 OpenAI `reasoning_effort` 有序降级候选链（`None` 表示省略参数）。"""
-    if effort == ReasoningEffort.AUTO or _openai_model_is_non_reasoning(model_name):
+    """将统一思考级别先经能力矩阵校正，再映射为 OpenAI `reasoning_effort` 有序降级候选链（`None` 表示省略参数）。"""
+    effective, _ = resolve_effective_reasoning_effort(MllmProvider.OPENAI, model_name, effort)
+    if effective == ReasoningEffort.AUTO:
         return (None,)
-    if effort == ReasoningEffort.OFF:
-        if _openai_model_requires_min_low_reasoning(model_name):
-            return ("low", None)
+    if effective == ReasoningEffort.OFF:
         return ("none", "minimal", "low", None)
-    if effort == ReasoningEffort.LOW:
+    if effective == ReasoningEffort.LOW:
         return ("low", None)
-    if effort == ReasoningEffort.MEDIUM:
+    if effective == ReasoningEffort.MEDIUM:
         return ("medium", None)
-    if effort == ReasoningEffort.HIGH:
+    if effective == ReasoningEffort.HIGH:
         return ("high", None)
     return ("xhigh", "high", None)
 
@@ -2583,6 +2717,14 @@ def run_mllm_review(
             )
         effective_refine_mode = BoxRefineMode.OFF
 
+    effective_effort = ReasoningEffort.AUTO
+    if not sam3_pure_local:
+        effective_effort, effort_notice = resolve_effective_reasoning_effort(
+            config.provider, config.model_name, config.reasoning_effort
+        )
+        if effort_notice and log_callback:
+            log_callback(f"提示：{effort_notice}。")
+
     client: MllmClient | None = None
     if not sam3_pure_local:
         client = client_override or build_mllm_client(config)
@@ -2603,7 +2745,7 @@ def run_mllm_review(
 
     if log_callback:
         refine_desc = effective_refine_mode.value
-        effort_desc = config.reasoning_effort.value
+        effort_desc = effective_effort.value
         if sam3_pure_local:
             log_callback(
                 f"开始纯本地 SAM 3 自动标注分流（共 {len(images)} 张图，类别: {allowed_classes}，"
@@ -2990,7 +3132,7 @@ def run_mllm_review(
         "classes": allowed_classes,
         "source_mode": config.source_mode.value,
         "provider": config.provider.value,
-        "reasoning_effort": ReasoningEffort.AUTO.value if sam3_pure_local else config.reasoning_effort.value,
+        "reasoning_effort": ReasoningEffort.AUTO.value if sam3_pure_local else effective_effort.value,
         "sam3_enable_llm_review": bool(config.sam3_enable_llm_review) if is_sam3_text else False,
         "box_refine_mode": effective_refine_mode.value,
         "items": [

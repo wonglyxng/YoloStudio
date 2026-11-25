@@ -957,3 +957,122 @@ def test_combobox_wheel_guard_blocks_accidental_change_and_forwards_scroll(
     finally:
         win.close()
 
+
+def test_review_tab_reasoning_effort_model_foolproof_guards(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证 Gemini 4 与 OpenAI 模型的思考/推理级别防呆：禁用不支持项、切模型平滑回退及历史非法配置静默纠偏。"""
+    import json
+
+    from PyQt6.QtGui import QStandardItemModel
+
+    tab = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        model = tab.reasoning_effort_combo.model()
+        assert isinstance(model, QStandardItemModel)
+
+        def _item_enabled(effort: ReasoningEffort) -> bool:
+            idx = tab.reasoning_effort_combo.findData(effort)
+            assert idx >= 0
+            item = model.item(idx)
+            assert item is not None
+            return item.isEnabled()
+
+        # 1) 默认 gemini-4-hydrogen：OFF 置灰禁用，LOW/MEDIUM/HIGH/XHIGH 启用
+        assert tab.model_edit.text() == "gemini-4-hydrogen"
+        assert _item_enabled(ReasoningEffort.AUTO) is True
+        assert _item_enabled(ReasoningEffort.OFF) is False
+        assert _item_enabled(ReasoningEffort.LOW) is True
+        assert _item_enabled(ReasoningEffort.MEDIUM) is True
+        assert _item_enabled(ReasoningEffort.HIGH) is True
+        assert _item_enabled(ReasoningEffort.XHIGH) is True
+
+        # 2) 在 gemini-4-neon 下选中 XHIGH，随后切到 gemini-4-carbon / gemini-4-argon：
+        #    XHIGH 与 OFF 置灰，当前值自动回退到 HIGH，且提示栏说明不支持 xhigh
+        def _preset_index(model_id: str) -> int:
+            return next(
+                i
+                for i in range(tab.preset_combo.count())
+                if (tab.preset_combo.itemData(i) or ("", ""))[0] == model_id
+            )
+
+        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-neon"))
+        tab.reasoning_effort_combo.setCurrentIndex(tab.reasoning_effort_combo.findData(ReasoningEffort.XHIGH))
+        qt_app.processEvents()
+        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.XHIGH
+
+        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-carbon"))
+        qt_app.processEvents()
+        assert _item_enabled(ReasoningEffort.OFF) is False
+        assert _item_enabled(ReasoningEffort.XHIGH) is False
+        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
+        assert "xhigh" in tab.reasoning_effort_hint_label.text()
+        assert "不支持" in tab.reasoning_effort_hint_label.text()
+
+        # 同样验证 gemini-4-argon 禁用 XHIGH
+        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-argon"))
+        qt_app.processEvents()
+        assert _item_enabled(ReasoningEffort.XHIGH) is False
+
+        # 切回 gemini-4-hydrogen 后 XHIGH 恢复启用
+        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-hydrogen"))
+        qt_app.processEvents()
+        assert _item_enabled(ReasoningEffort.XHIGH) is True
+
+        # 3) 切到 OpenAI 官方（gpt-6.2-sol / gpt-6.2-astra）：OFF 置灰，LOW..XHIGH 启用；
+        #    手输 gpt-4o 后自动锁回 AUTO 并禁用下拉框
+        tab.provider_combo.setCurrentIndex(tab.provider_combo.findData(MllmProvider.OPENAI))
+        qt_app.processEvents()
+        assert _item_enabled(ReasoningEffort.OFF) is False
+        assert _item_enabled(ReasoningEffort.XHIGH) is True
+        tab.reasoning_effort_combo.setCurrentIndex(tab.reasoning_effort_combo.findData(ReasoningEffort.HIGH))
+        qt_app.processEvents()
+
+        tab.model_edit.setText("gpt-4o")
+        qt_app.processEvents()
+        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.AUTO
+        assert tab.reasoning_effort_combo.isEnabled() is False
+        assert "非思考直出" in tab.reasoning_effort_hint_label.text()
+
+        # 4) 切到 OpenAI 兼容的硅基流动预设（Qwen2.5-VL）同样锁定为默认；切到 DashScope 后恢复可用
+        tab.provider_combo.setCurrentIndex(tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT))
+        qt_app.processEvents()
+        assert tab.reasoning_effort_combo.isEnabled() is True  # 默认第 1 项为 DashScope qwen-vl-max-latest
+        sf_idx = next(
+            i
+            for i in range(tab.preset_combo.count())
+            if "Qwen2.5-VL" in str((tab.preset_combo.itemData(i) or ("", ""))[0])
+        )
+        tab.preset_combo.setCurrentIndex(sf_idx)
+        qt_app.processEvents()
+        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.AUTO
+        assert tab.reasoning_effort_combo.isEnabled() is False
+    finally:
+        tab.close()
+
+    # 5) 恢复历史非法组合（gemini-4-carbon + xhigh）时静默纠偏为 HIGH 且不误置脏标记
+    settings = QSettings(str(tmp_path / "legacy_illegal_effort.ini"), QSettings.Format.IniFormat)
+    settings.setValue(
+        tab_review_mod._REVIEW_SETTINGS_KEY,
+        json.dumps(
+            {
+                "version": 1,
+                "provider": MllmProvider.GEMINI.value,
+                "model_name": "gemini-4-carbon",
+                "reasoning_effort": ReasoningEffort.XHIGH.value,
+            }
+        ),
+    )
+    settings.sync()
+
+    tab_restore = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab_restore.restore_settings(settings)
+        qt_app.processEvents()
+        assert tab_restore.model_edit.text() == "gemini-4-carbon"
+        assert tab_restore.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
+        assert tab_restore._settings_dirty is False
+    finally:
+        tab_restore.close()
+
+
