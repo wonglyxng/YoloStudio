@@ -2323,5 +2323,156 @@ def test_run_mllm_review_logs_timeout_and_exception_root_cause(tmp_path: Path) -
     assert "Connection reset by peer" in errors_by_name["b_conn.png"]
 
 
+def test_run_mllm_review_cancel_aborts_inflight_openai_socket_promptly(tmp_path: Path) -> None:
+    """验证置位 `cancel_event` 时通过关闭底层客户端立即打断阻塞中的网络请求，不死等超长超时也不误报错误。"""
+    import socket
+    import threading
+    import time
+
+    from yolo_studio.core.mllm_reviewer import OpenAICompatMllmClient, ReasoningEffort
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    for name in ("01.png", "02.png", "03.png"):
+        _write_img(in_dir / name, (160, 120))
+
+    # 启动仅接收请求但不回包的本地 TCP 黑洞服务端，模拟深度推理长阻塞等待
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(5)
+
+    connected_ev = threading.Event()
+    accepted_conns: list[socket.socket] = []
+
+    def _accept_loop() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                break
+            accepted_conns.append(conn)
+            try:
+                conn.recv(1024)
+            except OSError:
+                pass
+            connected_ev.set()
+
+    threading.Thread(target=_accept_loop, daemon=True).start()
+
+    cancel_ev = threading.Event()
+    client = OpenAICompatMllmClient(
+        api_key="sk-test",
+        base_url=f"http://127.0.0.1:{port}/v1",
+        model_name="gpt-6.2-astra",
+        reasoning_effort=ReasoningEffort.HIGH,
+        allow_anonymous_key=False,
+    )
+    assert client.request_timeout == 1200.0
+
+    def _trigger_cancel_when_connected() -> None:
+        if connected_ev.wait(timeout=5.0):
+            cancel_ev.set()
+
+    threading.Thread(target=_trigger_cancel_when_connected, daemon=True).start()
+
+    logs: list[str] = []
+    t0 = time.perf_counter()
+    try:
+        res = run_mllm_review(
+            MllmReviewConfig(
+                images_dir=in_dir,
+                output_dir=out_dir,
+                source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+                provider=MllmProvider.OPENAI,
+                model_name="gpt-6.2-astra",
+                reasoning_effort=ReasoningEffort.HIGH,
+                allowed_classes=["player"],
+                max_workers=1,
+            ),
+            client_override=client,
+            log_callback=logs.append,
+            cancel_event=cancel_ev,
+        )
+    finally:
+        for conn in accepted_conns:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        try:
+            srv.close()
+        except OSError:
+            pass
+
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 3.0, f"取消响应耗时过长（{elapsed:.2f}s），应立即中断在途连接"
+    assert res.cancelled is True
+    assert res.error_count == 0
+    assert any("已收到停止指令" in line for line in logs)
+    assert res.report_path is not None and res.report_path.is_file()
+    report = json.loads(res.report_path.read_text(encoding="utf-8"))
+    assert report["cancelled"] is True
+
+
+def test_run_mllm_review_cancel_exits_promptly_even_with_non_closeable_client(tmp_path: Path) -> None:
+    """验证即使客户端未实现 `close()` 仍处于阻塞中，`run_mllm_review` 也能跳过剩余图片并在排空窗口后迅速退出。"""
+    import threading
+    import time
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    for name in ("01.png", "02.png", "03.png"):
+        _write_img(in_dir / name, (160, 120))
+
+    cancel_ev = threading.Event()
+    unblock_ev = threading.Event()
+    second_entered = threading.Event()
+    calls: list[int] = []
+
+    class _BlockingNoCloseClient:
+        def review_image(self, *_args) -> MllmReviewResponse:
+            idx = len(calls)
+            calls.append(idx)
+            if idx == 0:
+                return MllmReviewResponse(
+                    added_boxes=[MissingBox(label="player", box_2d=[100, 100, 500, 500])],
+                    has_missing=False,
+                )
+            second_entered.set()
+            unblock_ev.wait(timeout=30.0)
+            return MllmReviewResponse(added_boxes=[], has_missing=False)
+
+    def _trigger_cancel() -> None:
+        if second_entered.wait(timeout=5.0):
+            cancel_ev.set()
+
+    threading.Thread(target=_trigger_cancel, daemon=True).start()
+
+    t0 = time.perf_counter()
+    try:
+        res = run_mllm_review(
+            MllmReviewConfig(
+                images_dir=in_dir,
+                output_dir=out_dir,
+                source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+                allowed_classes=["player"],
+                max_workers=1,
+            ),
+            client_override=_BlockingNoCloseClient(),
+            cancel_event=cancel_ev,
+        )
+    finally:
+        unblock_ev.set()
+
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 3.5, f"无 close() 客户端取消退出耗时过长（{elapsed:.2f}s）"
+    assert res.cancelled is True
+    assert len(res.records) == 1
+    assert res.records[0].added_count == 1
+    assert calls == [0, 1]
+
+
+
 
 

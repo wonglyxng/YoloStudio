@@ -1814,11 +1814,12 @@ class MllmReviewTab(QWidget):
         self.worker.start()
 
     def _on_stop(self) -> None:
-        """向正在运行的智能标注线程发送取消标志并禁用停止按钮防止重复点击。"""
+        """向正在运行的智能标注线程发送取消标志、禁用停止按钮并立即刷新顶部状态提示。"""
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
-            self.log_box.appendPlainText("正在停止自动智能标注任务...")
+            self.summary_label.setText("正在停止任务并中断在途请求，请稍候...")
+            self.log_box.appendPlainText("正在停止自动智能标注任务，正在中断在途请求...")
 
     def _record_matches_filter(self, rec: ImageReviewRecord, filter_key: str) -> bool:
         if filter_key == "all":

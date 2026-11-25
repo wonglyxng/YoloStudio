@@ -27,7 +27,7 @@ import re
 import shutil
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1004,6 +1004,18 @@ def _is_gemini_thinking_bad_request(exc: BaseException) -> bool:
     return any(tok in msg for tok in ("thinking_level", "thinking", "generation_config"))
 
 
+def _close_client_safely(client: object | None) -> None:
+    """安全关闭底层 HTTP/SDK 客户端以立即中断在途请求（幂等，忽略关闭异常）。"""
+    if client is None:
+        return
+    close_fn = getattr(client, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+
 class GeminiMllmClient:
     """基于官方 `google-genai` Interactions API 的 Google Gemini 多模态审核客户端。
 
@@ -1107,6 +1119,10 @@ class GeminiMllmClient:
         if not output_text:
             raise RuntimeError("Gemini 返回为空，未包含文本输出。")
         return parse_review_response_text(output_text)
+
+    def close(self) -> None:
+        """关闭底层 `genai.Client` HTTP 连接池以立即中断在途请求（可重复调用）。"""
+        _close_client_safely(self.client)
 
 
 def _extract_openai_bad_request_info(exc: BaseException) -> tuple[str, str]:
@@ -1374,6 +1390,10 @@ class OpenAICompatMllmClient:
         if not content.strip():
             raise RuntimeError(f"{self._provider_label}返回为空，未包含文本输出。")
         return parse_review_response_text(content)
+
+    def close(self) -> None:
+        """关闭底层 OpenAI HTTP 客户端以立即中断在途网络请求（可重复调用）。"""
+        _close_client_safely(self.client)
 
 
 def build_mllm_client(config: MllmReviewConfig) -> MllmClient:
@@ -2851,12 +2871,13 @@ def run_mllm_review(
         if effort_notice and log_callback:
             log_callback(f"提示：{effort_notice}。")
 
+    already_cancelled = bool(cancel_event and cancel_event.is_set())
     client: MllmClient | None = None
-    if not sam3_pure_local:
+    if not sam3_pure_local and not already_cancelled:
         client = client_override or build_mllm_client(config)
 
     sam_refiner: BoxRefinerProtocol | None = None
-    if effective_refine_mode == BoxRefineMode.SAM_LOCAL:
+    if effective_refine_mode == BoxRefineMode.SAM_LOCAL and not already_cancelled:
         if refiner_override is not None:
             sam_refiner = refiner_override
         else:
@@ -2869,7 +2890,7 @@ def run_mllm_review(
 
     output_names = _plan_output_names(images, config.images_dir)
 
-    if log_callback:
+    if log_callback and not already_cancelled:
         refine_desc = effective_refine_mode.value
         effort_desc = effective_effort.value
         if sam3_pure_local:
@@ -3009,6 +3030,8 @@ def run_mllm_review(
                 overview_jpeg = _encode_jpeg_bytes(img_bgr, max_dim=config.max_image_dim, quality=90)
                 system_prompt, user_prompt = _build_zero_shot_prompts(allowed_classes, config)
                 response = client.review_image(overview_jpeg, [], system_prompt, user_prompt)
+                if cancel_event and cancel_event.is_set():
+                    return None
                 after_boxes, kept, relabeled, deleted, added = apply_review_decisions(
                     [],
                     response,
@@ -3078,6 +3101,8 @@ def run_mllm_review(
                         coord_scale=_overview_scale(img_w, img_h, config.max_image_dim),
                     )
                     response = client.review_image(overview_jpeg, crops, system_prompt, user_prompt)
+                    if cancel_event and cancel_event.is_set():
+                        return None
                     after_boxes, kept, relabeled, deleted, added = apply_review_decisions(
                         before_boxes,
                         response,
@@ -3122,6 +3147,8 @@ def run_mllm_review(
                     ]
 
             if effective_refine_mode == BoxRefineMode.SAM_LOCAL and sam_refiner is not None and after_boxes:
+                if cancel_event and cancel_event.is_set():
+                    return None
                 if img_bgr is None:
                     img_bgr = _read_image_unicode_safe(img_path)
                 apply_sam_box_refinement(
@@ -3134,6 +3161,9 @@ def run_mllm_review(
                     min_area_ratio=config.refine_min_area_ratio,
                     min_iou=config.refine_min_iou,
                 )
+
+            if cancel_event and cancel_event.is_set():
+                return None
 
             refined_count = sum(1 for b in after_boxes if b.refined)
             loose_flagged_count = sum(1 for b in after_boxes if b.status == "refine_suspect")
@@ -3189,68 +3219,111 @@ def run_mllm_review(
                 skipped_mllm=skipped_mllm,
             )
         except Exception as exc:
+            # 用户取消时主动关闭客户端会触发 socket 断开异常，此时按取消收尾而非记为单图出错
+            if cancel_event and cancel_event.is_set():
+                return None
             return _write_error_record(img_path, before_boxes, exc)
 
     records: list[ImageReviewRecord] = []
     total = len(images)
-    cancelled = False
+    cancelled = already_cancelled
 
     workers = max(1, int(config.max_workers))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {}
-        for img_path in images:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures: dict[Future[ImageReviewRecord | None], Path] = {}
+        for img_path in ([] if already_cancelled else images):
             if cancel_event and cancel_event.is_set():
                 cancelled = True
                 break
             futures[pool.submit(_process_one, img_path)] = img_path
 
+        pending: set[Future[ImageReviewRecord | None]] = set(futures.keys())
         completed_count = 0
-        for fut in as_completed(futures):
+        cancel_notified = False
+        cancel_deadline: float | None = None
+
+        while pending:
             if cancel_event and cancel_event.is_set():
                 cancelled = True
-                for pending in futures:
-                    pending.cancel()
-            if fut.cancelled():
-                continue
-            try:
-                rec = fut.result()
-            except Exception as exc:
-                src = futures[fut]
-                rec = ImageReviewRecord(
-                    image_path=src,
-                    output_image_path=None,
-                    output_json_path=None,
-                    triage_bucket=BUCKET_NEED_REVIEW,
-                    has_missing=True,
-                    missing_note="",
-                    error=_format_exception_detail(exc),
+                for pending_fut in list(pending):
+                    if pending_fut.cancel():
+                        pending.discard(pending_fut)
+                if not cancel_notified:
+                    cancel_notified = True
+                    _close_client_safely(client)
+                    cancel_deadline = time.monotonic() + 1.5
+                    if log_callback:
+                        log_callback("已收到停止指令，正在中断在途请求并保存已完成结果...")
+                if not pending:
+                    break
+                remaining = (cancel_deadline - time.monotonic()) if cancel_deadline is not None else 0.0
+                if remaining <= 0:
+                    break
+                done, pending = wait(
+                    pending,
+                    timeout=min(0.1, remaining),
+                    return_when=FIRST_COMPLETED,
                 )
-            if rec is None:
-                cancelled = True
-                continue
-            records.append(rec)
-            completed_count += 1
-            if progress_callback:
-                progress_callback(completed_count, total, rec)
-            if log_callback:
-                if rec.error:
-                    log_callback(
-                        f"[{completed_count}/{total}] {rec.image_path.name} -> 处理出错 ({rec.triage_bucket}): {rec.error}"
+            else:
+                done, pending = wait(
+                    pending,
+                    timeout=0.1 if cancel_event is not None else None,
+                    return_when=FIRST_COMPLETED,
+                )
+
+            for fut in done:
+                if fut.cancelled():
+                    continue
+                try:
+                    rec = fut.result()
+                except Exception as exc:
+                    if cancel_event and cancel_event.is_set():
+                        cancelled = True
+                        continue
+                    src = futures[fut]
+                    rec = ImageReviewRecord(
+                        image_path=src,
+                        output_image_path=None,
+                        output_json_path=None,
+                        triage_bucket=BUCKET_NEED_REVIEW,
+                        has_missing=True,
+                        missing_note="",
+                        error=_format_exception_detail(exc),
                     )
-                else:
-                    refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
-                    loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
-                    if is_zero_shot or sam3_pure_local:
+                if rec is None:
+                    cancelled = True
+                    continue
+                records.append(rec)
+                completed_count += 1
+                if progress_callback:
+                    progress_callback(completed_count, total, rec)
+                if log_callback:
+                    if rec.error:
                         log_callback(
-                            f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                            f"(检出:{rec.added_count}{refine_part}{loose_part})"
+                            f"[{completed_count}/{total}] {rec.image_path.name} -> 处理出错 ({rec.triage_bucket}): {rec.error}"
                         )
                     else:
-                        log_callback(
-                            f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                            f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
-                            f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
-                        )
+                        refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
+                        loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
+                        if is_zero_shot or sam3_pure_local:
+                            log_callback(
+                                f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                                f"(检出:{rec.added_count}{refine_part}{loose_part})"
+                            )
+                        else:
+                            log_callback(
+                                f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                                f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
+                                f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
+                            )
+    finally:
+        if cancel_event and cancel_event.is_set():
+            cancelled = True
+            _close_client_safely(client)
+        elif client_override is None:
+            _close_client_safely(client)
+        pool.shutdown(wait=not cancelled, cancel_futures=True)
 
     records.sort(key=lambda r: str(r.image_path))
 
