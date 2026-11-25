@@ -3,7 +3,7 @@
 职责：
     在离线 `offscreen` Qt 环境下系统性验证五个配置标签页的防呆交互逻辑：
     1. 「1. 视频抽帧」：选 `png` 置灰 `JPG质量`、起止时间段非法拦截、去重 0 值提示与列表增删按钮空态保护；
-    2. 「3. LLM 智能标注」：已有 `.json` + 本地 SAM 模式下动态展示 GPU 开关、运行中禁用历史报告加载、
+    2. 「3. 自动智能标注」：已有 `.json` + 本地 SAM 模式下动态展示 GPU 开关、运行中禁用历史报告加载、
        LLM 凭据/模型名/Base URL 前置校验（含本地/局域网地址豁免）与分流子目录开关联动按钮文案；
     3. 「4. 数据集准备」：`Train` 比例上限允许 `1.00` 且不再误报归一化提示；
     4. 「5. YOLO26 训练」：断点续训 (`resume`) 置灰全部被 Ultralytics 忽略的超参数并保留可覆盖项、
@@ -810,7 +810,8 @@ def test_review_tab_official_openai_and_reasoning_effort_persistence(
     tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
         assert tab1.model_edit.text() == GEMINI_MODELS[0][0]
-        assert tab1.preset_combo.count() == len(GEMINI_MODELS)
+        assert tab1.preset_combo.count() == len(GEMINI_MODELS) + 1
+        assert tab1.preset_combo.itemData(tab1.preset_combo.count() - 1) == tab_review_mod._CUSTOM_PRESET_KEY
         tab1.source_mode_combo.setCurrentIndex(tab1.source_mode_combo.findData(tab_review_mod.ReviewSourceMode.EXISTING_JSON))
         tab1.set_images_dir(str(in_dir))
         tab1.output_picker.setText(str(tmp_path / "out"))
@@ -824,7 +825,8 @@ def test_review_tab_official_openai_and_reasoning_effort_persistence(
         assert tab1.base_url_edit.isHidden() is True
         assert tab1.base_url_edit.text() == ""
         assert tab1.model_edit.text() == OPENAI_MODELS[0][0]
-        assert tab1.preset_combo.count() == len(OPENAI_MODELS)
+        assert tab1.preset_combo.count() == len(OPENAI_MODELS) + 1
+        assert tab1.preset_combo.itemData(tab1.preset_combo.count() - 1) == tab_review_mod._CUSTOM_PRESET_KEY
         assert "OPENAI_API_KEY" in tab1.api_key_status_label.text()
 
         warnings.clear()
@@ -1070,9 +1072,84 @@ def test_review_tab_reasoning_effort_model_foolproof_guards(
         tab_restore.restore_settings(settings)
         qt_app.processEvents()
         assert tab_restore.model_edit.text() == "gemini-4-carbon"
+        assert tab_restore.preset_combo.currentData() == ("gemini-4-carbon", "")
         assert tab_restore.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
         assert tab_restore._settings_dirty is False
     finally:
         tab_restore.close()
+
+
+def test_review_tab_preset_combo_bidirectional_sync_and_legacy_restore(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证常用预设与模型名称/Base URL 双向同步及旧配置历史模型恢复对齐。"""
+    import json
+
+    from yolo_studio.core.mllm_reviewer import OPENAI_PRESETS
+
+    settings = QSettings(str(tmp_path / "legacy_preset_sync.ini"), QSettings.Format.IniFormat)
+    settings.setValue(
+        tab_review_mod._REVIEW_SETTINGS_KEY,
+        json.dumps(
+            {
+                "version": 1,
+                "provider": MllmProvider.GEMINI.value,
+                "model_name": "gemini-3.8-flash",
+            }
+        ),
+    )
+    settings.sync()
+
+    tab = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        # 1) 恢复历史非预设模型（如 gemini-3.8-flash）：常用预设应自动对齐到「自定义」且不触发脏标记
+        tab.restore_settings(settings)
+        qt_app.processEvents()
+        assert tab.model_edit.text() == "gemini-3.8-flash"
+        assert tab.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+        assert tab.preset_combo.currentText() == tab_review_mod._CUSTOM_PRESET_LABEL
+        assert tab._settings_dirty is False
+
+        # 2) 从自定义点选回第 0 项 Built-in 预设（Gemini 4 Hydrogen）能够顺利触发回填
+        tab.preset_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+        assert tab.model_edit.text() == GEMINI_MODELS[0][0]
+        assert tab.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
+        assert tab._settings_dirty is True
+
+        # 3) 下拉选中「自定义」本身不清空当前模型名称
+        custom_idx = tab.preset_combo.findData(tab_review_mod._CUSTOM_PRESET_KEY)
+        assert custom_idx >= 0
+        tab.preset_combo.setCurrentIndex(custom_idx)
+        qt_app.processEvents()
+        assert tab.model_edit.text() == GEMINI_MODELS[0][0]
+
+        # 4) 手动输入非预设模型名自动切至自定义，输入准确内置模型名自动跳回对应预设
+        tab.model_edit.setText("gemini-custom-test")
+        qt_app.processEvents()
+        assert tab.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+
+        tab.model_edit.setText("gemini-4-neon")
+        qt_app.processEvents()
+        assert tab.preset_combo.currentData() == ("gemini-4-neon", "")
+
+        # 5) OpenAI 兼容接口同时比对 Base URL（含末尾斜杠归一化）与模型名称
+        compat_idx = tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
+        assert compat_idx >= 0
+        tab.provider_combo.setCurrentIndex(compat_idx)
+        qt_app.processEvents()
+        expected_url = OPENAI_PRESETS[0][1]
+        expected_model = OPENAI_PRESETS[0][2]
+        assert tab.preset_combo.currentData() == (expected_model, expected_url)
+
+        tab.base_url_edit.setText("https://custom-gateway.example.com/v1")
+        qt_app.processEvents()
+        assert tab.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+
+        tab.base_url_edit.setText(expected_url.rstrip("/") + "/")
+        qt_app.processEvents()
+        assert tab.preset_combo.currentData() == (expected_model, expected_url)
+    finally:
+        tab.close()
 
 

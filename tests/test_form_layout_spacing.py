@@ -2,7 +2,7 @@
 
 职责：
     在离线 `offscreen` Qt 环境下验证共享布局辅助函数 `configure_form_layout` / `align_form_labels`，
-    以及五个配置标签页（视频抽帧、LLM 智能标注、数据集准备、YOLO26 训练、验证推理与导出）中：
+    以及五个配置标签页（视频抽帧、自动智能标注、数据集准备、YOLO26 训练、验证推理与导出）中：
     1. 所有 `QFormLayout` 标签均采用左对齐，且右侧下拉框/输入框紧邻最长标签紧凑对齐；
     2. 同页多分组在挂载到 `MainWindow` 并继承样式表字号后，所有标签左边缘对齐、右侧字段列沿同页最长标签垂直对齐且切换动态行不抖动；
     3. 行内多控件组合（如「格式:」+ 下拉框、「起:/止:」、「低阈值Conf:/IoU:/ImgSz:」、「Conf:/IoU:」）
@@ -150,7 +150,7 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
                 assert len(field_xs) == 1
 
         # 验证多分组页面的字段列左边缘沿同页最长标签精确垂直对齐（含样式表生效后的最终布局）
-        # 1) Tab 3（LLM 智能标注）：切出 OpenAI 兼容接口 Base URL 与 SAM 隐藏行后三组依然对齐，且最长标签紧邻控件
+        # 1) Tab 3（自动智能标注）：切出 OpenAI 兼容接口 Base URL 与 SAM 隐藏行后三组依然对齐，且最长标签紧邻控件
         win.tabs.setCurrentIndex(2)
         compat_idx = win.review_tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
         assert compat_idx >= 0
@@ -214,7 +214,7 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
         assert 2 <= _find_inline_pair_gap(win.review_tab, "IoU:", win.review_tab.yolo_iou_spin) <= 12
         assert 2 <= _find_inline_pair_gap(win.review_tab, "ImgSz:", win.review_tab.yolo_imgsz_spin) <= 12
 
-        # 多卡 GPU 环境下，LLM 智能标注页基准推理参数行的紧凑下拉框仅增加极小最小宽，不把表单撑出横向滚动条，
+        # 多卡 GPU 环境下，自动智能标注页基准推理参数行的紧凑下拉框仅增加极小最小宽，不把表单撑出横向滚动条，
         # 同时下拉弹出列表保留充足宽度以完整展示显卡型号
         single_gpu_min_w = win.review_tab.yolo_params_widget.minimumSizeHint().width()
         win._on_device_probed(_make_device_info(gpu_count=2))

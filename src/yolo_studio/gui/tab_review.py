@@ -1,4 +1,4 @@
-"""标签页 3：LLM 智能标注界面（基准模型预标 / 已有 .json 质检 / 零样本标注 / SAM 3 文本自动标注）。
+"""标签页 3：自动智能标注界面（基准模型预标 / 已有 .json 质检 / 零样本标注 / SAM 3 文本自动标注）。
 
 职责：
     配置候选框来源（基准 `.pt` 低阈值推理、已有 X-AnyLabeling `.json`、LLM 零样本直接标注
@@ -97,6 +97,8 @@ from yolo_studio.gui.workers import MllmConnectionTestWorker, MllmReviewWorker
 # 左右对比预览 JPEG 字节流的 LRU 缓存容量上限（按结果表行号索引，每次重新开始审核或加载报告时清空）
 _PREVIEW_CACHE_MAX = 64
 _REVIEW_SETTINGS_KEY = "review_tab/state_json"
+_CUSTOM_PRESET_KEY = "__custom__"
+_CUSTOM_PRESET_LABEL = "自定义（当前手动指定）"
 
 
 def _is_local_or_lan_url(base_url: str) -> bool:
@@ -167,12 +169,12 @@ class _ScaledPreviewLabel(QLabel):
 
 
 class MllmReviewTab(QWidget):
-    """LLM 智能标注、质检补漏与边框紧贴修正功能标签页（标签页 3）。
+    """自动智能标注、质检补漏与边框紧贴修正功能标签页（标签页 3）。
 
     内部状态：
         持有硬件探测信息 `device_info`、跨页计算设备互斥协调器 `gpu_guard`、后台标注线程 `worker`、
         连通性探测线程 `conn_test_worker`、逐图标注记录 `_records`、对比图 LRU 缓存 `_preview_cache`、
-        当前表格筛选器 `_active_filter`、配置持久化脏标记 `_settings_dirty`、
+        当前表格筛选器 `_active_filter`、配置持久化脏标记 `_settings_dirty`、预设应用重入保护 `_applying_preset`、
         最近输出目录 `_last_output_dir` 与类别文件 `_last_classes_txt`。
     """
 
@@ -198,6 +200,7 @@ class MllmReviewTab(QWidget):
         self._selected_row: int = -1
         self._restoring_state: bool = False
         self._settings_dirty: bool = False
+        self._applying_preset: bool = False
         self._effort_fallback_notice: str = ""
         self._last_output_dir: Path = workspace_root / "data" / "smart_labeled"
         self._last_classes_txt: str = ""
@@ -790,6 +793,8 @@ class MllmReviewTab(QWidget):
         self.open_selected_btn.clicked.connect(self._on_open_selected_in_xal)
         self.api_key_edit.textChanged.connect(self._refresh_api_key_status)
         self.base_url_edit.textChanged.connect(self._refresh_api_key_status)
+        self.base_url_edit.textChanged.connect(self._sync_preset_combo_from_fields)
+        self.model_edit.textChanged.connect(self._sync_preset_combo_from_fields)
         self.model_edit.textChanged.connect(self._sync_reasoning_effort_guard)
         self.reasoning_effort_combo.currentIndexChanged.connect(
             lambda *_args: self._sync_reasoning_effort_guard(clear_notice=True)
@@ -993,41 +998,85 @@ class MllmReviewTab(QWidget):
         is_openai_official = provider == MllmProvider.OPENAI
         is_compat = provider == MllmProvider.OPENAI_COMPAT
 
+        self._applying_preset = True
         self.preset_combo.blockSignals(True)
-        self.preset_combo.clear()
-        if is_gemini:
-            for model_id, label in GEMINI_MODELS:
-                self.preset_combo.addItem(label, (model_id, ""))
-            self.base_url_edit.setEnabled(False)
-            self.base_url_edit.clear()
-            self.model_edit.setText(GEMINI_MODELS[0][0])
-        elif is_openai_official:
-            for model_id, label in OPENAI_MODELS:
-                self.preset_combo.addItem(label, (model_id, ""))
-            self.base_url_edit.setEnabled(False)
-            self.base_url_edit.clear()
-            self.model_edit.setText(OPENAI_MODELS[0][0])
-        else:
-            for name, url, model_id in OPENAI_PRESETS:
-                self.preset_combo.addItem(name, (model_id, url))
-            self.base_url_edit.setEnabled(True)
-            self.base_url_edit.setText(OPENAI_PRESETS[0][1])
-            self.model_edit.setText(OPENAI_PRESETS[0][2])
-        self._llm_form.setRowVisible(self.base_url_edit, is_compat)
-        self.preset_combo.blockSignals(False)
+        try:
+            self.preset_combo.clear()
+            if is_gemini:
+                for model_id, label in GEMINI_MODELS:
+                    self.preset_combo.addItem(label, (model_id, ""))
+                self.base_url_edit.setEnabled(False)
+                self.base_url_edit.clear()
+                self.model_edit.setText(GEMINI_MODELS[0][0])
+            elif is_openai_official:
+                for model_id, label in OPENAI_MODELS:
+                    self.preset_combo.addItem(label, (model_id, ""))
+                self.base_url_edit.setEnabled(False)
+                self.base_url_edit.clear()
+                self.model_edit.setText(OPENAI_MODELS[0][0])
+            else:
+                for name, url, model_id in OPENAI_PRESETS:
+                    self.preset_combo.addItem(name, (model_id, url))
+                self.base_url_edit.setEnabled(True)
+                self.base_url_edit.setText(OPENAI_PRESETS[0][1])
+                self.model_edit.setText(OPENAI_PRESETS[0][2])
+            self.preset_combo.addItem(_CUSTOM_PRESET_LABEL, _CUSTOM_PRESET_KEY)
+            self.preset_combo.setCurrentIndex(0)
+            self._llm_form.setRowVisible(self.base_url_edit, is_compat)
+        finally:
+            self.preset_combo.blockSignals(False)
+            self._applying_preset = False
         self._refresh_api_key_status()
         self._sync_reasoning_effort_guard()
 
     def _on_preset_changed(self) -> None:
+        """选择内置预设时回填模型名称与 Base URL；切至自定义项时保留当前手动输入。"""
         data = self.preset_combo.currentData()
-        if not data:
+        if not isinstance(data, tuple) or len(data) != 2:
             return
         model_id, url = data
-        self.model_edit.setText(model_id)
-        if url:
-            self.base_url_edit.setText(url)
+        self._applying_preset = True
+        try:
+            self.model_edit.setText(model_id)
+            if url:
+                self.base_url_edit.setText(url)
+        finally:
+            self._applying_preset = False
         self._refresh_api_key_status()
         self._sync_reasoning_effort_guard()
+
+    def _sync_preset_combo_from_fields(self, *_args: object) -> None:
+        """根据当前模型名称与 Base URL 自动对齐常用预设下拉框（无匹配时切为自定义）。"""
+        if self._applying_preset:
+            return
+        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
+        cur_model = self.model_edit.text().strip()
+        cur_url = self.base_url_edit.text().strip().rstrip("/")
+        matched_idx = -1
+        for idx in range(self.preset_combo.count()):
+            data = self.preset_combo.itemData(idx)
+            if not isinstance(data, tuple) or len(data) != 2:
+                continue
+            preset_model, preset_url = data
+            if provider == MllmProvider.OPENAI_COMPAT:
+                if preset_model == cur_model and preset_url.strip().rstrip("/") == cur_url:
+                    matched_idx = idx
+                    break
+            elif preset_model == cur_model:
+                matched_idx = idx
+                break
+        if matched_idx < 0:
+            matched_idx = self.preset_combo.findData(_CUSTOM_PRESET_KEY)
+        if matched_idx >= 0 and self.preset_combo.currentIndex() != matched_idx:
+            # 反向对齐仅反映输入框当前状态，不能触发 _on_preset_changed 或污染脏标记
+            prev_restore = self._restoring_state
+            self._restoring_state = True
+            self.preset_combo.blockSignals(True)
+            try:
+                self.preset_combo.setCurrentIndex(matched_idx)
+            finally:
+                self.preset_combo.blockSignals(False)
+                self._restoring_state = prev_restore
 
     def _sync_reasoning_effort_guard(self, *_args: object, clear_notice: bool = False) -> None:
         """按当前模型能力置灰不支持的思考级别，并在已选中项不再受支持时自动平滑回退。"""
@@ -1453,7 +1502,7 @@ class MllmReviewTab(QWidget):
             QMessageBox.warning(self, "LLM 连接测试失败", message)
 
     def save_settings(self, settings: QSettings, *, force: bool = False) -> None:
-        """将当前 LLM 智能标注策略配置序列化写入 `settings`（默认不保存明文 API Key）。"""
+        """将当前自动智能标注策略配置序列化写入 `settings`（默认不保存明文 API Key）。"""
         if not force and not self._settings_dirty:
             return
         provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
@@ -1491,7 +1540,7 @@ class MllmReviewTab(QWidget):
         settings.setValue(_REVIEW_SETTINGS_KEY, json.dumps(state, ensure_ascii=False))
 
     def restore_settings(self, settings: QSettings) -> None:
-        """从 `settings` 恢复上次保存的 LLM 智能标注策略配置；数据缺失或损坏时静默保持默认。"""
+        """从 `settings` 恢复上次保存的自动智能标注策略配置；数据缺失或损坏时静默保持默认。"""
         raw = settings.value(_REVIEW_SETTINGS_KEY, "")
         if not isinstance(raw, str) or not raw.strip():
             return
@@ -1530,6 +1579,7 @@ class MllmReviewTab(QWidget):
                 self.base_url_edit.setText(str(state["base_url"]))
             if state.get("model_name"):
                 self.model_edit.setText(str(state["model_name"]))
+            self._sync_preset_combo_from_fields()
             effort_val = str(state.get("reasoning_effort") or "")
             for i in range(self.reasoning_effort_combo.count()):
                 item = self.reasoning_effort_combo.itemData(i)
@@ -1738,7 +1788,7 @@ class MllmReviewTab(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
-            self.log_box.appendPlainText("正在停止 LLM 智能标注任务...")
+            self.log_box.appendPlainText("正在停止自动智能标注任务...")
 
     def _record_matches_filter(self, rec: ImageReviewRecord, filter_key: str) -> bool:
         if filter_key == "all":
@@ -1867,7 +1917,7 @@ class MllmReviewTab(QWidget):
         start_dir = self.output_picker.text() or str(self.workspace_root)
         chosen, _ = QFileDialog.getOpenFileName(
             self,
-            "选择历史 LLM 智能标注报告 (review_report.json)",
+            "选择历史自动智能标注报告 (review_report.json)",
             start_dir,
             "标注报告 (review_report.json);;JSON 文件 (*.json);;所有文件 (*.*)",
         )
@@ -1944,7 +1994,7 @@ class MllmReviewTab(QWidget):
         self.summary_label.setText(f"执行失败: {err}")
         # 日志与结果列表共用页签区域，失败时自动切到“运行日志”便于直接查看出错上下文
         self.result_tabs.setCurrentWidget(self.log_box)
-        QMessageBox.critical(self, "LLM 智能标注失败", err)
+        QMessageBox.critical(self, "自动智能标注失败", err)
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
         """双击结果行时跳转到内嵌标注工作台并定位到对应输出图片。"""

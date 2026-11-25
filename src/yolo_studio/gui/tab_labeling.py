@@ -6,7 +6,7 @@
     （`R/W` 拖拽或两点画框、`H` 抓手平移、`E` 编辑与 8 控制点精修、方向键微调、`Tab` 轮选、
     `Ctrl+C/V` 跨图粘贴、撤销重做、AI 漏标提醒横幅、切图保持视野与图片内存缓存）、
     右侧类别管理与目标框详情面板（展示 LLM/SAM 审核理由与置信度，支持一键本地 SAM 像素级贴边收框），
-    并与「1. 视频抽帧」「3. LLM 智能标注」「4. 数据集准备」实现双向路径与变更信号联动。
+    并与「1. 视频抽帧」「3. 自动智能标注」「4. 数据集准备」实现双向路径与变更信号联动。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程，仅依赖 `PyQt6`、`Pillow` 及 `core.annotation_io`；
@@ -524,7 +524,7 @@ class LabelingStudioTab(QWidget):
         self.auto_save_chk.setToolTip("切图或退出前自动保存已修改的 .json 标注")
 
         self.to_review_btn = QPushButton("→智能标注")
-        self.to_review_btn.setToolTip("将当前图片目录发送到「3. LLM 智能标注」")
+        self.to_review_btn.setToolTip("将当前图片目录发送到「3. 自动智能标注」")
         self.to_dataset_btn = QPushButton("→数据集")
         self.to_dataset_btn.setObjectName("accentActionBtn")
         self.to_dataset_btn.setToolTip("将当前图片目录与类别清单发送到「4. 数据集准备」")

@@ -1,7 +1,7 @@
 """标签页 4：标注统计检验与 YOLO26 数据集准备界面。
 
 职责：
-    读取标注工作台或 LLM 智能标注产出的图片与标注，扫描并展示标注分布与告警，
+    读取标注工作台或自动智能标注产出的图片与标注，扫描并展示标注分布与告警，
     并按 train/val/test 比例生成 YOLO26 标准数据集与 `data.yaml`。
     左侧按“数据来源 / 划分与输出”分组：前者决定读取哪些图片与标注（扫描只依赖它），后者只影响生成结果。
     界面负责参数输入、划分比例归一化预览、覆盖已有划分前的确认、
@@ -212,7 +212,7 @@ class DatasetTab(QWidget):
         因此扫描按钮放在本组末尾；划分、输出等只影响生成结果的参数放在分组 2。
         递归与排除开关决定从图片目录中取哪些图片，作为图片目录的从属选项紧贴输入框放置（不设行标签），
         并实时显示图片数。递归默认开启：内嵌 X-AnyLabeling 打开目录时同样递归列出子目录图片，
-        按视频分建子目录的抽帧结果与 LLM 智能标注分流结果也都位于子目录；平铺目录开启递归结果不变，
+        按视频分建子目录的抽帧结果与自动智能标注分流结果也都位于子目录；平铺目录开启递归结果不变，
         未复核的 need_review 默认排除。
         """
         group = QGroupBox("1. 数据来源")
@@ -237,7 +237,7 @@ class DatasetTab(QWidget):
         self.exclude_need_review_chk = QCheckBox()
         self.exclude_need_review_chk.setChecked(True)
         self.exclude_need_review_chk.setToolTip(
-            "LLM 智能标注结果中的 need_review 含 LLM 补框与处理出错样本，人工复核完成前不应进入训练；"
+            "自动智能标注结果中的 need_review 含补框与处理出错样本，人工复核完成前不应进入训练；"
             "确认已在工作台复核后可取消勾选。仅在勾选「包含子目录」时生效。"
         )
         self.scope_hint = QLabel()
@@ -416,7 +416,7 @@ class DatasetTab(QWidget):
     def set_dataset_source(
         self, images_dir: str, classes_file: str = "", recursive: bool = True
     ) -> None:
-        """跨页写入：接收 LLM 智能标注结果目录、类别文件并同步递归扫描开关，清空独立标注目录栏。"""
+        """跨页写入：接收自动智能标注结果目录、类别文件并同步递归扫描开关，清空独立标注目录栏。"""
         if images_dir:
             self.images_picker.setText(images_dir)
             self.ann_picker.setText("")

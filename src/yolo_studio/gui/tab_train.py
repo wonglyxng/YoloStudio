@@ -731,7 +731,7 @@ class TrainTab(QWidget):
         self.send_eval_btn = QPushButton("将 best.pt 发送到「6. 验证与推理」→")
         self.send_eval_btn.setEnabled(False)
         self.send_eval_btn.setToolTip(
-            "训练产出 best.pt 后已自动同步到「6. 验证、推理与导出」与「3. LLM 智能标注」；点击再次同步并切换过去"
+            "训练产出 best.pt 后已自动同步到「6. 验证、推理与导出」与「3. 自动智能标注」；点击再次同步并切换过去"
         )
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.stop_btn)
