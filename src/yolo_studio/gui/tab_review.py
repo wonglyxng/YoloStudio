@@ -401,7 +401,7 @@ class MllmReviewTab(QWidget):
         self.base_url_edit.setPlaceholderText("OpenAI 兼容接口 Base URL（Gemini / OpenAI 官方模式无需填写）")
         l_form.addRow("Base URL:", self.base_url_edit)
 
-        self.model_edit = QLineEdit("gemini-3.8-flash")
+        self.model_edit = QLineEdit(GEMINI_MODELS[0][0])
         l_form.addRow("模型名称:", self.model_edit)
 
         effort_box = QVBoxLayout()
@@ -1034,6 +1034,8 @@ class MllmReviewTab(QWidget):
             if provider == MllmProvider.GEMINI:
                 if "flash-lite" in model_lower:
                     detail = "当前 Gemini 模型默认处于 minimal 极简思考（高吞吐低延迟）。"
+                elif "gemini-4-hydrogen" in model_lower or "gemini-4-neon" in model_lower:
+                    detail = "当前 Gemini 4 模型服务端默认思考级别为 high（追求更快速度可调至 low / medium）。"
                 elif "gemini-3.8" in model_lower or "gemini-4" in model_lower:
                     detail = "当前 Gemini 模型服务端默认思考级别为 medium（均衡模式）。"
                 else:
@@ -1043,6 +1045,8 @@ class MllmReviewTab(QWidget):
                     detail = "当前为非思考直出模型，将直接输出标注结果（无长思考消耗）。"
                 elif model_lower.startswith(("o1", "o3", "o4")):
                     detail = "当前 OpenAI o 系列模型服务端默认推理级别为 medium。"
+                elif model_lower.startswith("gpt-6"):
+                    detail = "当前 GPT-6.2 原生推理模型遵循服务端默认推理配置（最低可手动调至 low，不支持 none）。"
                 elif model_lower.startswith("gpt-5.1") or model_lower.startswith("gpt-5.2"):
                     detail = "当前模型服务端默认推理级别为 none（低延迟直出，需思考可手动调高）。"
                 elif model_lower.startswith("gpt-5"):
@@ -1058,8 +1062,8 @@ class MllmReviewTab(QWidget):
         elif effort == ReasoningEffort.OFF:
             if provider == MllmProvider.GEMINI and ("gemini-3.8" in model_lower or "gemini-4" in model_lower):
                 hint = f"{hint}（当前模型不支持 minimal，将自动映射至最低可用档 low）"
-            elif provider != MllmProvider.GEMINI and model_lower.startswith(("o1", "o3", "o4")):
-                hint = f"{hint}（OpenAI o 系列不支持关闭思考，将自动映射至最低可用档 low）"
+            elif provider != MllmProvider.GEMINI and model_lower.startswith(("o1", "o3", "o4", "gpt-6")):
+                hint = f"{hint}（当前模型不支持关闭思考，将自动映射至最低可用档 low）"
         self.reasoning_effort_hint_label.setText(hint)
 
     def _refresh_api_key_status(self, *_args: object) -> None:

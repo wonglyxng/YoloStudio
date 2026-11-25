@@ -480,7 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rv.add_argument("--imgsz", type=int, default=640)
     p_rv.add_argument("--device", default="0")
     p_rv.add_argument("--provider", choices=["gemini", "openai", "openai_compat"], default="gemini")
-    p_rv.add_argument("--model", default="gemini-3.8-flash")
+    p_rv.add_argument("--model", default="gemini-4-hydrogen")
     p_rv.add_argument("--api-key", default="")
     p_rv.add_argument("--base-url", default="")
     p_rv.add_argument(

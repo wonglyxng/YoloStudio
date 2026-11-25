@@ -347,11 +347,8 @@ def download_sam3_from_modelscope(
 OPENAI_OFFICIAL_BASE_URL = "https://api.openai.com/v1"
 
 OPENAI_MODELS: list[tuple[str, str]] = [
-    ("gpt-5.4", "GPT-5.4（旗舰视觉与推理，推荐）"),
-    ("gpt-5-mini", "GPT-5 Mini（速度快、成本均衡）"),
-    ("gpt-4.1", "GPT-4.1（稳定非思考直出，指令遵循强）"),
-    ("gpt-4o", "GPT-4o（经典多模态，低延迟）"),
-    ("o4-mini", "o4-mini（轻量视觉深度推理）"),
+    ("gpt-6.2-sol", "GPT-6.2 Sol（高效均衡、高性价比，推荐）"),
+    ("gpt-6.2-astra", "GPT-6.2 Astra（旗舰前沿、复杂场景最高精度）"),
 ]
 
 OPENAI_PRESETS: list[tuple[str, str, str]] = [
@@ -362,9 +359,10 @@ OPENAI_PRESETS: list[tuple[str, str, str]] = [
 ]
 
 GEMINI_MODELS: list[tuple[str, str]] = [
-    ("gemini-3.8-flash", "Gemini 3.8 Flash（速度快、精度均衡，推荐）"),
-    ("gemini-4-argon", "Gemini 4 Argon（复杂场景最高精度）"),
-    ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite（超高吞吐、最低成本）"),
+    ("gemini-4-hydrogen", "Gemini 4 Hydrogen（快速高效、成本最低，推荐）"),
+    ("gemini-4-neon", "Gemini 4 Neon（速度与精度均衡）"),
+    ("gemini-4-argon", "Gemini 4 Argon（低 Token 开销高效推理）"),
+    ("gemini-4-carbon", "Gemini 4 Carbon（旗舰重型、复杂场景最高精度）"),
 ]
 
 
@@ -615,7 +613,7 @@ class MllmReviewConfig:
     yolo_device: str = "0"
 
     provider: MllmProvider = MllmProvider.GEMINI
-    model_name: str = "gemini-3.8-flash"
+    model_name: str = "gemini-4-hydrogen"
     api_key: str = ""
     base_url: str = ""
     reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO
@@ -787,7 +785,7 @@ class GeminiMllmClient:
     def __init__(
         self,
         api_key: str,
-        model_name: str = "gemini-3.8-flash",
+        model_name: str = "gemini-4-hydrogen",
         *,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
     ) -> None:
@@ -797,7 +795,7 @@ class GeminiMllmClient:
         if not resolved_key:
             raise ValueError("未提供 Gemini API Key（可在界面填写或设置环境变量 GEMINI_API_KEY）。")
         self.client = genai.Client(api_key=resolved_key)
-        self.model_name = model_name.strip() or "gemini-3.8-flash"
+        self.model_name = model_name.strip() or "gemini-4-hydrogen"
         self.reasoning_effort = ReasoningEffort(reasoning_effort)
         self._thinking_candidates = _build_gemini_thinking_candidates(self.reasoning_effort, self.model_name)
         self._thinking_idx = 0
@@ -926,6 +924,15 @@ def _openai_model_is_o_series(model_name: str) -> bool:
     return bool(model_id and re.match(r"^o[1-9](?:$|[-._])", model_id))
 
 
+def _openai_model_requires_min_low_reasoning(model_name: str) -> bool:
+    """判断 OpenAI 推理模型是否不支持 `none`/`minimal`（`o` 系列及 `gpt-6+` 原生推理模型最低支持 `low`）。"""
+    if _openai_model_is_o_series(model_name):
+        return True
+    model_id = _normalize_openai_model_id(model_name)
+    gpt_match = re.match(r"^gpt-(\d+)(?:$|[-._])", model_id)
+    return bool(gpt_match and int(gpt_match.group(1)) >= 6)
+
+
 def _openai_model_is_non_reasoning(model_name: str) -> bool:
     """事前判断模型是否属于已知非推理直出模型（如 `gpt-4o` / `gpt-4.1` / `gpt-3.5`）。"""
     model_id = _normalize_openai_model_id(model_name)
@@ -954,7 +961,7 @@ def _build_openai_reasoning_candidates(
     if effort == ReasoningEffort.AUTO or _openai_model_is_non_reasoning(model_name):
         return (None,)
     if effort == ReasoningEffort.OFF:
-        if _openai_model_is_o_series(model_name):
+        if _openai_model_requires_min_low_reasoning(model_name):
             return ("low", None)
         return ("none", "minimal", "low", None)
     if effort == ReasoningEffort.LOW:
@@ -1009,7 +1016,7 @@ class OpenAICompatMllmClient:
         self._provider_label = provider_label
         self.model_name = model_name.strip()
         if not self.model_name:
-            hint = "gpt-5.4" if not allow_anonymous_key else "qwen-vl-max-latest"
+            hint = OPENAI_MODELS[0][0] if not allow_anonymous_key else "qwen-vl-max-latest"
             raise ValueError(f"请指定{provider_label}的模型名称（如 {hint}）。")
 
         explicit_or_env = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
@@ -1160,7 +1167,7 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
             resolved_key = config.api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
             if not resolved_key:
                 return False, "未提供 Gemini API Key（请在界面填写或设置环境变量 GEMINI_API_KEY）。"
-            model_name = config.model_name.strip() or "gemini-3.8-flash"
+            model_name = config.model_name.strip() or "gemini-4-hydrogen"
             client = genai.Client(api_key=resolved_key)
             interaction = client.interactions.create(
                 model=model_name,

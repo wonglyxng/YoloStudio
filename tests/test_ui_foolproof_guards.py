@@ -32,6 +32,7 @@ import yolo_studio.gui.tab_extract as tab_extract_mod
 import yolo_studio.gui.tab_review as tab_review_mod
 from yolo_studio.core.frame_extractor import ExtractionMode, ExtractionProgress, ExtractionResult
 from yolo_studio.core.mllm_reviewer import (
+    GEMINI_MODELS,
     OPENAI_MODELS,
     BoxRefineMode,
     MllmProvider,
@@ -808,6 +809,8 @@ def test_review_tab_official_openai_and_reasoning_effort_persistence(
 
     tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
+        assert tab1.model_edit.text() == GEMINI_MODELS[0][0]
+        assert tab1.preset_combo.count() == len(GEMINI_MODELS)
         tab1.source_mode_combo.setCurrentIndex(tab1.source_mode_combo.findData(tab_review_mod.ReviewSourceMode.EXISTING_JSON))
         tab1.set_images_dir(str(in_dir))
         tab1.output_picker.setText(str(tmp_path / "out"))

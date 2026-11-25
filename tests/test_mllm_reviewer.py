@@ -1613,6 +1613,7 @@ def test_openai_official_provider_separated_from_compat(monkeypatch) -> None:
     import pytest
 
     from yolo_studio.core.mllm_reviewer import (
+        GEMINI_MODELS,
         OPENAI_MODELS,
         OPENAI_OFFICIAL_BASE_URL,
         OPENAI_PRESETS,
@@ -1622,9 +1623,18 @@ def test_openai_official_provider_separated_from_compat(monkeypatch) -> None:
         test_mllm_connection,
     )
 
-    # 1) OPENAI_PRESETS 不再包含 OpenAI 官方；新增预设与推理说明不含 MLLM 字样
+    # 1) OPENAI_MODELS 仅含 GPT-6.2，GEMINI_MODELS 仅含 Gemini 4；OPENAI_PRESETS 不再包含 OpenAI 官方；预设与推理说明不含 MLLM 字样
+    assert [m for m, _ in OPENAI_MODELS] == ["gpt-6.2-sol", "gpt-6.2-astra"]
+    assert all(m.startswith("gpt-6.2-") for m, _ in OPENAI_MODELS)
+    assert [m for m, _ in GEMINI_MODELS] == [
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
+        "gemini-4-argon",
+        "gemini-4-carbon",
+    ]
+    assert all(m.startswith("gemini-4-") for m, _ in GEMINI_MODELS)
     assert all("api.openai.com" not in url and "OpenAI 官方" not in name for name, url, _ in OPENAI_PRESETS)
-    for _, label in OPENAI_MODELS:
+    for _, label in OPENAI_MODELS + GEMINI_MODELS:
         assert "MLLM" not in label
     for _, label in REASONING_EFFORT_ITEMS:
         assert "MLLM" not in label
@@ -1637,7 +1647,7 @@ def test_openai_official_provider_separated_from_compat(monkeypatch) -> None:
         images_dir=Path("."),
         output_dir=Path("."),
         provider=MllmProvider.OPENAI,
-        model_name="gpt-5.4",
+        model_name="gpt-6.2-sol",
         base_url="http://localhost:11434/v1",  # 即便残留兼容地址也不应被官方模式采纳
         api_key="",
     )
@@ -1674,12 +1684,12 @@ def test_openai_official_provider_separated_from_compat(monkeypatch) -> None:
         images_dir=Path("."),
         output_dir=Path("."),
         provider=MllmProvider.OPENAI,
-        model_name="gpt-5.4",
+        model_name="gpt-6.2-sol",
         base_url="http://localhost:11434/v1",
         api_key="sk-official-test",
     )
     client = build_mllm_client(cfg_ok)
-    assert client.model_name == "gpt-5.4"
+    assert client.model_name == "gpt-6.2-sol"
     assert captured_inits[-1]["api_key"] == "sk-official-test"
     assert captured_inits[-1]["base_url"] == OPENAI_OFFICIAL_BASE_URL
 
@@ -1803,30 +1813,32 @@ def test_openai_reasoning_effort_mapping_and_bad_request_downgrade() -> None:
         assert "reasoning_effort" not in calls[0]
 
     o_calls: list[dict[str, object]] = []
-    o_client = OpenAICompatMllmClient(
-        api_key="k",
-        base_url="https://api.openai.com/v1",
-        model_name="o4-mini",
-        reasoning_effort=ReasoningEffort.OFF,
-        allow_anonymous_key=False,
-    )
-    o_client.client = type(
-        "C",
-        (),
-        {
-            "chat": type(
-                "Chat",
-                (),
-                {
-                    "completions": type(
-                        "Comp", (), {"create": lambda _s, **kw: (o_calls.append(dict(kw)), _Resp())[1]}
-                    )()
-                },
-            )()
-        },
-    )()
-    o_client.review_image(b"x", [], "s", "u")
-    assert o_calls[0]["reasoning_effort"] == "low"
+    for min_low_model in ("o4-mini", "gpt-6.2-sol", "gpt-6.2-astra"):
+        o_calls.clear()
+        o_client = OpenAICompatMllmClient(
+            api_key="k",
+            base_url="https://api.openai.com/v1",
+            model_name=min_low_model,
+            reasoning_effort=ReasoningEffort.OFF,
+            allow_anonymous_key=False,
+        )
+        o_client.client = type(
+            "C",
+            (),
+            {
+                "chat": type(
+                    "Chat",
+                    (),
+                    {
+                        "completions": type(
+                            "Comp", (), {"create": lambda _s, **kw: (o_calls.append(dict(kw)), _Resp())[1]}
+                        )()
+                    },
+                )()
+            },
+        )()
+        o_client.review_image(b"x", [], "s", "u")
+        assert o_calls[0]["reasoning_effort"] == "low"
 
     # 2) gpt-5.4 + OFF 遇服务端拒绝 none 和 minimal，降级至 low 成功且全程保留 response_format
     seq_calls: list[dict[str, object]] = []
@@ -1882,8 +1894,10 @@ def test_openai_reasoning_effort_mapping_and_bad_request_downgrade() -> None:
     assert "reasoning_effort" not in compat_calls[1]
     assert compat_calls[1].get("response_format") == {"type": "json_object"}
 
-    # 4) CLI review 子命令支持 --provider openai 与 --reasoning-effort
+    # 4) CLI review 子命令默认模型及支持 --provider openai 与 --reasoning-effort
     parser = build_parser()
+    default_parsed = parser.parse_args(["review", "-i", "data/raw"])
+    assert default_parsed.model == "gemini-4-hydrogen"
     parsed = parser.parse_args(
         [
             "review",
@@ -1892,12 +1906,13 @@ def test_openai_reasoning_effort_mapping_and_bad_request_downgrade() -> None:
             "--provider",
             "openai",
             "--model",
-            "gpt-5.4",
+            "gpt-6.2-sol",
             "--reasoning-effort",
             "medium",
         ]
     )
     assert parsed.provider == "openai"
+    assert parsed.model == "gpt-6.2-sol"
     assert parsed.reasoning_effort == "medium"
 
 
