@@ -1082,74 +1082,151 @@ def test_review_tab_reasoning_effort_model_foolproof_guards(
 def test_review_tab_preset_combo_bidirectional_sync_and_legacy_restore(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证常用预设与模型名称/Base URL 双向同步及旧配置历史模型恢复对齐。"""
+    """验证旧版缓存模型自动迁移至当前默认预设、v2 显式自定义模型往返保留及预设双向联动。"""
     import json
 
     from yolo_studio.core.mllm_reviewer import OPENAI_PRESETS
 
-    settings = QSettings(str(tmp_path / "legacy_preset_sync.ini"), QSettings.Format.IniFormat)
-    settings.setValue(
+    # 1) 旧版（version: 1）缓存了已下线模型：恢复时自动迁移到当前接口第 0 项默认内置预设，
+    #    由预设带出模型名称，且保留其余参数并保持 _settings_dirty=False
+    legacy_gemini = QSettings(str(tmp_path / "legacy_gemini_v1.ini"), QSettings.Format.IniFormat)
+    legacy_gemini.setValue(
         tab_review_mod._REVIEW_SETTINGS_KEY,
         json.dumps(
             {
                 "version": 1,
                 "provider": MllmProvider.GEMINI.value,
                 "model_name": "gemini-3.8-flash",
+                "reasoning_effort": ReasoningEffort.HIGH.value,
             }
         ),
     )
-    settings.sync()
+    legacy_gemini.sync()
 
+    tab_legacy_g = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab_legacy_g.restore_settings(legacy_gemini)
+        qt_app.processEvents()
+        assert tab_legacy_g.preset_combo.currentIndex() == 0
+        assert tab_legacy_g.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
+        assert tab_legacy_g.model_edit.text() == GEMINI_MODELS[0][0]
+        assert tab_legacy_g.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
+        assert tab_legacy_g._settings_dirty is False
+    finally:
+        tab_legacy_g.close()
+
+    legacy_openai = QSettings(str(tmp_path / "legacy_openai_v1.ini"), QSettings.Format.IniFormat)
+    legacy_openai.setValue(
+        tab_review_mod._REVIEW_SETTINGS_KEY,
+        json.dumps(
+            {
+                "version": 1,
+                "provider": MllmProvider.OPENAI.value,
+                "model_name": "gpt-5.4",
+            }
+        ),
+    )
+    legacy_openai.sync()
+
+    tab_legacy_o = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab_legacy_o.restore_settings(legacy_openai)
+        qt_app.processEvents()
+        assert tab_legacy_o.preset_combo.currentIndex() == 0
+        assert tab_legacy_o.preset_combo.currentData() == (OPENAI_MODELS[0][0], "")
+        assert tab_legacy_o.model_edit.text() == OPENAI_MODELS[0][0]
+        assert tab_legacy_o._settings_dirty is False
+    finally:
+        tab_legacy_o.close()
+
+    # 2) 新版（version: 2）显式手动指定的自定义模型能完整往返保存并恢复为「自定义」，
+    #    且从「自定义」点击回第 0 项预设时能够顺利回填对应模型名称
+    v2_custom_settings = QSettings(str(tmp_path / "v2_custom_sync.ini"), QSettings.Format.IniFormat)
     tab = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        # 1) 恢复历史非预设模型（如 gemini-3.8-flash）：常用预设应自动对齐到「自定义」且不触发脏标记
-        tab.restore_settings(settings)
+        tab.model_edit.setText("gemini-3.8-flash")
         qt_app.processEvents()
-        assert tab.model_edit.text() == "gemini-3.8-flash"
         assert tab.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
         assert tab.preset_combo.currentText() == tab_review_mod._CUSTOM_PRESET_LABEL
-        assert tab._settings_dirty is False
+        tab.save_settings(v2_custom_settings)
+        v2_custom_settings.sync()
+    finally:
+        tab.close()
 
-        # 2) 从自定义点选回第 0 项 Built-in 预设（Gemini 4 Hydrogen）能够顺利触发回填
-        tab.preset_combo.setCurrentIndex(0)
+    tab_v2 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab_v2.restore_settings(v2_custom_settings)
         qt_app.processEvents()
-        assert tab.model_edit.text() == GEMINI_MODELS[0][0]
-        assert tab.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
-        assert tab._settings_dirty is True
+        assert tab_v2.model_edit.text() == "gemini-3.8-flash"
+        assert tab_v2.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+        assert tab_v2._settings_dirty is False
+
+        # 从自定义点选回第 0 项 Built-in 预设（Gemini 4 Hydrogen）能够顺利触发回填
+        tab_v2.preset_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+        assert tab_v2.model_edit.text() == GEMINI_MODELS[0][0]
+        assert tab_v2.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
+        assert tab_v2._settings_dirty is True
 
         # 3) 下拉选中「自定义」本身不清空当前模型名称
-        custom_idx = tab.preset_combo.findData(tab_review_mod._CUSTOM_PRESET_KEY)
+        custom_idx = tab_v2.preset_combo.findData(tab_review_mod._CUSTOM_PRESET_KEY)
         assert custom_idx >= 0
-        tab.preset_combo.setCurrentIndex(custom_idx)
+        tab_v2.preset_combo.setCurrentIndex(custom_idx)
         qt_app.processEvents()
-        assert tab.model_edit.text() == GEMINI_MODELS[0][0]
+        assert tab_v2.model_edit.text() == GEMINI_MODELS[0][0]
 
         # 4) 手动输入非预设模型名自动切至自定义，输入准确内置模型名自动跳回对应预设
-        tab.model_edit.setText("gemini-custom-test")
+        tab_v2.model_edit.setText("gemini-custom-test")
         qt_app.processEvents()
-        assert tab.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+        assert tab_v2.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
 
-        tab.model_edit.setText("gemini-4-neon")
+        tab_v2.model_edit.setText("gemini-4-neon")
         qt_app.processEvents()
-        assert tab.preset_combo.currentData() == ("gemini-4-neon", "")
+        assert tab_v2.preset_combo.currentData() == ("gemini-4-neon", "")
 
         # 5) OpenAI 兼容接口同时比对 Base URL（含末尾斜杠归一化）与模型名称
-        compat_idx = tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
+        compat_idx = tab_v2.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
         assert compat_idx >= 0
-        tab.provider_combo.setCurrentIndex(compat_idx)
+        tab_v2.provider_combo.setCurrentIndex(compat_idx)
         qt_app.processEvents()
         expected_url = OPENAI_PRESETS[0][1]
         expected_model = OPENAI_PRESETS[0][2]
-        assert tab.preset_combo.currentData() == (expected_model, expected_url)
+        assert tab_v2.preset_combo.currentData() == (expected_model, expected_url)
 
-        tab.base_url_edit.setText("https://custom-gateway.example.com/v1")
+        tab_v2.base_url_edit.setText("https://custom-gateway.example.com/v1")
         qt_app.processEvents()
-        assert tab.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+        assert tab_v2.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
 
-        tab.base_url_edit.setText(expected_url.rstrip("/") + "/")
+        tab_v2.base_url_edit.setText(expected_url.rstrip("/") + "/")
         qt_app.processEvents()
-        assert tab.preset_combo.currentData() == (expected_model, expected_url)
+        assert tab_v2.preset_combo.currentData() == (expected_model, expected_url)
     finally:
-        tab.close()
+        tab_v2.close()
+
+    # 6) 旧版 version: 1 下 OpenAI 兼容接口的自定义地址与模型仍原样保留
+    legacy_compat = QSettings(str(tmp_path / "legacy_compat_v1.ini"), QSettings.Format.IniFormat)
+    legacy_compat.setValue(
+        tab_review_mod._REVIEW_SETTINGS_KEY,
+        json.dumps(
+            {
+                "version": 1,
+                "provider": MllmProvider.OPENAI_COMPAT.value,
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model_name": "my-local-vlm",
+            }
+        ),
+    )
+    legacy_compat.sync()
+
+    tab_compat = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab_compat.restore_settings(legacy_compat)
+        qt_app.processEvents()
+        assert tab_compat.base_url_edit.text() == "http://127.0.0.1:8080/v1"
+        assert tab_compat.model_edit.text() == "my-local-vlm"
+        assert tab_compat.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+    finally:
+        tab_compat.close()
+
 
 

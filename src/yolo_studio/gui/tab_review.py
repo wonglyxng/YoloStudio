@@ -1512,7 +1512,7 @@ class MllmReviewTab(QWidget):
             self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
         )
         state: dict[str, object] = {
-            "version": 1,
+            "version": 2,
             "source_mode": source_mode.value,
             "yolo_conf": self.yolo_conf_spin.value(),
             "yolo_iou": self.yolo_iou_spin.value(),
@@ -1520,6 +1520,8 @@ class MllmReviewTab(QWidget):
             "provider": provider.value,
             "base_url": self.base_url_edit.text().strip(),
             "model_name": self.model_edit.text().strip(),
+            # 记录用户是否显式处于自定义模型状态，避免预设列表升级时把旧默认模型误留为自定义
+            "custom_model": self.preset_combo.currentData() == _CUSTOM_PRESET_KEY,
             "reasoning_effort": reasoning_effort.value,
             "classes": self.classes_edit.text().strip(),
             "guideline": self.guideline_edit.text().strip(),
@@ -1574,11 +1576,39 @@ class MllmReviewTab(QWidget):
                     self.provider_combo.setCurrentIndex(i)
                     break
 
+            try:
+                state_version = int(state.get("version") or 1)
+            except (TypeError, ValueError):
+                state_version = 1
+            explicit_custom = state_version >= 2 and bool(state.get("custom_model", False))
+
             restored_provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-            if restored_provider == MllmProvider.OPENAI_COMPAT and state.get("base_url"):
-                self.base_url_edit.setText(str(state["base_url"]))
-            if state.get("model_name"):
-                self.model_edit.setText(str(state["model_name"]))
+            saved_url = str(state.get("base_url") or "").strip()
+            saved_model = str(state.get("model_name") or "").strip()
+            if restored_provider == MllmProvider.OPENAI_COMPAT:
+                if saved_url:
+                    self.base_url_edit.setText(saved_url)
+                if saved_model:
+                    self.model_edit.setText(saved_model)
+            else:
+                builtin_models = {
+                    model_id
+                    for model_id, _ in (
+                        GEMINI_MODELS if restored_provider == MllmProvider.GEMINI else OPENAI_MODELS
+                    )
+                }
+                default_model = (
+                    GEMINI_MODELS[0][0]
+                    if restored_provider == MllmProvider.GEMINI
+                    else OPENAI_MODELS[0][0]
+                )
+                if saved_model in builtin_models:
+                    self.model_edit.setText(saved_model)
+                elif saved_model and explicit_custom:
+                    self.model_edit.setText(saved_model)
+                else:
+                    # 旧版缓存或已下线内置预设统一自动迁移到当前接口默认预设，由预设带出模型名称
+                    self.model_edit.setText(default_model)
             self._sync_preset_combo_from_fields()
             effort_val = str(state.get("reasoning_effort") or "")
             for i in range(self.reasoning_effort_combo.count()):
