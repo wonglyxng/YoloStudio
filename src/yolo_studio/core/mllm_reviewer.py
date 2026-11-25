@@ -121,7 +121,44 @@ class MllmProvider(str, Enum):
     """支持的多模态大模型接口提供方。"""
 
     GEMINI = "gemini"
+    OPENAI = "openai"
     OPENAI_COMPAT = "openai_compat"
+
+
+class ReasoningEffort(str, Enum):
+    """多模态大模型的统一思考/推理深度级别。
+
+    说明：
+        `AUTO` 不向服务端显式传入思考级别，由目标模型按自身默认策略执行；
+        其余级别会按接口与模型家族映射为 Gemini `thinking_level` 或 OpenAI `reasoning_effort`，
+        并在遇到不兼容的 400 响应时自动单调降级至受支持档位或省略参数。
+    """
+
+    AUTO = "auto"
+    OFF = "off"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+
+
+REASONING_EFFORT_ITEMS: list[tuple[ReasoningEffort, str]] = [
+    (ReasoningEffort.AUTO, "模型默认（不显式指定，推荐）"),
+    (ReasoningEffort.OFF, "关闭 / 极简（关闭思考或 minimal，最快）"),
+    (ReasoningEffort.LOW, "低（low，轻量思考、速度优先）"),
+    (ReasoningEffort.MEDIUM, "中（medium，速度与精度均衡）"),
+    (ReasoningEffort.HIGH, "高（high，复杂场景深度推理）"),
+    (ReasoningEffort.XHIGH, "极高（xhigh，仅旗舰推理模型支持）"),
+]
+
+REASONING_EFFORT_HINTS: dict[ReasoningEffort, str] = {
+    ReasoningEffort.AUTO: "不显式传入思考级别参数，遵循所选模型服务端默认推理深度。",
+    ReasoningEffort.OFF: "尽量关闭长思考或降至极简（Gemini 映射 minimal/low，OpenAI 推理模型映射 none/low）。",
+    ReasoningEffort.LOW: "显式设为 low：轻量思考以降低延迟和 Token 消耗，适合常规清晰画面。",
+    ReasoningEffort.MEDIUM: "显式设为 medium：兼顾标注准确率与响应速度，适合多数复杂检测场景。",
+    ReasoningEffort.HIGH: "显式设为 high：最大化深度思考，适合密集遮挡、易混类别与复杂规则判定。",
+    ReasoningEffort.XHIGH: "显式设为 xhigh：仅旗舰推理模型支持；若当前模型不支持则自动降级为 high。",
+}
 
 
 class BoxRefineMode(str, Enum):
@@ -307,12 +344,21 @@ def download_sam3_from_modelscope(
     return target.resolve()
 
 
+OPENAI_OFFICIAL_BASE_URL = "https://api.openai.com/v1"
+
+OPENAI_MODELS: list[tuple[str, str]] = [
+    ("gpt-5.4", "GPT-5.4（旗舰视觉与推理，推荐）"),
+    ("gpt-5-mini", "GPT-5 Mini（速度快、成本均衡）"),
+    ("gpt-4.1", "GPT-4.1（稳定非思考直出，指令遵循强）"),
+    ("gpt-4o", "GPT-4o（经典多模态，低延迟）"),
+    ("o4-mini", "o4-mini（轻量视觉深度推理）"),
+]
+
 OPENAI_PRESETS: list[tuple[str, str, str]] = [
     ("通义千问 DashScope (Qwen-VL)", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-vl-max-latest"),
     ("硅基流动 SiliconFlow", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-VL-72B-Instruct"),
     ("本地 Ollama", "http://localhost:11434/v1", "qwen2.5vl:7b"),
     ("本地 vLLM", "http://localhost:8000/v1", "Qwen/Qwen2.5-VL-7B-Instruct"),
-    ("OpenAI 官方", "https://api.openai.com/v1", "gpt-4o"),
 ]
 
 GEMINI_MODELS: list[tuple[str, str]] = [
@@ -545,6 +591,8 @@ class MllmReviewConfig:
     """LLM 智能标注管线的运行配置。
 
     关键字段说明：
+        `provider` / `reasoning_effort`：多模态大模型接口提供方（`gemini` / `openai` / `openai_compat`）
+            与统一思考/推理深度级别（默认 `auto` 遵循模型默认，不额外下发推理参数）。
         `yolo_conf` / `yolo_iou` / `high_conf_skip`：置信度与 IoU 阈值，取值范围 `(0, 1]`；
             仅当已有候选框非空、所有框均具有不低于 `high_conf_skip` 的置信度、`check_missing=False`
             且未启用要求全框收紧的边框修正时跳过 LLM。
@@ -570,6 +618,7 @@ class MllmReviewConfig:
     model_name: str = "gemini-3.8-flash"
     api_key: str = ""
     base_url: str = ""
+    reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO
 
     allowed_classes: list[str] = field(default_factory=list)
     custom_guideline: str = ""
@@ -682,15 +731,66 @@ def parse_review_response_text(raw_text: str) -> MllmReviewResponse:
     return MllmReviewResponse.model_validate_json(cleaned)
 
 
+def _gemini_model_supports_minimal(model_name: str) -> bool:
+    """判断 Gemini 模型是否支持 `thinking_level='minimal'`（`gemini-3.8-*` / `gemini-4-*` 不支持 `minimal`）。"""
+    lower = model_name.strip().lower()
+    if "flash-lite" in lower:
+        return True
+    if "gemini-3.8" in lower or "gemini-4" in lower:
+        return False
+    return True
+
+
+def _build_gemini_thinking_candidates(
+    effort: ReasoningEffort, model_name: str
+) -> tuple[str | None, ...]:
+    """将统一思考级别映射为 Gemini `thinking_level` 有序降级候选链（`None` 表示省略参数）。"""
+    if effort == ReasoningEffort.AUTO:
+        return (None,)
+    if effort == ReasoningEffort.OFF:
+        return ("minimal", "low", None) if _gemini_model_supports_minimal(model_name) else ("low", None)
+    if effort == ReasoningEffort.LOW:
+        return ("low", None)
+    if effort == ReasoningEffort.MEDIUM:
+        return ("medium", None)
+    if effort == ReasoningEffort.HIGH:
+        return ("high", None)
+    return ("xhigh", "high", None)
+
+
+def _is_gemini_thinking_bad_request(exc: BaseException) -> bool:
+    """判断 Gemini 异常是否因模型拒绝指定 `thinking_level` / `generation_config` 的 400 参数错误所致。"""
+    code = getattr(exc, "code", None)
+    status_code = getattr(exc, "status_code", None)
+    status = str(getattr(exc, "status", None) or "").strip().lower()
+    msg = f"{status} {exc}".lower()
+    is_bad_request = (
+        code == 400
+        or status_code == 400
+        or "invalid_argument" in msg
+        or bool(re.search(r"\b400\b", msg))
+    )
+    if not is_bad_request:
+        return False
+    return any(tok in msg for tok in ("thinking_level", "thinking", "generation_config"))
+
+
 class GeminiMllmClient:
     """基于官方 `google-genai` Interactions API 的 Google Gemini 多模态审核客户端。
 
     凭据与状态：
         初始化时优先使用传入的 `api_key`，为空时读取环境变量 `GEMINI_API_KEY`，均缺失则抛出 `ValueError`；
-        内部持有无状态交互会话客户端（每次调用设置 `store=False`）。
+        内部持有无状态交互会话客户端（每次调用设置 `store=False`），并按 `reasoning_effort`
+        维护单调降级索引 `_thinking_idx`，遇到不支持特定 `thinking_level` 的 400 响应时自动降级。
     """
 
-    def __init__(self, api_key: str, model_name: str = "gemini-3.8-flash") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "gemini-3.8-flash",
+        *,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+    ) -> None:
         from google import genai
 
         resolved_key = api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
@@ -698,6 +798,9 @@ class GeminiMllmClient:
             raise ValueError("未提供 Gemini API Key（可在界面填写或设置环境变量 GEMINI_API_KEY）。")
         self.client = genai.Client(api_key=resolved_key)
         self.model_name = model_name.strip() or "gemini-3.8-flash"
+        self.reasoning_effort = ReasoningEffort(reasoning_effort)
+        self._thinking_candidates = _build_gemini_thinking_candidates(self.reasoning_effort, self.model_name)
+        self._thinking_idx = 0
 
     def review_image(
         self,
@@ -706,7 +809,7 @@ class GeminiMllmClient:
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse:
-        """发送编号总览图及候选框裁剪图至 Gemini 并解析结构化审核结果；响应文本为空时抛出 `RuntimeError`。"""
+        """发送编号总览图及候选框裁剪图至 Gemini 并解析结构化审核结果；遇思考级别 400 拒绝时自动降级重试。"""
         contents: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt},
             {
@@ -730,17 +833,31 @@ class GeminiMllmClient:
                 }
             )
 
-        interaction = self.client.interactions.create(
-            model=self.model_name,
-            system_instruction=system_prompt,
-            input=contents,
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": MllmReviewResponse.model_json_schema(),
-            },
-            store=False,
-        )
+        while True:
+            sent_idx = self._thinking_idx
+            sent_level = self._thinking_candidates[sent_idx]
+            req_kwargs: dict[str, object] = {
+                "model": self.model_name,
+                "system_instruction": system_prompt,
+                "input": contents,
+                "response_format": {
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": MllmReviewResponse.model_json_schema(),
+                },
+                "store": False,
+            }
+            if sent_level is not None:
+                req_kwargs["generation_config"] = {"thinking_level": sent_level}
+            try:
+                interaction = self.client.interactions.create(**req_kwargs)
+                break
+            except Exception as exc:
+                if sent_level is not None and _is_gemini_thinking_bad_request(exc):
+                    self._thinking_idx = max(self._thinking_idx, sent_idx + 1)
+                    continue
+                raise
+
         output_text = getattr(interaction, "output_text", None) or ""
         if not output_text:
             raise RuntimeError("Gemini 返回为空，未包含文本输出。")
@@ -803,6 +920,22 @@ def _normalize_openai_model_id(model_name: str) -> str:
     return model_id
 
 
+def _openai_model_is_o_series(model_name: str) -> bool:
+    """判断规范化后的 OpenAI 模型名是否属于 `o` 系列推理模型（如 `o1` / `o3` / `o4-mini`）。"""
+    model_id = _normalize_openai_model_id(model_name)
+    return bool(model_id and re.match(r"^o[1-9](?:$|[-._])", model_id))
+
+
+def _openai_model_is_non_reasoning(model_name: str) -> bool:
+    """事前判断模型是否属于已知非推理直出模型（如 `gpt-4o` / `gpt-4.1` / `gpt-3.5`）。"""
+    model_id = _normalize_openai_model_id(model_name)
+    if not model_id:
+        return False
+    return bool(
+        re.match(r"^(?:gpt-4o|gpt-4\.1|gpt-4-|gpt-4$|gpt-3\.5|chatgpt-4o)(?:$|[-._])", model_id)
+    )
+
+
 def _openai_model_omits_custom_sampling(model_name: str) -> bool:
     """事前判断模型是否属于默认不支持自定义 `temperature` 及 `max_tokens` 的 OpenAI 新系列（`o` 系列与 `gpt-5+`）。"""
     model_id = _normalize_openai_model_id(model_name)
@@ -814,19 +947,50 @@ def _openai_model_omits_custom_sampling(model_name: str) -> bool:
     return bool(gpt_match and int(gpt_match.group(1)) >= 5)
 
 
+def _build_openai_reasoning_candidates(
+    effort: ReasoningEffort, model_name: str
+) -> tuple[str | None, ...]:
+    """将统一思考级别映射为 OpenAI `reasoning_effort` 有序降级候选链（`None` 表示省略参数）。"""
+    if effort == ReasoningEffort.AUTO or _openai_model_is_non_reasoning(model_name):
+        return (None,)
+    if effort == ReasoningEffort.OFF:
+        if _openai_model_is_o_series(model_name):
+            return ("low", None)
+        return ("none", "minimal", "low", None)
+    if effort == ReasoningEffort.LOW:
+        return ("low", None)
+    if effort == ReasoningEffort.MEDIUM:
+        return ("medium", None)
+    if effort == ReasoningEffort.HIGH:
+        return ("high", None)
+    return ("xhigh", "high", None)
+
+
+def _is_reasoning_effort_bad_request(exc: BaseException) -> bool:
+    """判断 OpenAI 官方或兼容接口的 400 异常是否因拒绝 `reasoning_effort` 参数或其取值所致。"""
+    param, text = _extract_openai_bad_request_info(exc)
+    if param in {"reasoning_effort", "reasoning", "reasoning.effort"}:
+        return True
+    return bool(
+        re.search(r"(?<![a-z0-9_])reasoning[_.\s-]*effort(?![a-z0-9_])", text)
+        or re.search(r"unsupported[^\n]*reasoning", text)
+    )
+
+
 class OpenAICompatMllmClient:
-    """OpenAI 兼容多模态审核客户端，适配通义千问 Qwen-VL、硅基流动、本地 Ollama、vLLM 与 OpenAI。
+    """OpenAI 官方与兼容接口多模态审核客户端，适配 OpenAI 官方、通义千问、硅基流动、Ollama 与 vLLM。
 
     凭据与兼容性：
-        初始化时依次回退 `api_key`、`OPENAI_API_KEY` 与 `"ollama"`（用于本地免鉴权服务），
-        `base_url` 为空时默认使用 DashScope 兼容端点，`model_name` 为空抛出 `ValueError`。
+        - 当 `allow_anonymous_key=False`（OpenAI 官方）时：仅读取 `api_key` 或环境变量 `OPENAI_API_KEY`，
+          均缺失时抛出 `ValueError`，绝不回退为 `"ollama"`；`base_url` 为空时默认使用 `OPENAI_OFFICIAL_BASE_URL`。
+        - 当 `allow_anonymous_key=True`（OpenAI 兼容接口）时：依次回退 `api_key`、`OPENAI_API_KEY` 与 `"ollama"`，
+          `base_url` 为空时默认使用 DashScope 兼容端点。
 
     参数事前预判与自动降级状态：
-        维护 `_temperature_supported` 与 `_json_mode_supported` 两个能力标志位：
-        初始化时会按模型名对 OpenAI `o` 系列及 `gpt-5+` 新系列预置 `_temperature_supported = False`
-        以避免首次 400 往返，其他模型默认开启；运行时仅在对应参数触发 `openai.BadRequestError`
-        时单调降级为 `False`。每轮请求前先对两个标志位取快照，多线程并发下依据本轮实际发送的
-        参数快照判定降级，不会互相误关且保证有限次终止。
+        维护 `_temperature_supported`、`_json_mode_supported` 与 `_reasoning_idx` 能力状态：
+        初始化时按模型名对 OpenAI `o` 系列及 `gpt-5+` 预置 `_temperature_supported = False`，对已知非推理模型
+        事前省略 `reasoning_effort`；运行时仅在对应参数触发 `openai.BadRequestError` 时单调降级。
+        每轮请求前先对状态取快照，多线程并发下依据本轮实际发送快照判定降级，不会互相误关且保证有限次终止。
     """
 
     def __init__(
@@ -835,18 +999,37 @@ class OpenAICompatMllmClient:
         base_url: str,
         model_name: str,
         timeout: float = 90.0,
+        *,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+        allow_anonymous_key: bool = True,
+        provider_label: str = "OpenAI 兼容接口",
     ) -> None:
         from openai import BadRequestError, OpenAI
 
+        self._provider_label = provider_label
         self.model_name = model_name.strip()
         if not self.model_name:
-            raise ValueError("请指定 OpenAI 兼容接口的模型名称（如 qwen-vl-max-latest）。")
-        resolved_key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip() or "ollama"
-        resolved_url = base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            hint = "gpt-5.4" if not allow_anonymous_key else "qwen-vl-max-latest"
+            raise ValueError(f"请指定{provider_label}的模型名称（如 {hint}）。")
+
+        explicit_or_env = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+        if not allow_anonymous_key and not explicit_or_env:
+            raise ValueError("未提供 OpenAI API Key（可在界面填写或设置环境变量 OPENAI_API_KEY）。")
+        resolved_key = explicit_or_env or "ollama"
+        default_url = (
+            OPENAI_OFFICIAL_BASE_URL
+            if not allow_anonymous_key
+            else "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        resolved_url = base_url.strip() or default_url
+
         self.client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=timeout)
         self._bad_request_error = BadRequestError
         self._temperature_supported = not _openai_model_omits_custom_sampling(self.model_name)
         self._json_mode_supported = True
+        self.reasoning_effort = ReasoningEffort(reasoning_effort)
+        self._reasoning_candidates = _build_openai_reasoning_candidates(self.reasoning_effort, self.model_name)
+        self._reasoning_idx = 0
 
     def review_image(
         self,
@@ -855,7 +1038,7 @@ class OpenAICompatMllmClient:
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse:
-        """发送多模态对话请求并解析 JSON 审核结果；若后端拒绝 `temperature` 或 `json_object` 则自动降级重试。"""
+        """发送多模态对话请求并解析 JSON 审核结果；若后端拒绝可选参数则按快照单调降级重试。"""
         user_content: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt},
             {
@@ -890,6 +1073,8 @@ class OpenAICompatMllmClient:
             # 先快照本轮实际发送的可选参数，防止并发线程修改标志位后漏判当前请求触发的 400
             sent_temperature = self._temperature_supported
             sent_json_mode = self._json_mode_supported
+            sent_reasoning_idx = self._reasoning_idx
+            sent_reasoning_val = self._reasoning_candidates[sent_reasoning_idx]
             req_kwargs: dict[str, object] = {
                 "model": self.model_name,
                 "messages": messages,
@@ -898,6 +1083,8 @@ class OpenAICompatMllmClient:
                 req_kwargs["temperature"] = 0.1
             if sent_json_mode:
                 req_kwargs["response_format"] = {"type": "json_object"}
+            if sent_reasoning_val is not None:
+                req_kwargs["reasoning_effort"] = sent_reasoning_val
             try:
                 # 保留 type: ignore 指令供静态类型检查器识别兼容接口动态构造的参数字典
                 resp = self.client.chat.completions.create(**req_kwargs)  # type: ignore[arg-type]
@@ -907,30 +1094,54 @@ class OpenAICompatMllmClient:
                 if sent_temperature and _is_temperature_bad_request(exc):
                     self._temperature_supported = False
                     downgraded = True
+                if sent_reasoning_val is not None and _is_reasoning_effort_bad_request(exc):
+                    self._reasoning_idx = max(self._reasoning_idx, sent_reasoning_idx + 1)
+                    downgraded = True
                 if sent_json_mode and _is_response_format_bad_request(exc):
                     self._json_mode_supported = False
                     downgraded = True
-                if not downgraded and sent_json_mode:
-                    # 兼容部分第三方 OpenAI 兼容服务端在不支持 response_format 时仅返回笼统 400 文案
-                    self._json_mode_supported = False
-                    downgraded = True
+                if not downgraded:
+                    if sent_reasoning_val is not None:
+                        # 遇笼统 400 时优先省略 reasoning_effort，避免误关 json_mode 结构化输出
+                        self._reasoning_idx = max(self._reasoning_idx, len(self._reasoning_candidates) - 1)
+                        downgraded = True
+                    elif sent_json_mode:
+                        # 兼容部分第三方 OpenAI 兼容服务端在不支持 response_format 时仅返回笼统 400 文案
+                        self._json_mode_supported = False
+                        downgraded = True
                 if not downgraded:
                     raise
 
         content = (resp.choices[0].message.content or "") if resp.choices else ""
         if not content.strip():
-            raise RuntimeError("OpenAI 兼容接口返回为空，未包含文本输出。")
+            raise RuntimeError(f"{self._provider_label}返回为空，未包含文本输出。")
         return parse_review_response_text(content)
 
 
 def build_mllm_client(config: MllmReviewConfig) -> MllmClient:
     """根据配置中的 `provider` 创建对应的 LLM 标注质检客户端实例。"""
     if config.provider == MllmProvider.GEMINI:
-        return GeminiMllmClient(api_key=config.api_key, model_name=config.model_name)
+        return GeminiMllmClient(
+            api_key=config.api_key,
+            model_name=config.model_name,
+            reasoning_effort=config.reasoning_effort,
+        )
+    if config.provider == MllmProvider.OPENAI:
+        return OpenAICompatMllmClient(
+            api_key=config.api_key,
+            base_url=OPENAI_OFFICIAL_BASE_URL,
+            model_name=config.model_name.strip() or OPENAI_MODELS[0][0],
+            reasoning_effort=config.reasoning_effort,
+            allow_anonymous_key=False,
+            provider_label="OpenAI 官方接口",
+        )
     return OpenAICompatMllmClient(
         api_key=config.api_key,
         base_url=config.base_url,
         model_name=config.model_name,
+        reasoning_effort=config.reasoning_effort,
+        allow_anonymous_key=True,
+        provider_label="OpenAI 兼容接口",
     )
 
 
@@ -963,11 +1174,24 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
 
         from openai import BadRequestError, OpenAI
 
-        resolved_key = config.api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip() or "ollama"
-        resolved_url = config.base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        is_official_openai = config.provider == MllmProvider.OPENAI
+        explicit_or_env = config.api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+        if is_official_openai:
+            if not explicit_or_env:
+                return False, "未提供 OpenAI API Key（请在界面填写或设置环境变量 OPENAI_API_KEY）。"
+            resolved_key = explicit_or_env
+            resolved_url = OPENAI_OFFICIAL_BASE_URL
+            provider_label = "OpenAI 官方接口"
+            model_placeholder = OPENAI_MODELS[0][0]
+        else:
+            resolved_key = explicit_or_env or "ollama"
+            resolved_url = config.base_url.strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            provider_label = "OpenAI 兼容接口"
+            model_placeholder = "qwen-vl-max-latest"
+
         model_name = config.model_name.strip()
         if not model_name:
-            return False, "请先填写模型名称（如 qwen-vl-max-latest）。"
+            return False, f"请先填写模型名称（如 {model_placeholder}）。"
         client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=20.0)
         omit_legacy_sampling = _openai_model_omits_custom_sampling(model_name)
         send_temperature = not omit_legacy_sampling
@@ -999,7 +1223,7 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
         reply = (resp.choices[0].message.content or "").strip() if resp.choices else ""
         elapsed = time.perf_counter() - t0
         preview = reply[:40].replace("\n", " ") if reply else "(空响应)"
-        return True, f"OpenAI 兼容接口连通正常（模型: {model_name}，耗时 {elapsed:.2f}s，回复: {preview}）"
+        return True, f"{provider_label}连通正常（模型: {model_name}，耗时 {elapsed:.2f}s，回复: {preview}）"
     except Exception as exc:
         elapsed = time.perf_counter() - t0
         return False, f"接口连接失败（耗时 {elapsed:.2f}s）: {exc}"
@@ -2372,6 +2596,7 @@ def run_mllm_review(
 
     if log_callback:
         refine_desc = effective_refine_mode.value
+        effort_desc = config.reasoning_effort.value
         if sam3_pure_local:
             log_callback(
                 f"开始纯本地 SAM 3 自动标注分流（共 {len(images)} 张图，类别: {allowed_classes}，"
@@ -2380,13 +2605,13 @@ def run_mllm_review(
         elif is_sam3_text:
             log_callback(
                 f"开始 SAM 3 预标 + LLM 二次质检（共 {len(images)} 张图，类别: {allowed_classes}，"
-                f"边框修正: {refine_desc}，并发={config.max_workers}）..."
+                f"推理级别: {effort_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
             )
         else:
             mode_title = "LLM 零样本直接标注" if is_zero_shot else "LLM 智能标注"
             log_callback(
                 f"开始 {mode_title}（共 {len(images)} 张图，类别: {allowed_classes}，"
-                f"边框修正: {refine_desc}，并发={config.max_workers}）..."
+                f"推理级别: {effort_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
             )
 
     def _bucket_dir(bucket: str) -> Path:
@@ -2757,6 +2982,8 @@ def run_mllm_review(
         "cancelled": cancelled,
         "classes": allowed_classes,
         "source_mode": config.source_mode.value,
+        "provider": config.provider.value,
+        "reasoning_effort": ReasoningEffort.AUTO.value if sam3_pure_local else config.reasoning_effort.value,
         "sam3_enable_llm_review": bool(config.sam3_enable_llm_review) if is_sam3_text else False,
         "box_refine_mode": effective_refine_mode.value,
         "items": [

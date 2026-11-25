@@ -15,10 +15,12 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary
 
-from PyQt6.QtCore import QEvent, QObject, QThread, Qt, QUrl, pyqtSignal as Signal
-from PyQt6.QtGui import QDesktopServices, QPixmap
+from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QThread, Qt, QUrl, pyqtSignal as Signal
+from PyQt6.QtGui import QDesktopServices, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
+    QAbstractScrollArea,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -42,6 +44,81 @@ LOG_MAX_LINES = 5000
 # 表单最长标签与右侧字段控件（下拉框、输入框、微调框等）之间的默认水平间距（像素）
 FORM_LABEL_SPACING = 8
 
+# 按 QCoreApplication 实例弱引用记录已安装的下拉框滚轮拦截器，避免重复安装且不阻碍实例回收
+_INSTALLED_WHEEL_GUARDS: WeakKeyDictionary[QCoreApplication, "_ComboBoxWheelBlocker"] = WeakKeyDictionary()
+
+
+class _ComboBoxWheelBlocker(QObject):
+    """全局拦截未展开 `QComboBox` 本体（含可编辑下拉框内部 `QLineEdit`）的鼠标滚轮切换事件。
+
+    设计原因：
+        表单页面普遍嵌套在 `QScrollArea` 中，用户滚动页面时极易误触下拉框导致选项被静默改写；
+        拦截后将滚轮事件坐标映射并透传给最近的祖先 `QAbstractScrollArea.viewport()`，
+        同时对已展开下拉弹出列表（`view().viewport()`）不作拦截，保证长列表仍可用滚轮浏览。
+    """
+
+    @staticmethod
+    def _find_scroll_area(combo: QComboBox) -> QAbstractScrollArea | None:
+        first_area: QAbstractScrollArea | None = None
+        parent = combo.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QAbstractScrollArea):
+                if first_area is None:
+                    first_area = parent
+                vbar = parent.verticalScrollBar()
+                hbar = parent.horizontalScrollBar()
+                if (vbar is not None and vbar.maximum() > vbar.minimum()) or (
+                    hbar is not None and hbar.maximum() > hbar.minimum()
+                ):
+                    return parent
+            parent = parent.parentWidget()
+        return first_area
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
+            combo: QComboBox | None = None
+            if isinstance(watched, QComboBox):
+                combo = watched
+            elif isinstance(watched, QLineEdit) and isinstance(watched.parent(), QComboBox):
+                combo = watched.parent()
+            if combo is not None:
+                event.ignore()
+                area = self._find_scroll_area(combo)
+                vp = area.viewport() if area is not None else None
+                if vp is not None:
+                    mapped_pos = QPointF(watched.mapTo(vp, event.position().toPoint()))
+                    forwarded = QWheelEvent(
+                        mapped_pos,
+                        event.globalPosition(),
+                        event.pixelDelta(),
+                        event.angleDelta(),
+                        event.buttons(),
+                        event.modifiers(),
+                        event.phase(),
+                        event.inverted(),
+                    )
+                    QCoreApplication.sendEvent(vp, forwarded)
+                return True
+        return super().eventFilter(watched, event)
+
+
+def install_combobox_wheel_guard(app: QCoreApplication | None = None) -> bool:
+    """为当前 Qt 应用幂等安装全局 `QComboBox` 滚轮防误触拦截器。
+
+    调用时机与返回值：
+        可在 `QApplication` 创建后任意时刻重复调用，已安装时直接返回 `True`；
+        若当前尚无 `QCoreApplication` 实例则返回 `False`。
+    """
+    target_app = app or QCoreApplication.instance()
+    if target_app is None:
+        return False
+    if target_app in _INSTALLED_WHEEL_GUARDS:
+        return True
+    guard = _ComboBoxWheelBlocker(target_app)
+    target_app.installEventFilter(guard)
+    _INSTALLED_WHEEL_GUARDS[target_app] = guard
+    return True
+
 
 def configure_form_layout(
     form: QFormLayout,
@@ -57,6 +134,7 @@ def configure_form_layout(
         `horizontal_spacing` 与 `align_form_labels` 的统一标签列宽，既保持左侧标签垂直齐平，
         又保证右侧控件紧邻最长标签左边缘垂直对齐、无多余留白。
     """
+    install_combobox_wheel_guard()
     form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     form.setHorizontalSpacing(horizontal_spacing)
     if vertical_spacing is not None:
@@ -338,6 +416,7 @@ class ComputeDeviceControl(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        install_combobox_wheel_guard()
         self.device_info = device_info
         self._show_status_text = show_status_text
         self._allow_multi_gpu = allow_multi_gpu

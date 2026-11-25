@@ -293,6 +293,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
         BoxRefineMode,
         MllmProvider,
         MllmReviewConfig,
+        ReasoningEffort,
         ReviewSourceMode,
         run_mllm_review,
     )
@@ -312,6 +313,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
         model_name=args.model,
         api_key=args.api_key,
         base_url=args.base_url,
+        reasoning_effort=ReasoningEffort(args.reasoning_effort),
         allowed_classes=classes,
         custom_guideline=args.guideline,
         high_conf_skip=args.high_conf_skip,
@@ -477,10 +479,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_rv.add_argument("--yolo-iou", type=float, default=0.60)
     p_rv.add_argument("--imgsz", type=int, default=640)
     p_rv.add_argument("--device", default="0")
-    p_rv.add_argument("--provider", choices=["gemini", "openai_compat"], default="gemini")
+    p_rv.add_argument("--provider", choices=["gemini", "openai", "openai_compat"], default="gemini")
     p_rv.add_argument("--model", default="gemini-3.8-flash")
     p_rv.add_argument("--api-key", default="")
     p_rv.add_argument("--base-url", default="")
+    p_rv.add_argument(
+        "--reasoning-effort",
+        choices=["auto", "off", "low", "medium", "high", "xhigh"],
+        default="auto",
+        help="思考/推理深度级别：auto(模型默认) / off(关闭或极简) / low / medium / high / xhigh",
+    )
     p_rv.add_argument(
         "--classes",
         default="",

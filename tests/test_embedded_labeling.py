@@ -1134,9 +1134,11 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         tab1.recursive_chk.setChecked(True)
         tab1.set_images_dir(str(in_dir))
 
-        # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行并更新模式提示；切到 OpenAI 显示 Base URL
+        # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行并更新模式提示；切到 OpenAI 兼容接口显示 Base URL
         tab1.source_mode_combo.setCurrentIndex(1)
-        tab1.provider_combo.setCurrentIndex(1)
+        compat_idx = tab1.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
+        assert compat_idx >= 0
+        tab1.provider_combo.setCurrentIndex(compat_idx)
         qt_app.processEvents()
         assert ".json" in tab1.source_mode_hint_label.text()
         assert tab1.weights_picker.isHidden() is True

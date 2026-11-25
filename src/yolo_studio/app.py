@@ -440,12 +440,14 @@ def main(workspace_root: Path | None = None) -> int:
     from PyQt6.QtCore import QTimer
     from PyQt6.QtWidgets import QApplication
 
+    from yolo_studio.gui.common import install_combobox_wheel_guard
     from yolo_studio.gui.tab_labeling import ensure_cuda_dll_search_paths
 
     ensure_cuda_dll_search_paths()
     _configure_windows_app_user_model_id()
 
     app = QApplication(sys.argv)
+    install_combobox_wheel_guard(app)
     app.setApplicationName("YOLO26 Training Studio")
     app.setApplicationVersion(__version__)
     install_runtime_excepthook(workspace_root=root)

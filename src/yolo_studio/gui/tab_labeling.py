@@ -68,7 +68,7 @@ from yolo_studio.core.annotation_io import (
 )
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.annotation_canvas import AnnotationCanvasView, load_image_pixmap
-from yolo_studio.gui.common import GpuTaskGuard
+from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
 
 _ADDED_DLL_HANDLES: list[object] = []
 _MAX_UNDO_STEPS = 80
@@ -392,6 +392,7 @@ class LabelingStudioTab(QWidget):
         gpu_guard: GpuTaskGuard | None = None,
     ) -> None:
         super().__init__(parent)
+        install_combobox_wheel_guard()
         self.workspace_root = workspace_root
         self._lazy_mount = lazy_mount
         self.device_info = device_info

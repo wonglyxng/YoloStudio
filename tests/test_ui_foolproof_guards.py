@@ -31,7 +31,13 @@ from PyQt6.QtWidgets import QApplication, QListWidgetItem, QMessageBox
 import yolo_studio.gui.tab_extract as tab_extract_mod
 import yolo_studio.gui.tab_review as tab_review_mod
 from yolo_studio.core.frame_extractor import ExtractionMode, ExtractionProgress, ExtractionResult
-from yolo_studio.core.mllm_reviewer import BoxRefineMode, MllmReviewResult
+from yolo_studio.core.mllm_reviewer import (
+    OPENAI_MODELS,
+    BoxRefineMode,
+    MllmProvider,
+    MllmReviewResult,
+    ReasoningEffort,
+)
 from yolo_studio.core.trainer import DeviceInfo
 from yolo_studio.gui.tab_dataset import DatasetTab
 from yolo_studio.gui.tab_eval import EvalTab
@@ -440,7 +446,9 @@ def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
         assert any("模型名称" in m for m in warnings)
 
         # OpenAI 兼容模式：云端地址缺 Key 拦截，局域网/本地地址免 Key 放行
-        tab.provider_combo.setCurrentIndex(1)
+        compat_idx = tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
+        assert compat_idx >= 0
+        tab.provider_combo.setCurrentIndex(compat_idx)
         tab.api_key_edit.clear()
         tab.base_url_edit.setText("https://dashscope.aliyuncs.com/compatible-mode/v1")
         tab.model_edit.setText("qwen-vl-max-latest")
@@ -760,3 +768,189 @@ def test_eval_tab_dynamic_batch_tooltip_and_engine_cpu_button_guard(
         assert tab.export_btn.isEnabled() is True
     finally:
         tab.close()
+
+
+def test_review_tab_official_openai_and_reasoning_effort_persistence(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证独立 OpenAI 官方提供方表单联动、Key 校验及思考/推理级别配置组装与持久化往返。"""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _p, _t, msg: warnings.append(str(msg)))
+
+    started_configs: list[object] = []
+
+    class _FakeSignal:
+        def connect(self, _slot) -> None:
+            pass
+
+    class _FakeReviewWorker:
+        def __init__(self, cfg) -> None:
+            self.cfg = cfg
+            self.progress = _FakeSignal()
+            self.log_line = _FakeSignal()
+            self.finished_result = _FakeSignal()
+            self.failed = _FakeSignal()
+
+        def start(self) -> None:
+            started_configs.append(self.cfg)
+
+        def isRunning(self) -> bool:
+            return False
+
+    monkeypatch.setattr(tab_review_mod, "MllmReviewWorker", _FakeReviewWorker)
+
+    in_dir = tmp_path / "imgs"
+    in_dir.mkdir()
+    settings = QSettings(str(tmp_path / "review_openai.ini"), QSettings.Format.IniFormat)
+
+    tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab1.source_mode_combo.setCurrentIndex(tab1.source_mode_combo.findData(tab_review_mod.ReviewSourceMode.EXISTING_JSON))
+        tab1.set_images_dir(str(in_dir))
+        tab1.output_picker.setText(str(tmp_path / "out"))
+
+        # 切换到 OpenAI 官方：隐藏 Base URL，填充官方模型预设，缺 OPENAI_API_KEY 拦截启动
+        openai_idx = tab1.provider_combo.findData(MllmProvider.OPENAI)
+        assert openai_idx >= 0
+        tab1.provider_combo.setCurrentIndex(openai_idx)
+        qt_app.processEvents()
+
+        assert tab1.base_url_edit.isHidden() is True
+        assert tab1.base_url_edit.text() == ""
+        assert tab1.model_edit.text() == OPENAI_MODELS[0][0]
+        assert tab1.preset_combo.count() == len(OPENAI_MODELS)
+        assert "OPENAI_API_KEY" in tab1.api_key_status_label.text()
+
+        warnings.clear()
+        tab1._on_start()
+        assert len(started_configs) == 0
+        assert any("OpenAI API Key" in w for w in warnings)
+
+        # 填写 Key 并选择 HIGH 推理级别后无需 Base URL 即可启动，且构建配置正确
+        tab1.api_key_edit.setText("sk-test-official")
+        high_idx = tab1.reasoning_effort_combo.findData(ReasoningEffort.HIGH)
+        assert high_idx >= 0
+        tab1.reasoning_effort_combo.setCurrentIndex(high_idx)
+        qt_app.processEvents()
+        assert "high" in tab1.reasoning_effort_hint_label.text()
+
+        tab1._on_start()
+        assert len(started_configs) == 1
+        assert started_configs[0].provider == MllmProvider.OPENAI
+        assert started_configs[0].reasoning_effort == ReasoningEffort.HIGH
+
+        tab1.save_settings(settings)
+        settings.sync()
+    finally:
+        tab1.close()
+
+    # 重建页面恢复配置：OpenAI 官方、模型与 HIGH 推理级别完整还原，且 Base URL 保持隐藏
+    tab2 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab2.restore_settings(settings)
+        qt_app.processEvents()
+        assert tab2.provider_combo.currentData() == MllmProvider.OPENAI
+        assert tab2.base_url_edit.isHidden() is True
+        assert tab2.model_edit.text() == OPENAI_MODELS[0][0]
+        assert tab2.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
+    finally:
+        tab2.close()
+
+
+def test_combobox_wheel_guard_blocks_accidental_change_and_forwards_scroll(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证全局下拉框禁滚轮守卫阻止未展开下拉框滚轮切换并透传外层滚动区，同时保留弹窗列表滚动。"""
+    from PyQt6.QtCore import QPoint, QPointF
+    from PyQt6.QtGui import QWheelEvent
+    from PyQt6.QtWidgets import QComboBox, QScrollArea, QVBoxLayout, QWidget
+
+    from yolo_studio.gui.common import install_combobox_wheel_guard
+    from yolo_studio.gui.main_window import MainWindow
+
+    assert install_combobox_wheel_guard(qt_app) is True
+
+    def _wheel_down(widget: QWidget) -> QWheelEvent:
+        pos = QPointF(6.0, 6.0)
+        gpos = QPointF(widget.mapToGlobal(QPoint(6, 6)))
+        return QWheelEvent(
+            pos,
+            gpos,
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.resize(320, 140)
+    container = QWidget()
+    lay = QVBoxLayout(container)
+    plain_combo = QComboBox()
+    plain_combo.addItems(["A", "B", "C"])
+    edit_combo = QComboBox()
+    edit_combo.setEditable(True)
+    edit_combo.addItems(["X", "Y", "Z"])
+    long_combo = QComboBox()
+    long_combo.addItems([f"item_{i}" for i in range(40)])
+    long_combo.setMaxVisibleItems(5)
+    lay.addWidget(plain_combo)
+    lay.addWidget(edit_combo)
+    lay.addWidget(long_combo)
+    spacer = QWidget()
+    spacer.setMinimumHeight(420)
+    lay.addWidget(spacer)
+    scroll.setWidget(container)
+    scroll.show()
+    qt_app.processEvents()
+
+    try:
+        # 1) 普通下拉框与可编辑下拉框本体均不响应滚轮切项，且滚轮透传使外层 QScrollArea 滚动
+        assert scroll.verticalScrollBar().value() == 0
+        QApplication.sendEvent(plain_combo, _wheel_down(plain_combo))
+        qt_app.processEvents()
+        assert plain_combo.currentIndex() == 0
+        after_first = scroll.verticalScrollBar().value()
+        assert after_first > 0
+
+        assert edit_combo.lineEdit() is not None
+        QApplication.sendEvent(edit_combo.lineEdit(), _wheel_down(edit_combo.lineEdit()))
+        qt_app.processEvents()
+        assert edit_combo.currentIndex() == 0
+        assert scroll.verticalScrollBar().value() > after_first
+
+        # 2) 展开下拉列表弹出窗口后，列表 viewport 仍可正常用滚轮滚动
+        long_combo.showPopup()
+        qt_app.processEvents()
+        popup_vp = long_combo.view().viewport()
+        QApplication.sendEvent(popup_vp, _wheel_down(popup_vp))
+        qt_app.processEvents()
+        assert long_combo.view().verticalScrollBar().value() > 0
+        assert long_combo.currentIndex() == 0
+        long_combo.hidePopup()
+    finally:
+        scroll.close()
+
+    # 3) 验证 MainWindow 各标签页的下拉框在滚轮下也不会意外变更当前选项
+    settings = QSettings(str(tmp_path / "wheel_main.ini"), QSettings.Format.IniFormat)
+    win = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=settings)
+    try:
+        win.show()
+        qt_app.processEvents()
+        combos = [c for c in win.findChildren(QComboBox) if c.count() >= 2]
+        assert len(combos) >= 8
+        for combo in combos:
+            before_idx = combo.currentIndex()
+            QApplication.sendEvent(combo, _wheel_down(combo))
+            if combo.isEditable() and combo.lineEdit() is not None:
+                QApplication.sendEvent(combo.lineEdit(), _wheel_down(combo.lineEdit()))
+            assert combo.currentIndex() == before_idx
+    finally:
+        win.close()
+

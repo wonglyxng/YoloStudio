@@ -1606,3 +1606,298 @@ def test_build_prompts_specifies_box_quality_enum_in_all_refine_modes() -> None:
             assert "MUST ONLY be one of 'tight', 'loose', or 'partial'" in sys_prompt
             assert "for 'delete'" in sys_prompt
 
+
+def test_openai_official_provider_separated_from_compat(monkeypatch) -> None:
+    """验证 OpenAI 官方作为独立提供方：移除出兼容预设、强制校验 Key、固定官方端点并正确连接。"""
+    import openai
+    import pytest
+
+    from yolo_studio.core.mllm_reviewer import (
+        OPENAI_MODELS,
+        OPENAI_OFFICIAL_BASE_URL,
+        OPENAI_PRESETS,
+        REASONING_EFFORT_HINTS,
+        REASONING_EFFORT_ITEMS,
+        build_mllm_client,
+        test_mllm_connection,
+    )
+
+    # 1) OPENAI_PRESETS 不再包含 OpenAI 官方；新增预设与推理说明不含 MLLM 字样
+    assert all("api.openai.com" not in url and "OpenAI 官方" not in name for name, url, _ in OPENAI_PRESETS)
+    for _, label in OPENAI_MODELS:
+        assert "MLLM" not in label
+    for _, label in REASONING_EFFORT_ITEMS:
+        assert "MLLM" not in label
+    for hint in REASONING_EFFORT_HINTS.values():
+        assert "MLLM" not in hint
+
+    # 2) OpenAI 官方缺失 Key 时 build_mllm_client 与 test_mllm_connection 均严格拒绝，不回退 ollama
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg_no_key = MllmReviewConfig(
+        images_dir=Path("."),
+        output_dir=Path("."),
+        provider=MllmProvider.OPENAI,
+        model_name="gpt-5.4",
+        base_url="http://localhost:11434/v1",  # 即便残留兼容地址也不应被官方模式采纳
+        api_key="",
+    )
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        build_mllm_client(cfg_no_key)
+
+    ok_missing, msg_missing = test_mllm_connection(cfg_no_key)
+    assert ok_missing is False
+    assert "OPENAI_API_KEY" in msg_missing
+
+    # 3) 提供 Key 后，build_mllm_client 与 test_mllm_connection 固定连向官方 Base URL
+    captured_inits: list[dict[str, object]] = []
+
+    class _FakeResp:
+        class _Choice:
+            class _Msg:
+                content = "OK"
+
+            message = _Msg()
+
+        choices = [_Choice()]
+
+    class _FakeCompletions:
+        def create(self, **_kwargs):
+            return _FakeResp()
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs) -> None:
+            captured_inits.append(dict(kwargs))
+            self.chat = type("Chat", (), {"completions": _FakeCompletions()})()
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+    cfg_ok = MllmReviewConfig(
+        images_dir=Path("."),
+        output_dir=Path("."),
+        provider=MllmProvider.OPENAI,
+        model_name="gpt-5.4",
+        base_url="http://localhost:11434/v1",
+        api_key="sk-official-test",
+    )
+    client = build_mllm_client(cfg_ok)
+    assert client.model_name == "gpt-5.4"
+    assert captured_inits[-1]["api_key"] == "sk-official-test"
+    assert captured_inits[-1]["base_url"] == OPENAI_OFFICIAL_BASE_URL
+
+    ok_conn, msg_conn = test_mllm_connection(cfg_ok)
+    assert ok_conn is True
+    assert "OpenAI 官方接口连通正常" in msg_conn
+    assert captured_inits[-1]["base_url"] == OPENAI_OFFICIAL_BASE_URL
+
+
+def test_gemini_thinking_level_mapping_and_bad_request_downgrade(monkeypatch) -> None:
+    """验证 Gemini 思考级别按模型映射并在遇 400 拒绝时自动单调降级。"""
+    from google import genai
+
+    from yolo_studio.core.mllm_reviewer import GeminiMllmClient, ReasoningEffort
+
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+    calls_log: list[dict[str, object]] = []
+
+    class _FakeInteractions:
+        def __init__(self, reject_levels: set[str] | None = None, fail_auth: bool = False) -> None:
+            self.reject_levels = reject_levels or set()
+            self.fail_auth = fail_auth
+
+        def create(self, **kwargs):
+            calls_log.append(dict(kwargs))
+            if self.fail_auth:
+                raise RuntimeError("401 UNAUTHENTICATED: invalid api key")
+            gen_cfg = kwargs.get("generation_config") or {}
+            level = gen_cfg.get("thinking_level") if isinstance(gen_cfg, dict) else None
+            if level in self.reject_levels:
+                err = RuntimeError(f"400 INVALID_ARGUMENT: thinking_level '{level}' is not supported")
+                setattr(err, "code", 400)
+                raise err
+            return type("Resp", (), {"output_text": ok_json})()
+
+    monkeypatch.setattr(genai, "Client", lambda **_kw: type("C", (), {"interactions": _FakeInteractions()})())
+
+    # 1) AUTO 不传 generation_config；flash-lite + OFF 传 minimal；3.8-flash + OFF 事前直传 low
+    c_auto = GeminiMllmClient(api_key="k", model_name="gemini-3.8-flash", reasoning_effort=ReasoningEffort.AUTO)
+    c_auto.review_image(b"x", [], "s", "u")
+    assert "generation_config" not in calls_log[-1]
+
+    c_lite_off = GeminiMllmClient(
+        api_key="k", model_name="gemini-3.5-flash-lite", reasoning_effort=ReasoningEffort.OFF
+    )
+    c_lite_off.review_image(b"x", [], "s", "u")
+    assert calls_log[-1]["generation_config"] == {"thinking_level": "minimal"}
+
+    c_flash_off = GeminiMllmClient(
+        api_key="k", model_name="gemini-3.8-flash", reasoning_effort=ReasoningEffort.OFF
+    )
+    c_flash_off.review_image(b"x", [], "s", "u")
+    assert calls_log[-1]["generation_config"] == {"thinking_level": "low"}
+
+    # 2) XHIGH 遇 400 依次从 xhigh -> high -> 省略，并在后续调用记住最终可用档位
+    calls_log.clear()
+    c_xhigh = GeminiMllmClient(api_key="k", model_name="gemini-4-argon", reasoning_effort=ReasoningEffort.XHIGH)
+    c_xhigh.client = type("C", (), {"interactions": _FakeInteractions(reject_levels={"xhigh", "high"})})()
+    c_xhigh.review_image(b"x", [], "s", "u")
+    c_xhigh.review_image(b"x", [], "s", "u")
+    assert [
+        (c.get("generation_config") or {}).get("thinking_level") if isinstance(c.get("generation_config"), dict) else None
+        for c in calls_log
+    ] == ["xhigh", "high", None, None]
+
+    # 3) 非 400 鉴权异常不得被吞掉
+    c_auth = GeminiMllmClient(api_key="k", model_name="gemini-3.8-flash", reasoning_effort=ReasoningEffort.HIGH)
+    c_auth.client = type("C", (), {"interactions": _FakeInteractions(fail_auth=True)})()
+    import pytest
+
+    with pytest.raises(RuntimeError, match="401 UNAUTHENTICATED"):
+        c_auth.review_image(b"x", [], "s", "u")
+
+
+def test_openai_reasoning_effort_mapping_and_bad_request_downgrade() -> None:
+    """验证 OpenAI 推理级别事前预判、400 单调降级且不误关 `json_object` 模式，以及 CLI 参数解析。"""
+    import httpx
+    import openai
+
+    from yolo_studio.cli import build_parser
+    from yolo_studio.core.mllm_reviewer import OpenAICompatMllmClient, ReasoningEffort
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    class _Msg:
+        content = ok_json
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    # 1) gpt-4o / gpt-4.1 即便指定 HIGH 也事前省略 reasoning_effort；o4-mini + OFF 事前直传 low
+    for non_r_model in ("gpt-4o", "gpt-4.1"):
+        calls: list[dict[str, object]] = []
+        client = OpenAICompatMllmClient(
+            api_key="k",
+            base_url="https://api.openai.com/v1",
+            model_name=non_r_model,
+            reasoning_effort=ReasoningEffort.HIGH,
+            allow_anonymous_key=False,
+        )
+        client.client = type(
+            "C",
+            (),
+            {
+                "chat": type(
+                    "Chat",
+                    (),
+                    {
+                        "completions": type(
+                            "Comp", (), {"create": lambda _s, **kw: (calls.append(dict(kw)), _Resp())[1]}
+                        )()
+                    },
+                )()
+            },
+        )()
+        client.review_image(b"x", [], "s", "u")
+        assert "reasoning_effort" not in calls[0]
+
+    o_calls: list[dict[str, object]] = []
+    o_client = OpenAICompatMllmClient(
+        api_key="k",
+        base_url="https://api.openai.com/v1",
+        model_name="o4-mini",
+        reasoning_effort=ReasoningEffort.OFF,
+        allow_anonymous_key=False,
+    )
+    o_client.client = type(
+        "C",
+        (),
+        {
+            "chat": type(
+                "Chat",
+                (),
+                {
+                    "completions": type(
+                        "Comp", (), {"create": lambda _s, **kw: (o_calls.append(dict(kw)), _Resp())[1]}
+                    )()
+                },
+            )()
+        },
+    )()
+    o_client.review_image(b"x", [], "s", "u")
+    assert o_calls[0]["reasoning_effort"] == "low"
+
+    # 2) gpt-5.4 + OFF 遇服务端拒绝 none 和 minimal，降级至 low 成功且全程保留 response_format
+    seq_calls: list[dict[str, object]] = []
+
+    class _RejectNoneMinimal:
+        def create(self, **kwargs):
+            seq_calls.append(dict(kwargs))
+            if kwargs.get("reasoning_effort") in {"none", "minimal"}:
+                raise openai.BadRequestError(
+                    "Unsupported value for reasoning_effort",
+                    response=httpx.Response(400, request=request),
+                    body={"error": {"param": "reasoning_effort", "message": "unsupported value"}},
+                )
+            return _Resp()
+
+    gpt5_client = OpenAICompatMllmClient(
+        api_key="k",
+        base_url="https://api.openai.com/v1",
+        model_name="gpt-5.4",
+        reasoning_effort=ReasoningEffort.OFF,
+        allow_anonymous_key=False,
+    )
+    gpt5_client.client = type("C", (), {"chat": type("Chat", (), {"completions": _RejectNoneMinimal()})()})()
+    gpt5_client.review_image(b"x", [], "s", "u")
+    gpt5_client.review_image(b"x", [], "s", "u")
+    assert [c.get("reasoning_effort") for c in seq_calls] == ["none", "minimal", "low", "low"]
+    assert all(c.get("response_format") == {"type": "json_object"} for c in seq_calls)
+
+    # 3) 第三方兼容接口对 reasoning_effort 返回笼统 400 时，先放弃 reasoning_effort 而不是先关 json_mode
+    compat_calls: list[dict[str, object]] = []
+
+    class _VagueRejectReasoning:
+        def create(self, **kwargs):
+            compat_calls.append(dict(kwargs))
+            if "reasoning_effort" in kwargs:
+                raise openai.BadRequestError(
+                    "invalid payload",
+                    response=httpx.Response(400, request=request),
+                    body={"message": "invalid payload"},
+                )
+            return _Resp()
+
+    compat_client = OpenAICompatMllmClient(
+        api_key="k",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model_name="qwen-vl-max-latest",
+        reasoning_effort=ReasoningEffort.HIGH,
+    )
+    compat_client.client = type("C", (), {"chat": type("Chat", (), {"completions": _VagueRejectReasoning()})()})()
+    compat_client.review_image(b"x", [], "s", "u")
+    assert len(compat_calls) == 2
+    assert "reasoning_effort" in compat_calls[0]
+    assert "reasoning_effort" not in compat_calls[1]
+    assert compat_calls[1].get("response_format") == {"type": "json_object"}
+
+    # 4) CLI review 子命令支持 --provider openai 与 --reasoning-effort
+    parser = build_parser()
+    parsed = parser.parse_args(
+        [
+            "review",
+            "-i",
+            "data/raw",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4",
+            "--reasoning-effort",
+            "medium",
+        ]
+    )
+    assert parsed.provider == "openai"
+    assert parsed.reasoning_effort == "medium"
+
+

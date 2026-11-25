@@ -60,7 +60,10 @@ from yolo_studio.core.mllm_reviewer import (
     BUCKET_LLM_FIXED,
     BUCKET_NEED_REVIEW,
     GEMINI_MODELS,
+    OPENAI_MODELS,
     OPENAI_PRESETS,
+    REASONING_EFFORT_HINTS,
+    REASONING_EFFORT_ITEMS,
     SAM_REFINE_MODELS,
     SOURCE_MODE_HINTS,
     SOURCE_MODE_ITEMS,
@@ -69,6 +72,7 @@ from yolo_studio.core.mllm_reviewer import (
     MllmProvider,
     MllmReviewConfig,
     MllmReviewResult,
+    ReasoningEffort,
     ReviewSourceMode,
     count_review_images,
     format_record_detail_summary,
@@ -380,6 +384,7 @@ class MllmReviewTab(QWidget):
         self.provider_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.provider_combo.setMinimumContentsLength(12)
         self.provider_combo.addItem("Google Gemini API (google-genai)", MllmProvider.GEMINI)
+        self.provider_combo.addItem("OpenAI 官方 API (api.openai.com)", MllmProvider.OPENAI)
         self.provider_combo.addItem(
             "OpenAI 兼容接口 (Qwen-VL / 硅基流动 / Ollama / vLLM)", MllmProvider.OPENAI_COMPAT
         )
@@ -393,11 +398,31 @@ class MllmReviewTab(QWidget):
         l_form.addRow("常用预设:", self.preset_combo)
 
         self.base_url_edit = QLineEdit()
-        self.base_url_edit.setPlaceholderText("OpenAI 兼容接口 Base URL（Gemini 模式无需填写）")
+        self.base_url_edit.setPlaceholderText("OpenAI 兼容接口 Base URL（Gemini / OpenAI 官方模式无需填写）")
         l_form.addRow("Base URL:", self.base_url_edit)
 
         self.model_edit = QLineEdit("gemini-3.8-flash")
         l_form.addRow("模型名称:", self.model_edit)
+
+        effort_box = QVBoxLayout()
+        effort_box.setContentsMargins(0, 0, 0, 0)
+        effort_box.setSpacing(3)
+        self.reasoning_effort_combo = QComboBox()
+        self.reasoning_effort_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.reasoning_effort_combo.setMinimumContentsLength(12)
+        for effort, effort_label in REASONING_EFFORT_ITEMS:
+            self.reasoning_effort_combo.addItem(effort_label, effort)
+        self.reasoning_effort_combo.setToolTip(
+            "统一控制模型思考/推理深度：默认遵循服务端模型配置，也可显式指定以平衡耗时与准确率"
+        )
+        self.reasoning_effort_hint_label = QLabel()
+        self.reasoning_effort_hint_label.setWordWrap(True)
+        self.reasoning_effort_hint_label.setStyleSheet("color: #57606a; font-size: 12px;")
+        effort_box.addWidget(self.reasoning_effort_combo)
+        effort_box.addWidget(self.reasoning_effort_hint_label)
+        l_form.addRow("思考/推理级别:", effort_box)
 
         key_box = QVBoxLayout()
         key_box.setContentsMargins(0, 0, 0, 0)
@@ -762,6 +787,8 @@ class MllmReviewTab(QWidget):
         self.open_selected_btn.clicked.connect(self._on_open_selected_in_xal)
         self.api_key_edit.textChanged.connect(self._refresh_api_key_status)
         self.base_url_edit.textChanged.connect(self._refresh_api_key_status)
+        self.model_edit.textChanged.connect(self._refresh_reasoning_effort_hint)
+        self.reasoning_effort_combo.currentIndexChanged.connect(self._refresh_reasoning_effort_hint)
         self.refine_mode_combo.currentIndexChanged.connect(self._sync_strategy_states)
         self.sam_refine_all_chk.toggled.connect(self._sync_strategy_states)
         self.sam3_llm_review_chk.toggled.connect(self._sync_strategy_states)
@@ -787,6 +814,7 @@ class MllmReviewTab(QWidget):
             self.source_mode_combo,
             self.provider_combo,
             self.preset_combo,
+            self.reasoning_effort_combo,
             self.refine_mode_combo,
         ):
             combo.currentIndexChanged.connect(self._mark_settings_dirty)
@@ -954,9 +982,12 @@ class MllmReviewTab(QWidget):
         self._sync_strategy_states()
 
     def _on_provider_changed(self) -> None:
-        """切换 Gemini 与 OpenAI 兼容接口时更新常用预设并按需折叠 Base URL 行。"""
-        provider = self.provider_combo.currentData()
+        """切换 Gemini、OpenAI 官方与 OpenAI 兼容接口时更新常用预设并按需折叠 Base URL 行。"""
+        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
         is_gemini = provider == MllmProvider.GEMINI
+        is_openai_official = provider == MllmProvider.OPENAI
+        is_compat = provider == MllmProvider.OPENAI_COMPAT
+
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
         if is_gemini:
@@ -965,15 +996,22 @@ class MllmReviewTab(QWidget):
             self.base_url_edit.setEnabled(False)
             self.base_url_edit.clear()
             self.model_edit.setText(GEMINI_MODELS[0][0])
+        elif is_openai_official:
+            for model_id, label in OPENAI_MODELS:
+                self.preset_combo.addItem(label, (model_id, ""))
+            self.base_url_edit.setEnabled(False)
+            self.base_url_edit.clear()
+            self.model_edit.setText(OPENAI_MODELS[0][0])
         else:
             for name, url, model_id in OPENAI_PRESETS:
                 self.preset_combo.addItem(name, (model_id, url))
             self.base_url_edit.setEnabled(True)
             self.base_url_edit.setText(OPENAI_PRESETS[0][1])
             self.model_edit.setText(OPENAI_PRESETS[0][2])
-        self._llm_form.setRowVisible(self.base_url_edit, not is_gemini)
+        self._llm_form.setRowVisible(self.base_url_edit, is_compat)
         self.preset_combo.blockSignals(False)
         self._refresh_api_key_status()
+        self._refresh_reasoning_effort_hint()
 
     def _on_preset_changed(self) -> None:
         data = self.preset_combo.currentData()
@@ -984,6 +1022,45 @@ class MllmReviewTab(QWidget):
         if url:
             self.base_url_edit.setText(url)
         self._refresh_api_key_status()
+        self._refresh_reasoning_effort_hint()
+
+    def _refresh_reasoning_effort_hint(self, *_args: object) -> None:
+        """结合当前接口、模型名称与思考级别实时展示服务端默认行为或自动映射提示。"""
+        effort: ReasoningEffort = self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
+        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
+        model_lower = self.model_edit.text().strip().lower()
+
+        if effort == ReasoningEffort.AUTO:
+            if provider == MllmProvider.GEMINI:
+                if "flash-lite" in model_lower:
+                    detail = "当前 Gemini 模型默认处于 minimal 极简思考（高吞吐低延迟）。"
+                elif "gemini-3.8" in model_lower or "gemini-4" in model_lower:
+                    detail = "当前 Gemini 模型服务端默认思考级别为 medium（均衡模式）。"
+                else:
+                    detail = "不显式传入 thinking_level，遵循 Gemini 服务端模型默认思考级别。"
+            else:
+                if model_lower.startswith(("gpt-4o", "gpt-4.1", "chatgpt-4o")):
+                    detail = "当前为非思考直出模型，将直接输出标注结果（无长思考消耗）。"
+                elif model_lower.startswith(("o1", "o3", "o4")):
+                    detail = "当前 OpenAI o 系列模型服务端默认推理级别为 medium。"
+                elif model_lower.startswith("gpt-5.1") or model_lower.startswith("gpt-5.2"):
+                    detail = "当前模型服务端默认推理级别为 none（低延迟直出，需思考可手动调高）。"
+                elif model_lower.startswith("gpt-5"):
+                    detail = "遵循当前模型服务端默认推理配置（通常为 medium 或模型默认）。"
+                else:
+                    detail = REASONING_EFFORT_HINTS[ReasoningEffort.AUTO]
+            self.reasoning_effort_hint_label.setText(detail)
+            return
+
+        hint = REASONING_EFFORT_HINTS.get(effort, "")
+        if provider != MllmProvider.GEMINI and model_lower.startswith(("gpt-4o", "gpt-4.1", "chatgpt-4o")):
+            hint = f"{hint}（当前为非思考直出模型，运行时将自动省略推理参数）"
+        elif effort == ReasoningEffort.OFF:
+            if provider == MllmProvider.GEMINI and ("gemini-3.8" in model_lower or "gemini-4" in model_lower):
+                hint = f"{hint}（当前模型不支持 minimal，将自动映射至最低可用档 low）"
+            elif provider != MllmProvider.GEMINI and model_lower.startswith(("o1", "o3", "o4")):
+                hint = f"{hint}（OpenAI o 系列不支持关闭思考，将自动映射至最低可用档 low）"
+        self.reasoning_effort_hint_label.setText(hint)
 
     def _refresh_api_key_status(self, *_args: object) -> None:
         """实时检测手动 Key 或系统环境变量是否已就绪，减少启动任务后才报鉴权失败的挫败感。"""
@@ -995,7 +1072,7 @@ class MllmReviewTab(QWidget):
             )
             return
 
-        provider = self.provider_combo.currentData()
+        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
         manual_key = self.api_key_edit.text().strip()
         if manual_key:
             self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
@@ -1013,6 +1090,15 @@ class MllmReviewTab(QWidget):
             return
 
         has_env = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+        if provider == MllmProvider.OPENAI:
+            if has_env:
+                self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
+                self.api_key_status_label.setText("已检测到环境变量 OPENAI_API_KEY，上方输入框可保持留空")
+            else:
+                self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 12px;")
+                self.api_key_status_label.setText("未检测到环境变量 OPENAI_API_KEY，请在上方填写或配置环境变量")
+            return
+
         base_url = self.base_url_edit.text().strip()
         is_local = _is_local_or_lan_url(base_url)
         if has_env:
@@ -1275,6 +1361,7 @@ class MllmReviewTab(QWidget):
             model_name=self.model_edit.text().strip(),
             api_key=self.api_key_edit.text().strip(),
             base_url=self.base_url_edit.text().strip(),
+            reasoning_effort=self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO,
             allowed_classes=allowed_classes,
             custom_guideline=self.guideline_edit.text().strip(),
             high_conf_skip=self.high_conf_spin.value(),
@@ -1323,6 +1410,9 @@ class MllmReviewTab(QWidget):
         provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
         source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
+        reasoning_effort: ReasoningEffort = (
+            self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
+        )
         state: dict[str, object] = {
             "version": 1,
             "source_mode": source_mode.value,
@@ -1332,6 +1422,7 @@ class MllmReviewTab(QWidget):
             "provider": provider.value,
             "base_url": self.base_url_edit.text().strip(),
             "model_name": self.model_edit.text().strip(),
+            "reasoning_effort": reasoning_effort.value,
             "classes": self.classes_edit.text().strip(),
             "guideline": self.guideline_edit.text().strip(),
             "high_conf_skip": self.high_conf_spin.value(),
@@ -1385,10 +1476,17 @@ class MllmReviewTab(QWidget):
                     self.provider_combo.setCurrentIndex(i)
                     break
 
-            if state.get("base_url"):
+            restored_provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
+            if restored_provider == MllmProvider.OPENAI_COMPAT and state.get("base_url"):
                 self.base_url_edit.setText(str(state["base_url"]))
             if state.get("model_name"):
                 self.model_edit.setText(str(state["model_name"]))
+            effort_val = str(state.get("reasoning_effort") or "")
+            for i in range(self.reasoning_effort_combo.count()):
+                item = self.reasoning_effort_combo.itemData(i)
+                if isinstance(item, ReasoningEffort) and item.value == effort_val:
+                    self.reasoning_effort_combo.setCurrentIndex(i)
+                    break
             if "classes" in state:
                 self.classes_edit.setText(str(state.get("classes") or ""))
             if "guideline" in state:
@@ -1436,6 +1534,7 @@ class MllmReviewTab(QWidget):
         self._on_source_mode_changed()
         self._sync_strategy_states()
         self._refresh_api_key_status()
+        self._refresh_reasoning_effort_hint()
         self._refresh_images_count()
 
     def _on_start(self) -> None:
@@ -1500,6 +1599,15 @@ class MllmReviewTab(QWidget):
                         "提示",
                         "未检测到 Gemini API Key：请在「2. 大语言模型 (LLM) 配置」中填写 API Key，"
                         "或配置环境变量 GEMINI_API_KEY。",
+                    )
+                    return
+            elif cfg.provider == MllmProvider.OPENAI:
+                if not (cfg.api_key or os.environ.get("OPENAI_API_KEY", "").strip()):
+                    QMessageBox.warning(
+                        self,
+                        "提示",
+                        "未检测到 OpenAI API Key：请在「2. 大语言模型 (LLM) 配置」中填写 API Key，"
+                        "或配置环境变量 OPENAI_API_KEY。",
                     )
                     return
             else:

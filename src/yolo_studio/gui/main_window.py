@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, Q
 
 from yolo_studio._version import __version__
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
-from yolo_studio.gui.common import GpuTaskGuard
+from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
 from yolo_studio.gui.tab_dataset import DatasetTab
 from yolo_studio.gui.tab_eval import EvalTab
 from yolo_studio.gui.tab_extract import ExtractTab
@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         settings: QSettings | None = None,
     ) -> None:
         super().__init__()
+        install_combobox_wheel_guard()
         self.workspace_root = workspace_root
         self._lazy_init = lazy_init
         self._device_probe_worker: DeviceProbeWorker | None = None

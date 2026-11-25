@@ -22,6 +22,7 @@ import pytest
 from PyQt6.QtCore import QCoreApplication, QSettings, Qt
 from PyQt6.QtWidgets import QApplication, QFormLayout, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
+from yolo_studio.core.mllm_reviewer import MllmProvider
 from yolo_studio.core.trainer import DeviceInfo
 from yolo_studio.gui.common import FORM_LABEL_SPACING, align_form_labels, configure_form_layout
 from yolo_studio.gui.main_window import MainWindow
@@ -149,9 +150,11 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
                 assert len(field_xs) == 1
 
         # 验证多分组页面的字段列左边缘沿同页最长标签精确垂直对齐（含样式表生效后的最终布局）
-        # 1) Tab 3（LLM 智能标注）：切出 OpenAI Base URL 与 SAM 隐藏行后三组依然对齐，且最长标签紧邻控件
+        # 1) Tab 3（LLM 智能标注）：切出 OpenAI 兼容接口 Base URL 与 SAM 隐藏行后三组依然对齐，且最长标签紧邻控件
         win.tabs.setCurrentIndex(2)
-        win.review_tab.provider_combo.setCurrentIndex(1)
+        compat_idx = win.review_tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
+        assert compat_idx >= 0
+        win.review_tab.provider_combo.setCurrentIndex(compat_idx)
         win.review_tab.refine_mode_combo.setCurrentIndex(win.review_tab.refine_mode_combo.count() - 1)
         qt_app.processEvents()
         review_forms = (win.review_tab._src_form, win.review_tab._llm_form, win.review_tab._pol_form)
