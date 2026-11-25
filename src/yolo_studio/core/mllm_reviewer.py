@@ -1005,6 +1005,142 @@ def _is_gemini_thinking_bad_request(exc: BaseException) -> bool:
     return any(tok in msg for tok in ("thinking_level", "thinking", "generation_config"))
 
 
+# 瞬时连接断开自动重试策略：仅针对耗时不超过阈值的非超时断连，避免长耗时深度思考重复扣费
+MLLM_TRANSIENT_DISCONNECT_MAX_ELAPSED_SECONDS: float = 90.0
+MLLM_TRANSIENT_DISCONNECT_RETRIES: int = 2
+MLLM_TRANSIENT_RETRY_BACKOFF_BASE_SECONDS: float = 1.5
+_TIMEOUT_EXC_NAMES = frozenset(
+    {
+        "APITimeoutError",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "TimeoutException",
+    }
+)
+_DISCONNECT_EXC_NAMES = frozenset(
+    {
+        "APIConnectionError",
+        "RemoteProtocolError",
+        "ReadError",
+        "WriteError",
+        "ConnectError",
+        "ProxyError",
+        "CloseError",
+        "ProtocolError",
+        "IncompleteRead",
+        "ChunkedEncodingError",
+    }
+)
+
+
+def _is_transient_disconnect_error(exc: BaseException) -> bool:
+    """判断异常是否属于网络或代理瞬时断开（明确排除一切超时异常及 HTTP 状态码响应）。"""
+    chain: list[BaseException] = []
+    seen_ids: set[int] = set()
+    cur: BaseException | None = exc
+    for _ in range(4):
+        if cur is None or id(cur) in seen_ids:
+            break
+        seen_ids.add(id(cur))
+        chain.append(cur)
+        cur = cur.__cause__
+
+    # 先排除超时异常（含继承自 APIConnectionError 的 APITimeoutError）以及带整型 HTTP 状态码的响应错误
+    for node in chain:
+        if isinstance(node, TimeoutError) or type(node).__name__ in _TIMEOUT_EXC_NAMES:
+            return False
+        if isinstance(getattr(node, "status_code", None), int) or isinstance(getattr(node, "code", None), int):
+            return False
+
+    for node in chain:
+        if isinstance(node, ConnectionError) or type(node).__name__ in _DISCONNECT_EXC_NAMES:
+            return True
+    return False
+
+
+def _is_gemini_stream_bad_request(exc: BaseException) -> bool:
+    """判断 Gemini 异常是否因模型或接口拒绝 `stream` 流式参数的 400 错误所致。"""
+    code = getattr(exc, "code", None)
+    status_code = getattr(exc, "status_code", None)
+    status = str(getattr(exc, "status", None) or "").strip().lower()
+    msg = f"{status} {exc}".lower()
+    is_bad_request = (
+        code == 400
+        or status_code == 400
+        or "invalid_argument" in msg
+        or bool(re.search(r"\b400\b", msg))
+    )
+    if not is_bad_request:
+        return False
+    return bool(re.search(r"(?<![a-z0-9_])stream(?![a-z0-9_])", msg))
+
+
+def _is_stream_bad_request(exc: BaseException) -> bool:
+    """判断 OpenAI 兼容接口 400 异常是否因后端不支持 `stream` 流式参数所致。"""
+    param, text = _extract_openai_bad_request_info(exc)
+    return param == "stream" or bool(re.search(r"(?<![a-z0-9_])stream(?![a-z0-9_])", text))
+
+
+def _consume_gemini_response(resp: object, closed_event: Event) -> str:
+    """提取 Gemini 非流式或流式 Interactions 响应的完整文本，并在结束或取消时安全关闭流对象。"""
+    if hasattr(resp, "output_text"):
+        return getattr(resp, "output_text", None) or ""
+
+    text_parts: list[str] = []
+    fallback_output_text = ""
+    try:
+        for ev in resp:  # type: ignore[attr-defined]
+            if closed_event.is_set():
+                break
+            event_type = getattr(ev, "event_type", None)
+            if event_type == "step.delta":
+                delta = getattr(ev, "delta", None)
+                if delta is not None and getattr(delta, "type", None) == "text":
+                    piece = getattr(delta, "text", None) or ""
+                    if piece:
+                        text_parts.append(piece)
+            elif event_type in {"interaction.completed", "interaction.incomplete"}:
+                inter = getattr(ev, "interaction", None)
+                if inter is not None:
+                    if getattr(inter, "status", None) == "failed":
+                        err_obj = getattr(inter, "error", None)
+                        raise RuntimeError(f"Gemini 交互失败: {err_obj or 'failed'}")
+                    fb = getattr(inter, "output_text", None) or ""
+                    if fb:
+                        fallback_output_text = fb
+            elif event_type in {"error", "interaction.failed"}:
+                err_obj = getattr(ev, "error", None) or getattr(ev, "message", None) or event_type
+                raise RuntimeError(f"Gemini 流式交互异常: {err_obj}")
+    finally:
+        _close_client_safely(resp)
+    return "".join(text_parts) or fallback_output_text
+
+
+def _consume_openai_response(resp: object, closed_event: Event) -> str:
+    """提取 OpenAI 兼容接口非流式或流式 `chat.completions` 响应的完整文本并安全关闭流。"""
+    if hasattr(resp, "choices"):
+        choices = getattr(resp, "choices", None) or ()
+        return (getattr(choices[0].message, "content", None) or "") if choices else ""
+
+    parts: list[str] = []
+    try:
+        for chunk in resp:  # type: ignore[attr-defined]
+            if closed_event.is_set():
+                break
+            choices = getattr(chunk, "choices", None) or ()
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            piece = getattr(delta, "content", None) if delta is not None else None
+            if isinstance(piece, str) and piece:
+                parts.append(piece)
+    finally:
+        _close_client_safely(resp)
+    return "".join(parts)
+
+
 def _close_client_safely(client: object | None) -> None:
     """安全关闭底层 HTTP/SDK 客户端以立即中断在途请求（幂等，忽略关闭异常）。"""
     if client is None:
@@ -1020,12 +1156,15 @@ def _close_client_safely(client: object | None) -> None:
 class GeminiMllmClient:
     """基于官方 `google-genai` Interactions API 的 Google Gemini 多模态审核客户端。
 
-    凭据、超时与状态：
+    凭据、流式传输、重试与状态：
         初始化时优先使用传入的 `api_key`，为空时读取环境变量 `GEMINI_API_KEY`，均缺失则抛出 `ValueError`；
         `timeout` 单位为秒，未显式传入正数时按模型与思考级别经 `resolve_mllm_request_timeout` 计算，
         并换算为毫秒写入 `types.HttpOptions(timeout=...)`（作为单次请求 HTTP 超时传给 `genai.Client`）。
-        内部持有无状态交互会话客户端（每次调用设置 `store=False`），并按 `reasoning_effort`
-        维护单调降级索引 `_thinking_idx`，遇到不支持特定 `thinking_level` 的 400 响应时自动降级。
+        默认启用 `stream=True` 流式接收并在本地拼接完整 JSON 文本以规避长思考静默期网关断连，
+        遇 400 拒绝 `stream` 时自动降级并记忆；对耗时不超过 `transient_disconnect_max_elapsed` 的瞬时
+        网络/代理断连，新建独立 SDK 客户端并按指数退避自动重连重试。
+        内部按 `reasoning_effort` 维护单调降级索引 `_thinking_idx`，遇到不支持特定 `thinking_level` 的
+        400 响应时自动降级。
     """
 
     def __init__(
@@ -1035,6 +1174,9 @@ class GeminiMllmClient:
         *,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         timeout: float | None = None,
+        transient_disconnect_retries: int = MLLM_TRANSIENT_DISCONNECT_RETRIES,
+        transient_disconnect_max_elapsed: float = MLLM_TRANSIENT_DISCONNECT_MAX_ELAPSED_SECONDS,
+        transient_retry_backoff_base: float = MLLM_TRANSIENT_RETRY_BACKOFF_BASE_SECONDS,
     ) -> None:
         from google import genai
         from google.genai import types
@@ -1042,6 +1184,9 @@ class GeminiMllmClient:
         resolved_key = api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
         if not resolved_key:
             raise ValueError("未提供 Gemini API Key（可在界面填写或设置环境变量 GEMINI_API_KEY）。")
+        self._genai = genai
+        self._genai_types = types
+        self._api_key = resolved_key
         self.model_name = model_name.strip() or "gemini-4-hydrogen"
         self.reasoning_effort = ReasoningEffort(reasoning_effort)
         effective_timeout = (
@@ -1052,13 +1197,24 @@ class GeminiMllmClient:
             )
         )
         self.request_timeout: float = effective_timeout
-        timeout_ms = max(1000, int(round(effective_timeout * 1000)))
-        self.client = genai.Client(
-            api_key=resolved_key,
-            http_options=types.HttpOptions(timeout=timeout_ms),
-        )
+        self._timeout_ms = max(1000, int(round(effective_timeout * 1000)))
+        self._transient_disconnect_retries = max(0, int(transient_disconnect_retries))
+        self._transient_disconnect_max_elapsed = max(0.0, float(transient_disconnect_max_elapsed))
+        self._transient_retry_backoff_base = max(0.0, float(transient_retry_backoff_base))
+        self._closed = Event()
+        self._client_lock = Lock()
+        self._active_clients: set[object] = set()
+        self.client = self._create_sdk_client()
+        self._initial_sdk_client = self.client
+        self._stream_supported = True
         self._thinking_candidates = _build_gemini_thinking_candidates(self.reasoning_effort, self.model_name)
         self._thinking_idx = 0
+
+    def _create_sdk_client(self):
+        return self._genai.Client(
+            api_key=self._api_key,
+            http_options=self._genai_types.HttpOptions(timeout=self._timeout_ms),
+        )
 
     def review_image(
         self,
@@ -1067,7 +1223,7 @@ class GeminiMllmClient:
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse:
-        """发送编号总览图及候选框裁剪图至 Gemini 并解析结构化审核结果；遇思考级别 400 拒绝时自动降级重试。"""
+        """发送编号总览图及候选框裁剪图至 Gemini 并解析结构化审核结果；支持流式降级、思考级别降级与短耗时断连重试。"""
         contents: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt},
             {
@@ -1091,9 +1247,12 @@ class GeminiMllmClient:
                 }
             )
 
+        disconnect_retries = 0
+        use_fresh_client = False
         while True:
             sent_idx = self._thinking_idx
             sent_level = self._thinking_candidates[sent_idx]
+            sent_stream = self._stream_supported
             req_kwargs: dict[str, object] = {
                 "model": self.model_name,
                 "system_instruction": system_prompt,
@@ -1105,24 +1264,58 @@ class GeminiMllmClient:
                 },
                 "store": False,
             }
+            if sent_stream:
+                req_kwargs["stream"] = True
             if sent_level is not None:
                 req_kwargs["generation_config"] = {"thinking_level": sent_level}
+
+            owns_active_client = use_fresh_client and (self.client is self._initial_sdk_client)
+            active_client = self._create_sdk_client() if owns_active_client else self.client
+            with self._client_lock:
+                self._active_clients.add(active_client)
+            attempt_t0 = time.perf_counter()
             try:
-                interaction = self.client.interactions.create(**req_kwargs)
+                resp = active_client.interactions.create(**req_kwargs)
+                output_text = _consume_gemini_response(resp, self._closed)
                 break
             except Exception as exc:
+                attempt_elapsed = time.perf_counter() - attempt_t0
                 if sent_level is not None and _is_gemini_thinking_bad_request(exc):
                     self._thinking_idx = max(self._thinking_idx, sent_idx + 1)
                     continue
+                if sent_stream and _is_gemini_stream_bad_request(exc):
+                    self._stream_supported = False
+                    continue
+                if (
+                    not self._closed.is_set()
+                    and disconnect_retries < self._transient_disconnect_retries
+                    and attempt_elapsed <= self._transient_disconnect_max_elapsed
+                    and _is_transient_disconnect_error(exc)
+                ):
+                    disconnect_retries += 1
+                    use_fresh_client = True
+                    delay = self._transient_retry_backoff_base * (2 ** (disconnect_retries - 1))
+                    if delay > 0 and self._closed.wait(timeout=delay):
+                        raise
+                    continue
                 raise
+            finally:
+                with self._client_lock:
+                    self._active_clients.discard(active_client)
+                if owns_active_client:
+                    _close_client_safely(active_client)
 
-        output_text = getattr(interaction, "output_text", None) or ""
         if not output_text:
             raise RuntimeError("Gemini 返回为空，未包含文本输出。")
         return parse_review_response_text(output_text)
 
     def close(self) -> None:
-        """关闭底层 `genai.Client` HTTP 连接池以立即中断在途请求（可重复调用）。"""
+        """置位关闭标志并关闭全部在途及默认 `genai.Client` HTTP 连接池以立即中断请求（可重复调用）。"""
+        self._closed.set()
+        with self._client_lock:
+            clients = list(self._active_clients)
+        for cli in clients:
+            _close_client_safely(cli)
         _close_client_safely(self.client)
 
 
@@ -1233,9 +1426,12 @@ class OpenAICompatMllmClient:
         - 请求超时（`request_timeout`，单位秒）：`timeout` 为 `None` 或非正数时按思考级别解析
           （均大于官方 600s 上限），连接超时限制为 `MLLM_CONNECT_TIMEOUT_SECONDS`（30s）；
           `max_retries` 未显式指定时对 `HIGH`/`XHIGH` 设为 `0` 以防深度推理超时重复扣费，其余设为 `1`。
+        - 默认启用 `stream=True` 流式接收并在本地拼接完整输出，遇 400 拒绝 `stream` 时自动降级并记忆；
+          对耗时不超过 `transient_disconnect_max_elapsed` 的瞬时网络/代理断连（不含任何超时），
+          通过新建独立 SDK 客户端连接池并按指数退避自动重连重试。
 
     参数事前预判与自动降级状态：
-        维护 `_temperature_supported`、`_json_mode_supported` 与 `_reasoning_idx` 能力状态：
+        维护 `_temperature_supported`、`_json_mode_supported`、`_stream_supported` 与 `_reasoning_idx` 能力状态：
         初始化时按模型名对 OpenAI `o` 系列及 `gpt-5+` 预置 `_temperature_supported = False`，对已知非推理模型
         事前省略 `reasoning_effort`；运行时仅在对应参数触发 `openai.BadRequestError` 时单调降级。
         每轮请求前先对状态取快照，多线程并发下依据本轮实际发送快照判定降级，不会互相误关且保证有限次终止。
@@ -1252,6 +1448,9 @@ class OpenAICompatMllmClient:
         allow_anonymous_key: bool = True,
         provider_label: str = "OpenAI 兼容接口",
         max_retries: int | None = None,
+        transient_disconnect_retries: int = MLLM_TRANSIENT_DISCONNECT_RETRIES,
+        transient_disconnect_max_elapsed: float = MLLM_TRANSIENT_DISCONNECT_MAX_ELAPSED_SECONDS,
+        transient_retry_backoff_base: float = MLLM_TRANSIENT_RETRY_BACKOFF_BASE_SECONDS,
     ) -> None:
         from openai import BadRequestError, OpenAI, Timeout
 
@@ -1294,17 +1493,33 @@ class OpenAICompatMllmClient:
             connect=min(MLLM_CONNECT_TIMEOUT_SECONDS, effective_timeout),
         )
 
-        self.client = OpenAI(
-            api_key=resolved_key,
-            base_url=resolved_url,
-            timeout=openai_timeout,
-            max_retries=effective_retries,
-        )
+        self._openai_cls = OpenAI
+        self._resolved_key = resolved_key
+        self._resolved_url = resolved_url
+        self._openai_timeout = openai_timeout
+        self._transient_disconnect_retries = max(0, int(transient_disconnect_retries))
+        self._transient_disconnect_max_elapsed = max(0.0, float(transient_disconnect_max_elapsed))
+        self._transient_retry_backoff_base = max(0.0, float(transient_retry_backoff_base))
+        self._closed = Event()
+        self._client_lock = Lock()
+        self._active_clients: set[object] = set()
+
+        self.client = self._create_sdk_client()
+        self._initial_sdk_client = self.client
         self._bad_request_error = BadRequestError
         self._temperature_supported = not _openai_model_omits_custom_sampling(self.model_name)
         self._json_mode_supported = True
+        self._stream_supported = True
         self._reasoning_candidates = _build_openai_reasoning_candidates(self.reasoning_effort, self.model_name)
         self._reasoning_idx = 0
+
+    def _create_sdk_client(self):
+        return self._openai_cls(
+            api_key=self._resolved_key,
+            base_url=self._resolved_url,
+            timeout=self._openai_timeout,
+            max_retries=self.max_retries,
+        )
 
     def review_image(
         self,
@@ -1313,7 +1528,7 @@ class OpenAICompatMllmClient:
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse:
-        """发送多模态对话请求并解析 JSON 审核结果；若后端拒绝可选参数则按快照单调降级重试。"""
+        """发送多模态对话请求并解析 JSON 审核结果；支持流式降级、400 参数单调降级与短耗时断连重试。"""
         user_content: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt},
             {
@@ -1344,28 +1559,43 @@ class OpenAICompatMllmClient:
             {"role": "user", "content": user_content},
         ]
 
+        disconnect_retries = 0
+        use_fresh_client = False
         while True:
             # 先快照本轮实际发送的可选参数，防止并发线程修改标志位后漏判当前请求触发的 400
             sent_temperature = self._temperature_supported
             sent_json_mode = self._json_mode_supported
+            sent_stream = self._stream_supported
             sent_reasoning_idx = self._reasoning_idx
             sent_reasoning_val = self._reasoning_candidates[sent_reasoning_idx]
             req_kwargs: dict[str, object] = {
                 "model": self.model_name,
                 "messages": messages,
             }
+            if sent_stream:
+                req_kwargs["stream"] = True
             if sent_temperature:
                 req_kwargs["temperature"] = 0.1
             if sent_json_mode:
                 req_kwargs["response_format"] = {"type": "json_object"}
             if sent_reasoning_val is not None:
                 req_kwargs["reasoning_effort"] = sent_reasoning_val
+
+            owns_active_client = use_fresh_client and (self.client is self._initial_sdk_client)
+            active_client = self._create_sdk_client() if owns_active_client else self.client
+            with self._client_lock:
+                self._active_clients.add(active_client)
+            attempt_t0 = time.perf_counter()
             try:
                 # 保留 type: ignore 指令供静态类型检查器识别兼容接口动态构造的参数字典
-                resp = self.client.chat.completions.create(**req_kwargs)  # type: ignore[arg-type]
+                resp = active_client.chat.completions.create(**req_kwargs)  # type: ignore[arg-type]
+                content = _consume_openai_response(resp, self._closed)
                 break
             except self._bad_request_error as exc:
                 downgraded = False
+                if sent_stream and _is_stream_bad_request(exc):
+                    self._stream_supported = False
+                    downgraded = True
                 if sent_temperature and _is_temperature_bad_request(exc):
                     self._temperature_supported = False
                     downgraded = True
@@ -1386,14 +1616,38 @@ class OpenAICompatMllmClient:
                         downgraded = True
                 if not downgraded:
                     raise
+            except Exception as exc:
+                attempt_elapsed = time.perf_counter() - attempt_t0
+                if (
+                    not self._closed.is_set()
+                    and disconnect_retries < self._transient_disconnect_retries
+                    and attempt_elapsed <= self._transient_disconnect_max_elapsed
+                    and _is_transient_disconnect_error(exc)
+                ):
+                    disconnect_retries += 1
+                    use_fresh_client = True
+                    delay = self._transient_retry_backoff_base * (2 ** (disconnect_retries - 1))
+                    if delay > 0 and self._closed.wait(timeout=delay):
+                        raise
+                    continue
+                raise
+            finally:
+                with self._client_lock:
+                    self._active_clients.discard(active_client)
+                if owns_active_client:
+                    _close_client_safely(active_client)
 
-        content = (resp.choices[0].message.content or "") if resp.choices else ""
         if not content.strip():
             raise RuntimeError(f"{self._provider_label}返回为空，未包含文本输出。")
         return parse_review_response_text(content)
 
     def close(self) -> None:
-        """关闭底层 OpenAI HTTP 客户端以立即中断在途网络请求（可重复调用）。"""
+        """置位关闭标志并关闭全部在途及默认 OpenAI HTTP 客户端以立即中断请求（可重复调用）。"""
+        self._closed.set()
+        with self._client_lock:
+            clients = list(self._active_clients)
+        for cli in clients:
+            _close_client_safely(cli)
         _close_client_safely(self.client)
 
 

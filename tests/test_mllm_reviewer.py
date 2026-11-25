@@ -2598,6 +2598,347 @@ def test_timestamped_log_formatting_and_all_tabs_emit_timestamps(tmp_path: Path)
     assert ts_line_re.match(eval_tab.log_box.toPlainText().strip())
 
 
+def test_transient_disconnect_classifier_excludes_timeouts_and_status_errors() -> None:
+    """验证瞬时断连识别函数精确命中连接/协议断开，并严格排除超时与 HTTP 状态错误。"""
+    import httpx
+    import httpx2
+    import openai
+
+    from yolo_studio.core.mllm_reviewer import _is_transient_disconnect_error
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    # 1) 真实连接/协议断开返回 True
+    conn_err = openai.APIConnectionError(request=req)
+    conn_err.__cause__ = httpx2.RemoteProtocolError("Server disconnected without sending a response.")
+    assert _is_transient_disconnect_error(conn_err) is True
+    assert _is_transient_disconnect_error(ConnectionResetError("reset")) is True
+    assert _is_transient_disconnect_error(httpx2.ReadError("read failed")) is True
+
+    # 2) APITimeoutError 虽然继承自 APIConnectionError，但必须被识别为超时而不触发重试
+    timeout_err = openai.APITimeoutError(request=req)
+    timeout_err.__cause__ = TimeoutError("timed out")
+    assert _is_transient_disconnect_error(timeout_err) is False
+    assert _is_transient_disconnect_error(TimeoutError("plain timeout")) is False
+    assert _is_transient_disconnect_error(httpx2.ReadTimeout("read timeout")) is False
+
+    # 3) HTTP 4xx/5xx 与普通业务异常均返回 False
+    bad_req = openai.BadRequestError("bad", response=httpx.Response(400, request=req), body=None)
+    auth_err = openai.AuthenticationError("denied", response=httpx.Response(401, request=req), body=None)
+    assert _is_transient_disconnect_error(bad_req) is False
+    assert _is_transient_disconnect_error(auth_err) is False
+    assert _is_transient_disconnect_error(RuntimeError("boom")) is False
+
+
+def test_gemini_streaming_accumulation_and_short_disconnect_reconnect_retry(monkeypatch) -> None:
+    """验证 Gemini 流式文本拼接、`stream` 400 自动降级、短耗时断连新建客户端重连与超时不重试。"""
+    import httpx2
+    import pytest
+    from google import genai
+
+    from yolo_studio.core.mllm_reviewer import GeminiMllmClient, ReasoningEffort
+
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    def _make_stream(chunks: list[str], *, closed_flag: list[bool] | None = None):
+        events = [
+            type("Ev", (), {"event_type": "interaction.created"})(),
+            type(
+                "Ev",
+                (),
+                {
+                    "event_type": "step.delta",
+                    "delta": type("D", (), {"type": "thought_signature", "text": None})(),
+                },
+            )(),
+        ]
+        for piece in chunks:
+            events.append(
+                type(
+                    "Ev",
+                    (),
+                    {
+                        "event_type": "step.delta",
+                        "delta": type("D", (), {"type": "text", "text": piece})(),
+                    },
+                )()
+            )
+        events.append(
+            type(
+                "Ev",
+                (),
+                {
+                    "event_type": "interaction.completed",
+                    "interaction": type("I", (), {"status": "completed", "output_text": None})(),
+                },
+            )()
+        )
+
+        class _FakeStream:
+            def __iter__(self):
+                return iter(events)
+
+            def close(self) -> None:
+                if closed_flag is not None:
+                    closed_flag.append(True)
+
+        return _FakeStream()
+
+    # 1) 默认传 stream=True，多段 delta 文本正确拼接且流被自动关闭
+    created_clients: list[object] = []
+    calls_log: list[dict[str, object]] = []
+    stream_closed: list[bool] = []
+
+    class _StreamOkInteractions:
+        def __init__(self, cid: int) -> None:
+            self.cid = cid
+
+        def create(self, **kwargs):
+            calls_log.append({"cid": self.cid, **kwargs})
+            return _make_stream([ok_json[:24], ok_json[24:]], closed_flag=stream_closed)
+
+    class _FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            cid = len(created_clients)
+            self.cid = cid
+            self.closed = False
+            self.interactions = _StreamOkInteractions(cid)
+            created_clients.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+    g_cli = GeminiMllmClient(api_key="k", model_name="gemini-4-neon", reasoning_effort=ReasoningEffort.HIGH)
+    parsed = g_cli.review_image(b"x", [], "s", "u")
+    assert parsed.has_missing is False
+    assert calls_log[0].get("stream") is True
+    assert stream_closed == [True]
+
+    # 2) 短耗时 RemoteProtocolError 触发新建 SDK 客户端并最终成功，新建临时客户端用完即关
+    created_clients.clear()
+    calls_log.clear()
+    mode = {"behavior": "disconnect_once"}
+
+    class _RetryInteractions:
+        def __init__(self, cid: int) -> None:
+            self.cid = cid
+
+        def create(self, **kwargs):
+            calls_log.append({"cid": self.cid, **kwargs})
+            if mode["behavior"] == "disconnect_once" and len(calls_log) == 1:
+                raise httpx2.RemoteProtocolError("Server disconnected without sending a response.")
+            if mode["behavior"] == "reject_stream" and kwargs.get("stream"):
+                err = RuntimeError("400 INVALID_ARGUMENT: stream is not supported")
+                setattr(err, "code", 400)
+                raise err
+            if mode["behavior"] == "non_stream_ok":
+                return type("Resp", (), {"output_text": ok_json})()
+            return _make_stream([ok_json])
+
+    class _FakeRetryClient:
+        def __init__(self, **_kwargs) -> None:
+            cid = len(created_clients)
+            self.cid = cid
+            self.closed = False
+            self.interactions = _RetryInteractions(cid)
+            created_clients.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(genai, "Client", _FakeRetryClient)
+    g_retry = GeminiMllmClient(
+        api_key="k",
+        model_name="gemini-4-neon",
+        transient_disconnect_retries=2,
+        transient_retry_backoff_base=0.0,
+    )
+    g_retry.review_image(b"x", [], "s", "u")
+    assert len(calls_log) == 2
+    assert calls_log[0]["cid"] == 0
+    assert calls_log[1]["cid"] == 1
+    assert created_clients[1].closed is True
+
+    # 3) 400 明确拒绝 stream 时降级为非流式并记住结论
+    calls_log.clear()
+    mode["behavior"] = "reject_stream"
+    g_retry.review_image(b"x", [], "s", "u")
+    mode["behavior"] = "non_stream_ok"
+    g_retry.review_image(b"x", [], "s", "u")
+    assert [bool(c.get("stream")) for c in calls_log] == [True, False, False]
+
+    # 4) 超过耗时阈值的长请求断连不重试，避免重复扣费
+    calls_log.clear()
+    mode["behavior"] = "disconnect_once"
+    g_long = GeminiMllmClient(
+        api_key="k",
+        model_name="gemini-4-neon",
+        transient_disconnect_retries=2,
+        transient_disconnect_max_elapsed=0.0,
+        transient_retry_backoff_base=0.0,
+    )
+    with pytest.raises(httpx2.RemoteProtocolError):
+        g_long.review_image(b"x", [], "s", "u")
+    assert len(calls_log) == 1
+
+
+def test_openai_streaming_accumulation_and_short_disconnect_reconnect_retry(monkeypatch) -> None:
+    """验证 OpenAI 流式分片拼接、`stream` 400 自动降级、短耗时断连重连、超时不重试及 `close()` 秒断退避。"""
+    import httpx
+    import httpx2
+    import openai
+    import pytest
+
+    from yolo_studio.core.mllm_reviewer import OpenAICompatMllmClient, ReasoningEffort
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    def _make_oa_stream(parts: list[str], *, closed_flag: list[bool] | None = None):
+        chunks = [
+            type(
+                "Chunk",
+                (),
+                {"choices": [type("C", (), {"delta": type("D", (), {"content": p})()})()]},
+            )()
+            for p in parts
+        ]
+        # 附加一个 choices=[] 的 usage 尾包验证空分片安全跳过
+        chunks.append(type("Chunk", (), {"choices": []})())
+
+        class _FakeStream:
+            def __iter__(self):
+                return iter(chunks)
+
+            def close(self) -> None:
+                if closed_flag is not None:
+                    closed_flag.append(True)
+
+        return _FakeStream()
+
+    created_clients: list[object] = []
+    calls_log: list[dict[str, object]] = []
+    stream_closed: list[bool] = []
+    mode = {"behavior": "stream_ok"}
+
+    class _Completions:
+        def __init__(self, cid: int) -> None:
+            self.cid = cid
+
+        def create(self, **kwargs):
+            calls_log.append({"cid": self.cid, **kwargs})
+            if mode["behavior"] == "disconnect_once" and len(calls_log) == 1:
+                err = openai.APIConnectionError(request=req)
+                err.__cause__ = httpx2.RemoteProtocolError("Server disconnected without sending a response.")
+                raise err
+            if mode["behavior"] == "timeout":
+                err = openai.APITimeoutError(request=req)
+                err.__cause__ = TimeoutError("read timed out")
+                raise err
+            if mode["behavior"] == "reject_stream" and kwargs.get("stream"):
+                raise openai.BadRequestError(
+                    "Unsupported parameter: stream",
+                    response=httpx.Response(400, request=req),
+                    body={"error": {"param": "stream", "message": "stream not supported"}},
+                )
+            if not kwargs.get("stream"):
+                return type(
+                    "Resp",
+                    (),
+                    {"choices": [type("C", (), {"message": type("M", (), {"content": ok_json})()})()]},
+                )()
+            return _make_oa_stream([ok_json[:20], ok_json[20:]], closed_flag=stream_closed)
+
+    class _FakeOpenAI:
+        def __init__(self, **_kwargs) -> None:
+            cid = len(created_clients)
+            self.cid = cid
+            self.closed = False
+            self.chat = type("Chat", (), {"completions": _Completions(cid)})()
+            created_clients.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+
+    # 1) 默认流式拼接并关闭流对象
+    cli = OpenAICompatMllmClient(
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model_name="gpt-6.2-astra",
+        reasoning_effort=ReasoningEffort.HIGH,
+        allow_anonymous_key=False,
+        transient_disconnect_retries=2,
+        transient_retry_backoff_base=0.0,
+    )
+    parsed = cli.review_image(b"x", [], "s", "u")
+    assert parsed.has_missing is False
+    assert calls_log[0].get("stream") is True
+    assert stream_closed == [True]
+
+    # 2) 短耗时 APIConnectionError 触发新建客户端实例重连并成功
+    calls_log.clear()
+    mode["behavior"] = "disconnect_once"
+    cli.review_image(b"x", [], "s", "u")
+    assert len(calls_log) == 2
+    assert calls_log[0]["cid"] == 0
+    assert calls_log[1]["cid"] == 1
+    assert created_clients[1].closed is True
+
+    # 3) 400 拒绝 stream 时降级并保留 json_object
+    calls_log.clear()
+    mode["behavior"] = "reject_stream"
+    cli.review_image(b"x", [], "s", "u")
+    cli.review_image(b"x", [], "s", "u")
+    assert [bool(c.get("stream")) for c in calls_log] == [True, False, False]
+    assert all(c.get("response_format") == {"type": "json_object"} for c in calls_log)
+
+    # 4) APITimeoutError 不触发瞬时断连重试
+    calls_log.clear()
+    mode["behavior"] = "timeout"
+    with pytest.raises(openai.APITimeoutError):
+        cli.review_image(b"x", [], "s", "u")
+    assert len(calls_log) == 1
+
+    # 5) 超过 max_elapsed 时不重试；close() 置位后立即中断退避等待
+    calls_log.clear()
+    mode["behavior"] = "disconnect_once"
+    cli_long = OpenAICompatMllmClient(
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model_name="gpt-6.2-astra",
+        allow_anonymous_key=False,
+        transient_disconnect_retries=2,
+        transient_disconnect_max_elapsed=0.0,
+        transient_retry_backoff_base=0.0,
+    )
+    with pytest.raises(openai.APIConnectionError):
+        cli_long.review_image(b"x", [], "s", "u")
+    assert len(calls_log) == 1
+
+    import threading
+    import time
+
+    calls_log.clear()
+    cli_cancel = OpenAICompatMllmClient(
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model_name="gpt-6.2-astra",
+        allow_anonymous_key=False,
+        transient_disconnect_retries=2,
+        transient_retry_backoff_base=10.0,
+    )
+    threading.Timer(0.15, cli_cancel.close).start()
+    t0 = time.perf_counter()
+    with pytest.raises(openai.APIConnectionError):
+        cli_cancel.review_image(b"x", [], "s", "u")
+    assert time.perf_counter() - t0 < 2.0
+    assert len(calls_log) == 1
+
+
+
 
 
 
