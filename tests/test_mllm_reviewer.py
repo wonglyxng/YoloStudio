@@ -2056,4 +2056,272 @@ def test_reasoning_effort_capability_matrix_and_guard(tmp_path: Path) -> None:
     assert report["reasoning_effort"] == "high"
 
 
+def test_mllm_timeouts_exceed_official_max_and_retries_follow_effort(monkeypatch) -> None:
+    """验证各提供方与各思考级别超时均大于官方 600s 上限，且深度推理禁用自动重试以免重复扣费。"""
+    import openai
+    from google import genai
+
+    from yolo_studio.core.mllm_reviewer import (
+        MLLM_CONNECT_TIMEOUT_SECONDS,
+        MLLM_PROBE_TIMEOUT_SECONDS,
+        MLLM_REQUEST_TIMEOUTS_SECONDS,
+        GeminiMllmClient,
+        OpenAICompatMllmClient,
+        ReasoningEffort,
+        build_mllm_client,
+        resolve_mllm_max_retries,
+        resolve_mllm_request_timeout,
+        test_mllm_connection,
+    )
+
+    # 1) 全矩阵超时解析均严格大于官方默认最大超时（600.0s），且随思考级别单调递增
+    official_max_timeout = 600.0
+    for effort, val in MLLM_REQUEST_TIMEOUTS_SECONDS.items():
+        assert val > official_max_timeout, f"{effort.value} 超时 {val}s 应大于官方上限 {official_max_timeout}s"
+
+    for provider, model_name in (
+        (MllmProvider.GEMINI, "gemini-4-neon"),
+        (MllmProvider.GEMINI, "gemini-3.5-flash-lite"),
+        (MllmProvider.OPENAI, "gpt-6.2-astra"),
+        (MllmProvider.OPENAI, "gpt-4o"),
+        (MllmProvider.OPENAI_COMPAT, "qwen-vl-max-latest"),
+        (MllmProvider.OPENAI_COMPAT, "Qwen/Qwen2.5-VL-72B-Instruct"),
+    ):
+        for effort in ReasoningEffort:
+            resolved = resolve_mllm_request_timeout(provider, model_name, effort)
+            assert resolved > official_max_timeout
+
+    # 支持完整 OFF..XHIGH 的模型按档位严格递增；不支持 OFF 的 gpt-6.2-astra 会先折算至 LOW (720s)
+    assert (
+        resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-5.4", ReasoningEffort.OFF)
+        < resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-5.4", ReasoningEffort.LOW)
+        < resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-5.4", ReasoningEffort.AUTO)
+        == resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-5.4", ReasoningEffort.MEDIUM)
+        < resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-5.4", ReasoningEffort.HIGH)
+        < resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-5.4", ReasoningEffort.XHIGH)
+    )
+    assert (
+        resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-6.2-astra", ReasoningEffort.OFF)
+        == resolve_mllm_request_timeout(MllmProvider.OPENAI, "gpt-6.2-astra", ReasoningEffort.LOW)
+        == 720.0
+    )
+    assert resolve_mllm_max_retries(ReasoningEffort.HIGH) == 0
+    assert resolve_mllm_max_retries(ReasoningEffort.XHIGH) == 0
+    for normal_effort in (
+        ReasoningEffort.AUTO,
+        ReasoningEffort.OFF,
+        ReasoningEffort.LOW,
+        ReasoningEffort.MEDIUM,
+    ):
+        assert resolve_mllm_max_retries(normal_effort) == 1
+
+    # 2) GeminiMllmClient 按模型能力矩阵折算毫秒传入 HttpOptions(timeout=...)，且支持显式覆盖
+    gemini_inits: list[dict[str, object]] = []
+
+    class _FakeGenaiClient:
+        def __init__(self, **kwargs) -> None:
+            gemini_inits.append(dict(kwargs))
+            self.interactions = object()
+
+    monkeypatch.setattr(genai, "Client", _FakeGenaiClient)
+
+    g_carbon = GeminiMllmClient(
+        api_key="k",
+        model_name="gemini-4-carbon",
+        reasoning_effort=ReasoningEffort.XHIGH,  # carbon 最高支持 high -> 1200s -> 1_200_000ms
+    )
+    assert g_carbon.request_timeout == 1200.0
+    assert gemini_inits[-1]["http_options"].timeout == 1_200_000
+
+    g_neon = GeminiMllmClient(
+        api_key="k",
+        model_name="gemini-4-neon",
+        reasoning_effort=ReasoningEffort.XHIGH,
+    )
+    assert g_neon.request_timeout == 1500.0
+    assert gemini_inits[-1]["http_options"].timeout == 1_500_000
+
+    g_override = GeminiMllmClient(
+        api_key="k",
+        model_name="gemini-4-hydrogen",
+        reasoning_effort=ReasoningEffort.LOW,
+        timeout=1800.0,
+    )
+    assert g_override.request_timeout == 1800.0
+    assert gemini_inits[-1]["http_options"].timeout == 1_800_000
+
+    # 3) OpenAICompatMllmClient（官方与兼容接口）传入 openai.Timeout 与 max_retries
+    openai_inits: list[dict[str, object]] = []
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs) -> None:
+            openai_inits.append(dict(kwargs))
+            self.chat = type("Chat", (), {"completions": object()})()
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+
+    oa_high = build_mllm_client(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.OPENAI,
+            model_name="gpt-6.2-astra",
+            api_key="sk-test",
+            reasoning_effort=ReasoningEffort.HIGH,
+        )
+    )
+    assert isinstance(oa_high, OpenAICompatMllmClient)
+    assert oa_high.request_timeout == 1200.0
+    assert oa_high.max_retries == 0
+    last_oa_kw = openai_inits[-1]
+    assert isinstance(last_oa_kw["timeout"], openai.Timeout)
+    assert last_oa_kw["timeout"].read == 1200.0
+    assert last_oa_kw["timeout"].connect == MLLM_CONNECT_TIMEOUT_SECONDS
+    assert last_oa_kw["max_retries"] == 0
+
+    compat_low = build_mllm_client(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.OPENAI_COMPAT,
+            base_url="http://localhost:11434/v1",
+            model_name="qwen2.5vl:7b",
+            reasoning_effort=ReasoningEffort.HIGH,  # 非推理模型折算回 AUTO (900s)
+        )
+    )
+    assert isinstance(compat_low, OpenAICompatMllmClient)
+    assert compat_low.request_timeout == 900.0
+    assert compat_low.max_retries == 1
+    assert openai_inits[-1]["timeout"].read == 900.0
+    assert openai_inits[-1]["max_retries"] == 1
+
+    explicit_oa = OpenAICompatMllmClient(
+        api_key="k",
+        base_url="http://localhost:11434/v1",
+        model_name="qwen-vl-max-latest",
+        timeout=2000.0,
+        max_retries=2,
+    )
+    assert explicit_oa.request_timeout == 2000.0
+    assert explicit_oa.max_retries == 2
+    assert openai_inits[-1]["timeout"].read == 2000.0
+    assert openai_inits[-1]["max_retries"] == 2
+
+    # 4) 连通性探针超时为 60s（OpenAI 探针 max_retries=0），失败时透出底层异常类型与 __cause__
+    import httpx
+
+    gemini_inits.clear()
+    openai_inits.clear()
+
+    class _FailGenaiInteractions:
+        def create(self, **_kwargs):
+            raise TimeoutError("probe read timed out")
+
+    class _FailGenaiClient:
+        def __init__(self, **kwargs) -> None:
+            gemini_inits.append(dict(kwargs))
+            self.interactions = _FailGenaiInteractions()
+
+    monkeypatch.setattr(genai, "Client", _FailGenaiClient)
+    ok_g, msg_g = test_mllm_connection(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.GEMINI,
+            model_name="gemini-4-hydrogen",
+            api_key="k",
+        )
+    )
+    assert ok_g is False
+    assert gemini_inits[-1]["http_options"].timeout == int(round(MLLM_PROBE_TIMEOUT_SECONDS * 1000))
+    assert "TimeoutError" in msg_g
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    class _ConnErrCompletions:
+        def create(self, **_kwargs):
+            root_cause = OSError("TLS handshake reset by peer")
+            err = openai.APIConnectionError(request=req)
+            err.__cause__ = root_cause
+            raise err
+
+    class _FailOpenAI:
+        def __init__(self, **kwargs) -> None:
+            openai_inits.append(dict(kwargs))
+            self.chat = type("Chat", (), {"completions": _ConnErrCompletions()})()
+
+    monkeypatch.setattr(openai, "OpenAI", _FailOpenAI)
+    ok_o, msg_o = test_mllm_connection(
+        MllmReviewConfig(
+            images_dir=Path("."),
+            output_dir=Path("."),
+            provider=MllmProvider.OPENAI,
+            model_name="gpt-6.2-astra",
+            api_key="sk-test",
+        )
+    )
+    assert ok_o is False
+    assert openai_inits[-1]["timeout"].read == MLLM_PROBE_TIMEOUT_SECONDS
+    assert openai_inits[-1]["max_retries"] == 0
+    assert "APIConnectionError" in msg_o
+    assert "TLS handshake reset by peer" in msg_o
+
+
+def test_run_mllm_review_logs_timeout_and_exception_root_cause(tmp_path: Path) -> None:
+    """验证 `run_mllm_review` 启动日志含单次超时配置，且失败记录与运行日志完整透出底层原因。"""
+    import httpx
+    import openai
+
+    from yolo_studio.core.mllm_reviewer import ReasoningEffort
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    _write_img(in_dir / "a_timeout.png", (320, 180))
+    _write_img(in_dir / "b_conn.png", (320, 180))
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    class _TimeoutAndConnClient:
+        request_timeout = 1200.0
+
+        def review_image(self, *_args):
+            if not hasattr(self, "_called"):
+                self._called = True
+                err = openai.APITimeoutError(request=req)
+                err.__cause__ = TimeoutError("The read operation timed out")
+                raise err
+            err = openai.APIConnectionError(request=req)
+            err.__cause__ = ConnectionResetError("Connection reset by peer")
+            raise err
+
+    logs: list[str] = []
+    res = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            provider=MllmProvider.OPENAI,
+            model_name="gpt-6.2-astra",
+            reasoning_effort=ReasoningEffort.HIGH,
+            allowed_classes=["player"],
+            max_workers=1,
+        ),
+        client_override=_TimeoutAndConnClient(),
+        log_callback=logs.append,
+    )
+
+    assert res.error_count == 2
+    assert any("单次超时: 1200s" in line for line in logs)
+    assert any("处理出错" in line and "APITimeoutError" in line and "The read operation timed out" in line for line in logs)
+    assert any("处理出错" in line and "APIConnectionError" in line and "Connection reset by peer" in line for line in logs)
+
+    report = json.loads(res.report_path.read_text(encoding="utf-8"))
+    errors_by_name = {item["image"]: item["error"] for item in report["items"]}
+    assert "APITimeoutError" in errors_by_name["a_timeout.png"]
+    assert "The read operation timed out" in errors_by_name["a_timeout.png"]
+    assert "APIConnectionError" in errors_by_name["b_conn.png"]
+    assert "Connection reset by peer" in errors_by_name["b_conn.png"]
+
+
+
 

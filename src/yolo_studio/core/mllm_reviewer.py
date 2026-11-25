@@ -893,6 +893,77 @@ def resolve_effective_reasoning_effort(
     )
 
 
+# 各级别单次请求读取超时（秒）：全部严格高于官方默认最大超时（600s），避免深度思考或高并发排队时被客户端提前掐断
+MLLM_CONNECT_TIMEOUT_SECONDS: float = 30.0
+MLLM_PROBE_TIMEOUT_SECONDS: float = 60.0
+MLLM_REQUEST_TIMEOUTS_SECONDS: dict[ReasoningEffort, float] = {
+    ReasoningEffort.OFF: 660.0,
+    ReasoningEffort.LOW: 720.0,
+    ReasoningEffort.AUTO: 900.0,
+    ReasoningEffort.MEDIUM: 900.0,
+    ReasoningEffort.HIGH: 1200.0,
+    ReasoningEffort.XHIGH: 1500.0,
+}
+
+
+def resolve_mllm_request_timeout(
+    provider: MllmProvider,
+    model_name: str,
+    effort: ReasoningEffort,
+) -> float:
+    """按接口、模型能力矩阵与思考级别返回单次请求读取超时（单位：秒，均高于官方 600s 上限）。"""
+    effective_effort, _ = resolve_effective_reasoning_effort(provider, model_name, effort)
+    return MLLM_REQUEST_TIMEOUTS_SECONDS.get(
+        effective_effort, MLLM_REQUEST_TIMEOUTS_SECONDS[ReasoningEffort.AUTO]
+    )
+
+
+def resolve_mllm_max_retries(effort: ReasoningEffort) -> int:
+    """按实际生效的思考级别返回 SDK 自动重试次数。
+
+    设计原因：
+        `HIGH` / `XHIGH` 深度推理单次耗时可能达十余分钟且消耗较多思考 Token，若超时后仍由 SDK 自动重试
+        会导致双倍耗费与更长卡顿，因此返回 `0`；其余级别保留 `1` 次重试以吸收偶发网络抖动或 429/5xx。
+    """
+    if effort in {ReasoningEffort.HIGH, ReasoningEffort.XHIGH}:
+        return 0
+    return 1
+
+
+def _format_exception_detail(exc: BaseException) -> str:
+    """提取异常类型、摘要文本及最多 3 层 `__cause__` 底层原因，供错误落盘与运行日志诊断使用。"""
+    base_msg = str(exc).strip()
+    exc_type = type(exc).__name__
+
+    causes: list[str] = []
+    seen_ids: set[int] = {id(exc)}
+    cur = exc.__cause__
+    for _ in range(3):
+        if cur is None or id(cur) in seen_ids:
+            break
+        seen_ids.add(id(cur))
+        c_type = type(cur).__name__
+        c_msg = str(cur).strip()
+        fragment = f"{c_type}: {c_msg}" if c_msg else c_type
+        if fragment and fragment not in causes and fragment != base_msg:
+            causes.append(fragment)
+        cur = cur.__cause__
+
+    if not base_msg:
+        summary = exc_type
+    elif exc_type in {"RuntimeError", "ValueError", "FileNotFoundError"} and not causes:
+        # 常规业务或校验异常本身已携带完整语义，无底层链时保持原文不变
+        return base_msg
+    elif exc_type in base_msg:
+        summary = base_msg
+    else:
+        summary = f"{exc_type}: {base_msg}"
+
+    if causes:
+        return f"{summary}（底层原因: {' -> '.join(causes)}）"
+    return summary
+
+
 def _gemini_model_supports_minimal(model_name: str) -> bool:
     """判断 Gemini 模型是否支持 `thinking_level='minimal'`。"""
     return ReasoningEffort.OFF in supported_reasoning_efforts(MllmProvider.GEMINI, model_name)
@@ -936,8 +1007,10 @@ def _is_gemini_thinking_bad_request(exc: BaseException) -> bool:
 class GeminiMllmClient:
     """基于官方 `google-genai` Interactions API 的 Google Gemini 多模态审核客户端。
 
-    凭据与状态：
+    凭据、超时与状态：
         初始化时优先使用传入的 `api_key`，为空时读取环境变量 `GEMINI_API_KEY`，均缺失则抛出 `ValueError`；
+        `timeout` 单位为秒，未显式传入正数时按模型与思考级别经 `resolve_mllm_request_timeout` 计算，
+        并换算为毫秒写入 `types.HttpOptions(timeout=...)`（作为单次请求 HTTP 超时传给 `genai.Client`）。
         内部持有无状态交互会话客户端（每次调用设置 `store=False`），并按 `reasoning_effort`
         维护单调降级索引 `_thinking_idx`，遇到不支持特定 `thinking_level` 的 400 响应时自动降级。
     """
@@ -948,15 +1021,29 @@ class GeminiMllmClient:
         model_name: str = "gemini-4-hydrogen",
         *,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+        timeout: float | None = None,
     ) -> None:
         from google import genai
+        from google.genai import types
 
         resolved_key = api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
         if not resolved_key:
             raise ValueError("未提供 Gemini API Key（可在界面填写或设置环境变量 GEMINI_API_KEY）。")
-        self.client = genai.Client(api_key=resolved_key)
         self.model_name = model_name.strip() or "gemini-4-hydrogen"
         self.reasoning_effort = ReasoningEffort(reasoning_effort)
+        effective_timeout = (
+            float(timeout)
+            if (timeout is not None and timeout > 0)
+            else resolve_mllm_request_timeout(
+                MllmProvider.GEMINI, self.model_name, self.reasoning_effort
+            )
+        )
+        self.request_timeout: float = effective_timeout
+        timeout_ms = max(1000, int(round(effective_timeout * 1000)))
+        self.client = genai.Client(
+            api_key=resolved_key,
+            http_options=types.HttpOptions(timeout=timeout_ms),
+        )
         self._thinking_candidates = _build_gemini_thinking_candidates(self.reasoning_effort, self.model_name)
         self._thinking_idx = 0
 
@@ -1121,11 +1208,14 @@ def _is_reasoning_effort_bad_request(exc: BaseException) -> bool:
 class OpenAICompatMllmClient:
     """OpenAI 官方与兼容接口多模态审核客户端，适配 OpenAI 官方、通义千问、硅基流动、Ollama 与 vLLM。
 
-    凭据与兼容性：
+    凭据、超时与重试归属：
         - 当 `allow_anonymous_key=False`（OpenAI 官方）时：仅读取 `api_key` 或环境变量 `OPENAI_API_KEY`，
           均缺失时抛出 `ValueError`，绝不回退为 `"ollama"`；`base_url` 为空时默认使用 `OPENAI_OFFICIAL_BASE_URL`。
         - 当 `allow_anonymous_key=True`（OpenAI 兼容接口）时：依次回退 `api_key`、`OPENAI_API_KEY` 与 `"ollama"`，
           `base_url` 为空时默认使用 DashScope 兼容端点。
+        - 请求超时（`request_timeout`，单位秒）：`timeout` 为 `None` 或非正数时按思考级别解析
+          （均大于官方 600s 上限），连接超时限制为 `MLLM_CONNECT_TIMEOUT_SECONDS`（30s）；
+          `max_retries` 未显式指定时对 `HIGH`/`XHIGH` 设为 `0` 以防深度推理超时重复扣费，其余设为 `1`。
 
     参数事前预判与自动降级状态：
         维护 `_temperature_supported`、`_json_mode_supported` 与 `_reasoning_idx` 能力状态：
@@ -1139,13 +1229,14 @@ class OpenAICompatMllmClient:
         api_key: str,
         base_url: str,
         model_name: str,
-        timeout: float = 90.0,
+        timeout: float | None = None,
         *,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
         allow_anonymous_key: bool = True,
         provider_label: str = "OpenAI 兼容接口",
+        max_retries: int | None = None,
     ) -> None:
-        from openai import BadRequestError, OpenAI
+        from openai import BadRequestError, OpenAI, Timeout
 
         self._provider_label = provider_label
         self.model_name = model_name.strip()
@@ -1164,11 +1255,37 @@ class OpenAICompatMllmClient:
         )
         resolved_url = base_url.strip() or default_url
 
-        self.client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=timeout)
+        provider = MllmProvider.OPENAI_COMPAT if allow_anonymous_key else MllmProvider.OPENAI
+        self.reasoning_effort = ReasoningEffort(reasoning_effort)
+        effective_effort, _ = resolve_effective_reasoning_effort(
+            provider, self.model_name, self.reasoning_effort
+        )
+        effective_timeout = (
+            float(timeout)
+            if (timeout is not None and timeout > 0)
+            else resolve_mllm_request_timeout(provider, self.model_name, self.reasoning_effort)
+        )
+        effective_retries = (
+            max(0, int(max_retries))
+            if max_retries is not None
+            else resolve_mllm_max_retries(effective_effort)
+        )
+        self.request_timeout: float = effective_timeout
+        self.max_retries: int = effective_retries
+        openai_timeout = Timeout(
+            effective_timeout,
+            connect=min(MLLM_CONNECT_TIMEOUT_SECONDS, effective_timeout),
+        )
+
+        self.client = OpenAI(
+            api_key=resolved_key,
+            base_url=resolved_url,
+            timeout=openai_timeout,
+            max_retries=effective_retries,
+        )
         self._bad_request_error = BadRequestError
         self._temperature_supported = not _openai_model_omits_custom_sampling(self.model_name)
         self._json_mode_supported = True
-        self.reasoning_effort = ReasoningEffort(reasoning_effort)
         self._reasoning_candidates = _build_openai_reasoning_candidates(self.reasoning_effort, self.model_name)
         self._reasoning_idx = 0
 
@@ -1297,12 +1414,16 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
     try:
         if config.provider == MllmProvider.GEMINI:
             from google import genai
+            from google.genai import types
 
             resolved_key = config.api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
             if not resolved_key:
                 return False, "未提供 Gemini API Key（请在界面填写或设置环境变量 GEMINI_API_KEY）。"
             model_name = config.model_name.strip() or "gemini-4-hydrogen"
-            client = genai.Client(api_key=resolved_key)
+            client = genai.Client(
+                api_key=resolved_key,
+                http_options=types.HttpOptions(timeout=int(round(MLLM_PROBE_TIMEOUT_SECONDS * 1000))),
+            )
             interaction = client.interactions.create(
                 model=model_name,
                 input=[{"type": "text", "text": "Reply OK."}],
@@ -1313,7 +1434,7 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
             preview = reply[:40].replace("\n", " ") if reply else "(空响应)"
             return True, f"Gemini 接口连通正常（模型: {model_name}，耗时 {elapsed:.2f}s，回复: {preview}）"
 
-        from openai import BadRequestError, OpenAI
+        from openai import BadRequestError, OpenAI, Timeout
 
         is_official_openai = config.provider == MllmProvider.OPENAI
         explicit_or_env = config.api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
@@ -1333,7 +1454,12 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
         model_name = config.model_name.strip()
         if not model_name:
             return False, f"请先填写模型名称（如 {model_placeholder}）。"
-        client = OpenAI(api_key=resolved_key, base_url=resolved_url, timeout=20.0)
+        client = OpenAI(
+            api_key=resolved_key,
+            base_url=resolved_url,
+            timeout=Timeout(MLLM_PROBE_TIMEOUT_SECONDS, connect=20.0),
+            max_retries=0,
+        )
         omit_legacy_sampling = _openai_model_omits_custom_sampling(model_name)
         send_temperature = not omit_legacy_sampling
         send_max_tokens = not omit_legacy_sampling
@@ -1367,7 +1493,7 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
         return True, f"{provider_label}连通正常（模型: {model_name}，耗时 {elapsed:.2f}s，回复: {preview}）"
     except Exception as exc:
         elapsed = time.perf_counter() - t0
-        return False, f"接口连接失败（耗时 {elapsed:.2f}s）: {exc}"
+        return False, f"接口连接失败（耗时 {elapsed:.2f}s）: {_format_exception_detail(exc)}"
 
 
 class UltralyticsSamBoxRefiner:
@@ -2751,17 +2877,27 @@ def run_mllm_review(
                 f"开始纯本地 SAM 3 自动标注分流（共 {len(images)} 张图，类别: {allowed_classes}，"
                 f"自动通过阈值 ≥ {config.high_conf_skip:.2f}）..."
             )
-        elif is_sam3_text:
-            log_callback(
-                f"开始 SAM 3 预标 + LLM 二次质检（共 {len(images)} 张图，类别: {allowed_classes}，"
-                f"推理级别: {effort_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
-            )
         else:
-            mode_title = "LLM 零样本直接标注" if is_zero_shot else "LLM 智能标注"
-            log_callback(
-                f"开始 {mode_title}（共 {len(images)} 张图，类别: {allowed_classes}，"
-                f"推理级别: {effort_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
+            raw_timeout = getattr(client, "request_timeout", None)
+            req_timeout = (
+                float(raw_timeout)
+                if isinstance(raw_timeout, (int, float)) and raw_timeout > 0
+                else resolve_mllm_request_timeout(
+                    config.provider, config.model_name, config.reasoning_effort
+                )
             )
+            timeout_desc = f"，单次超时: {int(round(req_timeout))}s"
+            if is_sam3_text:
+                log_callback(
+                    f"开始 SAM 3 预标 + LLM 二次质检（共 {len(images)} 张图，类别: {allowed_classes}，"
+                    f"推理级别: {effort_desc}{timeout_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
+                )
+            else:
+                mode_title = "LLM 零样本直接标注" if is_zero_shot else "LLM 智能标注"
+                log_callback(
+                    f"开始 {mode_title}（共 {len(images)} 张图，类别: {allowed_classes}，"
+                    f"推理级别: {effort_desc}{timeout_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
+                )
 
     def _bucket_dir(bucket: str) -> Path:
         return (config.output_dir / bucket) if config.triage_subfolders else config.output_dir
@@ -2778,7 +2914,7 @@ def run_mllm_review(
         img_path: Path, before_boxes: list[CandidateBox], exc: BaseException
     ) -> ImageReviewRecord:
         """把出错图片连同原始候选框写入 `need_review`；写出过程再失败时仅记录错误，不向外抛出。"""
-        message = str(exc)
+        message = _format_exception_detail(exc)
         out_img_path: Path | None = None
         out_json_path: Path | None = None
         try:
@@ -3087,7 +3223,7 @@ def run_mllm_review(
                     triage_bucket=BUCKET_NEED_REVIEW,
                     has_missing=True,
                     missing_note="",
-                    error=str(exc),
+                    error=_format_exception_detail(exc),
                 )
             if rec is None:
                 cancelled = True
@@ -3097,19 +3233,24 @@ def run_mllm_review(
             if progress_callback:
                 progress_callback(completed_count, total, rec)
             if log_callback:
-                refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
-                loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
-                if is_zero_shot or sam3_pure_local:
+                if rec.error:
                     log_callback(
-                        f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                        f"(检出:{rec.added_count}{refine_part}{loose_part})"
+                        f"[{completed_count}/{total}] {rec.image_path.name} -> 处理出错 ({rec.triage_bucket}): {rec.error}"
                     )
                 else:
-                    log_callback(
-                        f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                        f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
-                        f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
-                    )
+                    refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
+                    loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
+                    if is_zero_shot or sam3_pure_local:
+                        log_callback(
+                            f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                            f"(检出:{rec.added_count}{refine_part}{loose_part})"
+                        )
+                    else:
+                        log_callback(
+                            f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                            f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
+                            f"{refine_part}{loose_part}, 补漏:{rec.added_count})"
+                        )
 
     records.sort(key=lambda r: str(r.image_path))
 
