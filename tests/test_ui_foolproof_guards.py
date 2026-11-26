@@ -1257,4 +1257,79 @@ def test_review_tab_preset_combo_bidirectional_sync_and_legacy_restore(
         tab_compat.close()
 
 
+def test_review_tab_resume_checkbox_persistence_and_circuit_breaker_summary(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证自动智能标注页断点续传勾选默认值、配置组装/持久化往返，以及熔断停机摘要与日志切页。"""
+    settings = QSettings(str(tmp_path / "review_resume.ini"), QSettings.Format.IniFormat)
+    tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        # 默认勾选断点续传并准确透传到配置对象
+        assert tab1.resume_chk.isChecked() is True
+        assert tab1._build_current_config().resume_from_existing is True
+
+        # 取消勾选后置脏、写入配置并在新实例完整还原
+        tab1.resume_chk.setChecked(False)
+        qt_app.processEvents()
+        assert tab1._settings_dirty is True
+        assert tab1._build_current_config().resume_from_existing is False
+        tab1.save_settings(settings)
+        settings.sync()
+
+        # 模拟收到熔断停机结果：展示红字摘要、包含续传计数与熔断原因、写日志并切到运行日志页签
+        tab1.result_tabs.setCurrentWidget(tab1.result_table)
+        aborted_res = MllmReviewResult(
+            output_dir=tmp_path / "out",
+            classes=["player"],
+            total_images=12,
+            auto_passed_count=4,
+            llm_fixed_count=2,
+            need_review_count=6,
+            error_count=5,
+            cancelled=True,
+            resumed_skipped_count=4,
+            aborted_reason="连续 5 张图片发生网络/限流/服务端异常，已自动熔断停机",
+        )
+        tab1._on_finished(aborted_res)
+        qt_app.processEvents()
+        assert "已自动熔断停止" in tab1.summary_label.text()
+        assert "续传跳过 4 张" in tab1.summary_label.text()
+        assert "连续 5 张" in tab1.summary_label.text()
+        assert "#cf222e" in tab1.summary_label.styleSheet()
+        assert tab1.result_tabs.currentWidget() is tab1.log_box
+        assert "[熔断停机]" in tab1.log_box.toPlainText()
+
+        # 正常完成后摘要样式应恢复默认灰黑，且展示续传跳过数量
+        ok_res = MllmReviewResult(
+            output_dir=tmp_path / "out",
+            classes=["player"],
+            total_images=12,
+            auto_passed_count=10,
+            llm_fixed_count=2,
+            need_review_count=0,
+            error_count=0,
+            cancelled=False,
+            resumed_skipped_count=7,
+            aborted_reason="",
+        )
+        tab1._on_finished(ok_res)
+        qt_app.processEvents()
+        assert "标注完成" in tab1.summary_label.text()
+        assert "续传跳过 7 张" in tab1.summary_label.text()
+        assert "#424a53" in tab1.summary_label.styleSheet()
+    finally:
+        tab1.close()
+
+    tab2 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    try:
+        tab2.restore_settings(settings)
+        qt_app.processEvents()
+        assert tab2.resume_chk.isChecked() is False
+        assert tab2._build_current_config().resume_from_existing is False
+        assert tab2._settings_dirty is False
+    finally:
+        tab2.close()
+
+
+
 

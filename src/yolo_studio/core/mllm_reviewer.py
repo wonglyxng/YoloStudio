@@ -23,12 +23,15 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
@@ -583,6 +586,7 @@ class ImageReviewRecord:
     skipped_mllm: bool = False
     error: str = ""
     elapsed_sec: float | None = None  # 单张图片处理耗时（秒，仅在有实测记录时填充）
+    error_kind: str = ""  # 故障分级（仅内存使用）："" | "fatal" | "transient" | "other"
 
 
 @dataclass
@@ -601,6 +605,10 @@ class MllmReviewConfig:
         `max_crops_per_image`：每张图最多附带的局部放大裁剪数；`max_image_dim` 为送检图最长边像素限制。
         `max_workers`：并发处理线程池工作线程数（至少为 `1`）。
         `max_images`：本次最多处理的图片数量上限（`0` 表示处理目录中全部图片，`> 0` 仅按顺序抽取前 `N` 张用于快速试跑验证）。
+        `resume_from_existing`：是否启用断点续传（为 `True` 时读取输出目录已有 `review_report.json`，
+            复用校验通过的成功记录并跳过重复推理，仅处理未完成与上次出错的图片；核心 API 默认 `False`，GUI 默认勾选）。
+        `max_consecutive_errors`：连续多少张图片出现网络/限流/服务端等系统性故障后触发自动熔断停机（`<= 0` 表示关闭）。
+        `abort_on_fatal_error`：遇到 `401/402/403/404` 或账单额度耗尽等不可恢复错误时是否立即熔断停止后续图片。
     """
 
     images_dir: Path
@@ -637,11 +645,14 @@ class MllmReviewConfig:
     sam3_enable_llm_review: bool = False
     refine_min_area_ratio: float = 0.15
     refine_min_iou: float = 0.25
+    resume_from_existing: bool = False
+    max_consecutive_errors: int = 5
+    abort_on_fatal_error: bool = True
 
 
 @dataclass
 class MllmReviewResult:
-    """单次 LLM 智能标注任务完成或取消后的汇总结果。"""
+    """单次 LLM 智能标注任务完成、取消或自动熔断后的汇总结果。"""
 
     output_dir: Path
     classes: list[str]
@@ -654,6 +665,8 @@ class MllmReviewResult:
     report_path: Path | None = None
     classes_txt_path: Path | None = None
     cancelled: bool = False
+    resumed_skipped_count: int = 0
+    aborted_reason: str = ""
 
 
 class MllmClient(Protocol):
@@ -1009,6 +1022,28 @@ def _is_gemini_thinking_bad_request(exc: BaseException) -> bool:
 MLLM_TRANSIENT_DISCONNECT_MAX_ELAPSED_SECONDS: float = 90.0
 MLLM_TRANSIENT_DISCONNECT_RETRIES: int = 2
 MLLM_TRANSIENT_RETRY_BACKOFF_BASE_SECONDS: float = 1.5
+
+# 应用层限流（429）与服务端临时故障（5xx）独立退避策略：与长耗时超时彻底解耦
+MLLM_RATE_LIMIT_SERVER_RETRIES: int = 4
+MLLM_RATE_LIMIT_BACKOFF_BASE_SECONDS: float = 2.0
+MLLM_RATE_LIMIT_BACKOFF_MAX_SECONDS: float = 60.0
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
+_FATAL_HTTP_STATUS_CODES = frozenset({401, 402, 403, 404})
+_HARD_QUOTA_TOKENS = (
+    "insufficient_quota",
+    "exceeded your current quota",
+    "billing_hard_limit_reached",
+    "credit balance is too low",
+    "out of credits",
+    "account_deactivated",
+    "payment required",
+)
+_STATUS_CODE_PREFIX_RE = re.compile(
+    r"(?:error\s*code:\s*|http\s+|status[_\s]*code[:=\s]*)\b([1-5]\d{2})\b"
+    r"|\b(401|402|403|404|408|429|500|502|503|504|529)\s+(?:unauthenticated|permission_denied|not_found|resource_exhausted|unavailable|internal|bad_gateway|gateway_timeout)",
+    re.IGNORECASE,
+)
+
 _TIMEOUT_EXC_NAMES = frozenset(
     {
         "APITimeoutError",
@@ -1035,17 +1070,153 @@ _DISCONNECT_EXC_NAMES = frozenset(
 )
 
 
-def _is_transient_disconnect_error(exc: BaseException) -> bool:
-    """判断异常是否属于网络或代理瞬时断开（明确排除一切超时异常及 HTTP 状态码响应）。"""
+def _iter_exception_chain(exc: BaseException, max_depth: int = 4) -> list[BaseException]:
+    """沿异常及其 `__cause__` 链最多收集 `max_depth` 个非重复节点。"""
     chain: list[BaseException] = []
     seen_ids: set[int] = set()
     cur: BaseException | None = exc
-    for _ in range(4):
+    for _ in range(max_depth):
         if cur is None or id(cur) in seen_ids:
             break
         seen_ids.add(id(cur))
         chain.append(cur)
         cur = cur.__cause__
+    return chain
+
+
+def _extract_error_lower_text(exc: BaseException) -> str:
+    """提取异常消息与可选 `body`/`status` 载荷的小写拼接文本，用于错误归类判定。"""
+    parts: list[str] = []
+    for node in _iter_exception_chain(exc, max_depth=3):
+        body = getattr(node, "body", None)
+        if isinstance(body, dict):
+            err_obj = body.get("error")
+            payload = err_obj if isinstance(err_obj, dict) else body
+            for key in ("code", "type", "status", "message", "detail"):
+                val = payload.get(key)
+                if val:
+                    parts.append(str(val))
+        elif body is not None:
+            parts.append(str(body))
+        status = getattr(node, "status", None)
+        if status:
+            parts.append(str(status))
+        msg = str(node).strip()
+        if msg:
+            parts.append(msg)
+    return " ".join(parts).lower()
+
+
+def _extract_http_status_code(exc: BaseException) -> int | None:
+    """从异常对象及其底层原因链中提取有效 HTTP 状态码（`100..599`），无则返回 `None`。"""
+    for node in _iter_exception_chain(exc, max_depth=3):
+        for raw in (
+            getattr(node, "status_code", None),
+            getattr(node, "code", None),
+            getattr(getattr(node, "response", None), "status_code", None),
+        ):
+            if isinstance(raw, int) and not isinstance(raw, bool) and 100 <= raw <= 599:
+                return raw
+    match = _STATUS_CODE_PREFIX_RE.search(_extract_error_lower_text(exc))
+    if match:
+        code_str = match.group(1) or match.group(2)
+        if code_str:
+            return int(code_str)
+    return None
+
+
+def _is_hard_quota_or_billing_exhausted(exc: BaseException) -> bool:
+    """判断异常是否属于账户余额不足或硬配额耗尽（与瞬时 RPM/TPM 限流区分，不可靠退避重试恢复）。"""
+    text = _extract_error_lower_text(exc)
+    return any(tok in text for tok in _HARD_QUOTA_TOKENS)
+
+
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    """判断异常是否属于可通过指数退避恢复的 429 瞬时限流或 5xx/408 服务端临时故障。"""
+    if _is_hard_quota_or_billing_exhausted(exc):
+        return False
+    status = _extract_http_status_code(exc)
+    if status is not None:
+        return status in _RETRYABLE_HTTP_STATUS_CODES
+    text = _extract_error_lower_text(exc)
+    return any(
+        tok in text
+        for tok in (
+            "resource_exhausted",
+            "too many requests",
+            "rate limit",
+            "rate_limit_exceeded",
+            "service unavailable",
+            "overloaded",
+        )
+    )
+
+
+def _extract_retry_after_seconds(
+    exc: BaseException,
+    *,
+    max_delay: float = MLLM_RATE_LIMIT_BACKOFF_MAX_SECONDS,
+) -> float | None:
+    """解析服务端响应头中的 `Retry-After` / `Retry-After-Ms`（秒），并钳位到 `[0, max_delay]`。"""
+    for node in _iter_exception_chain(exc, max_depth=3):
+        resp = getattr(node, "response", None)
+        headers = getattr(resp, "headers", None)
+        if headers is None:
+            continue
+        lower_headers: dict[str, str] = {}
+        try:
+            for k, v in headers.items():
+                lower_headers[str(k).lower()] = str(v).strip()
+        except Exception:
+            continue
+
+        ms_raw = lower_headers.get("retry-after-ms")
+        if ms_raw:
+            try:
+                val = float(ms_raw) / 1000.0
+                if val >= 0.0:
+                    return min(max_delay, val)
+            except ValueError:
+                pass
+
+        sec_raw = lower_headers.get("retry-after")
+        if sec_raw:
+            try:
+                val = float(sec_raw)
+                if val >= 0.0:
+                    return min(max_delay, val)
+            except ValueError:
+                try:
+                    dt = parsedate_to_datetime(sec_raw)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    delta = (dt - datetime.now(dt.tzinfo)).total_seconds()
+                    return min(max_delay, max(0.0, delta))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    return None
+
+
+def _compute_rate_limit_backoff(
+    retry_idx: int,
+    retry_after: float | None,
+    *,
+    base: float = MLLM_RATE_LIMIT_BACKOFF_BASE_SECONDS,
+    max_delay: float = MLLM_RATE_LIMIT_BACKOFF_MAX_SECONDS,
+) -> float:
+    """计算 429/5xx 退避秒数：优先采纳 `Retry-After`，否则按指数退避叠加 `0~25%` 抖动。"""
+    if retry_after is not None:
+        return min(max_delay, max(0.0, retry_after))
+    if base <= 0.0:
+        return 0.0
+    raw = min(max_delay, base * (2 ** max(0, retry_idx - 1)))
+    jitter = random.uniform(0.0, raw * 0.25)
+    return min(max_delay, raw + jitter)
+
+
+def _is_transient_disconnect_error(exc: BaseException) -> bool:
+    """判断异常是否属于网络或代理瞬时断开（明确排除一切超时异常及 HTTP 状态码响应）。"""
+    chain = _iter_exception_chain(exc, max_depth=4)
 
     # 先排除超时异常（含继承自 APIConnectionError 的 APITimeoutError）以及带整型 HTTP 状态码的响应错误
     for node in chain:
@@ -1058,6 +1229,41 @@ def _is_transient_disconnect_error(exc: BaseException) -> bool:
         if isinstance(node, ConnectionError) or type(node).__name__ in _DISCONNECT_EXC_NAMES:
             return True
     return False
+
+
+def _classify_circuit_breaker_error(exc: BaseException) -> tuple[Literal["fatal", "transient", "other"], str]:
+    """将单图处理异常归类为不可恢复致命错误、系统性网络/限流故障或单图局部错误。
+
+    归类约定：
+        - `"fatal"`：鉴权失败（401）、余额/配额耗尽（402 或硬配额 429）、权限受限（403）、
+          模型不存在（404）等，触发立即熔断，避免上千张图白白空转；
+        - `"transient"`：网络断连、超时、重试耗尽的 429 限流或 5xx 服务端故障，
+          计入连续系统失败计数，达到阈值后触发熔断停机；
+        - `"other"`：单图损坏、JSON 解析异常或单图内容拒答等局部错误，仅记单图失败不触发全局熔断。
+    """
+    chain = _iter_exception_chain(exc, max_depth=4)
+    exc_names = {type(node).__name__ for node in chain}
+    status = _extract_http_status_code(exc)
+    text = _extract_error_lower_text(exc)
+
+    if _is_hard_quota_or_billing_exhausted(exc) or status == 402:
+        return "fatal", "账户余额或配额已耗尽"
+    if status == 401 or "AuthenticationError" in exc_names or any(
+        tok in text for tok in ("invalid_api_key", "api key not valid", "unauthenticated")
+    ):
+        return "fatal", "鉴权失败（API Key 无效或未授权）"
+    if status == 403 or "PermissionDeniedError" in exc_names or "permission_denied" in text:
+        return "fatal", "接口访问权限受限或区域不支持"
+    if status == 404 or "NotFoundError" in exc_names or "model_not_found" in text:
+        return "fatal", "所选模型不存在或接口地址无效"
+
+    if any(isinstance(node, TimeoutError) or type(node).__name__ in _TIMEOUT_EXC_NAMES for node in chain):
+        return "transient", "请求超时"
+    if _is_transient_disconnect_error(exc):
+        return "transient", "网络连接或代理断开"
+    if _is_retryable_http_error(exc):
+        return "transient", "接口限流或服务端过载"
+    return "other", ""
 
 
 def _is_gemini_stream_bad_request(exc: BaseException) -> bool:
@@ -1177,6 +1383,9 @@ class GeminiMllmClient:
         transient_disconnect_retries: int = MLLM_TRANSIENT_DISCONNECT_RETRIES,
         transient_disconnect_max_elapsed: float = MLLM_TRANSIENT_DISCONNECT_MAX_ELAPSED_SECONDS,
         transient_retry_backoff_base: float = MLLM_TRANSIENT_RETRY_BACKOFF_BASE_SECONDS,
+        rate_limit_retries: int = MLLM_RATE_LIMIT_SERVER_RETRIES,
+        rate_limit_backoff_base: float = MLLM_RATE_LIMIT_BACKOFF_BASE_SECONDS,
+        rate_limit_backoff_max: float = MLLM_RATE_LIMIT_BACKOFF_MAX_SECONDS,
     ) -> None:
         from google import genai
         from google.genai import types
@@ -1201,9 +1410,13 @@ class GeminiMllmClient:
         self._transient_disconnect_retries = max(0, int(transient_disconnect_retries))
         self._transient_disconnect_max_elapsed = max(0.0, float(transient_disconnect_max_elapsed))
         self._transient_retry_backoff_base = max(0.0, float(transient_retry_backoff_base))
+        self._rate_limit_retries = max(0, int(rate_limit_retries))
+        self._rate_limit_backoff_base = max(0.0, float(rate_limit_backoff_base))
+        self._rate_limit_backoff_max = max(0.0, float(rate_limit_backoff_max))
         self._closed = Event()
         self._client_lock = Lock()
         self._active_clients: set[object] = set()
+        self._cooldown_until: float = 0.0
         self.client = self._create_sdk_client()
         self._initial_sdk_client = self.client
         self._stream_supported = True
@@ -1216,6 +1429,24 @@ class GeminiMllmClient:
             http_options=self._genai_types.HttpOptions(timeout=self._timeout_ms),
         )
 
+    def _register_shared_cooldown(self, delay: float) -> None:
+        """在多线程共享客户端上更新单调冷却截止时间，防止并发线程同时冲撞限流。"""
+        if delay <= 0.0:
+            return
+        target = time.monotonic() + delay
+        with self._client_lock:
+            if target > self._cooldown_until:
+                self._cooldown_until = target
+
+    def _wait_for_shared_cooldown(self) -> None:
+        """若当前处于限流共享冷却窗口，可中断地等待冷却结束；已关闭时立即抛出取消异常。"""
+        if self._closed.is_set():
+            raise RuntimeError("请求已取消")
+        with self._client_lock:
+            wait_sec = self._cooldown_until - time.monotonic()
+        if wait_sec > 0.0 and self._closed.wait(timeout=wait_sec):
+            raise RuntimeError("请求已取消")
+
     def review_image(
         self,
         overview_jpeg: bytes,
@@ -1223,7 +1454,7 @@ class GeminiMllmClient:
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse:
-        """发送编号总览图及候选框裁剪图至 Gemini 并解析结构化审核结果；支持流式降级、思考级别降级与短耗时断连重试。"""
+        """发送编号总览图及候选框裁剪图至 Gemini 并解析结构化审核结果；支持流式/思考降级、429/5xx 退避及短耗时断连重试。"""
         contents: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt},
             {
@@ -1248,8 +1479,10 @@ class GeminiMllmClient:
             )
 
         disconnect_retries = 0
+        rate_limit_retries_used = 0
         use_fresh_client = False
         while True:
+            self._wait_for_shared_cooldown()
             sent_idx = self._thinking_idx
             sent_level = self._thinking_candidates[sent_idx]
             sent_stream = self._stream_supported
@@ -1285,6 +1518,27 @@ class GeminiMllmClient:
                     continue
                 if sent_stream and _is_gemini_stream_bad_request(exc):
                     self._stream_supported = False
+                    continue
+                if (
+                    not self._closed.is_set()
+                    and rate_limit_retries_used < self._rate_limit_retries
+                    and _is_retryable_http_error(exc)
+                ):
+                    rate_limit_retries_used += 1
+                    retry_after = _extract_retry_after_seconds(
+                        exc, max_delay=self._rate_limit_backoff_max
+                    )
+                    delay = _compute_rate_limit_backoff(
+                        rate_limit_retries_used,
+                        retry_after,
+                        base=self._rate_limit_backoff_base,
+                        max_delay=self._rate_limit_backoff_max,
+                    )
+                    status = _extract_http_status_code(exc)
+                    if status in {429, 503, 529} or retry_after is not None:
+                        self._register_shared_cooldown(delay)
+                    if delay > 0.0 and self._closed.wait(timeout=delay):
+                        raise
                     continue
                 if (
                     not self._closed.is_set()
@@ -1451,6 +1705,9 @@ class OpenAICompatMllmClient:
         transient_disconnect_retries: int = MLLM_TRANSIENT_DISCONNECT_RETRIES,
         transient_disconnect_max_elapsed: float = MLLM_TRANSIENT_DISCONNECT_MAX_ELAPSED_SECONDS,
         transient_retry_backoff_base: float = MLLM_TRANSIENT_RETRY_BACKOFF_BASE_SECONDS,
+        rate_limit_retries: int = MLLM_RATE_LIMIT_SERVER_RETRIES,
+        rate_limit_backoff_base: float = MLLM_RATE_LIMIT_BACKOFF_BASE_SECONDS,
+        rate_limit_backoff_max: float = MLLM_RATE_LIMIT_BACKOFF_MAX_SECONDS,
     ) -> None:
         from openai import BadRequestError, OpenAI, Timeout
 
@@ -1500,9 +1757,13 @@ class OpenAICompatMllmClient:
         self._transient_disconnect_retries = max(0, int(transient_disconnect_retries))
         self._transient_disconnect_max_elapsed = max(0.0, float(transient_disconnect_max_elapsed))
         self._transient_retry_backoff_base = max(0.0, float(transient_retry_backoff_base))
+        self._rate_limit_retries = max(0, int(rate_limit_retries))
+        self._rate_limit_backoff_base = max(0.0, float(rate_limit_backoff_base))
+        self._rate_limit_backoff_max = max(0.0, float(rate_limit_backoff_max))
         self._closed = Event()
         self._client_lock = Lock()
         self._active_clients: set[object] = set()
+        self._cooldown_until: float = 0.0
 
         self.client = self._create_sdk_client()
         self._initial_sdk_client = self.client
@@ -1521,6 +1782,24 @@ class OpenAICompatMllmClient:
             max_retries=self.max_retries,
         )
 
+    def _register_shared_cooldown(self, delay: float) -> None:
+        """在多线程共享客户端上更新单调冷却截止时间，防止并发线程同时冲撞限流。"""
+        if delay <= 0.0:
+            return
+        target = time.monotonic() + delay
+        with self._client_lock:
+            if target > self._cooldown_until:
+                self._cooldown_until = target
+
+    def _wait_for_shared_cooldown(self) -> None:
+        """若当前处于限流共享冷却窗口，可中断地等待冷却结束；已关闭时立即抛出取消异常。"""
+        if self._closed.is_set():
+            raise RuntimeError("请求已取消")
+        with self._client_lock:
+            wait_sec = self._cooldown_until - time.monotonic()
+        if wait_sec > 0.0 and self._closed.wait(timeout=wait_sec):
+            raise RuntimeError("请求已取消")
+
     def review_image(
         self,
         overview_jpeg: bytes,
@@ -1528,7 +1807,7 @@ class OpenAICompatMllmClient:
         system_prompt: str,
         user_prompt: str,
     ) -> MllmReviewResponse:
-        """发送多模态对话请求并解析 JSON 审核结果；支持流式降级、400 参数单调降级与短耗时断连重试。"""
+        """发送多模态对话请求并解析 JSON 审核结果；支持流式降级、400 参数单调降级、429/5xx 退避与短耗时断连重试。"""
         user_content: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt},
             {
@@ -1560,8 +1839,10 @@ class OpenAICompatMllmClient:
         ]
 
         disconnect_retries = 0
+        rate_limit_retries_used = 0
         use_fresh_client = False
         while True:
+            self._wait_for_shared_cooldown()
             # 先快照本轮实际发送的可选参数，防止并发线程修改标志位后漏判当前请求触发的 400
             sent_temperature = self._temperature_supported
             sent_json_mode = self._json_mode_supported
@@ -1618,6 +1899,27 @@ class OpenAICompatMllmClient:
                     raise
             except Exception as exc:
                 attempt_elapsed = time.perf_counter() - attempt_t0
+                if (
+                    not self._closed.is_set()
+                    and rate_limit_retries_used < self._rate_limit_retries
+                    and _is_retryable_http_error(exc)
+                ):
+                    rate_limit_retries_used += 1
+                    retry_after = _extract_retry_after_seconds(
+                        exc, max_delay=self._rate_limit_backoff_max
+                    )
+                    delay = _compute_rate_limit_backoff(
+                        rate_limit_retries_used,
+                        retry_after,
+                        base=self._rate_limit_backoff_base,
+                        max_delay=self._rate_limit_backoff_max,
+                    )
+                    status = _extract_http_status_code(exc)
+                    if status in {429, 503, 529} or retry_after is not None:
+                        self._register_shared_cooldown(delay)
+                    if delay > 0.0 and self._closed.wait(timeout=delay):
+                        raise
+                    continue
                 if (
                     not self._closed.is_set()
                     and disconnect_retries < self._transient_disconnect_retries
@@ -3029,7 +3331,118 @@ def load_review_report(report_or_dir: Path) -> MllmReviewResult:
         report_path=report_path,
         classes_txt_path=cls_file if cls_file.is_file() else None,
         cancelled=bool(payload.get("cancelled", False)),
+        resumed_skipped_count=int(payload.get("resumed_skipped", 0) or 0),
+        aborted_reason=str(payload.get("aborted_reason") or ""),
     )
+
+
+def _write_review_report_atomic(report_path: Path, payload: dict[str, object]) -> None:
+    """以“写同目录临时文件 + flush/fsync + 原子替换”方式写出 `review_report.json`，防止断电或崩溃损毁报告。"""
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = report_path.with_name(f".{report_path.name}.{os.getpid()}.tmp")
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, report_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _normalize_path_key(path: Path) -> str:
+    """将路径规范化为大小写不敏感的绝对键（兼容 Windows 盘符与路径分隔符差异）。"""
+    try:
+        return str(path.resolve()).lower()
+    except OSError:
+        return str(path).lower()
+
+
+def _load_resumable_records(
+    images: list[Path],
+    output_names: dict[Path, str],
+    config: MllmReviewConfig,
+) -> tuple[list[ImageReviewRecord], list[Path], list[str]]:
+    """读取输出目录已有 `review_report.json` 并筛选可安全复用的已成功记录（断点续传）。
+
+    复用条件：
+        1. 历史记录 `error` 为空（上次失败的图片不复用，自动进入待处理队列重跑）；
+        2. 对应 `output_image_path` 实际存在于磁盘，且若记录了 `output_json_path` 则该 `.json` 也存在；
+        3. 输出目录的分流子目录层级与本次 `config.triage_subfolders` 配置一致。
+    返回 `(可复用的成功记录列表, 仍需处理的待跑图片列表, 旧报告类别列表)`。
+    """
+    report_path = config.output_dir / "review_report.json"
+    if not report_path.is_file():
+        return [], list(images), []
+    try:
+        prev = load_review_report(report_path)
+    except Exception:
+        return [], list(images), []
+
+    out_root_resolved = config.output_dir.resolve()
+    by_source: dict[str, ImageReviewRecord] = {}
+    by_out_name: dict[str, ImageReviewRecord] = {}
+    for rec in prev.records:
+        if rec.error:
+            continue
+        out_img = rec.output_image_path
+        if out_img is None or not out_img.is_file():
+            continue
+        if rec.output_json_path is not None and not rec.output_json_path.is_file():
+            continue
+        try:
+            out_parent = out_img.parent.resolve()
+        except OSError:
+            continue
+        if config.triage_subfolders:
+            if out_parent.parent != out_root_resolved or out_parent.name not in TRIAGE_BUCKETS:
+                continue
+        else:
+            if out_parent != out_root_resolved:
+                continue
+        by_source[_normalize_path_key(rec.image_path)] = rec
+        by_out_name[out_img.name.lower()] = rec
+
+    reused: list[ImageReviewRecord] = []
+    pending: list[Path] = []
+    for img_path in images:
+        matched = by_source.get(_normalize_path_key(img_path))
+        if matched is None:
+            planned_name = output_names.get(img_path, img_path.name).lower()
+            matched = by_out_name.get(planned_name)
+        if matched is not None:
+            reused.append(
+                ImageReviewRecord(
+                    image_path=img_path,
+                    output_image_path=matched.output_image_path,
+                    output_json_path=matched.output_json_path,
+                    triage_bucket=matched.triage_bucket,
+                    before_boxes=list(matched.before_boxes),
+                    after_boxes=list(matched.after_boxes),
+                    kept_count=matched.kept_count,
+                    relabeled_count=matched.relabeled_count,
+                    deleted_count=matched.deleted_count,
+                    added_count=matched.added_count,
+                    refined_count=matched.refined_count,
+                    loose_flagged_count=matched.loose_flagged_count,
+                    has_missing=matched.has_missing,
+                    missing_note=matched.missing_note,
+                    skipped_mllm=matched.skipped_mllm,
+                    error="",
+                    elapsed_sec=matched.elapsed_sec,
+                )
+            )
+        else:
+            pending.append(img_path)
+    return reused, pending, list(prev.classes)
 
 
 def run_mllm_review(
@@ -3051,7 +3464,9 @@ def run_mllm_review(
         在 `SAM3_TEXT` 模式下必须提供非空 `allowed_classes` 与有效的本地 `sam3.pt`（或测试桩 `sam3_detector_override`）。
         当 `SAM3_TEXT` 未开启 `sam3_enable_llm_review` 时以纯本地模式运行，不初始化也不调用 LLM 客户端；
         所有检出框置信度均 >= `high_conf_skip` 且非空时归入 `auto_passed`，存在低置信度框或 0 框时归入 `need_review`。
-        单张图片处理异常不会中止整批流程，而是写入 `need_review` 并记录 `error`，保证 `review_report.json` 必落盘。
+        单张图片处理异常不会中止整批流程，而是写入 `need_review` 并记录 `error`，同时以节流原子替换持续落盘 `review_report.json`；
+        开启 `resume_from_existing` 时会自动复用输出目录中已成功且落盘完整的历史记录并仅重跑剩余及出错图片；
+        遇到不可恢复致命错误（鉴权/余额/权限/模型不存在）或连续系统性网络/限流/服务端异常达到 `max_consecutive_errors` 时会触发自动熔断停机并落盘最新进度报告。
     """
     if not config.images_dir.is_dir():
         raise FileNotFoundError(f"图片目录不存在: {config.images_dir}")
@@ -3075,19 +3490,52 @@ def run_mllm_review(
             )
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    output_names = _plan_output_names(images, config.images_dir)
+
+    resumed_records: list[ImageReviewRecord] = []
+    pending_images: list[Path] = list(images)
+    resumed_classes: list[str] = []
+    if config.resume_from_existing:
+        resumed_records, pending_images, resumed_classes = _load_resumable_records(
+            images, output_names, config
+        )
 
     is_zero_shot = config.source_mode == ReviewSourceMode.LLM_ZERO_SHOT
     is_sam3_text = config.source_mode == ReviewSourceMode.SAM3_TEXT
     sam3_pure_local = is_sam3_text and not config.sam3_enable_llm_review
     load_errors: dict[Path, str] = {}
-    if config.source_mode == ReviewSourceMode.YOLO_PREDICT:
+
+    if not pending_images:
+        candidates_map: dict[Path, list[CandidateBox]] = {}
+        if is_sam3_text:
+            sam3_classes, _sam3_prompts = parse_sam3_class_prompts(config.allowed_classes)
+            allowed_classes = sam3_classes or resumed_classes
+            if not allowed_classes:
+                raise ValueError(
+                    "SAM 3 文本自动标注模式必须指定「目标类别清单」（支持“类别名=英文提示词”，如 头盔=safety helmet）。"
+                )
+        else:
+            allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or resumed_classes
+            if is_zero_shot and not allowed_classes:
+                raise ValueError(
+                    "LLM 零样本直接标注模式必须指定「目标类别清单」（请至少提供一个类别名称或导入 classes.txt）。"
+                )
+    elif config.source_mode == ReviewSourceMode.YOLO_PREDICT:
         candidates_map, discovered_classes = _discover_yolo_candidates(
-            images, config, log_callback, cancel_event
+            pending_images, config, log_callback, cancel_event
         )
-        allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
+        allowed_classes = (
+            [c.strip() for c in config.allowed_classes if c.strip()]
+            or discovered_classes
+            or resumed_classes
+        )
     elif config.source_mode == ReviewSourceMode.EXISTING_JSON:
-        candidates_map, discovered_classes, load_errors = _discover_json_candidates(images, config)
-        allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()] or discovered_classes
+        candidates_map, discovered_classes, load_errors = _discover_json_candidates(pending_images, config)
+        allowed_classes = (
+            [c.strip() for c in config.allowed_classes if c.strip()]
+            or discovered_classes
+            or resumed_classes
+        )
     elif is_sam3_text:
         sam3_classes, sam3_prompts = parse_sam3_class_prompts(config.allowed_classes)
         if not sam3_classes:
@@ -3096,7 +3544,7 @@ def run_mllm_review(
             )
         allowed_classes = sam3_classes
         candidates_map, load_errors = _discover_sam3_candidates(
-            images,
+            pending_images,
             sam3_classes,
             sam3_prompts,
             config,
@@ -3105,7 +3553,7 @@ def run_mllm_review(
             detector_override=sam3_detector_override,
         )
     else:
-        candidates_map = {img_path: [] for img_path in images}
+        candidates_map = {img_path: [] for img_path in pending_images}
         allowed_classes = [c.strip() for c in config.allowed_classes if c.strip()]
         if not allowed_classes:
             raise ValueError(
@@ -3134,13 +3582,18 @@ def run_mllm_review(
         if effort_notice and log_callback:
             log_callback(f"提示：{effort_notice}。")
 
-    already_cancelled = bool(cancel_event and cancel_event.is_set())
+    stop_event = Event()
+
+    def _is_stopped() -> bool:
+        return stop_event.is_set() or bool(cancel_event and cancel_event.is_set())
+
+    already_cancelled = _is_stopped()
     client: MllmClient | None = None
-    if not sam3_pure_local and not already_cancelled:
+    if pending_images and not sam3_pure_local and not already_cancelled:
         client = client_override or build_mllm_client(config)
 
     sam_refiner: BoxRefinerProtocol | None = None
-    if effective_refine_mode == BoxRefineMode.SAM_LOCAL and not already_cancelled:
+    if pending_images and effective_refine_mode == BoxRefineMode.SAM_LOCAL and not already_cancelled:
         if refiner_override is not None:
             sam_refiner = refiner_override
         else:
@@ -3151,14 +3604,22 @@ def run_mllm_review(
                 device=config.yolo_device,
             )
 
-    output_names = _plan_output_names(images, config.images_dir)
+    if resumed_records and log_callback and not already_cancelled:
+        if pending_images:
+            log_callback(
+                f"断点续传：已复用 {len(resumed_records)} 张历史成功记录，本次仅处理剩余/重试 {len(pending_images)} 张图片。"
+            )
+        else:
+            log_callback(
+                f"断点续传：全部 {len(resumed_records)} 张图片均已成功处理，无需重复调用模型。"
+            )
 
-    if log_callback and not already_cancelled:
+    if log_callback and pending_images and not already_cancelled:
         refine_desc = effective_refine_mode.value
         effort_desc = effective_effort.value
         if sam3_pure_local:
             log_callback(
-                f"开始纯本地 SAM 3 自动标注分流（共 {len(images)} 张图，类别: {allowed_classes}，"
+                f"开始纯本地 SAM 3 自动标注分流（共 {len(pending_images)} 张待处理图，类别: {allowed_classes}，"
                 f"自动通过阈值 ≥ {config.high_conf_skip:.2f}）..."
             )
         else:
@@ -3173,13 +3634,13 @@ def run_mllm_review(
             timeout_desc = f"，单次超时: {int(round(req_timeout))}s"
             if is_sam3_text:
                 log_callback(
-                    f"开始 SAM 3 预标 + LLM 二次质检（共 {len(images)} 张图，类别: {allowed_classes}，"
+                    f"开始 SAM 3 预标 + LLM 二次质检（共 {len(pending_images)} 张待处理图，类别: {allowed_classes}，"
                     f"推理级别: {effort_desc}{timeout_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
                 )
             else:
                 mode_title = "LLM 零样本直接标注" if is_zero_shot else "LLM 智能标注"
                 log_callback(
-                    f"开始 {mode_title}（共 {len(images)} 张图，类别: {allowed_classes}，"
+                    f"开始 {mode_title}（共 {len(pending_images)} 张待处理图，类别: {allowed_classes}，"
                     f"推理级别: {effort_desc}{timeout_desc}，边框修正: {refine_desc}，并发={config.max_workers}）..."
                 )
 
@@ -3227,6 +3688,7 @@ def run_mllm_review(
         except Exception as write_exc:
             message = f"{message}；错误结果写出失败: {write_exc}"
             out_json_path = out_json_path if out_json_path and out_json_path.is_file() else None
+        err_kind, _ = _classify_circuit_breaker_error(exc)
         return ImageReviewRecord(
             image_path=img_path,
             output_image_path=out_img_path,
@@ -3238,10 +3700,11 @@ def run_mllm_review(
             missing_note="",
             error=message,
             elapsed_sec=elapsed_sec,
+            error_kind=err_kind,
         )
 
     def _process_one(img_path: Path) -> ImageReviewRecord | None:
-        if cancel_event and cancel_event.is_set():
+        if _is_stopped():
             return None
         img_t0 = time.perf_counter()
         before_boxes = candidates_map.get(img_path, [])
@@ -3299,7 +3762,7 @@ def run_mllm_review(
                 overview_jpeg = _encode_jpeg_bytes(img_bgr, max_dim=config.max_image_dim, quality=90)
                 system_prompt, user_prompt = _build_zero_shot_prompts(allowed_classes, config)
                 response = client.review_image(overview_jpeg, [], system_prompt, user_prompt)
-                if cancel_event and cancel_event.is_set():
+                if _is_stopped():
                     return None
                 after_boxes, kept, relabeled, deleted, added = apply_review_decisions(
                     [],
@@ -3370,7 +3833,7 @@ def run_mllm_review(
                         coord_scale=_overview_scale(img_w, img_h, config.max_image_dim),
                     )
                     response = client.review_image(overview_jpeg, crops, system_prompt, user_prompt)
-                    if cancel_event and cancel_event.is_set():
+                    if _is_stopped():
                         return None
                     after_boxes, kept, relabeled, deleted, added = apply_review_decisions(
                         before_boxes,
@@ -3416,7 +3879,7 @@ def run_mllm_review(
                     ]
 
             if effective_refine_mode == BoxRefineMode.SAM_LOCAL and sam_refiner is not None and after_boxes:
-                if cancel_event and cancel_event.is_set():
+                if _is_stopped():
                     return None
                 if img_bgr is None:
                     img_bgr = _read_image_unicode_safe(img_path)
@@ -3431,7 +3894,7 @@ def run_mllm_review(
                     min_iou=config.refine_min_iou,
                 )
 
-            if cancel_event and cancel_event.is_set():
+            if _is_stopped():
                 return None
 
             refined_count = sum(1 for b in after_boxes if b.refined)
@@ -3489,8 +3952,8 @@ def run_mllm_review(
                 elapsed_sec=round(max(0.0, time.perf_counter() - img_t0), 2),
             )
         except Exception as exc:
-            # 用户取消时主动关闭客户端会触发 socket 断开异常，此时按取消收尾而非记为单图出错
-            if cancel_event and cancel_event.is_set():
+            # 用户取消或触发熔断主动关闭客户端时会引发 socket 断开异常，此时按取消收尾而非记为单图出错
+            if _is_stopped():
                 return None
             return _write_error_record(
                 img_path,
@@ -3499,107 +3962,221 @@ def run_mllm_review(
                 elapsed_sec=round(max(0.0, time.perf_counter() - img_t0), 2),
             )
 
-    records: list[ImageReviewRecord] = []
+    records: list[ImageReviewRecord] = list(resumed_records)
     total = len(images)
     cancelled = already_cancelled
+    aborted_reason = ""
+    resumed_skipped_count = len(resumed_records)
+    report_path = config.output_dir / "review_report.json"
+    classes_txt_path = config.output_dir / "classes.txt"
+    if allowed_classes:
+        classes_txt_path.write_text("\n".join(allowed_classes) + "\n", encoding="utf-8")
 
-    workers = max(1, int(config.max_workers))
-    pool = ThreadPoolExecutor(max_workers=workers)
-    try:
-        futures: dict[Future[ImageReviewRecord | None], Path] = {}
-        for img_path in ([] if already_cancelled else images):
-            if cancel_event and cancel_event.is_set():
+    last_flush_at = 0.0
+    has_flushed_once = False
+
+    def _build_report_payload(sorted_recs: list[ImageReviewRecord]) -> dict[str, object]:
+        return {
+            "total_images": len(sorted_recs),
+            "auto_passed": sum(1 for r in sorted_recs if r.triage_bucket == BUCKET_AUTO_PASSED),
+            "llm_fixed": sum(1 for r in sorted_recs if r.triage_bucket == BUCKET_LLM_FIXED),
+            "need_review": sum(1 for r in sorted_recs if r.triage_bucket == BUCKET_NEED_REVIEW),
+            "errors": sum(1 for r in sorted_recs if r.error),
+            "cancelled": cancelled,
+            "resumed_skipped": resumed_skipped_count,
+            "aborted_reason": aborted_reason,
+            "classes": allowed_classes,
+            "source_mode": config.source_mode.value,
+            "provider": config.provider.value,
+            "reasoning_effort": ReasoningEffort.AUTO.value if sam3_pure_local else effective_effort.value,
+            "sam3_enable_llm_review": bool(config.sam3_enable_llm_review) if is_sam3_text else False,
+            "box_refine_mode": effective_refine_mode.value,
+            "items": [
+                {
+                    "image": r.image_path.name,
+                    "source": str(r.image_path),
+                    "bucket": r.triage_bucket,
+                    "kept": r.kept_count,
+                    "relabeled": r.relabeled_count,
+                    "deleted": r.deleted_count,
+                    "added": r.added_count,
+                    "refined": r.refined_count,
+                    "loose_flagged": r.loose_flagged_count,
+                    "has_missing": r.has_missing,
+                    "missing_note": r.missing_note,
+                    "error": r.error,
+                    "elapsed_sec": round(r.elapsed_sec, 2) if r.elapsed_sec is not None else None,
+                    "output_image": str(r.output_image_path) if r.output_image_path else "",
+                    "output_json": str(r.output_json_path) if r.output_json_path else "",
+                    "before_boxes": [_serialize_candidate_box(b) for b in r.before_boxes],
+                    "after_boxes": [_serialize_candidate_box(b) for b in r.after_boxes],
+                }
+                for r in sorted_recs
+            ],
+        }
+
+    def _flush_report_snapshot(*, force: bool = False) -> None:
+        nonlocal last_flush_at, has_flushed_once
+        now_m = time.monotonic()
+        if not force and has_flushed_once and (now_m - last_flush_at) < 0.5:
+            return
+        snapshot = sorted(records, key=lambda r: str(r.image_path))
+        _write_review_report_atomic(report_path, _build_report_payload(snapshot))
+        last_flush_at = now_m
+        has_flushed_once = True
+
+    completed_count = 0
+    for rec in resumed_records:
+        completed_count += 1
+        if progress_callback:
+            progress_callback(completed_count, total, rec)
+
+    if pending_images and not already_cancelled:
+        workers = max(1, int(config.max_workers))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            # 采用并发度大小的滑动窗口按需提交任务：避免数千张图预建大量 Future，
+            # 并在触发用户取消或熔断停机时杜绝排队中的下一张图被工作线程抢跑执行。
+            futures: dict[Future[ImageReviewRecord | None], Path] = {}
+            pending: set[Future[ImageReviewRecord | None]] = set()
+            pending_iter = iter(pending_images)
+
+            def _refill_pool() -> None:
+                while len(pending) < workers:
+                    if _is_stopped():
+                        return
+                    try:
+                        next_img = next(pending_iter)
+                    except StopIteration:
+                        return
+                    fut = pool.submit(_process_one, next_img)
+                    futures[fut] = next_img
+                    pending.add(fut)
+
+            _refill_pool()
+            if _is_stopped() and not pending:
                 cancelled = True
-                break
-            futures[pool.submit(_process_one, img_path)] = img_path
 
-        pending: set[Future[ImageReviewRecord | None]] = set(futures.keys())
-        completed_count = 0
-        cancel_notified = False
-        cancel_deadline: float | None = None
+            cancel_notified = False
+            cancel_deadline: float | None = None
+            consecutive_system_failures = 0
 
-        while pending:
-            if cancel_event and cancel_event.is_set():
-                cancelled = True
-                for pending_fut in list(pending):
-                    if pending_fut.cancel():
-                        pending.discard(pending_fut)
-                if not cancel_notified:
-                    cancel_notified = True
-                    _close_client_safely(client)
-                    cancel_deadline = time.monotonic() + 1.5
-                    if log_callback:
-                        log_callback("已收到停止指令，正在中断在途请求并保存已完成结果...")
-                if not pending:
-                    break
-                remaining = (cancel_deadline - time.monotonic()) if cancel_deadline is not None else 0.0
-                if remaining <= 0:
-                    break
-                done, pending = wait(
-                    pending,
-                    timeout=min(0.1, remaining),
-                    return_when=FIRST_COMPLETED,
-                )
-            else:
-                done, pending = wait(
-                    pending,
-                    timeout=0.1 if cancel_event is not None else None,
-                    return_when=FIRST_COMPLETED,
-                )
+            while pending:
+                if _is_stopped():
+                    cancelled = True
+                    for pending_fut in list(pending):
+                        if pending_fut.cancel():
+                            pending.discard(pending_fut)
+                    if not cancel_notified:
+                        cancel_notified = True
+                        _close_client_safely(client)
+                        cancel_deadline = time.monotonic() + 1.5
+                        if log_callback and not aborted_reason:
+                            log_callback("已收到停止指令，正在中断在途请求并保存已完成结果...")
+                    if not pending:
+                        break
+                    remaining = (cancel_deadline - time.monotonic()) if cancel_deadline is not None else 0.0
+                    if remaining <= 0:
+                        break
+                    done, pending = wait(
+                        pending,
+                        timeout=min(0.1, remaining),
+                        return_when=FIRST_COMPLETED,
+                    )
+                else:
+                    done, pending = wait(
+                        pending,
+                        timeout=0.1 if cancel_event is not None else None,
+                        return_when=FIRST_COMPLETED,
+                    )
 
-            for fut in done:
-                if fut.cancelled():
-                    continue
-                try:
-                    rec = fut.result()
-                except Exception as exc:
-                    if cancel_event and cancel_event.is_set():
+                for fut in done:
+                    if fut.cancelled():
+                        continue
+                    try:
+                        rec = fut.result()
+                    except Exception as exc:
+                        if _is_stopped():
+                            cancelled = True
+                            continue
+                        src = futures[fut]
+                        err_kind, _ = _classify_circuit_breaker_error(exc)
+                        rec = ImageReviewRecord(
+                            image_path=src,
+                            output_image_path=None,
+                            output_json_path=None,
+                            triage_bucket=BUCKET_NEED_REVIEW,
+                            has_missing=True,
+                            missing_note="",
+                            error=_format_exception_detail(exc),
+                            error_kind=err_kind,
+                        )
+                    if rec is None:
                         cancelled = True
                         continue
-                    src = futures[fut]
-                    rec = ImageReviewRecord(
-                        image_path=src,
-                        output_image_path=None,
-                        output_json_path=None,
-                        triage_bucket=BUCKET_NEED_REVIEW,
-                        has_missing=True,
-                        missing_note="",
-                        error=_format_exception_detail(exc),
-                    )
-                if rec is None:
-                    cancelled = True
-                    continue
-                records.append(rec)
-                completed_count += 1
-                if progress_callback:
-                    progress_callback(completed_count, total, rec)
-                if log_callback:
-                    elapsed_part = f", 耗时:{rec.elapsed_sec:.2f}s" if rec.elapsed_sec is not None else ""
-                    if rec.error:
-                        log_callback(
-                            f"[{completed_count}/{total}] {rec.image_path.name} -> 处理出错 ({rec.triage_bucket}{elapsed_part}): {rec.error}"
-                        )
-                    else:
-                        refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
-                        loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
-                        if is_zero_shot or sam3_pure_local:
+                    records.append(rec)
+                    completed_count += 1
+                    if progress_callback:
+                        progress_callback(completed_count, total, rec)
+                    if log_callback:
+                        elapsed_part = f", 耗时:{rec.elapsed_sec:.2f}s" if rec.elapsed_sec is not None else ""
+                        if rec.error:
                             log_callback(
-                                f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                                f"(检出:{rec.added_count}{refine_part}{loose_part}{elapsed_part})"
+                                f"[{completed_count}/{total}] {rec.image_path.name} -> 处理出错 ({rec.triage_bucket}{elapsed_part}): {rec.error}"
                             )
                         else:
-                            log_callback(
-                                f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
-                                f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
-                                f"{refine_part}{loose_part}, 补漏:{rec.added_count}{elapsed_part})"
+                            refine_part = f", 收框:{rec.refined_count}" if rec.refined_count else ""
+                            loose_part = f", 过松/超门禁:{rec.loose_flagged_count}" if rec.loose_flagged_count else ""
+                            if is_zero_shot or sam3_pure_local:
+                                log_callback(
+                                    f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                                    f"(检出:{rec.added_count}{refine_part}{loose_part}{elapsed_part})"
+                                )
+                            else:
+                                log_callback(
+                                    f"[{completed_count}/{total}] {rec.image_path.name} -> {rec.triage_bucket} "
+                                    f"(保留:{rec.kept_count}, 改类:{rec.relabeled_count}, 删误检:{rec.deleted_count}"
+                                    f"{refine_part}{loose_part}, 补漏:{rec.added_count}{elapsed_part})"
+                                )
+
+                    # 熔断检测：致命错误立即停机；连续网络/限流/服务端异常达到阈值自动停机
+                    if not rec.error:
+                        consecutive_system_failures = 0
+                    elif rec.error_kind == "fatal" and config.abort_on_fatal_error and not aborted_reason:
+                        aborted_reason = f"遇到不可恢复错误已立即熔断停机：{rec.error}"
+                        cancelled = True
+                        stop_event.set()
+                        if log_callback:
+                            log_callback(f"[熔断停机] {aborted_reason}")
+                    elif rec.error_kind == "transient" and not aborted_reason:
+                        consecutive_system_failures += 1
+                        if (
+                            config.max_consecutive_errors > 0
+                            and consecutive_system_failures >= config.max_consecutive_errors
+                        ):
+                            aborted_reason = (
+                                f"连续 {consecutive_system_failures} 张图片发生网络/限流/服务端异常，已自动熔断停机；"
+                                "请检查网络、代理或配额后启用断点续传继续处理。"
                             )
-    finally:
-        if cancel_event and cancel_event.is_set():
-            cancelled = True
-            _close_client_safely(client)
-        elif client_override is None:
-            _close_client_safely(client)
-        pool.shutdown(wait=not cancelled, cancel_futures=True)
+                            cancelled = True
+                            stop_event.set()
+                            if log_callback:
+                                log_callback(f"[熔断停机] {aborted_reason}")
+
+                    try:
+                        _flush_report_snapshot(force=bool(aborted_reason))
+                    except OSError:
+                        pass
+
+                if not _is_stopped():
+                    _refill_pool()
+        finally:
+            if _is_stopped():
+                cancelled = True
+                _close_client_safely(client)
+            elif client_override is None:
+                _close_client_safely(client)
+            pool.shutdown(wait=not cancelled, cancel_futures=True)
 
     records.sort(key=lambda r: str(r.image_path))
 
@@ -3608,48 +4185,10 @@ def run_mllm_review(
     need_review = sum(1 for r in records if r.triage_bucket == BUCKET_NEED_REVIEW)
     error_count = sum(1 for r in records if r.error)
 
-    classes_txt_path = config.output_dir / "classes.txt"
     if allowed_classes:
         classes_txt_path.write_text("\n".join(allowed_classes) + "\n", encoding="utf-8")
 
-    report_payload = {
-        "total_images": len(records),
-        "auto_passed": auto_passed,
-        "llm_fixed": llm_fixed,
-        "need_review": need_review,
-        "errors": error_count,
-        "cancelled": cancelled,
-        "classes": allowed_classes,
-        "source_mode": config.source_mode.value,
-        "provider": config.provider.value,
-        "reasoning_effort": ReasoningEffort.AUTO.value if sam3_pure_local else effective_effort.value,
-        "sam3_enable_llm_review": bool(config.sam3_enable_llm_review) if is_sam3_text else False,
-        "box_refine_mode": effective_refine_mode.value,
-        "items": [
-            {
-                "image": r.image_path.name,
-                "source": str(r.image_path),
-                "bucket": r.triage_bucket,
-                "kept": r.kept_count,
-                "relabeled": r.relabeled_count,
-                "deleted": r.deleted_count,
-                "added": r.added_count,
-                "refined": r.refined_count,
-                "loose_flagged": r.loose_flagged_count,
-                "has_missing": r.has_missing,
-                "missing_note": r.missing_note,
-                "error": r.error,
-                "elapsed_sec": round(r.elapsed_sec, 2) if r.elapsed_sec is not None else None,
-                "output_image": str(r.output_image_path) if r.output_image_path else "",
-                "output_json": str(r.output_json_path) if r.output_json_path else "",
-                "before_boxes": [_serialize_candidate_box(b) for b in r.before_boxes],
-                "after_boxes": [_serialize_candidate_box(b) for b in r.after_boxes],
-            }
-            for r in records
-        ],
-    }
-    report_path = config.output_dir / "review_report.json"
-    report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _flush_report_snapshot(force=True)
 
     return MllmReviewResult(
         output_dir=config.output_dir,
@@ -3663,6 +4202,8 @@ def run_mllm_review(
         report_path=report_path,
         classes_txt_path=classes_txt_path if allowed_classes else None,
         cancelled=cancelled,
+        resumed_skipped_count=resumed_skipped_count,
+        aborted_reason=aborted_reason,
     )
 
 

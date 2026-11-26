@@ -594,6 +594,11 @@ class MllmReviewTab(QWidget):
         self.triage_dirs_chk = QCheckBox("按结果分建子目录")
         self.triage_dirs_chk.setChecked(True)
         self.triage_dirs_chk.setToolTip("在输出目录下自动分建 auto_passed / llm_fixed / need_review 三个子目录")
+        self.resume_chk = QCheckBox("断点续传（跳过已成功）")
+        self.resume_chk.setChecked(True)
+        self.resume_chk.setToolTip(
+            "重跑同一输出目录时，自动复用 review_report.json 中已成功且输出完整的图片，仅处理剩余与上次出错的图片"
+        )
 
         def _make_check_grid(boxes: list[QCheckBox]) -> QWidget:
             """按统一的 3 列等宽网格排列复选框，保证“标注策略”与“输出选项”两行纵向对齐。"""
@@ -610,7 +615,7 @@ class MllmReviewTab(QWidget):
         p_form.addRow(
             "标注策略:", _make_check_grid([self.check_missing_chk, self.add_missing_chk, self.crops_chk])
         )
-        p_form.addRow("输出选项:", _make_check_grid([self.triage_dirs_chk]))
+        p_form.addRow("输出选项:", _make_check_grid([self.triage_dirs_chk, self.resume_chk]))
         align_form_labels([s_form, l_form, p_form])
         form_stack.addWidget(pol_group)
         form_stack.addStretch(1)
@@ -846,6 +851,7 @@ class MllmReviewTab(QWidget):
             self.add_missing_chk,
             self.crops_chk,
             self.triage_dirs_chk,
+            self.resume_chk,
             self.recursive_chk,
             self.sam_refine_all_chk,
             self.sam3_llm_review_chk,
@@ -1471,6 +1477,7 @@ class MllmReviewTab(QWidget):
             max_images=self.max_images_spin.value(),
             triage_subfolders=self.triage_dirs_chk.isChecked(),
             recursive=self.recursive_chk.isChecked(),
+            resume_from_existing=self.resume_chk.isChecked(),
             box_refine_mode=refine_mode,
             sam_model_name=self._resolve_sam_model_name(),
             sam_refine_all_kept=self.sam_refine_all_chk.isChecked(),
@@ -1537,6 +1544,7 @@ class MllmReviewTab(QWidget):
             "add_missing": self.add_missing_chk.isChecked(),
             "include_crops": self.crops_chk.isChecked(),
             "triage_dirs": self.triage_dirs_chk.isChecked(),
+            "resume_from_existing": self.resume_chk.isChecked(),
             # 旧版键名 recursive 保存的多为旧默认值 False，改用新键名使“默认递归”对已有用户生效
             "recursive_subdirs": self.recursive_chk.isChecked(),
             "box_refine_mode": refine_mode.value,
@@ -1639,6 +1647,8 @@ class MllmReviewTab(QWidget):
                 self.crops_chk.setChecked(bool(state["include_crops"]))
             if "triage_dirs" in state:
                 self.triage_dirs_chk.setChecked(bool(state["triage_dirs"]))
+            if "resume_from_existing" in state:
+                self.resume_chk.setChecked(bool(state["resume_from_existing"]))
             if "recursive_subdirs" in state:
                 self.recursive_chk.setChecked(bool(state["recursive_subdirs"]))
 
@@ -1794,6 +1804,7 @@ class MllmReviewTab(QWidget):
         self.stop_btn.setEnabled(True)
         self.load_report_btn.setEnabled(False)
         self.send_ds_btn.setEnabled(False)
+        self.summary_label.setStyleSheet("color: #424a53;")
         if is_sam3:
             self.summary_label.setText(
                 "正在运行 SAM 3 文本预标与 LLM 二次质检..."
@@ -1939,11 +1950,21 @@ class MllmReviewTab(QWidget):
         self.send_ds_btn.setEnabled(res.total_images > 0)
         self.progress_bar.setValue(100 if res.total_images > 0 else 0)
         refined_total = sum(r.refined_count for r in res.records)
-        self.summary_label.setText(
-            f"已加载历史报告（共 {res.total_images} 张）：自动通过 {res.auto_passed_count} | "
-            f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
-            f"待人工复核 {res.need_review_count} | 出错 {res.error_count}"
-        )
+        resume_hint = f"（续传跳过 {res.resumed_skipped_count} 张）" if res.resumed_skipped_count > 0 else ""
+        if res.aborted_reason:
+            self.summary_label.setStyleSheet("color: #cf222e; font-weight: 500;")
+            self.summary_label.setText(
+                f"已加载历史报告（上次熔断停机，共 {res.total_images} 张{resume_hint}）：自动通过 {res.auto_passed_count} | "
+                f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
+                f"待人工复核 {res.need_review_count} | 出错 {res.error_count} | {res.aborted_reason}"
+            )
+        else:
+            self.summary_label.setStyleSheet("color: #424a53;")
+            self.summary_label.setText(
+                f"已加载历史报告（共 {res.total_images} 张{resume_hint}）：自动通过 {res.auto_passed_count} | "
+                f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
+                f"待人工复核 {res.need_review_count} | 出错 {res.error_count}"
+            )
         self._append_log(f"[历史报告] 已加载: {res.report_path}")
         return res
 
@@ -2013,12 +2034,25 @@ class MllmReviewTab(QWidget):
         self.send_ds_btn.setEnabled(res.total_images > 0)
 
         refined_total = sum(r.refined_count for r in res.records)
-        state = "已停止" if res.cancelled else "标注完成"
-        self.summary_label.setText(
-            f"{state}（共 {res.total_images} 张）：自动通过 {res.auto_passed_count} | "
-            f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
-            f"待人工复核 {res.need_review_count} | 出错 {res.error_count}"
-        )
+        resume_hint = f"（续传跳过 {res.resumed_skipped_count} 张）" if res.resumed_skipped_count > 0 else ""
+        if res.aborted_reason:
+            state = "已自动熔断停止"
+            self.summary_label.setStyleSheet("color: #cf222e; font-weight: 500;")
+            self.summary_label.setText(
+                f"{state}（共 {res.total_images} 张{resume_hint}）：自动通过 {res.auto_passed_count} | "
+                f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
+                f"待人工复核 {res.need_review_count} | 出错 {res.error_count} | {res.aborted_reason}"
+            )
+            self._append_log(f"[熔断停机] {res.aborted_reason}")
+            self.result_tabs.setCurrentWidget(self.log_box)
+        else:
+            state = "已停止" if res.cancelled else "标注完成"
+            self.summary_label.setStyleSheet("color: #424a53;")
+            self.summary_label.setText(
+                f"{state}（共 {res.total_images} 张{resume_hint}）：自动通过 {res.auto_passed_count} | "
+                f"已删改/收框 {res.llm_fixed_count}（收紧 {refined_total} 框）| "
+                f"待人工复核 {res.need_review_count} | 出错 {res.error_count}"
+            )
         self._refresh_filter_counts()
         if res.report_path:
             self._append_log(f"\n标注报告已保存: {res.report_path}")

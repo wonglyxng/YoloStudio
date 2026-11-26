@@ -2938,6 +2938,479 @@ def test_openai_streaming_accumulation_and_short_disconnect_reconnect_retry(monk
     assert len(calls_log) == 1
 
 
+def test_rate_limit_and_server_error_backoff_retry_and_shared_cooldown(monkeypatch) -> None:
+    """验证 429/5xx 分类、Retry-After 尊重、硬配额 0 重试、应用层退避重试及共享冷却与关闭打断。"""
+    import threading
+    import time
+
+    import httpx
+    import openai
+    import pytest
+    from google import genai
+
+    from yolo_studio.core.mllm_reviewer import (
+        GeminiMllmClient,
+        OpenAICompatMllmClient,
+        ReasoningEffort,
+        _classify_circuit_breaker_error,
+        _extract_http_status_code,
+        _extract_retry_after_seconds,
+        _is_hard_quota_or_billing_exhausted,
+        _is_retryable_http_error,
+    )
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    ok_json = '{"box_reviews": [], "has_missing": false, "missing_note": "", "added_boxes": []}'
+
+    # 1) 状态码提取、Retry-After 解析与错误归类边界
+    rl_err = openai.RateLimitError(
+        "Rate limit reached",
+        response=httpx.Response(429, headers={"Retry-After": "1.5"}, request=req),
+        body={"error": {"code": "rate_limit_exceeded", "message": "Rate limit reached"}},
+    )
+    rl_ms_err = openai.RateLimitError(
+        "Rate limit reached",
+        response=httpx.Response(429, headers={"retry-after-ms": "250"}, request=req),
+        body={"error": {"code": "rate_limit_exceeded"}},
+    )
+    quota_err = openai.RateLimitError(
+        "You exceeded your current quota, please check your plan and billing details.",
+        response=httpx.Response(429, request=req),
+        body={"error": {"code": "insufficient_quota", "type": "insufficient_quota"}},
+    )
+    srv_err = openai.InternalServerError(
+        "Service Unavailable",
+        response=httpx.Response(503, request=req),
+        body={"error": {"message": "overloaded"}},
+    )
+    auth_err = openai.AuthenticationError(
+        "Invalid API key",
+        response=httpx.Response(401, request=req),
+        body={"error": {"code": "invalid_api_key"}},
+    )
+    not_found_err = openai.NotFoundError(
+        "Model not found",
+        response=httpx.Response(404, request=req),
+        body={"error": {"code": "model_not_found"}},
+    )
+
+    assert _extract_http_status_code(rl_err) == 429
+    assert _extract_retry_after_seconds(rl_err) == pytest.approx(1.5)
+    assert _extract_retry_after_seconds(rl_ms_err) == pytest.approx(0.25)
+    assert _is_retryable_http_error(rl_err) is True
+    assert _is_retryable_http_error(srv_err) is True
+    assert _is_hard_quota_or_billing_exhausted(quota_err) is True
+    assert _is_retryable_http_error(quota_err) is False
+    assert _is_retryable_http_error(auth_err) is False
+
+    assert _classify_circuit_breaker_error(rl_err)[0] == "transient"
+    assert _classify_circuit_breaker_error(srv_err)[0] == "transient"
+    assert _classify_circuit_breaker_error(quota_err)[0] == "fatal"
+    assert _classify_circuit_breaker_error(auth_err)[0] == "fatal"
+    assert _classify_circuit_breaker_error(not_found_err)[0] == "fatal"
+    assert _classify_circuit_breaker_error(RuntimeError("局部 JSON 解析失败"))[0] == "other"
+
+    # 2) OpenAI 在 HIGH（SDK max_retries=0）下遇 429 + 503 仍在应用层重试成功，并写入共享冷却；
+    #    遇硬配额 429 或 401 时 0 重试立即抛出
+    oa_calls: list[dict[str, object]] = []
+    oa_script: list[object] = []
+
+    class _OaCompletions:
+        def create(self, **kwargs):
+            oa_calls.append(dict(kwargs))
+            action = oa_script.pop(0)
+            if isinstance(action, Exception):
+                raise action
+            return type(
+                "Resp",
+                (),
+                {"choices": [type("C", (), {"message": type("M", (), {"content": ok_json})()})()]},
+            )()
+
+    class _FakeOpenAI:
+        def __init__(self, **_kwargs) -> None:
+            self.chat = type("Chat", (), {"completions": _OaCompletions()})()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+    oa_cli = OpenAICompatMllmClient(
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model_name="gpt-6.2-astra",
+        reasoning_effort=ReasoningEffort.HIGH,
+        allow_anonymous_key=False,
+        rate_limit_retries=4,
+        rate_limit_backoff_base=0.0,
+        rate_limit_backoff_max=5.0,
+    )
+    assert oa_cli.max_retries == 0
+    oa_cli._stream_supported = False
+
+    oa_script.extend(
+        [
+            openai.RateLimitError(
+                "429",
+                response=httpx.Response(429, headers={"Retry-After": "0.05"}, request=req),
+                body={"error": {"code": "rate_limit_exceeded"}},
+            ),
+            srv_err,
+            "ok",
+        ]
+    )
+    before_cd = time.monotonic()
+    parsed_oa = oa_cli.review_image(b"x", [], "s", "u")
+    assert parsed_oa.has_missing is False
+    assert len(oa_calls) == 3
+    assert oa_cli._cooldown_until >= before_cd
+
+    # 硬配额 429 与 401 不重试
+    oa_calls.clear()
+    oa_script.append(quota_err)
+    with pytest.raises(openai.RateLimitError):
+        oa_cli.review_image(b"x", [], "s", "u")
+    assert len(oa_calls) == 1
+
+    oa_calls.clear()
+    oa_script.append(auth_err)
+    with pytest.raises(openai.AuthenticationError):
+        oa_cli.review_image(b"x", [], "s", "u")
+    assert len(oa_calls) == 1
+
+    # 共享冷却可被 close() 立即打断，且不会发出新的 HTTP 请求
+    oa_cli._register_shared_cooldown(10.0)
+    oa_calls.clear()
+    threading.Timer(0.12, oa_cli.close).start()
+    t0 = time.perf_counter()
+    with pytest.raises(RuntimeError, match="请求已取消"):
+        oa_cli.review_image(b"x", [], "s", "u")
+    assert time.perf_counter() - t0 < 2.0
+    assert len(oa_calls) == 0
+
+    # 3) Gemini 在 HIGH 下遇 429 RESOURCE_EXHAUSTED / 503 UNAVAILABLE 同样在应用层重试成功，遇 403/硬配额不重试
+    g_calls: list[dict[str, object]] = []
+    g_script: list[object] = []
+
+    class _FakeGenaiClient:
+        def __init__(self, **_kwargs) -> None:
+            self.interactions = self
+
+        def create(self, **kwargs):
+            g_calls.append(dict(kwargs))
+            action = g_script.pop(0)
+            if isinstance(action, Exception):
+                raise action
+            return type("Resp", (), {"output_text": ok_json})()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(genai, "Client", _FakeGenaiClient)
+    g_cli = GeminiMllmClient(
+        api_key="k",
+        model_name="gemini-4-neon",
+        reasoning_effort=ReasoningEffort.HIGH,
+        rate_limit_retries=3,
+        rate_limit_backoff_base=0.0,
+    )
+    g_cli._stream_supported = False
+
+    g_429 = RuntimeError("429 RESOURCE_EXHAUSTED: rate limit exceeded")
+    setattr(g_429, "code", 429)
+    g_503 = RuntimeError("503 UNAVAILABLE: model overloaded")
+    setattr(g_503, "code", 503)
+    g_403 = RuntimeError("403 PERMISSION_DENIED: api key invalid")
+    setattr(g_403, "code", 403)
+
+    g_script.extend([g_429, g_503, "ok"])
+    parsed_g = g_cli.review_image(b"x", [], "s", "u")
+    assert parsed_g.has_missing is False
+    assert len(g_calls) == 3
+
+    g_calls.clear()
+    g_script.append(g_403)
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        g_cli.review_image(b"x", [], "s", "u")
+    assert len(g_calls) == 1
+
+
+def test_run_mllm_review_resume_skips_succeeded_and_retries_errors_with_atomic_report(
+    tmp_path: Path,
+) -> None:
+    """验证实时原子落盘无残留临时文件，以及断点续传复用已成功记录、仅补跑失败与未处理图片。"""
+    from threading import Event
+
+    from yolo_studio.core.mllm_reviewer import load_review_report
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    img_names = ["01_ok.jpg", "02_ok.jpg", "03_err.jpg", "04_pending.jpg"]
+    for name in img_names:
+        _write_img(in_dir / name, (320, 180))
+
+    # 第 1 轮：01/02 成功，03 局部报错，第 3 张完成后触发取消跳过 04；验证实时落盘与无残留 .tmp
+    cancel_ev = Event()
+    round1_calls: list[int] = []
+
+    class _Round1Client:
+        def review_image(self, *_args) -> MllmReviewResponse:
+            idx = len(round1_calls)
+            round1_calls.append(idx)
+            if idx == 2:
+                raise RuntimeError("模拟单图返回损坏 JSON")
+            return MllmReviewResponse(
+                box_reviews=[],
+                has_missing=False,
+                added_boxes=[MissingBox(label="player", box_2d=[100, 100, 500, 500], reason="ok")],
+            )
+
+    progress_r1: list[tuple[int, int, str]] = []
+
+    def _on_prog_r1(cur: int, total: int, rec) -> None:
+        progress_r1.append((cur, total, rec.image_path.name))
+        if cur == 3:
+            cancel_ev.set()
+
+    res1 = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+            resume_from_existing=True,
+        ),
+        client_override=_Round1Client(),
+        progress_callback=_on_prog_r1,
+        cancel_event=cancel_ev,
+    )
+    assert res1.cancelled is True
+    assert res1.total_images == 3
+    assert res1.error_count == 1
+    assert res1.resumed_skipped_count == 0
+    assert len(round1_calls) == 3
+    assert res1.report_path is not None and res1.report_path.is_file()
+    assert list(out_dir.glob("*.tmp")) == []
+
+    # 第 2 轮启用断点续传：跳过 01/02，仅处理 03（上次报错）和 04（上次未跑）
+    round2_calls: list[int] = []
+
+    class _AlwaysOkClient:
+        def __init__(self, counter: list[int]) -> None:
+            self._counter = counter
+
+        def review_image(self, *_args) -> MllmReviewResponse:
+            self._counter.append(len(self._counter))
+            return MllmReviewResponse(
+                box_reviews=[],
+                has_missing=False,
+                added_boxes=[MissingBox(label="player", box_2d=[120, 120, 480, 480], reason="resumed")],
+            )
+
+    progress_r2: list[tuple[int, int, str]] = []
+    res2 = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+            resume_from_existing=True,
+        ),
+        client_override=_AlwaysOkClient(round2_calls),
+        progress_callback=lambda c, t, r: progress_r2.append((c, t, r.image_path.name)),
+    )
+    assert res2.cancelled is False
+    assert res2.total_images == 4
+    assert res2.error_count == 0
+    assert res2.resumed_skipped_count == 2
+    assert len(round2_calls) == 2
+    assert len(progress_r2) == 4
+    assert [name for _, _, name in progress_r2[:2]] == ["01_ok.jpg", "02_ok.jpg"]
+
+    loaded_r2 = load_review_report(res2.report_path)
+    assert loaded_r2.resumed_skipped_count == 2
+    assert loaded_r2.aborted_reason == ""
+
+    # 第 3 轮再次续传：全部 4 张已成功且输出完整 -> 0 次模型调用
+    round3_calls: list[int] = []
+    res3 = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+            resume_from_existing=True,
+        ),
+        client_override=_AlwaysOkClient(round3_calls),
+    )
+    assert res3.resumed_skipped_count == 4
+    assert len(round3_calls) == 0
+
+    # 删除其中 1 张输出图后再续传：仅自动补跑缺失的那 1 张
+    rec_01 = next(r for r in res3.records if r.image_path.name == "01_ok.jpg")
+    assert rec_01.output_image_path is not None
+    rec_01.output_image_path.unlink()
+    round4_calls: list[int] = []
+    res4 = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_dir,
+            output_dir=out_dir,
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+            resume_from_existing=True,
+        ),
+        client_override=_AlwaysOkClient(round4_calls),
+    )
+    assert res4.resumed_skipped_count == 3
+    assert len(round4_calls) == 1
+
+
+def test_run_mllm_review_circuit_breaker_on_fatal_and_consecutive_transient_errors(
+    tmp_path: Path,
+) -> None:
+    """验证致命错误立即熔断、连续系统性故障自动熔断、成功清零计数、局部错误不误触发及 CLI 参数解析。"""
+    import httpx
+    import openai
+
+    from yolo_studio.cli import build_parser
+    from yolo_studio.core.mllm_reviewer import load_review_report
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    # 场景 A：6 张图第 1 张遇到 401 鉴权失败 / 429 硬配额耗尽 -> 立即熔断，仅调用 1 次并落盘 aborted_reason
+    in_fatal = tmp_path / "in_fatal"
+    for i in range(6):
+        _write_img(in_fatal / f"img_{i:02d}.jpg", (240, 160))
+
+    for tag, fatal_exc in (
+        (
+            "auth401",
+            openai.AuthenticationError(
+                "Invalid API key",
+                response=httpx.Response(401, request=req),
+                body={"error": {"code": "invalid_api_key"}},
+            ),
+        ),
+        (
+            "quota429",
+            openai.RateLimitError(
+                "Exceeded quota",
+                response=httpx.Response(429, request=req),
+                body={"error": {"code": "insufficient_quota"}},
+            ),
+        ),
+    ):
+        call_count = 0
+
+        class _FatalClient:
+            def __init__(self, exc: Exception) -> None:
+                self._exc = exc
+
+            def review_image(self, *_args):
+                nonlocal call_count
+                call_count += 1
+                raise self._exc
+
+        logs: list[str] = []
+        res_fatal = run_mllm_review(
+            MllmReviewConfig(
+                images_dir=in_fatal,
+                output_dir=tmp_path / f"out_{tag}",
+                source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+                allowed_classes=["player"],
+                max_workers=1,
+            ),
+            client_override=_FatalClient(fatal_exc),
+            log_callback=logs.append,
+        )
+        assert call_count == 1
+        assert res_fatal.cancelled is True
+        assert res_fatal.total_images == 1
+        assert res_fatal.error_count == 1
+        assert res_fatal.aborted_reason != ""
+        assert any("[熔断停机]" in line for line in logs)
+        reloaded = load_review_report(res_fatal.report_path)
+        assert reloaded.aborted_reason == res_fatal.aborted_reason
+
+    # 场景 B：8 张图，max_consecutive_errors=3；前 2 次网络断连 -> 第 3 张成功（清零）-> 第 4~6 张连续 3 次断连触发熔断，第 7~8 张不调用
+    in_trans = tmp_path / "in_trans"
+    for i in range(8):
+        _write_img(in_trans / f"t_{i:02d}.jpg", (240, 160))
+
+    trans_calls = 0
+
+    class _FlakyClient:
+        def review_image(self, *_args) -> MllmReviewResponse:
+            nonlocal trans_calls
+            idx = trans_calls
+            trans_calls += 1
+            if idx == 2:
+                return MllmReviewResponse(box_reviews=[], has_missing=False, added_boxes=[])
+            raise openai.APIConnectionError(request=req)
+
+    res_trans = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_trans,
+            output_dir=tmp_path / "out_trans",
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+            max_consecutive_errors=3,
+        ),
+        client_override=_FlakyClient(),
+    )
+    assert trans_calls == 6
+    assert res_trans.cancelled is True
+    assert res_trans.total_images == 6
+    assert res_trans.error_count == 5
+    assert "连续 3 张" in res_trans.aborted_reason
+
+    # 场景 C：连续 4 张普通 RuntimeError（单图局部错误）不应误触发全局熔断
+    in_local = tmp_path / "in_local"
+    for i in range(4):
+        _write_img(in_local / f"loc_{i:02d}.jpg", (240, 160))
+
+    local_calls = 0
+
+    class _LocalErrClient:
+        def review_image(self, *_args):
+            nonlocal local_calls
+            local_calls += 1
+            raise RuntimeError("模型输出缺少有效 JSON")
+
+    res_local = run_mllm_review(
+        MllmReviewConfig(
+            images_dir=in_local,
+            output_dir=tmp_path / "out_local",
+            source_mode=ReviewSourceMode.LLM_ZERO_SHOT,
+            allowed_classes=["player"],
+            max_workers=1,
+            max_consecutive_errors=2,
+        ),
+        client_override=_LocalErrClient(),
+    )
+    assert local_calls == 4
+    assert res_local.cancelled is False
+    assert res_local.aborted_reason == ""
+
+    # 场景 D：CLI 参数 --resume / --no-resume 与 --max-consecutive-errors 解析验证
+    parser = build_parser()
+    args_default = parser.parse_args(["review", "-i", "in_dir"])
+    assert args_default.resume is False
+    assert args_default.max_consecutive_errors == 5
+    args_custom = parser.parse_args(["review", "-i", "in_dir", "--resume", "--max-consecutive-errors", "3"])
+    assert args_custom.resume is True
+    assert args_custom.max_consecutive_errors == 3
+    args_off = parser.parse_args(["review", "-i", "in_dir", "--no-resume", "--max-consecutive-errors", "0"])
+    assert args_off.resume is False
+    assert args_off.max_consecutive_errors == 0
+
+
+
 
 
 

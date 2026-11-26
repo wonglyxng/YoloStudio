@@ -324,6 +324,8 @@ def _cmd_review(args: argparse.Namespace) -> int:
         max_images=max(0, args.max_images),
         triage_subfolders=not args.flat,
         recursive=args.recursive,
+        resume_from_existing=bool(args.resume),
+        max_consecutive_errors=max(0, int(args.max_consecutive_errors)),
         box_refine_mode=BoxRefineMode(args.box_refine),
         sam_model_name=args.sam_model,
         sam_refine_all_kept=args.sam_refine_all,
@@ -331,12 +333,15 @@ def _cmd_review(args: argparse.Namespace) -> int:
     )
     res = run_mllm_review(cfg, log_callback=print)
     refined_total = sum(r.refined_count for r in res.records)
+    resume_suffix = f", 续传跳过={res.resumed_skipped_count}" if res.resumed_skipped_count > 0 else ""
     print(
-        f"LLM 智能标注完成: 总计={res.total_images}, 自动通过={res.auto_passed_count}, "
+        f"LLM 智能标注完成: 总计={res.total_images}{resume_suffix}, 自动通过={res.auto_passed_count}, "
         f"已删改/收框={res.llm_fixed_count}(收紧 {refined_total} 框), "
         f"待人工复核={res.need_review_count}, 出错={res.error_count}"
     )
-    return 0 if res.error_count == 0 else 1
+    if res.aborted_reason:
+        print(f"[熔断停机] {res.aborted_reason}")
+    return 0 if (res.error_count == 0 and not res.aborted_reason) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -530,6 +535,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_rv.add_argument("--flat", action="store_true", help="不按状态分建子目录")
     p_rv.add_argument("-r", "--recursive", action="store_true", help="递归扫描输入子目录")
+    p_rv.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="启用断点续传：复用输出目录 review_report.json 中已成功且输出完整的图片，仅补跑剩余与出错图片",
+    )
+    p_rv.add_argument(
+        "--max-consecutive-errors",
+        type=int,
+        default=5,
+        help="连续网络/限流/服务端异常达到该阈值时自动熔断停机（默认 5；设为 0 关闭连续故障熔断）",
+    )
     p_rv.set_defaults(func=_cmd_review)
 
     p_exp = sub.add_parser("export", help="查看权重元数据并导出部署模型 (ONNX / TorchScript / TensorRT 等)")
