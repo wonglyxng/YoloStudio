@@ -188,6 +188,7 @@ class MainWindow(QMainWindow):
         self.review_tab = MllmReviewTab(
             workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
         )
+        self.labeling_tab.set_review_config_provider(self.review_tab.build_current_config)
         self.train_tab = TrainTab(
             workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
         )
@@ -359,6 +360,8 @@ class MainWindow(QMainWindow):
             getattr(self.extract_tab, "probe_worker", None),
             getattr(self.extract_tab, "worker", None),
             getattr(self.labeling_tab, "sam_worker", None),
+            getattr(self.labeling_tab, "sam_point_worker", None),
+            getattr(self.labeling_tab, "llm_fix_worker", None),
             getattr(self.dataset_tab, "scan_worker", None),
             getattr(self.dataset_tab, "build_worker", None),
             getattr(self.review_tab, "worker", None),

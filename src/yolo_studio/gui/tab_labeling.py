@@ -3,15 +3,16 @@
 职责：
     提供面向 YOLO 目标检测（矩形框）与 AI 复核闭环的高性能原生 PyQt6 标注工作台：
     左侧图片文件列表（搜索/状态筛选/进度统计）、中央可精准锚点缩放与自由平移交互画布
-    （`R/W` 拖拽或两点画框、`H` 抓手平移、`E` 编辑与 8 控制点精修、方向键微调、`Tab` 轮选、
+    （`R/W` 拖拽或两点画框、`Q` 本地 SAM 2.1 多点正负提示点选成框、`H` 抓手平移、`E` 编辑与 8 控制点精修、方向键微调、`Tab` 轮选、
     `Ctrl+C/V` 跨图粘贴、撤销重做、AI 漏标提醒横幅、切图保持视野与图片内存缓存）、
-    右侧类别管理与目标框详情面板（展示 LLM/SAM 审核理由与置信度，支持一键本地 SAM 像素级贴边收框），
+    右侧类别管理与目标框详情面板（展示 LLM/SAM 审核理由与置信度，支持一键本地 SAM 像素级贴边收框与单框局部 AI 精修），
     并与「1. 视频抽帧」「3. 自动智能标注」「4. 数据集准备」实现双向路径与变更信号联动。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程，仅依赖 `PyQt6`、`Pillow` 及 `core.annotation_io`；
-    完全不依赖 X-AnyLabeling 或 `PyQt6-WebEngine`。本地 SAM 贴边收框按需在后台 `QThread`
-    中延迟加载 `core.mllm_reviewer.UltralyticsSamBoxRefiner` 并遵守 `GpuTaskGuard` 互斥保护。
+    完全不依赖 X-AnyLabeling 或 `PyQt6-WebEngine`。本地 SAM 贴边收框与点选分割按需在后台 `QThread`
+    中延迟加载 `core.mllm_reviewer.UltralyticsSamBoxRefiner` 并遵守 `GpuTaskGuard` 互斥保护；
+    单框局部 AI 精修复用第 3 页 LLM 配置在后台 `QThread` 中仅上传单目标周边局部裁剪图执行，支持取消与 `Ctrl+Z` 撤回。
     保存格式 100% 兼容标准 LabelMe / X-AnyLabeling `.json` 矩形标注协议。
 """
 
@@ -19,12 +20,15 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import copy
+import ipaddress
 import os
 import subprocess
 import sys
+from threading import Event, Lock
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QIntValidator, QKeyEvent, QKeySequence, QPainter, QPen, QPixmap
@@ -369,6 +373,187 @@ class _SamBoxRefineWorker(QThread):
             self.failed.emit(f"本地 SAM 贴边收紧失败：{exc}")
 
 
+def _is_local_or_lan_url(base_url: str) -> bool:
+    """判断 OpenAI 兼容接口 Base URL 是否指向本机或局域网服务（如 Ollama / vLLM，通常免填 API Key）。"""
+    raw = base_url.strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        return False
+
+
+class _SamPointSegmentWorker(QThread):
+    """在后台线程中使用本地 SAM 2.1 按单目标正/负点提示分割轮廓并返回最小外接矩形。"""
+
+    segment_ready = Signal(int, str, object)  # 参数：(req_id, image_path_str, (x1, y1, x2, y2) | None)
+    failed = Signal(int, str)
+
+    def __init__(
+        self,
+        req_id: int,
+        image_path: Path,
+        points: list[tuple[float, float, int]],
+        *,
+        device: str = "0",
+        model_name: str = "sam2.1_t.pt",
+        refiner_cache: dict[tuple[str, str], Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.req_id = int(req_id)
+        self.image_path = image_path
+        self.points = [(float(x), float(y), 1 if int(lbl) == 1 else 0) for x, y, lbl in points]
+        self.device = device
+        self.model_name = model_name
+        self._refiner_cache = refiner_cache if refiner_cache is not None else {}
+
+    def run(self) -> None:
+        try:
+            import cv2
+            import numpy as np
+
+            from yolo_studio.core.mllm_reviewer import UltralyticsSamBoxRefiner
+
+            raw_bytes = np.fromfile(str(self.image_path), dtype=np.uint8)
+            img_bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                self.failed.emit(self.req_id, f"无法读取图像像素：{self.image_path.name}")
+                return
+
+            cache_key = (self.model_name, self.device)
+            refiner = self._refiner_cache.get(cache_key)
+            if refiner is None:
+                refiner = UltralyticsSamBoxRefiner(model_name=self.model_name, device=self.device)
+                self._refiner_cache[cache_key] = refiner
+
+            pts_xy = [(x, y) for x, y, _ in self.points]
+            pts_lbl = [lbl for _, _, lbl in self.points]
+            coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl)
+            self.segment_ready.emit(self.req_id, str(self.image_path.resolve()), coords)
+        except Exception as exc:
+            self.failed.emit(self.req_id, f"本地 SAM 点选分割失败：{exc}")
+
+
+class _SingleBoxLlmFixWorker(QThread):
+    """在后台线程中仅裁剪工作台选中的单个目标框局部图送交 LLM 精修尺寸、类别或判定误检。"""
+
+    fix_ready = Signal(str, int, object, object)  # 参数：(image_path_str, box_index, orig_box, SingleBoxFixResult)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        image_path: Path,
+        box_index: int,
+        orig_box: RectAnnotation,
+        review_config: Any,
+        allowed_classes: list[str],
+        *,
+        client_override: Any | None = None,
+    ) -> None:
+        super().__init__()
+        self.image_path = image_path
+        self.box_index = int(box_index)
+        self.orig_box = orig_box.clone()
+        self.review_config = review_config
+        self.allowed_classes = list(allowed_classes)
+        self._client_override = client_override
+        self._cancel_event = Event()
+        self._client_lock = Lock()
+        self._active_client: Any | None = None
+
+    def cancel(self) -> None:
+        """置位取消标志并关闭在途 LLM HTTP 客户端以立即中断请求（可重复调用）。"""
+        self._cancel_event.set()
+        with self._client_lock:
+            client = self._active_client
+        if client is not None:
+            from yolo_studio.core.mllm_reviewer import _close_client_safely
+
+            _close_client_safely(client)
+
+    def run(self) -> None:
+        client: Any | None = None
+        owns_client = self._client_override is None
+        try:
+            if self._cancel_event.is_set():
+                return
+            import cv2
+            import numpy as np
+
+            from yolo_studio.core.mllm_reviewer import (
+                CandidateBox,
+                _close_client_safely,
+                _format_exception_detail,
+                build_mllm_client,
+                fix_single_box_with_mllm,
+            )
+
+            raw_bytes = np.fromfile(str(self.image_path), dtype=np.uint8)
+            img_bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                if not self._cancel_event.is_set():
+                    self.failed.emit(f"无法读取图像像素：{self.image_path.name}")
+                return
+
+            if self._cancel_event.is_set():
+                return
+
+            client = self._client_override or build_mllm_client(self.review_config)
+            with self._client_lock:
+                self._active_client = client
+            if self._cancel_event.is_set():
+                return
+
+            cand = CandidateBox(
+                box_id=0,
+                label=self.orig_box.label,
+                x1=self.orig_box.x1,
+                y1=self.orig_box.y1,
+                x2=self.orig_box.x2,
+                y2=self.orig_box.y2,
+                confidence=self.orig_box.score,
+                original_label=self.orig_box.label,
+            )
+            result = fix_single_box_with_mllm(
+                img_bgr,
+                cand,
+                self.review_config,
+                allowed_classes=self.allowed_classes,
+                client_override=client,
+            )
+            if not self._cancel_event.is_set():
+                self.fix_ready.emit(
+                    str(self.image_path.resolve()),
+                    self.box_index,
+                    self.orig_box.clone(),
+                    result,
+                )
+        except Exception as exc:
+            if not self._cancel_event.is_set():
+                try:
+                    from yolo_studio.core.mllm_reviewer import _format_exception_detail
+
+                    detail = _format_exception_detail(exc)
+                except Exception:
+                    detail = str(exc)
+                self.failed.emit(f"AI 局部精修失败：{detail}")
+        finally:
+            with self._client_lock:
+                self._active_client = None
+            if owns_client and client is not None:
+                from yolo_studio.core.mllm_reviewer import _close_client_safely
+
+                _close_client_safely(client)
+
+
 class LabelingStudioTab(QWidget):
     """原生 PyQt6 轻量标注与复核工作台标签页（标签页 2）。
 
@@ -390,6 +575,7 @@ class LabelingStudioTab(QWidget):
         lazy_mount: bool = False,
         device_info: DeviceInfo | None = None,
         gpu_guard: GpuTaskGuard | None = None,
+        review_config_provider: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__(parent)
         install_combobox_wheel_guard()
@@ -397,6 +583,7 @@ class LabelingStudioTab(QWidget):
         self._lazy_mount = lazy_mount
         self.device_info = device_info
         self.gpu_guard = gpu_guard
+        self._review_config_provider = review_config_provider
 
         self._current_dir: Path | None = None
         self._last_classes_file: Path | None = None
@@ -415,7 +602,12 @@ class LabelingStudioTab(QWidget):
         self._suppress_watch_until: float = 0.0
 
         self.sam_worker: _SamBoxRefineWorker | None = None
+        self.sam_point_worker: _SamPointSegmentWorker | None = None
+        self.llm_fix_worker: _SingleBoxLlmFixWorker | None = None
         self._sam_refiner_cache: dict[tuple[str, str], Any] = {}
+        self._sam_point_req_id: int = 0
+        self._pending_sam_point_request: tuple[int, Path, list[tuple[float, float, int]]] | None = None
+        self._llm_fix_client_override: Any | None = None
         self._scoped_actions: list[QAction] = []
         self._clipboard_boxes: list[RectAnnotation] = []
         self._clipboard_source_image: Path | None = None
@@ -452,9 +644,11 @@ class LabelingStudioTab(QWidget):
             "QCheckBox { font-size: 12px; spacing: 3px; }"
             "QPushButton#segEditBtn { border-top-right-radius: 0px; border-bottom-right-radius: 0px; }"
             "QPushButton#segDrawBtn { border-radius: 0px; border-left: none; border-right: none; }"
+            "QPushButton#segSamBtn { border-radius: 0px; border-right: none; }"
             "QPushButton#segPanBtn { border-top-left-radius: 0px; border-bottom-left-radius: 0px; }"
             "QPushButton#segEditBtn:checked { background-color: #ddf4ff; border-color: #0969da; color: #0550ae; font-weight: 600; }"
             "QPushButton#segDrawBtn:checked { background-color: #ffebe9; border-color: #cf222e; color: #a40e26; font-weight: 600; }"
+            "QPushButton#segSamBtn:checked { background-color: #e6fffa; border-color: #0d9488; color: #115e59; font-weight: 600; }"
             "QPushButton#segPanBtn:checked { background-color: #fff8c5; border-color: #bf8700; color: #7d4e00; font-weight: 600; }"
             "QPushButton#verifyNextBtn { background-color: #eafaf1; border-color: #2da44e; color: #1a7f37; font-weight: 600; }"
             "QPushButton#verifyNextBtn:hover { background-color: #dafbe1; }"
@@ -481,12 +675,19 @@ class LabelingStudioTab(QWidget):
         self.draw_mode_btn.setObjectName("segDrawBtn")
         self.draw_mode_btn.setCheckable(True)
         self.draw_mode_btn.setToolTip("画矩形框模式 (R / W)：支持按住拖拽成框或轻点起点+终点两点画框")
+        self.sam_point_mode_btn = QPushButton("点选(Q)")
+        self.sam_point_mode_btn.setObjectName("segSamBtn")
+        self.sam_point_mode_btn.setCheckable(True)
+        self.sam_point_mode_btn.setToolTip(
+            "本地 SAM 点选标注模式 (Q)：左键点击漏标目标生成贴边预览框，右键点击武器/特效排除背景，Enter 确认落框，Backspace 撤点，Esc 取消"
+        )
         self.pan_mode_btn = QPushButton("抓手(H)")
         self.pan_mode_btn.setObjectName("segPanBtn")
         self.pan_mode_btn.setCheckable(True)
         self.pan_mode_btn.setToolTip("抓手平移模式 (H)：左键直接拖动画布，不误碰目标框（也可随时右键/中键/空格+左键平移）")
         mode_seg_lay.addWidget(self.edit_mode_btn)
         mode_seg_lay.addWidget(self.draw_mode_btn)
+        mode_seg_lay.addWidget(self.sam_point_mode_btn)
         mode_seg_lay.addWidget(self.pan_mode_btn)
 
         self.dup_box_btn = QPushButton("复制")
@@ -512,6 +713,10 @@ class LabelingStudioTab(QWidget):
 
         self.sam_refine_btn = QPushButton("SAM收框")
         self.sam_refine_btn.setToolTip("调用本地 SAM 2.1 对当前选中框（未选中时对整图全部框）执行像素级轮廓贴边收紧")
+        self.llm_fix_btn = QPushButton("AI修框")
+        self.llm_fix_btn.setToolTip(
+            "使用「3. 自动智能标注」配置的 LLM 与辅助判定规则对当前选中框做局部放大精修（自动修正尺寸、类别或误检，极省 Token；快捷键 G）"
+        )
 
         self.keep_view_chk = QCheckBox("保持视野")
         self.keep_view_chk.setChecked(False)
@@ -533,6 +738,7 @@ class LabelingStudioTab(QWidget):
             self.open_dir_btn,
             self.edit_mode_btn,
             self.draw_mode_btn,
+            self.sam_point_mode_btn,
             self.pan_mode_btn,
             self.dup_box_btn,
             self.del_box_btn,
@@ -543,6 +749,7 @@ class LabelingStudioTab(QWidget):
             self.save_btn,
             self.verify_next_btn,
             self.sam_refine_btn,
+            self.llm_fix_btn,
             self.keep_view_chk,
             self.show_labels_chk,
             self.auto_save_chk,
@@ -566,6 +773,7 @@ class LabelingStudioTab(QWidget):
         t_lay.addWidget(self.verify_next_btn)
         t_lay.addWidget(self._make_vsep())
         t_lay.addWidget(self.sam_refine_btn)
+        t_lay.addWidget(self.llm_fix_btn)
         t_lay.addWidget(self._make_vsep())
         t_lay.addWidget(self.keep_view_chk)
         t_lay.addWidget(self.show_labels_chk)
@@ -777,6 +985,18 @@ class LabelingStudioTab(QWidget):
             btn.setStyleSheet("padding: 3px 6px; font-size: 11px;")
             box_ops.addWidget(btn, 1)
         detail_lay.addLayout(box_ops)
+
+        box_ai_ops = QHBoxLayout()
+        box_ai_ops.setSpacing(4)
+        self.box_sam_inline_btn = QPushButton("SAM收框")
+        self.box_sam_inline_btn.setToolTip("使用本地 SAM 2.1 对当前选中框做像素级贴边收紧")
+        self.box_llm_fix_inline_btn = QPushButton("AI精修(G)")
+        self.box_llm_fix_inline_btn.setToolTip("仅裁剪当前选中框局部图送交 LLM 按规则精修尺寸/类别/误检 (快捷键 G)")
+        for btn in (self.box_sam_inline_btn, self.box_llm_fix_inline_btn):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setStyleSheet("padding: 3px 6px; font-size: 11px;")
+            box_ai_ops.addWidget(btn, 1)
+        detail_lay.addLayout(box_ai_ops)
         self.box_detail_panel.setVisible(False)
         obj_lay.addWidget(self.box_detail_panel)
         self.right_splitter.addWidget(obj_card)
@@ -884,12 +1104,17 @@ class LabelingStudioTab(QWidget):
 
         self.edit_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT))
         self.draw_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW))
+        self.sam_point_mode_btn.clicked.connect(
+            lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_SAM_POINT)
+        )
         self.pan_mode_btn.clicked.connect(lambda: self.canvas.set_mode(AnnotationCanvasView.MODE_PAN))
         self.dup_box_btn.clicked.connect(self._duplicate_selected_box)
         self.del_box_btn.clicked.connect(self._delete_selected_box)
         self.box_del_inline_btn.clicked.connect(self._delete_selected_box)
         self.change_cls_btn.clicked.connect(self._prompt_relabel_selected_box)
         self.focus_box_btn.clicked.connect(self._focus_selected_box)
+        self.box_sam_inline_btn.clicked.connect(self._on_sam_refine_clicked)
+        self.box_llm_fix_inline_btn.clicked.connect(self._on_llm_fix_box_clicked)
         self.clear_boxes_btn.clicked.connect(self._clear_all_boxes)
         self.undo_btn.clicked.connect(self._undo)
         self.redo_btn.clicked.connect(self._redo)
@@ -899,6 +1124,7 @@ class LabelingStudioTab(QWidget):
         self.verify_next_btn.clicked.connect(self._verify_and_next)
         self.clear_hint_btn.clicked.connect(self._clear_missing_hint)
         self.sam_refine_btn.clicked.connect(self._on_sam_refine_clicked)
+        self.llm_fix_btn.clicked.connect(self._on_llm_fix_box_clicked)
         self.keep_view_chk.toggled.connect(self._on_keep_view_toggled)
         self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_by(1.0 / 1.25))
         self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom_by(1.25))
@@ -933,6 +1159,8 @@ class LabelingStudioTab(QWidget):
         self.canvas.cursor_pos_changed.connect(self._on_canvas_cursor_changed)
         self.canvas.box_double_clicked.connect(lambda _idx: self._prompt_relabel_selected_box())
         self.canvas.context_menu_requested.connect(self._on_canvas_context_menu)
+        self.canvas.sam_points_changed.connect(self._on_sam_points_changed)
+        self.canvas.sam_prompt_commit_requested.connect(self._commit_sam_point_preview)
 
         # 在工作台自身与主要非文本子控件上安装键盘过滤器，保证全局空格平移与单键快捷键响应且绝不拦截文本输入
         for target in (self, self.canvas, self.file_list, self.shape_list, self.unique_label_list):
@@ -1077,11 +1305,26 @@ class LabelingStudioTab(QWidget):
         if key in (Qt.Key.Key_R, Qt.Key.Key_W):
             self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
             return True
+        if key == Qt.Key.Key_Q:
+            self.canvas.set_mode(AnnotationCanvasView.MODE_SAM_POINT)
+            return True
         if key == Qt.Key.Key_E:
             self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
             return True
         if key == Qt.Key.Key_H:
             self.canvas.set_mode(AnnotationCanvasView.MODE_PAN)
+            return True
+        if key == Qt.Key.Key_G:
+            if self._doc is not None and self.canvas.selected_index() >= 0:
+                self._on_llm_fix_box_clicked()
+                return True
+            return False
+        if (
+            key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and self.canvas.sam_pointing()
+            and self.canvas.sam_preview_rect() is not None
+        ):
+            self._commit_sam_point_preview()
             return True
         if key == Qt.Key.Key_L:
             self.show_labels_chk.toggle()
@@ -1113,6 +1356,9 @@ class LabelingStudioTab(QWidget):
             return True
         if key == Qt.Key.Key_Right:
             self.open_next_image()
+            return True
+        if key == Qt.Key.Key_Backspace and self.canvas.sam_pointing() and self.canvas.sam_points():
+            self.canvas.undo_last_sam_point()
             return True
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             if self.canvas.selected_index() >= 0:
@@ -1163,8 +1409,12 @@ class LabelingStudioTab(QWidget):
         return True
 
     def apply_device_info(self, info: DeviceInfo) -> None:
-        """接收主窗口后台硬件探测结果，供本地 SAM 贴边收框自动选择 GPU 或 CPU。"""
+        """接收主窗口后台硬件探测结果，供本地 SAM 贴边收框与点选标注自动选择 GPU 或 CPU。"""
         self.device_info = info
+
+    def set_review_config_provider(self, provider: Callable[[], Any] | None) -> None:
+        """注入第 3 页 LLM 配置获取回调，供工作台单框 AI 精修复用模型、Key 与辅助判定规则。"""
+        self._review_config_provider = provider
 
     def current_directory(self) -> Path | None:
         """返回工作台当前打开的图片目录；若尚未打开任何目录则返回 `None`。"""
@@ -1204,6 +1454,8 @@ class LabelingStudioTab(QWidget):
         self._doc = None
         self._dirty = False
         self._last_nudge_key = None
+        self._sam_point_req_id += 1
+        self._pending_sam_point_request = None
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -1368,11 +1620,16 @@ class LabelingStudioTab(QWidget):
         return True
 
     def prepare_for_close(self) -> bool:
-        """在主窗口退出前处理未保存标注修改并安全停止可能运行的 SAM 收框线程。"""
+        """在主窗口退出前处理未保存标注修改并安全停止运行中的 SAM 与单框 AI 精修线程。"""
         if not self._may_continue():
             return False
-        if self.sam_worker is not None and self.sam_worker.isRunning():
-            self.sam_worker.wait(3000)
+        self._sam_point_req_id += 1
+        self._pending_sam_point_request = None
+        if self.llm_fix_worker is not None and self.llm_fix_worker.isRunning():
+            self.llm_fix_worker.cancel()
+        for worker in (self.sam_worker, self.sam_point_worker, self.llm_fix_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait(3000)
         return True
 
     # ------------------------------------------------------------------
@@ -1575,6 +1832,8 @@ class LabelingStudioTab(QWidget):
         self._doc = doc
         self._dirty = False
         self._last_nudge_key = None
+        self._sam_point_req_id += 1
+        self._pending_sam_point_request = None
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -1700,6 +1959,8 @@ class LabelingStudioTab(QWidget):
         has_sel = has_img and self.canvas.selected_index() >= 0
         has_boxes = has_img and self._doc is not None and len(self._doc.boxes) > 0
         sam_busy = self.sam_worker is not None and self.sam_worker.isRunning()
+        sam_point_busy = self.sam_point_worker is not None and self.sam_point_worker.isRunning()
+        llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
 
         self.dup_box_btn.setEnabled(has_sel)
         self.del_box_btn.setEnabled(has_sel)
@@ -1715,8 +1976,15 @@ class LabelingStudioTab(QWidget):
         self.next_img_btn.setEnabled(len(self._filtered_images) > 1)
         self.jump_index_edit.setEnabled(len(self._filtered_images) > 0)
         self.next_unlabeled_btn.setEnabled(len(self._filtered_images) > 0)
-        self.sam_refine_btn.setEnabled(has_boxes and not sam_busy)
+        self.sam_point_mode_btn.setEnabled(has_img)
+        self.sam_refine_btn.setEnabled(has_boxes and not sam_busy and not sam_point_busy)
         self.sam_refine_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
+        self.box_sam_inline_btn.setEnabled(has_sel and not sam_busy and not sam_point_busy)
+        self.box_sam_inline_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
+        self.llm_fix_btn.setEnabled(has_sel and not llm_busy)
+        self.llm_fix_btn.setText("AI精修中" if llm_busy else "AI修框")
+        self.box_llm_fix_inline_btn.setEnabled(has_sel and not llm_busy)
+        self.box_llm_fix_inline_btn.setText("AI精修中" if llm_busy else "AI精修(G)")
 
     # ------------------------------------------------------------------
     # 类别管理
@@ -1803,6 +2071,9 @@ class LabelingStudioTab(QWidget):
             return
         cls_name = self._classes[cls_idx]
         self._set_active_class(cls_name)
+        # 点选标注模式下数字键仅切换待落框类别（同步刷新预览色与标签），避免误改此前刚落盘的框
+        if self.canvas.sam_pointing():
+            return
         sel = self.canvas.selected_index()
         if self._doc is not None and 0 <= sel < len(self._doc.boxes):
             self._relabel_box(sel, cls_name)
@@ -2209,12 +2480,22 @@ class LabelingStudioTab(QWidget):
             self.open_next_image()
 
     # ------------------------------------------------------------------
-    # 本地 SAM 像素级贴边收紧
+    # 本地 SAM 像素级贴边收紧、SAM 点选标注与单框局部 AI 精修
     # ------------------------------------------------------------------
+    def _resolve_sam_device(self) -> str:
+        """获取本地 SAM 使用的推理设备，若后台硬件探测尚未完成则同步兜底检测。"""
+        dev_info = self.device_info
+        if dev_info is None or dev_info.probing:
+            dev_info = detect_compute_device()
+            self.device_info = dev_info
+        return dev_info.recommended_device
+
     def _on_sam_refine_clicked(self) -> None:
         if self._doc is None or not self._doc.boxes:
             return
-        if self.sam_worker is not None and self.sam_worker.isRunning():
+        if (self.sam_worker is not None and self.sam_worker.isRunning()) or (
+            self.sam_point_worker is not None and self.sam_point_worker.isRunning()
+        ):
             return
         if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "工作台本地 SAM 收框"):
             return
@@ -2225,11 +2506,7 @@ class LabelingStudioTab(QWidget):
         else:
             targets = list(enumerate(self._doc.boxes))
 
-        dev_info = self.device_info
-        if dev_info is None or dev_info.probing:
-            dev_info = detect_compute_device()
-            self.device_info = dev_info
-        device = dev_info.recommended_device
+        device = self._resolve_sam_device()
 
         self.sam_worker = _SamBoxRefineWorker(
             self._doc.image_path,
@@ -2242,10 +2519,14 @@ class LabelingStudioTab(QWidget):
             self.gpu_guard.bind(self.sam_worker, "工作台本地 SAM 收框")
         self.sam_worker.refined_ready.connect(self._on_sam_refine_finished)
         self.sam_worker.failed.connect(self._on_sam_refine_failed)
-        self.sam_worker.finished.connect(self._refresh_action_states)
+        self.sam_worker.finished.connect(self._on_sam_box_worker_done)
         self._refresh_action_states()
         self.save_state_label.setText(f"正在用本地 SAM 2.1 收紧 {len(targets)} 个框...")
         self.sam_worker.start()
+
+    def _on_sam_box_worker_done(self) -> None:
+        self._refresh_action_states()
+        self._drain_pending_sam_point_request()
 
     def _on_sam_refine_finished(self, img_path_str: str, refined_map: dict) -> None:
         if self._doc is None or str(self._doc.image_path.resolve()) != img_path_str:
@@ -2280,6 +2561,323 @@ class LabelingStudioTab(QWidget):
     def _on_sam_refine_failed(self, msg: str) -> None:
         self.save_state_label.setText("SAM 收框失败")
         QMessageBox.warning(self, "本地 SAM 收框失败", msg)
+
+    def _on_sam_points_changed(self, raw_points: list) -> None:
+        """响应画布点选提示点变更：按最新点集异步调用本地 SAM 2.1 更新预览框，防并发乱序覆盖。"""
+        self._sam_point_req_id += 1
+        req_id = self._sam_point_req_id
+        points = [(float(x), float(y), 1 if int(lbl) == 1 else 0) for x, y, lbl in raw_points]
+        if self._doc is None or not points or not any(lbl == 1 for _, _, lbl in points):
+            self._pending_sam_point_request = None
+            self.canvas.set_sam_preview_rect(None, predicting=False)
+            return
+
+        if (self.sam_point_worker is not None and self.sam_point_worker.isRunning()) or (
+            self.sam_worker is not None and self.sam_worker.isRunning()
+        ):
+            self._pending_sam_point_request = (req_id, self._doc.image_path, points)
+            self.save_state_label.setText("已排队最新 SAM 点选分割请求...")
+            return
+
+        self._launch_sam_point_worker(req_id, self._doc.image_path, points)
+
+    def _launch_sam_point_worker(
+        self, req_id: int, image_path: Path, points: list[tuple[float, float, int]]
+    ) -> None:
+        if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "工作台本地 SAM 点选标注"):
+            self.canvas.set_sam_preview_rect(self.canvas.sam_preview_rect(), predicting=False)
+            return
+
+        device = self._resolve_sam_device()
+        self.sam_point_worker = _SamPointSegmentWorker(
+            req_id,
+            image_path,
+            points,
+            device=device,
+            model_name="sam2.1_t.pt",
+            refiner_cache=self._sam_refiner_cache,
+        )
+        if self.gpu_guard is not None:
+            self.gpu_guard.bind(self.sam_point_worker, "工作台本地 SAM 点选标注")
+        self.sam_point_worker.segment_ready.connect(self._on_sam_point_finished)
+        self.sam_point_worker.failed.connect(self._on_sam_point_failed)
+        self.sam_point_worker.finished.connect(self._on_sam_point_worker_done)
+        self._refresh_action_states()
+        self.save_state_label.setText(f"正在用本地 SAM 2.1 分割点选目标（{len(points)} 个提示点）...")
+        self.sam_point_worker.start()
+
+    def _drain_pending_sam_point_request(self) -> None:
+        if self._pending_sam_point_request is None:
+            return
+        if (self.sam_point_worker is not None and self.sam_point_worker.isRunning()) or (
+            self.sam_worker is not None and self.sam_worker.isRunning()
+        ):
+            return
+        req_id, img_path, points = self._pending_sam_point_request
+        self._pending_sam_point_request = None
+        if (
+            self._doc is None
+            or not self.canvas.sam_pointing()
+            or req_id != self._sam_point_req_id
+            or self._doc.image_path != img_path
+        ):
+            return
+        self._launch_sam_point_worker(req_id, img_path, points)
+
+    def _on_sam_point_worker_done(self) -> None:
+        self._refresh_action_states()
+        self._drain_pending_sam_point_request()
+
+    def _on_sam_point_finished(self, req_id: int, img_path_str: str, coords: object) -> None:
+        if (
+            self._doc is None
+            or req_id != self._sam_point_req_id
+            or str(self._doc.image_path.resolve()) != img_path_str
+            or not self.canvas.sam_pointing()
+        ):
+            return
+        if isinstance(coords, tuple) and len(coords) == 4:
+            x1, y1, x2, y2 = (float(v) for v in coords)
+            self.canvas.set_sam_preview_rect((x1, y1, x2, y2), predicting=False)
+            self.save_state_label.setText("SAM 预览就绪：Enter 确认落框，右键排除背景，Esc 取消")
+        else:
+            self.canvas.set_sam_preview_rect(None, predicting=False)
+            self.save_state_label.setText("SAM 未分割出有效目标轮廓，可继续补点或 Esc 取消")
+
+    def _on_sam_point_failed(self, req_id: int, msg: str) -> None:
+        if req_id != self._sam_point_req_id:
+            return
+        self.canvas.set_sam_preview_rect(None, predicting=False)
+        self.save_state_label.setText("SAM 点选分割失败")
+        QMessageBox.warning(self, "本地 SAM 点选标注失败", msg)
+
+    def _commit_sam_point_preview(self) -> None:
+        """将当前画布上的 SAM 点选预览框落盘为正式矩形标注并重置点选草稿（保持点选模式连续标注）。"""
+        if self._doc is None:
+            return
+        rect = self.canvas.sam_preview_rect()
+        if rect is None:
+            return
+        x1, y1, x2, y2 = rect
+        if (x2 - x1) < AnnotationCanvasView.MIN_BOX_SIZE_PX or (
+            y2 - y1
+        ) < AnnotationCanvasView.MIN_BOX_SIZE_PX:
+            return
+
+        label = self._active_label
+        if not label:
+            dlg = _LabelPickerDialog(self._classes, title="为 SAM 点选框指定类别", parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            label = dlg.selected_label()
+            self._set_active_class(label)
+
+        self._push_undo_snapshot()
+        new_box = RectAnnotation(
+            label=label,
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            description="sam_point: 本地 SAM 点选标注",
+            flags={"llm_added": False, "box_refined": True},
+        )
+        if self._doc.image_width > 0 and self._doc.image_height > 0:
+            new_box = new_box.clamped(self._doc.image_width, self._doc.image_height)
+        self._doc.boxes.append(new_box)
+        self._sam_point_req_id += 1
+        self._pending_sam_point_request = None
+        self.canvas.clear_sam_prompt(emit_signal=False)
+        new_idx = len(self._doc.boxes) - 1
+        self._apply_boxes_change(selected_idx=new_idx)
+        self.save_state_label.setText(f"已落框「{label}」（Ctrl+Z 可撤回）")
+        self.canvas.show_hud_message(
+            f"已通过 SAM 点选标注「{label}」· 可继续点击下一个目标",
+            color="#0d9488",
+            duration_ms=1500,
+        )
+
+    def _on_llm_fix_box_clicked(self) -> None:
+        """对当前选中的单个目标框发起局部裁剪 AI 精修（复用第 3 页 LLM 配置与辅助判定规则）。"""
+        if self._doc is None:
+            return
+        sel = self.canvas.selected_index()
+        if not (0 <= sel < len(self._doc.boxes)):
+            QMessageBox.information(self, "提示", "请先在画布或右侧列表中选中需要精修的单个目标框。")
+            return
+        if self.llm_fix_worker is not None and self.llm_fix_worker.isRunning():
+            return
+        if self._review_config_provider is None:
+            QMessageBox.warning(
+                self,
+                "未连接 LLM 配置",
+                "工作台尚未连接「3. 自动智能标注」的 LLM 配置来源，请先在「3. 自动智能标注」完成模型与凭据配置。",
+            )
+            return
+
+        cfg = self._review_config_provider()
+        if self._llm_fix_client_override is None:
+            from yolo_studio.core.mllm_reviewer import MllmProvider
+
+            if not (cfg.model_name or "").strip():
+                QMessageBox.warning(
+                    self,
+                    "缺少 LLM 模型配置",
+                    "请先在「3. 自动智能标注 → 2. 大语言模型 (LLM) 配置」中填写模型名称。",
+                )
+                return
+            if cfg.provider == MllmProvider.GEMINI:
+                if not ((cfg.api_key or "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()):
+                    QMessageBox.warning(
+                        self,
+                        "缺少 Gemini API Key",
+                        "未检测到 Gemini API Key：请先在「3. 自动智能标注」中填写 API Key，或配置环境变量 GEMINI_API_KEY。",
+                    )
+                    return
+            elif cfg.provider == MllmProvider.OPENAI:
+                if not ((cfg.api_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()):
+                    QMessageBox.warning(
+                        self,
+                        "缺少 OpenAI API Key",
+                        "未检测到 OpenAI API Key：请先在「3. 自动智能标注」中填写 API Key，或配置环境变量 OPENAI_API_KEY。",
+                    )
+                    return
+            else:
+                if not (cfg.base_url or "").strip():
+                    QMessageBox.warning(
+                        self,
+                        "缺少接口地址",
+                        "请先在「3. 自动智能标注」中填写 OpenAI 兼容接口的 Base URL。",
+                    )
+                    return
+                if (
+                    not (cfg.api_key or "").strip()
+                    and not os.environ.get("OPENAI_API_KEY", "").strip()
+                    and not _is_local_or_lan_url(cfg.base_url)
+                ):
+                    QMessageBox.warning(
+                        self,
+                        "缺少 API Key",
+                        "未检测到 API Key 或环境变量 OPENAI_API_KEY，请先在「3. 自动智能标注」中配置凭据。",
+                    )
+                    return
+
+        merged_classes: list[str] = []
+        seen: set[str] = set()
+        for raw_cls in list(self._classes) + list(getattr(cfg, "allowed_classes", []) or []):
+            name = str(raw_cls).strip()
+            if name and name not in seen:
+                seen.add(name)
+                merged_classes.append(name)
+
+        target_box = self._doc.boxes[sel].clone()
+        self.llm_fix_worker = _SingleBoxLlmFixWorker(
+            self._doc.image_path,
+            sel,
+            target_box,
+            cfg,
+            merged_classes,
+            client_override=self._llm_fix_client_override,
+        )
+        self.llm_fix_worker.fix_ready.connect(self._on_llm_fix_finished)
+        self.llm_fix_worker.failed.connect(self._on_llm_fix_failed)
+        self.llm_fix_worker.finished.connect(self._refresh_action_states)
+        self._refresh_action_states()
+        model_label = (cfg.model_name or "LLM").strip()
+        self.save_state_label.setText(f"正在使用 {model_label} 局部精修框 #{sel + 1}...")
+        self.canvas.show_hud_message(
+            f"正在使用 {model_label} 局部精修选中框 #{sel + 1}（仅上传单框局部图）...",
+            color="#0969da",
+            duration_ms=4000,
+        )
+        self.llm_fix_worker.start()
+
+    def _on_llm_fix_finished(
+        self, img_path_str: str, box_idx: int, orig_box_obj: object, result_obj: object
+    ) -> None:
+        if self._doc is None or str(self._doc.image_path.resolve()) != img_path_str:
+            self.save_state_label.setText("已切离原图，跳过单框 AI 精修回填")
+            return
+        if not (0 <= box_idx < len(self._doc.boxes)) or not isinstance(orig_box_obj, RectAnnotation):
+            self.save_state_label.setText("目标框列表已变化，跳过单框 AI 精修回填")
+            return
+
+        cur = self._doc.boxes[box_idx]
+        same_target = (
+            cur.label == orig_box_obj.label
+            and abs(cur.x1 - orig_box_obj.x1) <= 1e-2
+            and abs(cur.y1 - orig_box_obj.y1) <= 1e-2
+            and abs(cur.x2 - orig_box_obj.x2) <= 1e-2
+            and abs(cur.y2 - orig_box_obj.y2) <= 1e-2
+        )
+        if not same_target:
+            self.save_state_label.setText("该框在请求期间已被手动修改，已跳过 AI 覆盖")
+            return
+
+        action = str(getattr(result_obj, "action", "keep"))
+        reason = str(getattr(result_obj, "reason", "") or "").strip()
+        reason_suffix = f"：{reason}" if reason else ""
+
+        if action == "delete":
+            self._push_undo_snapshot()
+            self._doc.boxes.pop(box_idx)
+            next_sel = min(box_idx, len(self._doc.boxes) - 1)
+            self._apply_boxes_change(selected_idx=next_sel)
+            msg = f"AI 判定误检已删除{reason_suffix}（Ctrl+Z 可撤回）"
+            self.save_state_label.setText(msg)
+            self.canvas.show_hud_message(msg, color="#cf222e", duration_ms=2600)
+            return
+
+        new_label = str(getattr(result_obj, "label", cur.label) or cur.label).strip() or cur.label
+        relabeled = bool(getattr(result_obj, "relabeled", False)) and new_label != cur.label
+        refined = bool(getattr(result_obj, "refined", False))
+
+        if not relabeled and not refined:
+            msg = f"AI 核验通过，原框已符合规则{reason_suffix}"
+            self.save_state_label.setText(msg)
+            self.canvas.show_hud_message(msg, color="#1a7f37", duration_ms=2200)
+            return
+
+        self._push_undo_snapshot()
+        if new_label not in self._classes:
+            self._classes.append(new_label)
+        flags = copy.deepcopy(cur.flags)
+        if refined:
+            flags["box_refined"] = True
+        new_desc = cur.description
+        if reason:
+            tag = "ai_fix_relabel_refine" if (relabeled and refined) else ("ai_fix_relabel" if relabeled else "ai_fix_refine")
+            new_desc = f"{tag}: {reason}"
+
+        updated = RectAnnotation(
+            label=new_label,
+            x1=float(getattr(result_obj, "x1", cur.x1)),
+            y1=float(getattr(result_obj, "y1", cur.y1)),
+            x2=float(getattr(result_obj, "x2", cur.x2)),
+            y2=float(getattr(result_obj, "y2", cur.y2)),
+            score=cur.score,
+            description=new_desc,
+            difficult=cur.difficult,
+            group_id=cur.group_id,
+            flags=flags,
+        )
+        if self._doc.image_width > 0 and self._doc.image_height > 0:
+            updated = updated.clamped(self._doc.image_width, self._doc.image_height)
+        self._doc.boxes[box_idx] = updated
+        self._apply_boxes_change(selected_idx=box_idx)
+
+        change_parts: list[str] = []
+        if relabeled:
+            change_parts.append(f"改类 {cur.label}→{new_label}")
+        if refined:
+            change_parts.append("已精修边框")
+        summary = "AI " + "、".join(change_parts) + f"{reason_suffix}（Ctrl+Z 可撤回）"
+        self.save_state_label.setText(summary)
+        self.canvas.show_hud_message(summary, color="#0969da", duration_ms=2600)
+
+    def _on_llm_fix_failed(self, msg: str) -> None:
+        self.save_state_label.setText("AI 局部精修失败")
+        QMessageBox.warning(self, "单框 AI 局部精修失败", msg)
 
     # ------------------------------------------------------------------
     # 右侧目标框列表与画布双向同步
@@ -2363,8 +2961,13 @@ class LabelingStudioTab(QWidget):
         dup_act = menu.addAction("复制框 (Ctrl+D)")
         copy_act = menu.addAction("复制到剪贴板 (Ctrl+C)")
         sam_act = menu.addAction("SAM 贴边收框")
-        sam_busy = self.sam_worker is not None and self.sam_worker.isRunning()
+        sam_busy = (self.sam_worker is not None and self.sam_worker.isRunning()) or (
+            self.sam_point_worker is not None and self.sam_point_worker.isRunning()
+        )
         sam_act.setEnabled(not sam_busy)
+        llm_act = menu.addAction("AI 精修此框 (G)")
+        llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
+        llm_act.setEnabled(not llm_busy)
         menu.addSeparator()
         del_act = menu.addAction("删除框 (Del)")
         chosen = menu.exec(self.shape_list.mapToGlobal(pos))
@@ -2378,6 +2981,8 @@ class LabelingStudioTab(QWidget):
             self._copy_boxes_to_clipboard()
         elif chosen is sam_act:
             self._on_sam_refine_clicked()
+        elif chosen is llm_act:
+            self._on_llm_fix_box_clicked()
         elif chosen is del_act:
             self._delete_selected_box()
 
@@ -2393,8 +2998,13 @@ class LabelingStudioTab(QWidget):
             dup_act = menu.addAction("复制框 (Ctrl+D)")
             copy_act = menu.addAction("复制到剪贴板 (Ctrl+C)")
             sam_act = menu.addAction("SAM 贴边收框")
-            sam_busy = self.sam_worker is not None and self.sam_worker.isRunning()
+            sam_busy = (self.sam_worker is not None and self.sam_worker.isRunning()) or (
+                self.sam_point_worker is not None and self.sam_point_worker.isRunning()
+            )
             sam_act.setEnabled(not sam_busy)
+            llm_act = menu.addAction("AI 精修此框 (G)")
+            llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
+            llm_act.setEnabled(not llm_busy)
             menu.addSeparator()
             del_act = menu.addAction("删除框 (Del)")
             chosen = menu.exec(global_pos)
@@ -2408,6 +3018,8 @@ class LabelingStudioTab(QWidget):
                 self._copy_boxes_to_clipboard()
             elif chosen is sam_act:
                 self._on_sam_refine_clicked()
+            elif chosen is llm_act:
+                self._on_llm_fix_box_clicked()
             elif chosen is del_act:
                 self._delete_selected_box()
             return
@@ -2418,6 +3030,9 @@ class LabelingStudioTab(QWidget):
         draw_act = menu.addAction("画矩形框 (R)")
         draw_act.setCheckable(True)
         draw_act.setChecked(self.canvas.drawing())
+        sam_pt_act = menu.addAction("SAM 点选标注 (Q)")
+        sam_pt_act.setCheckable(True)
+        sam_pt_act.setChecked(self.canvas.sam_pointing())
         pan_act = menu.addAction("抓手平移 (H)")
         pan_act.setCheckable(True)
         pan_act.setChecked(self.canvas.panning_mode())
@@ -2438,6 +3053,8 @@ class LabelingStudioTab(QWidget):
             self.canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
         elif chosen is draw_act:
             self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
+        elif chosen is sam_pt_act:
+            self.canvas.set_mode(AnnotationCanvasView.MODE_SAM_POINT)
         elif chosen is pan_act:
             self.canvas.set_mode(AnnotationCanvasView.MODE_PAN)
         elif chosen is paste_act:
@@ -2496,10 +3113,12 @@ class LabelingStudioTab(QWidget):
 
     def _on_canvas_mode_changed(self, mode: str) -> None:
         is_draw = mode == AnnotationCanvasView.MODE_DRAW
+        is_sam_point = mode == AnnotationCanvasView.MODE_SAM_POINT
         is_pan = mode == AnnotationCanvasView.MODE_PAN
-        is_edit = not is_draw and not is_pan
+        is_edit = not is_draw and not is_sam_point and not is_pan
         self.edit_mode_btn.setChecked(is_edit)
         self.draw_mode_btn.setChecked(is_draw)
+        self.sam_point_mode_btn.setChecked(is_sam_point)
         self.pan_mode_btn.setChecked(is_pan)
         if is_draw:
             self.mode_badge_label.setText("模式: 画框 (拖/两点 · Esc退出)")
@@ -2509,6 +3128,17 @@ class LabelingStudioTab(QWidget):
             if self.isVisible() and self._doc is not None:
                 self.canvas.show_hud_message(
                     "画框模式：按住拖拽，或轻点起点+终点成框（Esc 退出）", color="#cf222e"
+                )
+        elif is_sam_point:
+            self.mode_badge_label.setText("模式: SAM点选 (左前景/右排除 · Enter落框)")
+            self.mode_badge_label.setStyleSheet(
+                "border: none; color: #0d9488; font-weight: 600; font-size: 12px;"
+            )
+            if self.isVisible() and self._doc is not None:
+                self.canvas.show_hud_message(
+                    "SAM 点选标注：左键点目标生成贴边框，右键排除武器/特效，Enter 确认落框（Esc 退出）",
+                    color="#0d9488",
+                    duration_ms=2600,
                 )
         elif is_pan:
             self.mode_badge_label.setText("模式: 抓手平移 (Esc返回)")

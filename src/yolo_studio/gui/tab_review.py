@@ -1445,6 +1445,10 @@ class MllmReviewTab(QWidget):
             return
         self.classes_edit.setText(", ".join(classes))
 
+    def build_current_config(self) -> MllmReviewConfig:
+        """按当前表单控件组装 `MllmReviewConfig`（供标注工作台单框 AI 精修等跨页能力复用接口与规则）。"""
+        return self._build_current_config()
+
     def _build_current_config(self) -> MllmReviewConfig:
         """按当前表单控件组装 `MllmReviewConfig`（不校验目录磁盘存在性，供测试连接与智能标注启动复用）。"""
         raw_classes = self.classes_edit.text().replace("，", ",")

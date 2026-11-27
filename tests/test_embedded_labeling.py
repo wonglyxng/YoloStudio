@@ -1836,3 +1836,282 @@ def test_mainwindow_uses_title_bar_status_without_bottom_statusbar(
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_workbench_sam_point_mode_multi_point_commit_undo_and_escape(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证工作台本地 SAM 点选模式（Q 切换、左键前景/右键排除背景、数字键切类不误改旧框、Backspace 撤点、Enter 落框与 Esc 两段退出）。"""
+    from PyQt6.QtCore import QPointF
+
+    from yolo_studio.gui.annotation_canvas import AnnotationCanvasView
+
+    frames_dir = tmp_path / "sam_point_frames"
+    img_p = frames_dir / "frame_01.jpg"
+    _write_sample_frame(img_p, size=(400, 300))
+    cls_file = tmp_path / "classes.txt"
+    cls_file.write_text("player\nmonster\nloot\n", encoding="utf-8")
+
+    # 注入离线模拟 SAM 引擎：仅前景点返回宽松框，加入右键排除点后返回去掉武器特效后的紧贴框
+    sam_calls: list[tuple[list[tuple[float, float]], list[int]]] = []
+
+    class _FakeSamPointRefiner:
+        def segment_by_points(self, _img_bgr, points, labels):
+            sam_calls.append((list(points), list(labels)))
+            if 0 in labels:
+                return (110.0, 70.0, 190.0, 170.0)
+            return (100.0, 60.0, 240.0, 180.0)
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    win.activateWindow()
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir, classes_file=cls_file) is True
+        qt_app.processEvents()
+        tab.canvas.set_zoom(1.0)
+        qt_app.processEvents()
+
+        # 先画一个初始 player 框，用来验证点选模式下按数字键 2 不会误改已有框
+        tab.canvas.box_drawn.emit(10.0, 10.0, 60.0, 60.0)
+        assert tab._doc is not None and len(tab._doc.boxes) == 1
+        assert tab._doc.boxes[0].label == "player"
+
+        device = tab._resolve_sam_device()
+        tab._sam_refiner_cache[("sam2.1_t.pt", device)] = _FakeSamPointRefiner()
+
+        # 1) 按 Q 进入 SAM 点选标注模式
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Q)
+        qt_app.processEvents()
+        assert tab.canvas.sam_pointing() is True
+        assert tab.sam_point_mode_btn.isChecked() is True
+
+        # 2) 点选模式下按数字键 2 仅切换待落框类别为 monster，不误改已选中的旧框 0
+        QTest.keyClick(tab.canvas, Qt.Key.Key_2)
+        qt_app.processEvents()
+        assert tab._active_label == "monster"
+        assert tab._doc.boxes[0].label == "player"
+
+        def _wait_sam_point() -> None:
+            deadline = time.monotonic() + 5.0
+            while (
+                tab.sam_point_worker is not None
+                and tab.sam_point_worker.isRunning()
+                and time.monotonic() < deadline
+            ):
+                qt_app.processEvents()
+                time.sleep(0.02)
+            qt_app.processEvents()
+
+        # 3) 左键点击目标添加前景正点 -> 生成初始预览框
+        pos_vp = tab.canvas.mapFromScene(QPointF(150.0, 120.0))
+        QTest.mouseClick(tab.canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos_vp)
+        _wait_sam_point()
+        assert len(tab.canvas.sam_points()) == 1
+        assert tab.canvas.sam_points()[0][2] == 1
+        assert tab.canvas.sam_preview_rect() == (100.0, 60.0, 240.0, 180.0)
+
+        # 4) 右键轻点武器区域添加背景排除点 -> 预览框实时收紧去除武器
+        neg_vp = tab.canvas.mapFromScene(QPointF(220.0, 120.0))
+        QTest.mousePress(tab.canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, neg_vp)
+        QTest.mouseRelease(tab.canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, neg_vp)
+        _wait_sam_point()
+        assert [p[2] for p in tab.canvas.sam_points()] == [1, 0]
+        assert tab.canvas.sam_preview_rect() == (110.0, 70.0, 190.0, 170.0)
+
+        # 5) Backspace 撤回负点后重算回宽松预览，再补回负点并按 Enter 正式落框
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Backspace)
+        _wait_sam_point()
+        assert [p[2] for p in tab.canvas.sam_points()] == [1]
+        assert tab.canvas.sam_preview_rect() == (100.0, 60.0, 240.0, 180.0)
+
+        QTest.mousePress(tab.canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, neg_vp)
+        QTest.mouseRelease(tab.canvas.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, neg_vp)
+        _wait_sam_point()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Return)
+        qt_app.processEvents()
+
+        assert len(tab._doc.boxes) == 2
+        added = tab._doc.boxes[1]
+        assert added.label == "monster"
+        assert (added.x1, added.y1, added.x2, added.y2) == (110.0, 70.0, 190.0, 170.0)
+        assert added.flags.get("box_refined") is True
+        # 落框后清空草稿但仍停留在点选模式，方便继续点标下一个漏标
+        assert tab.canvas.sam_pointing() is True
+        assert tab.canvas.has_sam_prompt() is False
+
+        # 6) 再次左键点出一个草稿，按 Esc 第一次仅清草稿，按 Esc 第二次退出回编辑模式
+        QTest.mouseClick(tab.canvas.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos_vp)
+        _wait_sam_point()
+        assert tab.canvas.has_sam_prompt() is True
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Escape)
+        qt_app.processEvents()
+        assert tab.canvas.has_sam_prompt() is False
+        assert tab.canvas.sam_pointing() is True
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Escape)
+        qt_app.processEvents()
+        assert tab.canvas.mode == AnnotationCanvasView.MODE_EDIT
+
+        # 7) Ctrl+Z 可一键撤回刚才落盘的 SAM 点选框
+        tab._undo()
+        assert len(tab._doc.boxes) == 1
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+def test_workbench_single_box_llm_fix_reuses_review_config_and_undo(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证工作台单框 AI 精修（G 快捷键与按钮）复用第 3 页配置与辅助规则、不误动其他框且支持 Ctrl+Z 撤回。"""
+    from yolo_studio.core.mllm_reviewer import BoxDecision, MllmProvider, MllmReviewResponse
+
+    frames_dir = tmp_path / "llm_fix_frames"
+    img_p = frames_dir / "scene.jpg"
+    _write_sample_frame(img_p, size=(400, 300))
+    init_json = {
+        "version": "2.4.4",
+        "flags": {},
+        "shapes": [
+            {
+                "label": "monster",
+                "points": [[100.0, 80.0], [200.0, 180.0]],
+                "shape_type": "rectangle",
+                "flags": {},
+            },
+            {
+                "label": "loot",
+                "points": [[300.0, 200.0], [340.0, 240.0]],
+                "shape_type": "rectangle",
+                "flags": {},
+            },
+        ],
+        "imagePath": img_p.name,
+        "imageData": None,
+        "imageHeight": 300,
+        "imageWidth": 400,
+    }
+    img_p.with_suffix(".json").write_text(json.dumps(init_json, ensure_ascii=False), encoding="utf-8")
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    win.activateWindow()
+    qt_app.processEvents()
+    try:
+        # 在第 3 页填写辅助判定规则与类别，确认工作台自动复用
+        win.review_tab.classes_edit.setText("player, monster, loot")
+        win.review_tab.guideline_edit.setText("只框主体，不含武器及特效")
+
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+
+        # 未选中框时 AI修框按钮应禁用
+        assert tab.llm_fix_btn.isEnabled() is False
+
+        # 选中第 0 个框后按钮启用
+        tab.canvas.select_box(0, emit_signal=True)
+        qt_app.processEvents()
+        assert tab.llm_fix_btn.isEnabled() is True
+        assert tab.box_llm_fix_inline_btn.isEnabled() is True
+
+        # 验证缺少 API Key 时前置拦截且弹出中文提示
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            staticmethod(lambda _p, title, text: warnings.append(f"{title}:{text}")),
+        )
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        idx_openai = win.review_tab.provider_combo.findData(MllmProvider.OPENAI)
+        win.review_tab.provider_combo.setCurrentIndex(idx_openai)
+        win.review_tab.api_key_edit.clear()
+        tab._on_llm_fix_box_clicked()
+        assert len(warnings) == 1
+        assert "API Key" in warnings[0]
+        assert tab.llm_fix_worker is None
+
+        # 注入离线模拟 LLM 客户端测试完整后台线程：1) 改类+收框 2) 误检删除
+        calls: list[tuple[list, str]] = []
+        scripted: list[MllmReviewResponse] = [
+            MllmReviewResponse(
+                box_reviews=[
+                    BoxDecision(
+                        box_id=0,
+                        action="relabel",
+                        new_label="player",
+                        box_quality="loose",
+                        refined_box_2d=[260, 260, 740, 740],
+                        reason="主体为玩家且去掉了武器特效",
+                    )
+                ]
+            ),
+            MllmReviewResponse(
+                box_reviews=[
+                    BoxDecision(box_id=0, action="delete", reason="背景特效误检")
+                ]
+            ),
+        ]
+
+        class _FakeFixClient:
+            def review_image(self, _overview, crops, sys_prompt, _user_prompt):
+                calls.append((list(crops), sys_prompt))
+                return scripted.pop(0)
+
+            def close(self) -> None:
+                pass
+
+        tab._llm_fix_client_override = _FakeFixClient()
+
+        def _wait_llm_fix() -> None:
+            deadline = time.monotonic() + 5.0
+            while (
+                tab.llm_fix_worker is not None
+                and tab.llm_fix_worker.isRunning()
+                and time.monotonic() < deadline
+            ):
+                qt_app.processEvents()
+                time.sleep(0.02)
+            qt_app.processEvents()
+
+        # 1) 按 G 触发选中框 0 局部 AI 精修
+        QTest.keyClick(tab.canvas, Qt.Key.Key_G)
+        _wait_llm_fix()
+        assert len(calls) == 1
+        assert calls[0][0] == []
+        assert "只框主体，不含武器及特效" in calls[0][1]
+        assert tab._doc is not None and len(tab._doc.boxes) == 2
+        b0 = tab._doc.boxes[0]
+        assert b0.label == "player"
+        assert b0.flags.get("box_refined") is True
+        assert b0.x1 > 100.0 and b0.x2 < 200.0
+        assert "武器特效" in b0.description
+        # 未选中的第 1 个框毫发无损
+        b1 = tab._doc.boxes[1]
+        assert b1.label == "loot"
+        assert (b1.x1, b1.y1, b1.x2, b1.y2) == (300.0, 200.0, 340.0, 240.0)
+
+        # Ctrl+Z 一键撤回改类与收框
+        tab._undo()
+        assert tab._doc.boxes[0].label == "monster"
+        assert tab._doc.boxes[0].x1 == 100.0
+
+        # 2) 重新选中框 0，触发 AI 判定误检删除并验证 Ctrl+Z 撤回
+        tab.canvas.select_box(0, emit_signal=True)
+        tab._on_llm_fix_box_clicked()
+        _wait_llm_fix()
+        assert len(tab._doc.boxes) == 1
+        assert tab._doc.boxes[0].label == "loot"
+        tab._undo()
+        assert len(tab._doc.boxes) == 2
+        assert tab._doc.boxes[0].label == "monster"
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+

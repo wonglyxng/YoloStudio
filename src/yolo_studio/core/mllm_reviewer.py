@@ -2073,11 +2073,54 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
         return False, f"接口连接失败（耗时 {elapsed:.2f}s）: {_format_exception_detail(exc)}"
 
 
+def _mask_to_point_prompt_xyxy(
+    binary_mask: np.ndarray,
+    points: list[tuple[float, float]],
+    labels: list[int],
+    img_w: int,
+    img_h: int,
+) -> tuple[float, float, float, float] | None:
+    """从点提示分割出的二值掩码提取紧贴目标的外接矩形，自动过滤远离前景点的孤立噪点连通域。"""
+    if binary_mask.ndim != 2 or not np.any(binary_mask):
+        return None
+    mh, mw = binary_mask.shape[:2]
+    mask = binary_mask
+    if mh != img_h or mw != img_w:
+        mask = cv2.resize(binary_mask.astype(np.float32), (img_w, img_h), interpolation=cv2.INTER_NEAREST) > 0.5
+
+    pos_points = [(x, y) for (x, y), lbl in zip(points, labels) if int(lbl) == 1]
+    filtered = mask
+    if pos_points:
+        num_labels, comp_map = cv2.connectedComponents(mask.astype(np.uint8))
+        if num_labels > 2:
+            hit_ids: set[int] = set()
+            for px, py in pos_points:
+                ix = max(0, min(img_w - 1, int(round(px))))
+                iy = max(0, min(img_h - 1, int(round(py))))
+                patch = comp_map[max(0, iy - 1) : min(img_h, iy + 2), max(0, ix - 1) : min(img_w, ix + 2)]
+                for cid in np.unique(patch):
+                    if int(cid) > 0:
+                        hit_ids.add(int(cid))
+            if hit_ids:
+                filtered = np.isin(comp_map, list(hit_ids))
+
+    ys, xs = np.nonzero(filtered)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    nx1 = max(0.0, float(int(xs.min())))
+    ny1 = max(0.0, float(int(ys.min())))
+    nx2 = min(float(img_w), float(int(xs.max()) + 1))
+    ny2 = min(float(img_h), float(int(ys.max()) + 1))
+    if (nx2 - nx1) <= 2.0 or (ny2 - ny1) <= 2.0:
+        return None
+    return nx1, ny1, nx2, ny2
+
+
 class UltralyticsSamBoxRefiner:
-    """基于 `ultralytics.SAM` 的本地像素级边框紧贴修正器（Box Prompt → 掩码最小外接矩形）。
+    """基于 `ultralytics.SAM` 的本地像素级边框紧贴与点选分割引擎（支持 Box Prompt 收框与 Point Prompt 点选成框）。
 
     线程安全与运行环境：
-        内部持有 `threading.Lock` 串行化 GPU/CPU 模型推理，保证多并发 LLM 标注线程共享同一 SAM 实例时
+        内部持有 `threading.Lock` 串行化 GPU/CPU 模型推理，保证多并发线程共享同一 SAM 实例时
         不发生 CUDA 上下文争抢；若本地不存在权重，Ultralytics 会按模型名称自动下载。
     """
 
@@ -2144,6 +2187,45 @@ class UltralyticsSamBoxRefiner:
             if (nx2 - nx1) > 2.0 and (ny2 - ny1) > 2.0:
                 refined_map[box.box_id] = (nx1, ny1, min(float(img_w), nx2), min(float(img_h), ny2))
         return refined_map
+
+    def segment_by_points(
+        self,
+        image_bgr: np.ndarray,
+        points: list[tuple[float, float]],
+        labels: list[int],
+    ) -> tuple[float, float, float, float] | None:
+        """按单目标多点正负提示（`1` 前景、`0` 排除背景）执行本地 SAM 掩码分割并返回最小外接矩形。
+
+        输入约定：
+            `points` 为原图像素坐标列表 `[(x, y), ...]`，`labels` 为等长的 `1`/`0` 整数列表且至少含一个前景点；
+            内部按 Ultralytics `SAM2Predictor._prepare_prompts` 的单目标多点形状 `(1, K, 2)` 与 `(1, K)` 传入。
+        """
+        if not points or len(points) != len(labels):
+            return None
+        if not any(int(lbl) == 1 for lbl in labels):
+            return None
+
+        img_h, img_w = image_bgr.shape[:2]
+        points_arg = [[[float(x), float(y)] for x, y in points]]
+        labels_arg = [[1 if int(lbl) == 1 else 0 for lbl in labels]]
+        with self._lock:
+            results = self._model.predict(
+                source=image_bgr,
+                points=points_arg,
+                labels=labels_arg,
+                device=self.device,
+                verbose=False,
+            )
+
+        if not results:
+            return None
+        masks = getattr(results[0], "masks", None)
+        if masks is None or getattr(masks, "data", None) is None:
+            return None
+        mask_arr = masks.data.detach().cpu().numpy()
+        if len(mask_arr) == 0:
+            return None
+        return _mask_to_point_prompt_xyxy(mask_arr[0] > 0.5, points, labels, img_w, img_h)
 
 
 class UltralyticsSam3Detector:
@@ -4277,6 +4359,227 @@ def _draw_labeled_boxes(
     bar = np.full((bar_h, w, 3), 30, dtype=np.uint8)
     cv2.putText(bar, banner_text, (10, int(bar_h * 0.72)), cv2.FONT_HERSHEY_SIMPLEX, max(0.55, font_scale), (240, 240, 240), 2, cv2.LINE_AA)
     return np.vstack([bar, canvas])
+
+
+@dataclass
+class SingleBoxFixResult:
+    """工作台单框局部 AI 精修结果（仅裁剪该目标周边局部图送检，极省 Token）。"""
+
+    action: Literal["keep", "relabel", "delete"]
+    label: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    refined: bool = False
+    relabeled: bool = False
+    reason: str = ""
+    box_quality: Literal["tight", "loose", "partial"] = "tight"
+
+
+def _render_single_box_fix_crop(
+    image_bgr: np.ndarray,
+    box: CandidateBox,
+    *,
+    expand_ratio: float = 0.45,
+    min_context_px: int = 48,
+    max_crop_dim: int = 640,
+) -> tuple[bytes, tuple[int, int, int, int], list[int]]:
+    """裁剪单个问题框外扩上下文局部图并用细虚线标出当前原框位置，返回 `(JPEG字节流, 裁剪区xyxy, 原框局部0-1000坐标)`。"""
+    img_h, img_w = image_bgr.shape[:2]
+    bw = max(1.0, box.x2 - box.x1)
+    bh = max(1.0, box.y2 - box.y1)
+    mx = max(bw * expand_ratio, float(min_context_px))
+    my = max(bh * expand_ratio, float(min_context_px))
+    cx1 = max(0, int(round(box.x1 - mx)))
+    cy1 = max(0, int(round(box.y1 - my)))
+    cx2 = min(img_w, int(round(box.x2 + mx)))
+    cy2 = min(img_h, int(round(box.y2 + my)))
+    if (cx2 - cx1) < 8 or (cy2 - cy1) < 8:
+        cx1, cy1, cx2, cy2 = 0, 0, img_w, img_h
+
+    crop = image_bgr[cy1:cy2, cx1:cx2].copy()
+    cw = max(1, cx2 - cx1)
+    ch = max(1, cy2 - cy1)
+    lx1 = max(0, min(cw - 1, int(round(box.x1 - cx1))))
+    ly1 = max(0, min(ch - 1, int(round(box.y1 - cy1))))
+    lx2 = max(0, min(cw - 1, int(round(box.x2 - cx1))))
+    ly2 = max(0, min(ch - 1, int(round(box.y2 - cy1))))
+    # 使用双层细虚线标出原框参考位置，既在明暗背景下均清晰可见，又不遮挡目标边缘像素
+    _draw_dashed_rect(crop, (lx1, ly1), (lx2, ly2), (0, 0, 0), thickness=2, dash_len=6)
+    _draw_dashed_rect(crop, (lx1, ly1), (lx2, ly2), (255, 220, 40), thickness=1, dash_len=6)
+
+    cur_norm = [
+        int(round(max(0.0, min(1000.0, ((box.y1 - cy1) / float(ch)) * 1000.0)))),
+        int(round(max(0.0, min(1000.0, ((box.x1 - cx1) / float(cw)) * 1000.0)))),
+        int(round(max(0.0, min(1000.0, ((box.y2 - cy1) / float(ch)) * 1000.0)))),
+        int(round(max(0.0, min(1000.0, ((box.x2 - cx1) / float(cw)) * 1000.0)))),
+    ]
+    crop_jpeg = _encode_jpeg_bytes(crop, max_dim=max_crop_dim, quality=92)
+    return crop_jpeg, (cx1, cy1, cx2, cy2), cur_norm
+
+
+def _build_single_box_fix_prompts(
+    box: CandidateBox,
+    allowed_classes: list[str],
+    cur_norm_box_2d: list[int],
+    custom_guideline: str = "",
+) -> tuple[str, str]:
+    """构造工作台单框局部精修的系统与用户提示词，复用 `MllmReviewResponse` 结构化输出协议。"""
+    classes_str = ", ".join(allowed_classes) if allowed_classes else "(any relevant object)"
+    system_prompt = (
+        "You are a precise computer vision bounding-box repair assistant. "
+        "The user selected ONE candidate bounding box inside a zoomed local crop and asked you to verify and fix ONLY that box. "
+        "Output ONLY valid JSON matching the requested schema.\n"
+        f"Allowed target classes: [{classes_str}].\n"
+        "Rules:\n"
+        "1. Evaluate ONLY the single dashed reference box `box_id=0` (ignore other nearby objects outside this target):\n"
+        "   - 'keep': the dashed box targets a valid object of its current class.\n"
+        "   - 'relabel': the dashed box targets a valid object, but its class should be changed to an EXACT name from Allowed target classes (`new_label`).\n"
+        "   - 'delete': the dashed box is pure background noise, a false positive, or explicitly excluded by guidelines.\n"
+        "2. When `action` is 'keep' or 'relabel', assess tightness (`box_quality`: 'tight' | 'loose' | 'partial'):\n"
+        "   - If the dashed box is too loose (includes excess background, excluded weapons/effects, etc.), partially clipped, or misaligned, "
+        "return `refined_box_2d` as [ymin, xmin, ymax, xmax] integers normalized to 0-1000 INSIDE THIS CROP IMAGE tightly enclosing ONLY the intended target object.\n"
+        "   - If the dashed box is already tightly and accurately aligned, set `box_quality='tight'` and `refined_box_2d=null`.\n"
+        "3. Always return `has_missing=false`, `missing_note=\"\"`, and `added_boxes=[]`."
+    )
+    if custom_guideline.strip():
+        system_prompt += f"\nDomain Annotation Guidelines:\n{custom_guideline.strip()}"
+
+    user_prompt = (
+        f"Inspect and repair ONLY the dashed reference box `box_id=0` in this zoomed crop image.\n"
+        f"- box_id=0, current label='{box.label}', current normalized box_2d [ymin, xmin, ymax, xmax] (0-1000)={cur_norm_box_2d}\n\n"
+        "Return strict JSON with keys: box_reviews (list containing ONLY one entry for box_id=0 with "
+        "{box_id: 0, action: 'keep'|'relabel'|'delete', new_label: str|null, "
+        "box_quality: 'tight'|'loose'|'partial', refined_box_2d: [ymin,xmin,ymax,xmax]|null, reason: str}), "
+        "has_missing (false), missing_note (\"\"), added_boxes ([])."
+    )
+    return system_prompt, user_prompt
+
+
+def fix_single_box_with_mllm(
+    image_bgr: np.ndarray,
+    box: CandidateBox,
+    config: MllmReviewConfig,
+    *,
+    allowed_classes: list[str] | None = None,
+    client_override: MllmClient | None = None,
+    expand_ratio: float = 0.45,
+    min_context_px: int = 48,
+    max_crop_dim: int = 640,
+) -> SingleBoxFixResult:
+    """仅裁剪单个候选框周边局部放大图送交 LLM 精修边界、核验类别或判定误检。
+
+    行为与失败方式：
+        - 仅上传 1 张包含原框虚线参考位置的局部放大图（最长边不超过 `max_crop_dim`），极大降低 Token 消耗；
+        - 外扩比例默认 `0.45` 且至少保留 `min_context_px` 像素上下文，同时支持缩紧过松框与补全截断偏小框；
+        - 未传 `client_override` 时按 `config` 创建临时客户端并在退出前自动关闭；
+        - 接口异常或响应非法时向上抛出，由调用方展示错误并保留原框不变。
+    """
+    img_h, img_w = image_bgr.shape[:2]
+    classes = [
+        c.strip()
+        for c in (allowed_classes if allowed_classes is not None else config.allowed_classes)
+        if c.strip()
+    ]
+    if box.label and box.label not in classes:
+        classes = list(classes) + [box.label]
+
+    crop_jpeg, crop_region, cur_norm = _render_single_box_fix_crop(
+        image_bgr,
+        box,
+        expand_ratio=expand_ratio,
+        min_context_px=min_context_px,
+        max_crop_dim=max_crop_dim,
+    )
+    system_prompt, user_prompt = _build_single_box_fix_prompts(
+        box, classes, cur_norm, custom_guideline=config.custom_guideline
+    )
+
+    owns_client = client_override is None
+    client = client_override or build_mllm_client(config)
+    try:
+        response = client.review_image(crop_jpeg, [], system_prompt, user_prompt)
+    finally:
+        if owns_client:
+            _close_client_safely(client)
+
+    decision: BoxDecision | None = None
+    for item in response.box_reviews:
+        if item.box_id == 0:
+            decision = item
+            break
+    if decision is None and response.box_reviews:
+        decision = response.box_reviews[0]
+
+    if decision is None:
+        return SingleBoxFixResult(
+            action="keep",
+            label=box.label,
+            x1=box.x1,
+            y1=box.y1,
+            x2=box.x2,
+            y2=box.y2,
+            refined=False,
+            relabeled=False,
+            reason="模型未返回改动建议，保持原框",
+            box_quality="tight",
+        )
+
+    if decision.action == "delete":
+        return SingleBoxFixResult(
+            action="delete",
+            label=box.label,
+            x1=box.x1,
+            y1=box.y1,
+            x2=box.x2,
+            y2=box.y2,
+            refined=False,
+            relabeled=False,
+            reason=decision.reason.strip(),
+            box_quality=decision.box_quality,
+        )
+
+    final_action: Literal["keep", "relabel", "delete"] = "keep"
+    final_label = box.label
+    relabeled = False
+    if decision.action == "relabel":
+        resolved = _normalize_class_name(decision.new_label, classes)
+        if resolved and resolved != box.label:
+            final_label = resolved
+            final_action = "relabel"
+            relabeled = True
+
+    fx1, fy1, fx2, fy2 = box.x1, box.y1, box.x2, box.y2
+    refined = False
+    if decision.refined_box_2d:
+        mapped = map_crop_box_2d_to_image_xyxy(decision.refined_box_2d, crop_region, img_w, img_h)
+        if mapped is not None:
+            nx1, ny1, nx2, ny2 = mapped
+            probe = CandidateBox(box_id=0, label=final_label, x1=nx1, y1=ny1, x2=nx2, y2=ny2)
+            iou = _box_iou(box, probe)
+            max_delta = max(
+                abs(nx1 - box.x1),
+                abs(ny1 - box.y1),
+                abs(nx2 - box.x2),
+                abs(ny2 - box.y2),
+            )
+            if not (iou >= 0.98 and max_delta <= 1.5):
+                fx1, fy1, fx2, fy2 = nx1, ny1, nx2, ny2
+                refined = True
+
+    return SingleBoxFixResult(
+        action=final_action,
+        label=final_label,
+        x1=fx1,
+        y1=fy1,
+        x2=fx2,
+        y2=fy2,
+        refined=refined,
+        relabeled=relabeled,
+        reason=decision.reason.strip(),
+        box_quality=decision.box_quality,
+    )
 
 
 def render_review_comparison(record: ImageReviewRecord, max_width: int = 1200) -> bytes:

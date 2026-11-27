@@ -79,6 +79,7 @@ class AnnotationCanvasView(QGraphicsView):
 
     MODE_EDIT = "edit"
     MODE_DRAW = "draw"
+    MODE_SAM_POINT = "sam_point"
     MODE_PAN = "pan"
 
     MIN_ZOOM = 0.05
@@ -93,11 +94,13 @@ class AnnotationCanvasView(QGraphicsView):
     box_drawn = Signal(float, float, float, float)  # 新绘制矩形框 (x1, y1, x2, y2)
     box_geometry_committed = Signal(int, float, float, float, float)  # 拖拽/调大小提交 (index, x1, y1, x2, y2)
     selection_changed = Signal(int)  # 选中框索引变更，无选中为 -1
-    mode_changed = Signal(str)  # 交互模式变更 ("edit" | "draw" | "pan")
+    mode_changed = Signal(str)  # 交互模式变更 ("edit" | "draw" | "sam_point" | "pan")
     zoom_changed = Signal(float)  # 缩放倍率变更 (1.0 = 100%)
     cursor_pos_changed = Signal(int, int)  # 鼠标图像像素坐标变更（移出图像时发 -1, -1）
     box_double_clicked = Signal(int)  # 双击已有框（用于快速改类别）
     context_menu_requested = Signal(QPoint, int)  # 右键上下文菜单请求 (全局坐标, 命中框索引/-1)
+    sam_points_changed = Signal(list)  # SAM 点选提示点变更：[(x, y, 1|0), ...]
+    sam_prompt_commit_requested = Signal()  # 请求将当前 SAM 点选预览框落盘为正式矩形框
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -141,6 +144,11 @@ class AnnotationCanvasView(QGraphicsView):
         self._draw_dragged: bool = False
         self._draw_start: QPointF = QPointF()
         self._draw_current: QPointF = QPointF()
+
+        # SAM 点选标注交互草稿状态（支持多前景正点 + 背景排除负点与实时预览框）
+        self._sam_points: list[tuple[float, float, int]] = []
+        self._sam_preview_rect: tuple[float, float, float, float] | None = None
+        self._sam_predicting: bool = False
 
         # 编辑拖拽状态（带最小移动阈值防手抖误改）
         self._edit_action: str = "none"  # "none" | "pending_handle" | "dragging_handle" | "pending_move" | "moving_box" | "pending_blank_pan" | "blank_panning"
@@ -197,6 +205,10 @@ class AnnotationCanvasView(QGraphicsView):
         """当前是否处于绘制矩形框模式。"""
         return self._mode == self.MODE_DRAW
 
+    def sam_pointing(self) -> bool:
+        """当前是否处于本地 SAM 点选标注模式。"""
+        return self._mode == self.MODE_SAM_POINT
+
     def editing(self) -> bool:
         """当前是否处于选择与编辑矩形框模式。"""
         return self._mode == self.MODE_EDIT
@@ -204,6 +216,59 @@ class AnnotationCanvasView(QGraphicsView):
     def panning_mode(self) -> bool:
         """当前是否处于抓手平移模式。"""
         return self._mode == self.MODE_PAN
+
+    def has_sam_prompt(self) -> bool:
+        """当前是否存在未确认落框的 SAM 点选提示点或预览框。"""
+        return bool(self._sam_points) or self._sam_preview_rect is not None
+
+    def sam_points(self) -> list[tuple[float, float, int]]:
+        """返回当前 SAM 点选提示点副本列表，元素格式为 `(x, y, 1|0)`。"""
+        return list(self._sam_points)
+
+    def sam_preview_rect(self) -> tuple[float, float, float, float] | None:
+        """返回当前 SAM 点选分割生成的实时预览框 `(x1, y1, x2, y2)`；无则返回 `None`。"""
+        return self._sam_preview_rect
+
+    def set_sam_preview_rect(
+        self,
+        rect: tuple[float, float, float, float] | None,
+        *,
+        predicting: bool = False,
+    ) -> None:
+        """更新画布上的 SAM 点选预览框与推理中提示状态。"""
+        self._sam_preview_rect = rect
+        self._sam_predicting = bool(predicting)
+        self.viewport().update()
+
+    def clear_sam_prompt(self, *, emit_signal: bool = False) -> bool:
+        """清空当前 SAM 点选提示点与预览框；若原本存在草稿则返回 `True`。"""
+        had = bool(self._sam_points) or self._sam_preview_rect is not None or self._sam_predicting
+        if not had:
+            return False
+        self._sam_points.clear()
+        self._sam_preview_rect = None
+        self._sam_predicting = False
+        self.viewport().update()
+        if emit_signal:
+            self.sam_points_changed.emit([])
+        return True
+
+    def undo_last_sam_point(self) -> bool:
+        """撤销最近添加的一个 SAM 提示点并触发重新分割；若已无前景点则清空草稿。"""
+        if not self._sam_points:
+            return False
+        self._sam_points.pop()
+        if any(lbl == 1 for _, _, lbl in self._sam_points):
+            self._sam_predicting = True
+            self.viewport().update()
+            self.sam_points_changed.emit(list(self._sam_points))
+        else:
+            self._sam_points.clear()
+            self._sam_preview_rect = None
+            self._sam_predicting = False
+            self.viewport().update()
+            self.sam_points_changed.emit([])
+        return True
 
     def is_fit_mode(self) -> bool:
         """当前视图是否处于自适应窗口状态。"""
@@ -229,9 +294,9 @@ class AnnotationCanvasView(QGraphicsView):
         return self._logical_scale() * self._display_dpr()
 
     def set_active_label(self, label: str) -> None:
-        """设置当前默认绘制类别名称（仅影响草稿框预览颜色与角标显示）。"""
+        """设置当前默认绘制类别名称（同步刷新画框草稿或 SAM 点选预览颜色与角标）。"""
         self._active_label = label.strip()
-        if self._draw_state != "idle":
+        if self._draw_state != "idle" or self.has_sam_prompt():
             self.viewport().update()
 
     def set_show_labels(self, visible: bool) -> None:
@@ -272,33 +337,42 @@ class AnnotationCanvasView(QGraphicsView):
         self._update_cursor_for_hover()
 
     def set_mode(self, mode: str) -> None:
-        """在编辑模式（`edit`）、画框模式（`draw`）与抓手模式（`pan`）之间切换。"""
+        """在编辑（`edit`）、画框（`draw`）、SAM 点选（`sam_point`）与抓手（`pan`）模式间切换。"""
         if mode == self.MODE_DRAW:
             normalized = self.MODE_DRAW
+        elif mode == self.MODE_SAM_POINT:
+            normalized = self.MODE_SAM_POINT
         elif mode == self.MODE_PAN:
             normalized = self.MODE_PAN
         else:
             normalized = self.MODE_EDIT
         changed = normalized != self._mode
+        had_sam = self.has_sam_prompt()
         self._mode = normalized
         self._cancel_transient_interactions()
         self._update_cursor_for_hover()
         self.viewport().update()
+        if had_sam:
+            self.sam_points_changed.emit([])
         if changed:
             self.mode_changed.emit(self._mode)
 
     def cancel_active_draft(self) -> bool:
-        """取消当前未落地的画框草稿或框编辑拖拽；存在活跃草稿时返回 `True`。"""
+        """取消当前未落地的画框草稿、SAM 点选草稿或框编辑拖拽；存在活跃草稿时返回 `True`。"""
+        had_sam = self.has_sam_prompt() or self._sam_predicting
         had_active = (
             self._draw_state != "idle"
             or self._edit_action != "none"
             or self._panning
+            or had_sam
         )
         if not had_active:
             return False
         self._cancel_transient_interactions()
         self._update_cursor_for_hover()
         self.viewport().update()
+        if had_sam:
+            self.sam_points_changed.emit([])
         return True
 
     def set_image(
@@ -811,6 +885,9 @@ class AnnotationCanvasView(QGraphicsView):
         self._right_dragged = False
         self._draw_state = "idle"
         self._draw_dragged = False
+        self._sam_points.clear()
+        self._sam_preview_rect = None
+        self._sam_predicting = False
         self._reset_edit_drag_state()
 
     def _update_cursor_for_hover(self) -> None:
@@ -820,7 +897,7 @@ class AnnotationCanvasView(QGraphicsView):
         if self._space_pressed or self._mode == self.MODE_PAN:
             self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
             return
-        if self._mode == self.MODE_DRAW:
+        if self._mode in (self.MODE_DRAW, self.MODE_SAM_POINT):
             self.viewport().setCursor(QCursor(Qt.CursorShape.CrossCursor))
             return
         if self._hover_handle and self._hover_handle in HANDLE_CURSORS:
@@ -944,7 +1021,12 @@ class AnnotationCanvasView(QGraphicsView):
             event.accept()
             return
         if event.key() == Qt.Key.Key_Escape:
-            if self._draw_state != "idle" or self._edit_action != "none":
+            if (
+                self._draw_state != "idle"
+                or self._edit_action != "none"
+                or self.has_sam_prompt()
+                or self._sam_predicting
+            ):
                 self.cancel_active_draft()
                 event.accept()
                 return
@@ -952,6 +1034,22 @@ class AnnotationCanvasView(QGraphicsView):
                 self.set_mode(self.MODE_EDIT)
                 event.accept()
                 return
+        if (
+            self._mode == self.MODE_SAM_POINT
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and self._sam_preview_rect is not None
+        ):
+            self.sam_prompt_commit_requested.emit()
+            event.accept()
+            return
+        if (
+            self._mode == self.MODE_SAM_POINT
+            and event.key() == Qt.Key.Key_Backspace
+            and self._sam_points
+        ):
+            self.undo_last_sam_point()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
@@ -1018,6 +1116,19 @@ class AnnotationCanvasView(QGraphicsView):
             self._draw_start = clamped
             self._draw_current = clamped
             self.viewport().update()
+            event.accept()
+            return
+
+        # 4b) SAM 点选标注模式：左键在图像范围内添加前景正点并立即触发分割预览
+        if self._mode == self.MODE_SAM_POINT:
+            if 0.0 <= scene_pos.x() <= float(self._image_width) and 0.0 <= scene_pos.y() <= float(
+                self._image_height
+            ):
+                clamped = self._clamp_point(scene_pos)
+                self._sam_points.append((clamped.x(), clamped.y(), 1))
+                self._sam_predicting = True
+                self.viewport().update()
+                self.sam_points_changed.emit(list(self._sam_points))
             event.accept()
             return
 
@@ -1099,6 +1210,13 @@ class AnnotationCanvasView(QGraphicsView):
                 self.viewport().update()
                 event.accept()
                 return
+            self._hover_idx = -1
+            self._hover_handle = None
+            self._update_cursor_for_hover()
+            self.viewport().update()
+            return
+
+        if self._mode == self.MODE_SAM_POINT:
             self._hover_idx = -1
             self._hover_handle = None
             self._update_cursor_for_hover()
@@ -1196,6 +1314,17 @@ class AnnotationCanvasView(QGraphicsView):
                 self._stop_edge_scroll()
                 self._update_cursor_for_hover()
                 self.viewport().update()
+                event.accept()
+                return
+            if self._mode == self.MODE_SAM_POINT and self._sam_points:
+                if 0.0 <= scene_pos.x() <= float(self._image_width) and 0.0 <= scene_pos.y() <= float(
+                    self._image_height
+                ):
+                    clamped = self._clamp_point(scene_pos)
+                    self._sam_points.append((clamped.x(), clamped.y(), 0))
+                    self._sam_predicting = True
+                    self.viewport().update()
+                    self.sam_points_changed.emit(list(self._sam_points))
                 event.accept()
                 return
             hit_idx = self._hit_test_box(scene_pos)
@@ -1393,6 +1522,46 @@ class AnnotationCanvasView(QGraphicsView):
                     size_tip = f"{self._active_label}  {size_tip}"
                 self._paint_tag_pill(painter, dx1, dy1, size_tip, QColor(r, g, b, 230), inv)
 
+        # SAM 点选标注模式：十字准星、实时预览框与正负提示点渲染
+        if self._mode == self.MODE_SAM_POINT:
+            if self._cursor_scene_pos is not None:
+                cx = max(0.0, min(float(self._image_width), self._cursor_scene_pos.x()))
+                cy = max(0.0, min(float(self._image_height), self._cursor_scene_pos.y()))
+                painter.setPen(QPen(QColor(0, 0, 0, 115), 2.0 * inv, Qt.PenStyle.SolidLine))
+                painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
+                painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+                painter.setPen(QPen(QColor(45, 212, 191, 215), 1.0 * inv, Qt.PenStyle.DashLine))
+                painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
+                painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+
+            if self._sam_preview_rect is not None:
+                px1, py1, px2, py2 = self._sam_preview_rect
+                r, g, b = label_color_rgb(self._active_label or "sam_preview")
+                preview_rect = QRectF(px1, py1, px2 - px1, py2 - py1)
+                painter.setBrush(QBrush(QColor(r, g, b, 52)))
+                painter.setPen(QPen(QColor(255, 255, 255, 225), 3.6 * inv, Qt.PenStyle.SolidLine))
+                painter.drawRect(preview_rect)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(r, g, b, 250), 2.0 * inv, Qt.PenStyle.DashLine))
+                painter.drawRect(preview_rect)
+                size_tip = f"{int(round(px2 - px1))}×{int(round(py2 - py1))} · Enter确认"
+                if self._active_label:
+                    size_tip = f"{self._active_label}  {size_tip}"
+                self._paint_tag_pill(painter, px1, py1, size_tip, QColor(r, g, b, 238), inv)
+
+            dot_r = 5.5 * inv
+            cross_r = 2.6 * inv
+            for pt_x, pt_y, pt_lbl in self._sam_points:
+                center = QPointF(pt_x, pt_y)
+                fill_color = QColor("#2da44e") if pt_lbl == 1 else QColor("#cf222e")
+                painter.setBrush(QBrush(fill_color))
+                painter.setPen(QPen(QColor(255, 255, 255, 245), 1.8 * inv))
+                painter.drawEllipse(center, dot_r, dot_r)
+                painter.setPen(QPen(QColor(255, 255, 255, 250), 1.5 * inv))
+                painter.drawLine(QPointF(pt_x - cross_r, pt_y), QPointF(pt_x + cross_r, pt_y))
+                if pt_lbl == 1:
+                    painter.drawLine(QPointF(pt_x, pt_y - cross_r), QPointF(pt_x, pt_y + cross_r))
+
         painter.restore()
         self._paint_hud_overlay(painter)
 
@@ -1401,6 +1570,15 @@ class AnnotationCanvasView(QGraphicsView):
         if self._mode == self.MODE_DRAW and self._draw_state == "waiting_second":
             text = "已定起点 · 点击第二角点完成（滚轮缩放 / 中键平移，右键或 Esc 取消）"
             dot_color = QColor("#f85149")
+        elif self._mode == self.MODE_SAM_POINT and self._sam_predicting:
+            text = "SAM 正在分割所选目标，请稍候..."
+            dot_color = QColor("#0d9488")
+        elif self._mode == self.MODE_SAM_POINT and self._sam_preview_rect is not None:
+            text = "SAM 预览就绪：Enter 确认落框 · 左键补前景 / 右键排除背景 · Backspace 撤点 · Esc 取消"
+            dot_color = QColor("#2da44e")
+        elif self._mode == self.MODE_SAM_POINT and self._sam_points:
+            text = "SAM 未分割出有效目标轮廓：可继续左键补点，或按 Esc 清除"
+            dot_color = QColor("#d4a72c")
         elif self._hud_message:
             text = self._hud_message
             dot_color = QColor(self._hud_accent)

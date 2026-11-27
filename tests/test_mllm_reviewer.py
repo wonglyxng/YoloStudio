@@ -3410,6 +3410,172 @@ def test_run_mllm_review_circuit_breaker_on_fatal_and_consecutive_transient_erro
     assert args_off.max_consecutive_errors == 0
 
 
+def test_sam_point_prompt_mask_and_refiner_shape() -> None:
+    """验证本地 SAM 点选掩码孤立噪点连通域过滤及单目标多点 `(1, K, 2)` 提示张量约定。"""
+    import threading
+    import numpy as np
+
+    from yolo_studio.core.mllm_reviewer import (
+        UltralyticsSamBoxRefiner,
+        _mask_to_point_prompt_xyxy,
+    )
+
+    # 1) 二值掩码含主目标块 [40:100, 60:140] 与远处孤立噪点 [5:12, 5:12]，前景点落在主目标上时应自动过滤噪点
+    mask = np.zeros((200, 300), dtype=bool)
+    mask[40:100, 60:140] = True
+    mask[5:12, 5:12] = True
+    xyxy = _mask_to_point_prompt_xyxy(mask, points=[(100.0, 70.0), (10.0, 10.0)], labels=[1, 0], img_w=300, img_h=200)
+    assert xyxy == (60.0, 40.0, 140.0, 100.0)
+
+    # 2) 空掩码返回 None
+    assert _mask_to_point_prompt_xyxy(np.zeros((200, 300), dtype=bool), [(100.0, 70.0)], [1], 300, 200) is None
+
+    # 3) UltralyticsSamBoxRefiner.segment_by_points 按单目标多点 3D/2D 形状传给底层 SAM.predict
+    predict_calls: list[dict[str, object]] = []
+
+    class _FakeMaskTensor:
+        def __init__(self, arr: np.ndarray) -> None:
+            self._arr = arr
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self) -> np.ndarray:
+            return self._arr
+
+    class _FakeSamModel:
+        def predict(self, **kwargs):
+            predict_calls.append(kwargs)
+            m = np.zeros((1, 200, 300), dtype=np.float32)
+            m[0, 50:120, 80:160] = 1.0
+            return [type("Res", (), {"masks": type("M", (), {"data": _FakeMaskTensor(m)})()})()]
+
+    refiner = object.__new__(UltralyticsSamBoxRefiner)
+    refiner.device = "cpu"
+    refiner._lock = threading.Lock()
+    refiner._model = _FakeSamModel()
+
+    img_bgr = np.zeros((200, 300, 3), dtype=np.uint8)
+    # 缺少前景点直接返回 None，不触发推理
+    assert refiner.segment_by_points(img_bgr, [(100.0, 80.0)], [0]) is None
+    assert len(predict_calls) == 0
+
+    out = refiner.segment_by_points(img_bgr, [(110.0, 80.0), (170.0, 80.0)], [1, 0])
+    assert out == (80.0, 50.0, 160.0, 120.0)
+    assert len(predict_calls) == 1
+    assert predict_calls[0]["points"] == [[[110.0, 80.0], [170.0, 80.0]]]
+    assert predict_calls[0]["labels"] == [[1, 0]]
+
+
+def test_fix_single_box_with_mllm_relabel_refine_delete_and_keep(tmp_path: Path) -> None:
+    """验证单框局部 AI 精修仅上传 1 张外扩局部图、透传业务规则，并正确处理改类/收框/扩框/删除与保留。"""
+    import numpy as np
+    import pytest
+
+    from yolo_studio.core.mllm_reviewer import (
+        BoxDecision,
+        CandidateBox,
+        MllmReviewConfig,
+        MllmReviewResponse,
+        fix_single_box_with_mllm,
+    )
+
+    img_bgr = np.full((600, 800, 3), 120, dtype=np.uint8)
+    orig_box = CandidateBox(box_id=0, label="monster", x1=200.0, y1=150.0, x2=300.0, y2=250.0)
+    cfg = MllmReviewConfig(
+        images_dir=tmp_path,
+        output_dir=tmp_path / "out",
+        allowed_classes=["player", "monster", "loot"],
+        custom_guideline="只框主体，不含武器及特效",
+    )
+
+    seen_calls: list[tuple[bytes, list, str, str]] = []
+    scripted: list[MllmReviewResponse] = []
+
+    class _StubClient:
+        def review_image(self, overview_jpeg, crops, system_prompt, user_prompt):
+            seen_calls.append((overview_jpeg, list(crops), system_prompt, user_prompt))
+            return scripted.pop(0)
+
+    # 1) 改类 + 缩框：外扩 45%（mx=max(45,48)=48）后裁剪区为 [152, 102, 348, 298]，尺寸 196×196
+    scripted.append(
+        MllmReviewResponse(
+            box_reviews=[
+                BoxDecision(
+                    box_id=0,
+                    action="relabel",
+                    new_label="player",
+                    box_quality="loose",
+                    refined_box_2d=[250, 250, 750, 750],
+                    reason="主体为玩家且去除了右侧武器",
+                )
+            ]
+        )
+    )
+    res1 = fix_single_box_with_mllm(img_bgr, orig_box, cfg, client_override=_StubClient())
+    assert len(seen_calls) == 1
+    assert seen_calls[0][1] == []  # 仅发 1 张局部图，无额外 crops 爆炸
+    assert "只框主体，不含武器及特效" in seen_calls[0][2]
+    assert res1.action == "relabel"
+    assert res1.label == "player"
+    assert res1.relabeled is True
+    assert res1.refined is True
+    assert res1.x1 == pytest.approx(152.0 + 0.25 * 196.0, abs=1.0)
+    assert res1.x2 == pytest.approx(152.0 + 0.75 * 196.0, abs=1.0)
+    assert "武器" in res1.reason
+
+    # 2) 截断偏小框向外扩全（测试能超出原框范围补全主体）
+    scripted.append(
+        MllmReviewResponse(
+            box_reviews=[
+                BoxDecision(
+                    box_id=0,
+                    action="keep",
+                    box_quality="partial",
+                    refined_box_2d=[100, 100, 900, 900],
+                    reason="原框截断了下半身已向外补全",
+                )
+            ]
+        )
+    )
+    res2 = fix_single_box_with_mllm(img_bgr, orig_box, cfg, client_override=_StubClient())
+    assert res2.action == "keep"
+    assert res2.refined is True
+    assert res2.x1 < orig_box.x1 and res2.x2 > orig_box.x2
+    assert res2.y1 < orig_box.y1 and res2.y2 > orig_box.y2
+
+    # 3) 判定误检删除
+    scripted.append(
+        MllmReviewResponse(
+            box_reviews=[
+                BoxDecision(box_id=0, action="delete", reason="纯技能光效非目标")
+            ]
+        )
+    )
+    res3 = fix_single_box_with_mllm(img_bgr, orig_box, cfg, client_override=_StubClient())
+    assert res3.action == "delete"
+    assert res3.refined is False
+    assert "光效" in res3.reason
+
+    # 4) 核验通过（原框已紧贴不改动）
+    scripted.append(
+        MllmReviewResponse(
+            box_reviews=[
+                BoxDecision(box_id=0, action="keep", box_quality="tight", refined_box_2d=None, reason="框已紧贴主体")
+            ]
+        )
+    )
+    res4 = fix_single_box_with_mllm(img_bgr, orig_box, cfg, client_override=_StubClient())
+    assert res4.action == "keep"
+    assert res4.refined is False
+    assert res4.relabeled is False
+    assert (res4.x1, res4.y1, res4.x2, res4.y2) == (200.0, 150.0, 300.0, 250.0)
+
+
+
 
 
 
