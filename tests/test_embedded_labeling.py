@@ -2680,5 +2680,162 @@ def test_workbench_micro_ops_crosshair_view_enhance_and_copy_prev_frame(
         win.close()
 
 
+def test_workbench_label_audit_dialog_sorting_ghost_overlay_and_accept_missing(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证模型反查弹窗、训练权重回填、工作台异常排序筛选、非破坏性预测幽灵框与一键采纳漏标撤回闭环。"""
+    import time
+
+    from yolo_studio.core.label_auditor import PredictedBox
+    from yolo_studio.gui.label_audit_dialog import LabelAuditDialog
+
+    frames_dir = tmp_path / "audit_frames"
+    f_clean = frames_dir / "a_clean.jpg"
+    f_spurious = frames_dir / "b_spurious.jpg"
+    f_severe = frames_dir / "c_severe.jpg"
+    for p in (f_clean, f_spurious, f_severe):
+        _write_sample_frame(p, (400, 300))
+
+    def _save_gt(img_p: Path, boxes: list[tuple[str, float, float, float, float]]) -> None:
+        img_p.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "version": "2.5.4",
+                    "flags": {},
+                    "shapes": [
+                        {
+                            "label": lbl,
+                            "points": [[x1, y1], [x2, y2]],
+                            "group_id": None,
+                            "description": "",
+                            "shape_type": "rectangle",
+                            "flags": {},
+                        }
+                        for lbl, x1, y1, x2, y2 in boxes
+                    ],
+                    "imagePath": img_p.name,
+                    "imageHeight": 300,
+                    "imageWidth": 400,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    _save_gt(f_clean, [("player", 20.0, 20.0, 120.0, 120.0)])
+    _save_gt(f_spurious, [("player", 20.0, 20.0, 120.0, 120.0)])
+    _save_gt(f_severe, [("player", 20.0, 20.0, 120.0, 120.0)])
+
+    fake_best = tmp_path / "best.pt"
+    fake_best.write_bytes(b"fake-yolo-pt")
+    fake_yaml = tmp_path / "data.yaml"
+    fake_yaml.write_text("path: .\n", encoding="utf-8")
+
+    preds_map = {
+        f_clean.name: [PredictedBox("player", 22.0, 22.0, 118.0, 118.0, 0.94)],
+        f_spurious.name: [],
+        f_severe.name: [
+            PredictedBox("monster", 22.0, 22.0, 118.0, 118.0, 0.89),
+            PredictedBox("loot", 240.0, 140.0, 350.0, 240.0, 0.92),
+        ],
+    }
+
+    def _fake_predictor(img_path: Path):
+        return preds_map[img_path.name], ["player", "monster", "loot"]
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        # 1) 训练产出权重自动同步至工作台反查默认权重
+        win._on_weights_ready(str(fake_best), str(fake_yaml))
+        tab = win.labeling_tab
+        assert tab._audit_weights_path == str(fake_best)
+
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+        assert tab.audit_btn.isEnabled() is True
+
+        # 2) 运行反查对话框后台扫描，验证权重预填、汇总计数与结果产出
+        dlg = LabelAuditDialog(
+            list(tab._all_images),
+            tmp_path,
+            default_weights=tab._audit_weights_path,
+            device="cpu",
+            gpu_guard=win.gpu_guard,
+            predictor_override=_fake_predictor,
+            parent=tab,
+        )
+        try:
+            assert Path(dlg.weights_picker.text()) == fake_best
+            dlg._on_start()
+            deadline = time.monotonic() + 5.0
+            while (
+                dlg.worker is not None
+                and dlg.worker.isRunning()
+                and time.monotonic() < deadline
+            ):
+                qt_app.processEvents()
+                time.sleep(0.015)
+            qt_app.processEvents()
+            assert dlg.audit_result is not None
+            assert dlg.apply_btn.isEnabled() is True
+            assert "检出 2 张疑似异常图" in dlg.summary_label.text()
+            audit_res = dlg.audit_result
+        finally:
+            dlg.close()
+
+        # 3) 应用反查结果到工作台：自动切入「疑似异常 (2)」并按异常严重度置顶排序
+        tab.apply_audit_result(audit_res)
+        qt_app.processEvents()
+        assert tab.status_filter_combo.currentData() == "audit"
+        assert [p.name for p in tab._filtered_images] == [f_severe.name, f_spurious.name]
+        assert tab.audit_summary_bar.isVisible() is True
+        assert tab._doc is not None and tab._doc.image_path == f_severe.resolve()
+        assert tab.audit_banner.isVisible() is True
+        assert tab.audit_accept_missing_btn.isVisible() is True
+        assert "+1" in tab.audit_accept_missing_btn.text()
+        assert len(tab.canvas._audit_overlays) == 2  # 1 漏标幽灵框 + 1 错类幽灵框
+        assert tab.canvas._audit_flagged_gt == {0: "错类?"}
+        assert not tab.canvas.grab().isNull()
+
+        # 4) 一键采纳疑似漏标框：正式入框、自动消掉对应漏标幽灵框、支持 Ctrl+Z 一步撤回
+        assert len(tab._doc.boxes) == 1
+        tab.audit_accept_missing_btn.click()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 2
+        assert tab._doc.boxes[1].label == "loot"
+        assert tab.audit_accept_missing_btn.isVisible() is False  # 待采纳漏标已清零
+        assert len(tab.canvas._audit_overlays) == 1  # 仅剩错类幽灵框
+
+        tab._undo()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 1
+        assert tab.audit_accept_missing_btn.isVisible() is True
+
+        # 5) 单图「忽略此图」移出异常列表，随后「清除反查」恢复全部 3 张图与默认顺序
+        tab.audit_dismiss_img_btn.click()
+        qt_app.processEvents()
+        assert [p.name for p in tab._filtered_images] == [f_spurious.name]
+
+        tab.clear_audit_btn.click()
+        qt_app.processEvents()
+        assert tab.audit_summary_bar.isVisible() is False
+        assert tab.audit_banner.isVisible() is False
+        assert tab.status_filter_combo.findData("audit") == -1
+        assert [p.name for p in tab._filtered_images] == [
+            f_clean.name,
+            f_spurious.name,
+            f_severe.name,
+        ]
+        assert tab.canvas._audit_overlays == []
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+
 
 

@@ -188,6 +188,10 @@ class AnnotationCanvasView(QGraphicsView):
         self._view_enhance_brightness: int = self.DEFAULT_ENHANCE_BRIGHTNESS
         self._view_enhance_contrast: float = self.DEFAULT_ENHANCE_CONTRAST
         self._view_enhance_gamma: float = self.DEFAULT_ENHANCE_GAMMA
+        # 模型反查非破坏性预测幽灵框叠层：元素为 ((x1, y1, x2, y2), tag_text, kind_key)
+        self._audit_overlays: list[tuple[tuple[float, float, float, float], str, str]] = []
+        self._audit_flagged_gt: dict[int, str] = {}
+        self._audit_overlays_visible: bool = True
 
         # 视口缩放与自适应状态
         self._fit_mode: bool = True
@@ -437,6 +441,43 @@ class AnnotationCanvasView(QGraphicsView):
         self._pixmap_item.setPixmap(displayed)
         self.viewport().update()
 
+    def audit_overlays_visible(self) -> bool:
+        """返回当前模型反查预测幽灵框叠层的显示开关状态。"""
+        return self._audit_overlays_visible
+
+    def set_audit_overlays(
+        self,
+        overlays: list[tuple[tuple[float, float, float, float], str, str]],
+        *,
+        flagged_gt: dict[int, str] | None = None,
+        visible: bool | None = None,
+    ) -> None:
+        """设置当前图片的非破坏性模型预测幽灵参考框与异常人工框预警标记（绝不修改标注数据）。"""
+        self._audit_overlays = [
+            ((float(r[0]), float(r[1]), float(r[2]), float(r[3])), str(tag), str(kind))
+            for r, tag, kind in overlays
+        ]
+        self._audit_flagged_gt = {int(k): str(v) for k, v in (flagged_gt or {}).items()}
+        if visible is not None:
+            self._audit_overlays_visible = bool(visible)
+        self.viewport().update()
+
+    def set_audit_overlays_visible(self, visible: bool) -> None:
+        """切换画布上模型反查预测幽灵参考框的显隐状态。"""
+        flag = bool(visible)
+        if flag == self._audit_overlays_visible:
+            return
+        self._audit_overlays_visible = flag
+        self.viewport().update()
+
+    def clear_audit_overlays(self) -> None:
+        """清空当前画布的模型反查预测幽灵参考框与异常标记。"""
+        if not self._audit_overlays and not self._audit_flagged_gt:
+            return
+        self._audit_overlays.clear()
+        self._audit_flagged_gt.clear()
+        self.viewport().update()
+
     def show_hud_message(
         self,
         text: str,
@@ -523,6 +564,8 @@ class AnnotationCanvasView(QGraphicsView):
         self._selected_idx = -1
         self._hover_idx = -1
         self._hover_handle = None
+        self._audit_overlays.clear()
+        self._audit_flagged_gt.clear()
 
         if pixmap.isNull():
             self.clear_image()
@@ -556,6 +599,8 @@ class AnnotationCanvasView(QGraphicsView):
         self._selected_idx = -1
         self._hover_idx = -1
         self._hover_handle = None
+        self._audit_overlays.clear()
+        self._audit_flagged_gt.clear()
         self._fit_mode = True
         self._pending_fit = False
         self._scene.setSceneRect(0, 0, 1, 1)
@@ -1628,6 +1673,10 @@ class AnnotationCanvasView(QGraphicsView):
                 show_live_size=is_active_edit,
             )
 
+        # 模型反查非破坏性预测幽灵参考框与疑似异常人工框角标
+        if self._audit_overlays_visible and (self._audit_overlays or self._audit_flagged_gt):
+            self._paint_audit_overlays(painter, inv)
+
         # 绘制模式：双色高对比十字准星与实时草稿框
         if self._mode == self.MODE_DRAW:
             if self._cursor_scene_pos is not None:
@@ -1731,6 +1780,62 @@ class AnnotationCanvasView(QGraphicsView):
         painter.setPen(QPen(inner_color, 1.0 * inv, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
         painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+
+    def _paint_audit_overlays(self, painter: QPainter, inv: float) -> None:
+        """绘制模型反查产出的预测幽灵虚线框与异常人工框右上角轻量预警角标。"""
+        kind_colors: dict[str, QColor] = {
+            "missing": QColor("#f97316"),
+            "wrong_label": QColor("#d946ef"),
+            "misaligned": QColor("#8b5cf6"),
+        }
+        for (ox1, oy1, ox2, oy2), tag_text, kind_key in self._audit_overlays:
+            color = kind_colors.get(kind_key, QColor("#f97316"))
+            rect_f = QRectF(ox1, oy1, ox2 - ox1, oy2 - oy1)
+            fill = QColor(color)
+            fill.setAlpha(28)
+            painter.setBrush(QBrush(fill))
+            painter.setPen(QPen(QColor(255, 255, 255, 210), 3.2 * inv, Qt.PenStyle.SolidLine))
+            painter.drawRect(rect_f)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(color, 1.9 * inv, Qt.PenStyle.DashLine))
+            painter.drawRect(rect_f)
+            if tag_text:
+                pill_bg = QColor(color)
+                pill_bg.setAlpha(228)
+                self._paint_tag_pill(painter, ox1, oy1, tag_text, pill_bg, inv)
+
+        for gt_idx, badge in self._audit_flagged_gt.items():
+            if not (0 <= gt_idx < len(self._boxes)) or not badge:
+                continue
+            b = self._boxes[gt_idx]
+            self._paint_corner_alert_pill(painter, b.x2, b.y1, badge, QColor(207, 34, 46, 232), inv)
+
+    def _paint_corner_alert_pill(
+        self,
+        painter: QPainter,
+        x_right: float,
+        y_top: float,
+        text: str,
+        bg_color: QColor,
+        inv: float,
+    ) -> None:
+        """在目标框右上角绘制轻量预警角标（避开左上角正常类别标签）。"""
+        painter.save()
+        painter.translate(x_right, y_top)
+        painter.scale(inv, inv)
+        font = QFont("Microsoft YaHei UI", 8, QFont.Weight.DemiBold)
+        painter.setFont(font)
+        fm = QFontMetricsF(font)
+        tw = fm.horizontalAdvance(text) + 10.0
+        th = fm.height() + 4.0
+        top_y = -th - 1.0 if (y_top / max(inv, 1e-6)) >= (th + 2.0) else 1.0
+        pill = QRectF(-tw, top_y, tw, th)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(bg_color))
+        painter.drawRoundedRect(pill, 3.0, 3.0)
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
 
     def _paint_hud_overlay(self, painter: QPainter) -> None:
         """在画布视口顶部中央按需绘制轻量悬浮提示胶囊（不遮挡目标且不拦截鼠标事件）。"""

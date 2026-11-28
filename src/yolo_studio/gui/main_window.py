@@ -466,6 +466,7 @@ class MainWindow(QMainWindow):
         """
         self.eval_tab.set_weights_and_yaml(weights_path, yaml_path)
         self.review_tab.set_weights_path(weights_path)
+        self.labeling_tab.set_audit_weights_path(weights_path)
 
     def open_settings_dialog(self, initial_page: str = PAGE_AI) -> int:
         """弹出全局「设置」分栏对话框（AI 大模型 / 本地视觉模型 / 通用设置），确认或应用时即刻落盘。"""

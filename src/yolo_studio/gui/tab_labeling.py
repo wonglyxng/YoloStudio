@@ -72,6 +72,11 @@ from yolo_studio.core.annotation_io import (
     save_image_annotation,
     scan_labeling_directory,
 )
+from yolo_studio.core.label_auditor import (
+    AuditIssueKind,
+    ImageAuditReport,
+    LabelAuditResult,
+)
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.annotation_canvas import AnnotationCanvasView, load_image_pixmap
 from yolo_studio.gui.app_settings import (
@@ -82,6 +87,7 @@ from yolo_studio.gui.app_settings import (
     validate_llm_credentials,
 )
 from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
+from yolo_studio.gui.label_audit_dialog import LabelAuditDialog
 
 _ADDED_DLL_HANDLES: list[object] = []
 _MAX_UNDO_STEPS = 80
@@ -791,6 +797,10 @@ class LabelingStudioTab(QWidget):
         self._pending_sam_point_request: tuple[int, Path, list[tuple[float, float, int]]] | None = None
         self._pending_sam_refine_request: tuple[Path, list[tuple[int, RectAnnotation]]] | None = None
         self._llm_fix_client_override: Any | None = None
+        self._audit_weights_path: str = ""
+        self._audit_result: LabelAuditResult | None = None
+        self._audit_report_map: dict[Path, ImageAuditReport] = {}
+        self._audit_predictor_override: Any | None = None
         self._scoped_actions: list[QAction] = []
         self._clipboard_boxes: list[RectAnnotation] = []
         self._clipboard_source_image: Path | None = None
@@ -1003,6 +1013,35 @@ class LabelingStudioTab(QWidget):
         banner_lay.addWidget(self.clear_hint_btn)
         self.review_banner.setVisible(False)
         center_lay.addWidget(self.review_banner)
+
+        self.audit_banner = QFrame()
+        self.audit_banner.setStyleSheet(
+            "QFrame { background-color: #faf5ff; border: 1px solid #c084fc; border-radius: 5px; }"
+        )
+        audit_b_lay = QHBoxLayout(self.audit_banner)
+        audit_b_lay.setContentsMargins(10, 4, 10, 4)
+        audit_b_lay.setSpacing(6)
+        self.audit_banner_label = QLabel("")
+        self.audit_banner_label.setWordWrap(True)
+        self.audit_banner_label.setStyleSheet(
+            "border: none; color: #6b21a8; font-weight: 500; font-size: 12px;"
+        )
+        self.audit_overlay_chk = QCheckBox("显示预测框")
+        self.audit_overlay_chk.setChecked(True)
+        self.audit_overlay_chk.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.audit_overlay_chk.setStyleSheet("font-size: 12px; color: #581c87;")
+        self.audit_accept_missing_btn = QPushButton("采纳漏标")
+        self.audit_accept_missing_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.audit_accept_missing_btn.setStyleSheet("padding: 2px 8px; font-size: 12px;")
+        self.audit_dismiss_img_btn = QPushButton("忽略此图")
+        self.audit_dismiss_img_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.audit_dismiss_img_btn.setStyleSheet("padding: 2px 8px; font-size: 12px;")
+        audit_b_lay.addWidget(self.audit_banner_label, 1)
+        audit_b_lay.addWidget(self.audit_overlay_chk)
+        audit_b_lay.addWidget(self.audit_accept_missing_btn)
+        audit_b_lay.addWidget(self.audit_dismiss_img_btn)
+        self.audit_banner.setVisible(False)
+        center_lay.addWidget(self.audit_banner)
 
         self.canvas = AnnotationCanvasView()
         center_lay.addWidget(self.canvas, 1)
@@ -1248,14 +1287,38 @@ class LabelingStudioTab(QWidget):
         file_title.setStyleSheet("font-weight: 600; color: #24292f;")
         self.status_label = _ElidedStatusLabel("未打开目录")
         self.status_label.setStyleSheet("border: none; color: #57606a; font-size: 11px;")
+        self.audit_btn = QPushButton("模型反查")
+        self.audit_btn.setToolTip(
+            "使用已训练的 YOLO .pt 权重扫描当前标注目录，按异常严重度置顶疑似漏标、错类、误标与偏移框"
+        )
+        self.audit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.audit_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.setToolTip("重新扫描当前目录中的图片与 .json 标注状态")
         self.refresh_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.refresh_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
         file_hdr.addWidget(file_title)
         file_hdr.addWidget(self.status_label, 1)
+        file_hdr.addWidget(self.audit_btn)
         file_hdr.addWidget(self.refresh_btn)
         file_lay.addLayout(file_hdr)
+
+        self.audit_summary_bar = QFrame()
+        self.audit_summary_bar.setStyleSheet(
+            "QFrame { background-color: #faf5ff; border: 1px solid #d8b4fe; border-radius: 4px; }"
+        )
+        as_lay = QHBoxLayout(self.audit_summary_bar)
+        as_lay.setContentsMargins(6, 3, 6, 3)
+        as_lay.setSpacing(4)
+        self.audit_summary_label = _ElidedStatusLabel("", min_width=40)
+        self.audit_summary_label.setStyleSheet("border: none; color: #6b21a8; font-size: 11px; font-weight: 500;")
+        self.clear_audit_btn = QPushButton("清除反查")
+        self.clear_audit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clear_audit_btn.setStyleSheet("padding: 1px 6px; font-size: 11px;")
+        as_lay.addWidget(self.audit_summary_label, 1)
+        as_lay.addWidget(self.clear_audit_btn)
+        self.audit_summary_bar.setVisible(False)
+        file_lay.addWidget(self.audit_summary_bar)
 
         filter_row = QHBoxLayout()
         filter_row.setSpacing(4)
@@ -1332,6 +1395,11 @@ class LabelingStudioTab(QWidget):
         # 事件信号连接
         self.open_dir_btn.clicked.connect(self._on_pick_and_open_dir)
         self.load_classes_btn.clicked.connect(self._on_pick_and_load_classes)
+        self.audit_btn.clicked.connect(self._on_open_label_audit_dialog)
+        self.clear_audit_btn.clicked.connect(lambda: self.clear_audit_result(refresh_list=True))
+        self.audit_overlay_chk.toggled.connect(self.canvas.set_audit_overlays_visible)
+        self.audit_accept_missing_btn.clicked.connect(self._accept_audit_missing_boxes)
+        self.audit_dismiss_img_btn.clicked.connect(self._dismiss_current_image_audit)
         self.refresh_btn.clicked.connect(self._on_refresh_dir)
         self.to_dataset_btn.clicked.connect(self._on_send_to_dataset)
         self.to_review_btn.clicked.connect(self._on_send_to_review)
@@ -1661,6 +1729,12 @@ class LabelingStudioTab(QWidget):
         """接收主窗口后台硬件探测结果，供本地 SAM 贴边收框与点选标注自动选择 GPU 或 CPU。"""
         self.device_info = info
 
+    def set_audit_weights_path(self, weights_path: str) -> None:
+        """记录最近一次训练产出的 `best.pt` 权重路径，供模型反查弹窗自动预填。"""
+        clean = (weights_path or "").strip()
+        if clean:
+            self._audit_weights_path = clean
+
     def set_review_config_provider(self, provider: Callable[[], Any] | None) -> None:
         """注入历史兼容的审阅配置回调（优先使用全局 `settings_store` 与 `review_guidance_provider`）。"""
         self._review_config_provider = provider
@@ -1782,6 +1856,7 @@ class LabelingStudioTab(QWidget):
         # 已通过未保存保护校验，清空旧文档引用，确保刷新同目录同单图时强制重读磁盘最新 .json
         if self._current_dir != target_dir:
             self._pixmap_cache.clear()
+            self.clear_audit_result(refresh_list=False)
         self._doc = None
         self._dirty = False
         self._last_nudge_key = None
@@ -2024,13 +2099,25 @@ class LabelingStudioTab(QWidget):
                 rel = img_path.name
 
         key = summary.status_key
+        base_text = rel
         if key in ("labeled", "review"):
-            return f"{rel}  [{summary.box_count}]"
-        if key == "empty":
-            return f"{rel}  [0]"
-        return rel
+            base_text = f"{rel}  [{summary.box_count}]"
+        elif key == "empty":
+            base_text = f"{rel}  [0]"
 
-    def _style_file_item(self, item: QListWidgetItem, summary: ImageStatusSummary) -> None:
+        report = self._audit_report_map.get(img_path.resolve())
+        if report is not None and report.has_issues:
+            badge = report.compact_badge()
+            if badge:
+                return f"{base_text}  · {badge}"
+        return base_text
+
+    def _style_file_item(self, item: QListWidgetItem, summary: ImageStatusSummary, img_path: Path | None = None) -> None:
+        if img_path is not None:
+            report = self._audit_report_map.get(img_path.resolve())
+            if report is not None and report.has_issues:
+                item.setForeground(QColor("#c2410c"))
+                return
         key = summary.status_key
         if key == "review":
             item.setForeground(QColor("#9a6700"))
@@ -2051,7 +2138,11 @@ class LabelingStudioTab(QWidget):
         filtered: list[Path] = []
         for img_path in self._all_images:
             summary = self._status_map.get(img_path) or inspect_image_status(img_path)
-            if mode != "all" and summary.status_key != mode:
+            if mode == "audit":
+                report = self._audit_report_map.get(img_path.resolve())
+                if report is None or not report.has_issues:
+                    continue
+            elif mode != "all" and summary.status_key != mode:
                 continue
             if keyword:
                 rel_str = str(img_path).lower()
@@ -2063,6 +2154,20 @@ class LabelingStudioTab(QWidget):
                 if keyword not in rel_str:
                     continue
             filtered.append(img_path)
+
+        # 反查结果生效时按异常严重度降序置顶，异常分相同的保持原有目录顺序
+        if self._audit_report_map:
+            order_idx = {p: i for i, p in enumerate(filtered)}
+            filtered.sort(
+                key=lambda p: (
+                    -(
+                        self._audit_report_map[p.resolve()].anomaly_score
+                        if p.resolve() in self._audit_report_map
+                        else 0.0
+                    ),
+                    order_idx[p],
+                )
+            )
 
         self._filtered_images = filtered
         if not self._all_images:
@@ -2087,8 +2192,12 @@ class LabelingStudioTab(QWidget):
                     self._format_file_item_text(img_path, summary),
                 )
                 item.setData(Qt.ItemDataRole.UserRole, str(img_path))
-                item.setToolTip(str(img_path))
-                self._style_file_item(item, summary)
+                report = self._audit_report_map.get(img_path.resolve())
+                if report is not None and report.has_issues:
+                    item.setToolTip(f"{img_path}\n{report.headline_summary()}")
+                else:
+                    item.setToolTip(str(img_path))
+                self._style_file_item(item, summary, img_path)
                 self.file_list.addItem(item)
                 if cur_img is not None and img_path == cur_img:
                     target_row = idx
@@ -2210,6 +2319,7 @@ class LabelingStudioTab(QWidget):
         self._refresh_class_counts()
         self._refresh_shape_list()
         self._refresh_review_banner()
+        self._refresh_audit_banner_and_overlays()
         self._refresh_footer_and_title()
         self._refresh_action_states()
         self._refresh_progress_summary()
@@ -2227,7 +2337,7 @@ class LabelingStudioTab(QWidget):
                         _make_status_dot_icon(summary.status_key, verified=summary.is_verified)
                     )
                     item.setText(self._format_file_item_text(resolved, summary))
-                    self._style_file_item(item, summary)
+                    self._style_file_item(item, summary, resolved)
                 break
         self._refresh_progress_summary()
 
@@ -2274,6 +2384,239 @@ class LabelingStudioTab(QWidget):
         else:
             self.review_banner.setVisible(False)
 
+    # ------------------------------------------------------------------
+    # 模型反查脏标注 / 漏标（迷你 FiftyOne 联动）
+    # ------------------------------------------------------------------
+    def _on_open_label_audit_dialog(self) -> None:
+        """弹出模型反查配置与扫描对话框，完成后按异常严重度置顶排序当前目录。"""
+        if not self._all_images:
+            QMessageBox.information(self, "提示", "请先打开包含图片的标注目录。")
+            return
+        if not self._may_continue():
+            return
+        dlg = LabelAuditDialog(
+            list(self._all_images),
+            self.workspace_root,
+            default_weights=self._audit_weights_path,
+            device=self._resolve_sam_device(),
+            gpu_guard=self.gpu_guard,
+            predictor_override=self._audit_predictor_override,
+            parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.audit_result is not None:
+            chosen_w = dlg.weights_picker.text().strip()
+            if chosen_w:
+                self._audit_weights_path = chosen_w
+            self.apply_audit_result(dlg.audit_result)
+
+    def apply_audit_result(self, result: LabelAuditResult) -> None:
+        """将模型反查结果应用到工作台：按异常严重度排序图片列表、切入异常筛选并渲染预测幽灵框。"""
+        self._audit_result = result
+        self._audit_report_map = {
+            p.resolve(): rep for p, rep in result.report_map.items()
+        }
+        flagged = sum(1 for r in self._audit_report_map.values() if r.has_issues)
+        self._sync_audit_filter_option(flagged)
+
+        if flagged > 0:
+            self.audit_summary_label.setText(
+                f"反查异常 {flagged} 张（漏{result.total_missing} 错类{result.total_wrong_label} "
+                f"误标{result.total_spurious} 偏移{result.total_misaligned}）"
+            )
+            self.audit_summary_bar.setVisible(True)
+            audit_idx = self.status_filter_combo.findData("audit")
+            if audit_idx >= 0:
+                self._syncing_lists = True
+                try:
+                    self.status_filter_combo.setCurrentIndex(audit_idx)
+                finally:
+                    self._syncing_lists = False
+            self._apply_file_filter(keep_current=False)
+            if self._filtered_images:
+                self.file_list.setCurrentRow(0)
+                if self._doc is None or self._doc.image_path != self._filtered_images[0]:
+                    self._load_image(self._filtered_images[0])
+            self.save_state_label.setText(f"模型反查完成：已置顶 {flagged} 张疑似异常图")
+        else:
+            self.audit_summary_label.setText(
+                f"反查完成（已扫 {result.scanned_images} 张，未发现高置信异常 ✓）"
+            )
+            self.audit_summary_bar.setVisible(True)
+            self._apply_file_filter(keep_current=True)
+            self._refresh_audit_banner_and_overlays()
+            self.save_state_label.setText("模型反查完成：未发现高置信异常")
+
+    def clear_audit_result(self, *, refresh_list: bool = True) -> None:
+        """清除当前模型反查结果，恢复默认目录顺序与筛选并隐藏全部预测幽灵框。"""
+        self._audit_result = None
+        self._audit_report_map.clear()
+        self.audit_summary_bar.setVisible(False)
+        self.audit_banner.setVisible(False)
+        self.canvas.clear_audit_overlays()
+        self._sync_audit_filter_option(0)
+        if refresh_list:
+            self._apply_file_filter(keep_current=True)
+            self.save_state_label.setText("已清除模型反查结果，恢复默认排序")
+
+    def _sync_audit_filter_option(self, flagged_count: int) -> None:
+        existing_idx = self.status_filter_combo.findData("audit")
+        self._syncing_lists = True
+        try:
+            if flagged_count > 0:
+                label = f"疑似异常 ({flagged_count})"
+                if existing_idx >= 0:
+                    self.status_filter_combo.setItemText(existing_idx, label)
+                else:
+                    self.status_filter_combo.addItem(label, "audit")
+            elif existing_idx >= 0:
+                was_audit = self.status_filter_combo.currentIndex() == existing_idx
+                self.status_filter_combo.removeItem(existing_idx)
+                if was_audit:
+                    self.status_filter_combo.setCurrentIndex(0)
+        finally:
+            self._syncing_lists = False
+
+    def _active_missing_issues_for_current_doc(self, report: ImageAuditReport) -> list[tuple[str, tuple[float, float, float, float], float]]:
+        """返回当前图尚未被人工补齐/采纳的疑似漏标列表 `(pred_label, pred_box, pred_conf)`。"""
+        if self._doc is None:
+            return []
+        pending: list[tuple[str, tuple[float, float, float, float], float]] = []
+        for item in report.issues:
+            if item.kind != AuditIssueKind.MISSING or item.pred_box is None:
+                continue
+            cand = RectAnnotation(
+                label=item.pred_label,
+                x1=item.pred_box[0],
+                y1=item.pred_box[1],
+                x2=item.pred_box[2],
+                y2=item.pred_box[3],
+            )
+            if any(ex.label == cand.label and _rect_iou(ex, cand) >= 0.50 for ex in self._doc.boxes):
+                continue
+            pending.append((item.pred_label, item.pred_box, item.pred_conf))
+        return pending
+
+    def _refresh_audit_banner_and_overlays(self) -> None:
+        if self._doc is None:
+            self.audit_banner.setVisible(False)
+            self.canvas.clear_audit_overlays()
+            return
+        report = self._audit_report_map.get(self._doc.image_path.resolve())
+        if report is None or not report.has_issues:
+            self.audit_banner.setVisible(False)
+            self.canvas.clear_audit_overlays()
+            return
+
+        overlays: list[tuple[tuple[float, float, float, float], str, str]] = []
+        flagged_gt: dict[int, str] = {}
+        active_missing = self._active_missing_issues_for_current_doc(report)
+        active_missing_boxes = {b for _lbl, b, _c in active_missing}
+
+        for item in report.issues:
+            if item.kind == AuditIssueKind.MISSING:
+                if item.pred_box is not None and item.pred_box in active_missing_boxes:
+                    overlays.append(
+                        (item.pred_box, f"漏标? {item.pred_label} {item.pred_conf:.2f}", "missing")
+                    )
+            elif item.kind == AuditIssueKind.WRONG_LABEL:
+                if item.pred_box is not None:
+                    overlays.append(
+                        (item.pred_box, f"改类? {item.pred_label} {item.pred_conf:.2f}", "wrong_label")
+                    )
+                if item.gt_index is not None and 0 <= item.gt_index < len(self._doc.boxes):
+                    flagged_gt[item.gt_index] = "错类?"
+            elif item.kind == AuditIssueKind.MISALIGNED:
+                if item.pred_box is not None:
+                    overlays.append(
+                        (item.pred_box, f"偏移? {item.pred_label} {item.pred_conf:.2f}", "misaligned")
+                    )
+                if item.gt_index is not None and 0 <= item.gt_index < len(self._doc.boxes):
+                    flagged_gt[item.gt_index] = "偏移?"
+            elif item.kind == AuditIssueKind.SPURIOUS:
+                if item.gt_index is not None and 0 <= item.gt_index < len(self._doc.boxes):
+                    flagged_gt[item.gt_index] = "误标?"
+
+        self.audit_banner_label.setText(report.headline_summary())
+        if active_missing:
+            self.audit_accept_missing_btn.setText(f"采纳漏标 (+{len(active_missing)})")
+            self.audit_accept_missing_btn.setVisible(True)
+        else:
+            self.audit_accept_missing_btn.setVisible(False)
+        self.audit_banner.setVisible(True)
+        self.canvas.set_audit_overlays(
+            overlays,
+            flagged_gt=flagged_gt,
+            visible=self.audit_overlay_chk.isChecked(),
+        )
+
+    def _accept_audit_missing_boxes(self) -> int:
+        """将当前图中模型反查出的全部待采纳疑似漏标框一步转为正式标注框（支持 Ctrl+Z 撤回）。"""
+        if self._doc is None:
+            return 0
+        report = self._audit_report_map.get(self._doc.image_path.resolve())
+        if report is None:
+            return 0
+        pending = self._active_missing_issues_for_current_doc(report)
+        if not pending:
+            self.save_state_label.setText("当前图无待采纳的疑似漏标框")
+            return 0
+
+        added: list[RectAnnotation] = []
+        unseen_labels: list[str] = []
+        for pred_label, (x1, y1, x2, y2), conf in pending:
+            box = RectAnnotation(
+                label=pred_label,
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                score=conf,
+                description=f"audit_missing: 采纳模型反查疑似漏标 ({conf:.2f})",
+                flags={"llm_added": False, "box_refined": False},
+            )
+            if self._doc.image_width > 0 and self._doc.image_height > 0:
+                box = box.clamped(self._doc.image_width, self._doc.image_height)
+            if (
+                box.width < AnnotationCanvasView.MIN_BOX_SIZE_PX
+                or box.height < AnnotationCanvasView.MIN_BOX_SIZE_PX
+            ):
+                continue
+            added.append(box)
+            if box.label and box.label not in self._classes and box.label not in unseen_labels:
+                unseen_labels.append(box.label)
+
+        if not added:
+            return 0
+
+        self._push_undo_snapshot()
+        if unseen_labels:
+            self._merge_classes(unseen_labels, replace_order=False)
+        self._doc.boxes.extend(added)
+        self._apply_boxes_change(selected_idx=len(self._doc.boxes) - 1)
+        self.canvas.ensure_box_visible(len(self._doc.boxes) - 1)
+        msg = f"已采纳 {len(added)} 个疑似漏标框（Ctrl+Z 可撤回，可点 SAM收框 进一步贴边）"
+        self.save_state_label.setText(msg)
+        self.canvas.show_hud_message(msg, color="#7e22ce", duration_ms=1800)
+        return len(added)
+
+    def _dismiss_current_image_audit(self) -> None:
+        """将当前图片从本轮模型反查异常清单中移除（不修改磁盘标注），便于专注剩余异常图。"""
+        if self._doc is None:
+            return
+        resolved = self._doc.image_path.resolve()
+        if resolved not in self._audit_report_map:
+            return
+        self._audit_report_map.pop(resolved, None)
+        remaining_flagged = sum(1 for r in self._audit_report_map.values() if r.has_issues)
+        self._sync_audit_filter_option(remaining_flagged)
+        if remaining_flagged > 0:
+            self.audit_summary_label.setText(f"剩余反查异常 {remaining_flagged} 张")
+        else:
+            self.audit_summary_label.setText("本轮反查异常已全部处理 ✓")
+        self._refresh_audit_banner_and_overlays()
+        self._apply_file_filter(keep_current=True)
+        self.save_state_label.setText("已将当前图移出本轮反查异常列表")
+
     def _refresh_footer_and_title(self) -> None:
         if self._doc is None:
             self.img_info_label.setText("分辨率: -")
@@ -2318,6 +2661,7 @@ class LabelingStudioTab(QWidget):
         self.next_img_btn.setEnabled(len(self._filtered_images) > 1)
         self.jump_index_edit.setEnabled(len(self._filtered_images) > 0)
         self.next_unlabeled_btn.setEnabled(len(self._filtered_images) > 0)
+        self.audit_btn.setEnabled(len(self._all_images) > 0)
         self.sam_point_mode_btn.setEnabled(has_img)
         self.sam_refine_btn.setEnabled(has_boxes and not sam_busy and not sam_point_busy)
         self.sam_refine_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
@@ -2536,6 +2880,7 @@ class LabelingStudioTab(QWidget):
         self._refresh_class_counts()
         self._refresh_shape_list(selected_idx=selected_idx)
         self._refresh_review_banner()
+        self._refresh_audit_banner_and_overlays()
         self._refresh_footer_and_title()
         self._refresh_action_states()
 
