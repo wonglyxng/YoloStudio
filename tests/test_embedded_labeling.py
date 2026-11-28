@@ -2295,3 +2295,47 @@ def test_global_settings_dialog_syncs_ai_sam_and_general_preferences_across_tabs
         win2.close()
 
 
+def test_labeling_toolbar_places_ai_refine_between_modes_and_box_ops(qt_app, tmp_path: Path) -> None:
+    """验证标注工作台顶栏按方案 B 顺序排列：模式胶囊 → SAM收框/AI修框(G) → 框操作 → 翻页/通过 → 视图开关。"""
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        qt_app.processEvents()
+
+        assert tab.sam_refine_btn.text() == "SAM收框"
+        assert tab.llm_fix_btn.text() == "AI修框(G)"
+
+        # 以控件在顶栏中的实际水平坐标（x）严格校验从左到右视觉顺序
+        ordered = [
+            tab.open_dir_btn,
+            tab.edit_mode_btn,
+            tab.draw_mode_btn,
+            tab.sam_point_mode_btn,
+            tab.pan_mode_btn,
+            tab.sam_refine_btn,
+            tab.llm_fix_btn,
+            tab.dup_box_btn,
+            tab.del_box_btn,
+            tab.undo_btn,
+            tab.redo_btn,
+            tab.prev_img_btn,
+            tab.next_img_btn,
+            tab.save_btn,
+            tab.verify_next_btn,
+            tab.keep_view_chk,
+            tab.show_labels_chk,
+            tab.auto_save_chk,
+            tab.to_review_btn,
+            tab.to_dataset_btn,
+        ]
+        xs = [w.mapTo(tab, w.rect().topLeft()).x() for w in ordered]
+        assert xs == sorted(xs) and len(set(xs)) == len(xs), f"顶栏控件水平顺序异常: {xs}"
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+

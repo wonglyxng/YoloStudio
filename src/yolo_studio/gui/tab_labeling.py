@@ -638,7 +638,7 @@ class LabelingStudioTab(QWidget):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
-        # 1) 单行精简主工具栏（模式分段胶囊 + 框操作 + 翻页/通过 + 视图偏好 + 右端工作流出口）
+        # 1) 单行精简主工具栏（模式分段胶囊 + 智能修框 + 框操作 + 翻页/通过 + 视图偏好 + 右端工作流出口）
         tools = QFrame()
         tools.setObjectName("workbenchTools")
         tools.setStyleSheet(
@@ -646,13 +646,13 @@ class LabelingStudioTab(QWidget):
             "QPushButton { padding: 3px 7px; font-size: 12px; }"
             "QCheckBox { font-size: 12px; spacing: 3px; }"
             "QPushButton#segEditBtn { border-top-right-radius: 0px; border-bottom-right-radius: 0px; }"
-            "QPushButton#segDrawBtn { border-radius: 0px; border-left: none; border-right: none; }"
-            "QPushButton#segSamBtn { border-radius: 0px; border-right: none; }"
-            "QPushButton#segPanBtn { border-top-left-radius: 0px; border-bottom-left-radius: 0px; }"
+            "QPushButton#segDrawBtn { border-radius: 0px; border-left: none; }"
+            "QPushButton#segSamBtn { border-radius: 0px; border-left: none; }"
+            "QPushButton#segPanBtn { border-top-left-radius: 0px; border-bottom-left-radius: 0px; border-left: none; }"
             "QPushButton#segEditBtn:checked { background-color: #ddf4ff; border-color: #0969da; color: #0550ae; font-weight: 600; }"
-            "QPushButton#segDrawBtn:checked { background-color: #ffebe9; border-color: #cf222e; color: #a40e26; font-weight: 600; }"
-            "QPushButton#segSamBtn:checked { background-color: #e6fffa; border-color: #0d9488; color: #115e59; font-weight: 600; }"
-            "QPushButton#segPanBtn:checked { background-color: #fff8c5; border-color: #bf8700; color: #7d4e00; font-weight: 600; }"
+            "QPushButton#segDrawBtn:checked { background-color: #ffebe9; border: 1px solid #cf222e; padding-left: 6px; color: #a40e26; font-weight: 600; }"
+            "QPushButton#segSamBtn:checked { background-color: #e6fffa; border: 1px solid #0d9488; padding-left: 6px; color: #115e59; font-weight: 600; }"
+            "QPushButton#segPanBtn:checked { background-color: #fff8c5; border: 1px solid #bf8700; padding-left: 6px; color: #7d4e00; font-weight: 600; }"
             "QPushButton#verifyNextBtn { background-color: #eafaf1; border-color: #2da44e; color: #1a7f37; font-weight: 600; }"
             "QPushButton#verifyNextBtn:hover { background-color: #dafbe1; }"
             "QPushButton#verifyNextBtn:disabled { background-color: #f2f2f2; border-color: #d0d7de; color: #999999; }"
@@ -693,6 +693,13 @@ class LabelingStudioTab(QWidget):
         mode_seg_lay.addWidget(self.sam_point_mode_btn)
         mode_seg_lay.addWidget(self.pan_mode_btn)
 
+        self.sam_refine_btn = QPushButton("SAM收框")
+        self.sam_refine_btn.setToolTip("调用本地 SAM 2.1 对当前选中框（未选中时对整图全部框）执行像素级轮廓贴边收紧")
+        self.llm_fix_btn = QPushButton("AI修框(G)")
+        self.llm_fix_btn.setToolTip(
+            "使用全局 AI 模型（右上角「⚙ 设置」）与辅助判定规则对当前选中框做局部放大精修（自动修正尺寸、类别或误检，极省 Token；快捷键 G）"
+        )
+
         self.dup_box_btn = QPushButton("复制")
         self.dup_box_btn.setToolTip("复制当前选中框 (Ctrl+D)")
         self.del_box_btn = QPushButton("删除")
@@ -713,13 +720,6 @@ class LabelingStudioTab(QWidget):
         self.verify_next_btn = QPushButton("✓ 通过(F)")
         self.verify_next_btn.setObjectName("verifyNextBtn")
         self.verify_next_btn.setToolTip("标记当前图已人工复核（0 框时保存为显式空图负样本）、清除漏标提醒并自动切换下一张 (F)")
-
-        self.sam_refine_btn = QPushButton("SAM收框")
-        self.sam_refine_btn.setToolTip("调用本地 SAM 2.1 对当前选中框（未选中时对整图全部框）执行像素级轮廓贴边收紧")
-        self.llm_fix_btn = QPushButton("AI修框")
-        self.llm_fix_btn.setToolTip(
-            "使用「3. 自动智能标注」配置的 LLM 与辅助判定规则对当前选中框做局部放大精修（自动修正尺寸、类别或误检，极省 Token；快捷键 G）"
-        )
 
         self.keep_view_chk = QCheckBox("保持视野")
         self.keep_view_chk.setChecked(False)
@@ -743,6 +743,8 @@ class LabelingStudioTab(QWidget):
             self.draw_mode_btn,
             self.sam_point_mode_btn,
             self.pan_mode_btn,
+            self.sam_refine_btn,
+            self.llm_fix_btn,
             self.dup_box_btn,
             self.del_box_btn,
             self.undo_btn,
@@ -751,8 +753,6 @@ class LabelingStudioTab(QWidget):
             self.next_img_btn,
             self.save_btn,
             self.verify_next_btn,
-            self.sam_refine_btn,
-            self.llm_fix_btn,
             self.keep_view_chk,
             self.show_labels_chk,
             self.auto_save_chk,
@@ -765,6 +765,9 @@ class LabelingStudioTab(QWidget):
         t_lay.addWidget(self._make_vsep())
         t_lay.addWidget(mode_seg)
         t_lay.addWidget(self._make_vsep())
+        t_lay.addWidget(self.sam_refine_btn)
+        t_lay.addWidget(self.llm_fix_btn)
+        t_lay.addWidget(self._make_vsep())
         t_lay.addWidget(self.dup_box_btn)
         t_lay.addWidget(self.del_box_btn)
         t_lay.addWidget(self.undo_btn)
@@ -774,9 +777,6 @@ class LabelingStudioTab(QWidget):
         t_lay.addWidget(self.next_img_btn)
         t_lay.addWidget(self.save_btn)
         t_lay.addWidget(self.verify_next_btn)
-        t_lay.addWidget(self._make_vsep())
-        t_lay.addWidget(self.sam_refine_btn)
-        t_lay.addWidget(self.llm_fix_btn)
         t_lay.addWidget(self._make_vsep())
         t_lay.addWidget(self.keep_view_chk)
         t_lay.addWidget(self.show_labels_chk)
@@ -954,7 +954,7 @@ class LabelingStudioTab(QWidget):
         obj_lay.addLayout(obj_hdr)
 
         self.shape_list = _EmptyHintListWidget(
-            "当前图暂无目标框\n按 R 进入画框模式，拖拽或两点点击即可标注"
+            "当前图暂无目标框\n按 R 画框，或按 Q 使用本地 SAM 点选标注"
         )
         self.shape_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.shape_list.setStyleSheet(
@@ -2015,7 +2015,7 @@ class LabelingStudioTab(QWidget):
         self.box_sam_inline_btn.setEnabled(has_sel and not sam_busy and not sam_point_busy)
         self.box_sam_inline_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
         self.llm_fix_btn.setEnabled(has_sel and not llm_busy)
-        self.llm_fix_btn.setText("AI精修中" if llm_busy else "AI修框")
+        self.llm_fix_btn.setText("AI精修中" if llm_busy else "AI修框(G)")
         self.box_llm_fix_inline_btn.setEnabled(has_sel and not llm_busy)
         self.box_llm_fix_inline_btn.setText("AI精修中" if llm_busy else "AI精修(G)")
 
