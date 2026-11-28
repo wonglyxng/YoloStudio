@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import (
@@ -50,6 +51,63 @@ HANDLE_CURSORS: dict[str, Qt.CursorShape] = {
     "e": Qt.CursorShape.SizeHorCursor,
     "w": Qt.CursorShape.SizeHorCursor,
 }
+
+
+def build_view_enhancement_lut(
+    *,
+    brightness: int = 0,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+) -> np.ndarray:
+    """构造 256 级 uint8 视图增强查表（先 Gamma 暗部提亮，再以 128 为中心拉伸对比度并偏移亮度）。
+
+    参数范围：
+        - `brightness`：`-100 ~ +100`；
+        - `contrast`：`0.2 ~ 3.0`（`1.0` 为原始对比度）；
+        - `gamma`：`0.2 ~ 4.0`（`> 1.0` 提亮暗部阴影且抑制高光过曝，`1.0` 为原始伽马）。
+    """
+    b = max(-100, min(100, int(brightness)))
+    c = max(0.2, min(3.0, float(contrast)))
+    g = max(0.2, min(4.0, float(gamma)))
+    x = np.arange(256, dtype=np.float32)
+    if abs(g - 1.0) > 1e-4:
+        x = np.power(x / 255.0, 1.0 / g) * 255.0
+    if abs(c - 1.0) > 1e-4:
+        x = (x - 128.0) * c + 128.0
+    if b != 0:
+        x = x + float(b)
+    return np.clip(np.rint(x), 0.0, 255.0).astype(np.uint8)
+
+
+def apply_view_enhancement(
+    pixmap: QPixmap,
+    *,
+    brightness: int = 0,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+) -> QPixmap:
+    """对画布显示的 `QPixmap` 副本执行非破坏性临时视图增强（仅影响屏幕显示，不改动原图数据）。"""
+    if pixmap.isNull():
+        return pixmap
+    if brightness == 0 and abs(contrast - 1.0) < 1e-3 and abs(gamma - 1.0) < 1e-3:
+        return pixmap
+
+    qimg = pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    w = qimg.width()
+    h = qimg.height()
+    if w <= 0 or h <= 0:
+        return pixmap
+    bpl = qimg.bytesPerLine()
+    ptr = qimg.bits()
+    if ptr is None:
+        return pixmap
+    ptr.setsize(h * bpl)
+    buf = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))
+    rgba = np.ascontiguousarray(buf[:, : w * 4].reshape((h, w, 4)))
+    lut = build_view_enhancement_lut(brightness=brightness, contrast=contrast, gamma=gamma)
+    rgba[..., :3] = lut[rgba[..., :3]]
+    enhanced_img = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+    return QPixmap.fromImage(enhanced_img)
 
 
 def load_image_pixmap(image_path: Path) -> tuple[QPixmap, int, int]:
@@ -89,6 +147,9 @@ class AnnotationCanvasView(QGraphicsView):
     HANDLE_DRAG_THRESHOLD_PX = 2.5
     PIXEL_SHARP_ZOOM = 2.0
     EDGE_SCROLL_MARGIN_PX = 28.0
+    DEFAULT_ENHANCE_BRIGHTNESS = 14
+    DEFAULT_ENHANCE_CONTRAST = 1.18
+    DEFAULT_ENHANCE_GAMMA = 1.55
 
     # 画布交互信号
     box_drawn = Signal(float, float, float, float)  # 新绘制矩形框 (x1, y1, x2, y2)
@@ -114,6 +175,7 @@ class AnnotationCanvasView(QGraphicsView):
 
         self._image_width: int = 0
         self._image_height: int = 0
+        self._source_pixmap: QPixmap = QPixmap()
         self._boxes: list[RectAnnotation] = []
         self._selected_idx: int = -1
         self._hover_idx: int = -1
@@ -121,6 +183,11 @@ class AnnotationCanvasView(QGraphicsView):
         self._mode: str = self.MODE_EDIT
         self._active_label: str = ""
         self._show_labels: bool = True
+        self._always_show_crosshair: bool = False
+        self._view_enhance_enabled: bool = False
+        self._view_enhance_brightness: int = self.DEFAULT_ENHANCE_BRIGHTNESS
+        self._view_enhance_contrast: float = self.DEFAULT_ENHANCE_CONTRAST
+        self._view_enhance_gamma: float = self.DEFAULT_ENHANCE_GAMMA
 
         # 视口缩放与自适应状态
         self._fit_mode: bool = True
@@ -304,6 +371,72 @@ class AnnotationCanvasView(QGraphicsView):
         self._show_labels = bool(visible)
         self.viewport().update()
 
+    def always_show_crosshair(self) -> bool:
+        """返回全模式常显十字准星开关状态（画框与 SAM 点选模式下始终自带准星）。"""
+        return self._always_show_crosshair
+
+    def set_always_show_crosshair(self, enabled: bool) -> None:
+        """切换是否在编辑与抓手等全模式下常显双色高对比度十字准星。"""
+        flag = bool(enabled)
+        if flag == self._always_show_crosshair:
+            return
+        self._always_show_crosshair = flag
+        self.viewport().update()
+
+    def view_enhancement_enabled(self) -> bool:
+        """返回当前是否开启暗部/对比度临时视图增强。"""
+        return self._view_enhance_enabled
+
+    def view_enhancement_params(self) -> tuple[int, float, float]:
+        """返回当前视图增强参数 `(brightness, contrast, gamma)`。"""
+        return (
+            self._view_enhance_brightness,
+            self._view_enhance_contrast,
+            self._view_enhance_gamma,
+        )
+
+    def set_view_enhancement(
+        self,
+        enabled: bool,
+        *,
+        brightness: int | None = None,
+        contrast: float | None = None,
+        gamma: float | None = None,
+    ) -> None:
+        """更新画布临时视图增强开关与参数并实时刷新显示像素（不改动原图缓存与磁盘文件）。"""
+        self._view_enhance_enabled = bool(enabled)
+        if brightness is not None:
+            self._view_enhance_brightness = max(-100, min(100, int(brightness)))
+        if contrast is not None:
+            self._view_enhance_contrast = max(0.2, min(3.0, float(contrast)))
+        if gamma is not None:
+            self._view_enhance_gamma = max(0.2, min(4.0, float(gamma)))
+        self._refresh_displayed_pixmap()
+
+    def reset_view_enhancement(self, *, disable: bool = False) -> None:
+        """将临时视图增强参数重置为默认暗部提亮预设；`disable=True` 时一并关闭增强。"""
+        self._view_enhance_brightness = self.DEFAULT_ENHANCE_BRIGHTNESS
+        self._view_enhance_contrast = self.DEFAULT_ENHANCE_CONTRAST
+        self._view_enhance_gamma = self.DEFAULT_ENHANCE_GAMMA
+        if disable:
+            self._view_enhance_enabled = False
+        self._refresh_displayed_pixmap()
+
+    def _refresh_displayed_pixmap(self) -> None:
+        if self._source_pixmap.isNull():
+            return
+        if self._view_enhance_enabled:
+            displayed = apply_view_enhancement(
+                self._source_pixmap,
+                brightness=self._view_enhance_brightness,
+                contrast=self._view_enhance_contrast,
+                gamma=self._view_enhance_gamma,
+            )
+        else:
+            displayed = self._source_pixmap
+        self._pixmap_item.setPixmap(displayed)
+        self.viewport().update()
+
     def show_hud_message(
         self,
         text: str,
@@ -395,7 +528,8 @@ class AnnotationCanvasView(QGraphicsView):
             self.clear_image()
             return
 
-        self._pixmap_item.setPixmap(pixmap)
+        self._source_pixmap = pixmap
+        self._refresh_displayed_pixmap()
         self._image_width = int(width or pixmap.width())
         self._image_height = int(height or pixmap.height())
         self._update_scene_bounds(self._logical_scale())
@@ -414,6 +548,7 @@ class AnnotationCanvasView(QGraphicsView):
         self._cached_center_scene = None
         self._hud_timer.stop()
         self._hud_message = ""
+        self._source_pixmap = QPixmap()
         self._pixmap_item.setPixmap(QPixmap())
         self._image_width = 0
         self._image_height = 0
@@ -1227,6 +1362,8 @@ class AnnotationCanvasView(QGraphicsView):
             self._hover_idx = -1
             self._hover_handle = None
             self._update_cursor_for_hover()
+            if self._always_show_crosshair:
+                self.viewport().update()
             return
 
         # 编辑模式拖拽判定与更新
@@ -1283,7 +1420,7 @@ class AnnotationCanvasView(QGraphicsView):
         self._hover_handle = self._hit_test_handle(scene_pos)
         self._hover_idx = self._selected_idx if self._hover_handle else self._hit_test_box(scene_pos)
         self._update_cursor_for_hover()
-        if (self._hover_idx, self._hover_handle) != prev_hover:
+        if (self._hover_idx, self._hover_handle) != prev_hover or self._always_show_crosshair:
             self.viewport().update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
@@ -1494,14 +1631,12 @@ class AnnotationCanvasView(QGraphicsView):
         # 绘制模式：双色高对比十字准星与实时草稿框
         if self._mode == self.MODE_DRAW:
             if self._cursor_scene_pos is not None:
-                cx = max(0.0, min(float(self._image_width), self._cursor_scene_pos.x()))
-                cy = max(0.0, min(float(self._image_height), self._cursor_scene_pos.y()))
-                painter.setPen(QPen(QColor(0, 0, 0, 145), 2.2 * inv, Qt.PenStyle.SolidLine))
-                painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
-                painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
-                painter.setPen(QPen(QColor(255, 255, 255, 225), 1.0 * inv, Qt.PenStyle.DashLine))
-                painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
-                painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+                self._paint_crosshair(
+                    painter,
+                    inv,
+                    outer_color=QColor(0, 0, 0, 145),
+                    inner_color=QColor(255, 255, 255, 225),
+                )
 
             if self._draw_state != "idle":
                 dx1, dx2 = sorted((self._draw_start.x(), self._draw_current.x()))
@@ -1525,14 +1660,12 @@ class AnnotationCanvasView(QGraphicsView):
         # SAM 点选标注模式：十字准星、实时预览框与正负提示点渲染
         if self._mode == self.MODE_SAM_POINT:
             if self._cursor_scene_pos is not None:
-                cx = max(0.0, min(float(self._image_width), self._cursor_scene_pos.x()))
-                cy = max(0.0, min(float(self._image_height), self._cursor_scene_pos.y()))
-                painter.setPen(QPen(QColor(0, 0, 0, 115), 2.0 * inv, Qt.PenStyle.SolidLine))
-                painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
-                painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
-                painter.setPen(QPen(QColor(45, 212, 191, 215), 1.0 * inv, Qt.PenStyle.DashLine))
-                painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
-                painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+                self._paint_crosshair(
+                    painter,
+                    inv,
+                    outer_color=QColor(0, 0, 0, 115),
+                    inner_color=QColor(45, 212, 191, 215),
+                )
 
             if self._sam_preview_rect is not None:
                 px1, py1, px2, py2 = self._sam_preview_rect
@@ -1562,8 +1695,42 @@ class AnnotationCanvasView(QGraphicsView):
                 if pt_lbl == 1:
                     painter.drawLine(QPointF(pt_x, pt_y - cross_r), QPointF(pt_x, pt_y + cross_r))
 
+        # 编辑或抓手模式下若开启全模式十字准星（X），在非平移态绘制双色辅助对齐线
+        if (
+            self._always_show_crosshair
+            and self._mode in (self.MODE_EDIT, self.MODE_PAN)
+            and not self._panning
+            and self._cursor_scene_pos is not None
+        ):
+            self._paint_crosshair(
+                painter,
+                inv,
+                outer_color=QColor(0, 0, 0, 120),
+                inner_color=QColor(125, 211, 252, 220),
+            )
+
         painter.restore()
         self._paint_hud_overlay(painter)
+
+    def _paint_crosshair(
+        self,
+        painter: QPainter,
+        inv: float,
+        *,
+        outer_color: QColor,
+        inner_color: QColor,
+    ) -> None:
+        """在当前光标所在图像位置绘制横贯整张画面的双色高对比度十字准星。"""
+        if self._cursor_scene_pos is None:
+            return
+        cx = max(0.0, min(float(self._image_width), self._cursor_scene_pos.x()))
+        cy = max(0.0, min(float(self._image_height), self._cursor_scene_pos.y()))
+        painter.setPen(QPen(outer_color, 2.2 * inv, Qt.PenStyle.SolidLine))
+        painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
+        painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+        painter.setPen(QPen(inner_color, 1.0 * inv, Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
+        painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
 
     def _paint_hud_overlay(self, painter: QPainter) -> None:
         """在画布视口顶部中央按需绘制轻量悬浮提示胶囊（不遮挡目标且不拦截鼠标事件）。"""

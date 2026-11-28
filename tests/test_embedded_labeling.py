@@ -2519,4 +2519,166 @@ def test_workbench_sam_feature_cache_precompute_and_stale_model_cleanup(
         win.close()
 
 
+def test_workbench_micro_ops_crosshair_view_enhance_and_copy_prev_frame(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证标注员微操三件套：全模式十字准星(X)、非破坏性暗部视图增强(B)与一键复用上一张图框(Shift+V)。"""
+    from PyQt6.QtGui import QColor
+
+    frames_dir = tmp_path / "micro_ops_frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    f1 = frames_dir / "001.png"
+    f2 = frames_dir / "002.png"
+    f3 = frames_dir / "003.png"
+    # 使用无损 PNG 暗图精确断言 LUT 提亮前后像素值，确保不改动原图文件
+    Image.new("RGB", (400, 300), color=(30, 40, 50)).save(f1)
+    Image.new("RGB", (400, 300), color=(25, 35, 45)).save(f2)
+    Image.new("RGB", (800, 600), color=(20, 30, 40)).save(f3)
+    f1_orig_bytes = f1.read_bytes()
+
+    f1.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "player",
+                        "points": [[40.0, 30.0], [160.0, 210.0]],
+                        "group_id": None,
+                        "description": "",
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "monster",
+                        "points": [[220.0, 60.0], [340.0, 180.0]],
+                        "group_id": None,
+                        "description": "",
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                ],
+                "imagePath": f1.name,
+                "imageHeight": 300,
+                "imageWidth": 400,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    win.activateWindow()
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+
+        # 1) 全模式十字准星（X）：编辑模式下按键切换开关，且搜索框打字不误触
+        assert tab.crosshair_btn.isChecked() is False
+        assert tab.canvas.always_show_crosshair() is False
+        QTest.keyClick(tab.canvas, Qt.Key.Key_X)
+        qt_app.processEvents()
+        assert tab.crosshair_btn.isChecked() is True
+        assert tab.canvas.always_show_crosshair() is True
+        assert not tab.canvas.grab().isNull()
+
+        # 文本输入框聚焦时按 X / B / Shift+V 均不误触发快捷键
+        tab.file_search.setFocus()
+        qt_app.processEvents()
+        QTest.keyClick(tab.file_search, Qt.Key.Key_X)
+        QTest.keyClick(tab.file_search, Qt.Key.Key_B)
+        QTest.keyClick(tab.file_search, Qt.Key.Key_V, Qt.KeyboardModifier.ShiftModifier)
+        qt_app.processEvents()
+        assert tab.crosshair_btn.isChecked() is True
+        assert tab.view_enhance_btn.isChecked() is False
+        tab.file_search.clear()
+        tab.canvas.setFocus()
+        qt_app.processEvents()
+
+        QTest.keyClick(tab.canvas, Qt.Key.Key_X)
+        qt_app.processEvents()
+        assert tab.crosshair_btn.isChecked() is False
+        assert tab.canvas.always_show_crosshair() is False
+
+        # 2) 暗部/对比度临时视图增强（B）：仅提亮显示像素，不改动原图缓存与磁盘文件，切图自动延续
+        before_px: QColor = tab.canvas._pixmap_item.pixmap().toImage().pixelColor(10, 10)
+        assert (before_px.red(), before_px.green(), before_px.blue()) == (30, 40, 50)
+
+        QTest.keyClick(tab.canvas, Qt.Key.Key_B)
+        qt_app.processEvents()
+        assert tab.view_enhance_btn.isChecked() is True
+        assert tab.canvas.view_enhancement_enabled() is True
+        after_px: QColor = tab.canvas._pixmap_item.pixmap().toImage().pixelColor(10, 10)
+        assert after_px.red() > 50 and after_px.green() > 60 and after_px.blue() > 70
+        # 源缓存与磁盘文件毫发无损
+        src_px: QColor = tab.canvas._source_pixmap.toImage().pixelColor(10, 10)
+        assert (src_px.red(), src_px.green(), src_px.blue()) == (30, 40, 50)
+        assert f1.read_bytes() == f1_orig_bytes
+
+        # 构造滑块微调菜单确保无异常
+        enhance_menu = tab._build_view_enhance_menu()
+        assert len(enhance_menu.actions()) == 1
+        enhance_menu.deleteLater()
+
+        # 3) 首张图时「←上帧」禁用；切至图 2 时启用且视图增强自动延续
+        assert tab.copy_prev_boxes_btn.isEnabled() is False
+        tab.open_next_image()
+        qt_app.processEvents()
+        assert tab.copy_prev_boxes_btn.isEnabled() is True
+        assert tab._doc is not None and len(tab._doc.boxes) == 0
+        f2_px: QColor = tab.canvas._pixmap_item.pixmap().toImage().pixelColor(10, 10)
+        assert f2_px.red() > 45  # 切图后继续套用临时增强
+
+        # 再按 B 恢复原始像素显示
+        QTest.keyClick(tab.canvas, Qt.Key.Key_B)
+        qt_app.processEvents()
+        assert tab.view_enhance_btn.isChecked() is False
+        f2_raw: QColor = tab.canvas._pixmap_item.pixmap().toImage().pixelColor(10, 10)
+        assert (f2_raw.red(), f2_raw.green(), f2_raw.blue()) == (25, 35, 45)
+
+        # 按 Shift+V 一键复用图 1 的 2 个框，连按第二次自动防重跳过，Ctrl+Z 一步撤回
+        QTest.keyClick(tab.canvas, Qt.Key.Key_V, Qt.KeyboardModifier.ShiftModifier)
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 2
+        assert [b.label for b in tab._doc.boxes] == ["player", "monster"]
+        assert (tab._doc.boxes[0].x1, tab._doc.boxes[0].y1) == (40.0, 30.0)
+
+        QTest.keyClick(tab.canvas, Qt.Key.Key_V, Qt.KeyboardModifier.ShiftModifier)
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 2  # 同类高重合自动去重，不叠加重影框
+        assert "无需重复" in tab.save_state_label.text()
+
+        tab._undo()
+        assert len(tab._doc.boxes) == 0
+
+        # 重新复用并保存图 2，切至不同分辨率（800×600）的图 3，点击「←上帧」验证等比缩放映射
+        tab.copy_prev_boxes_btn.click()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 2
+        assert tab.save_current_annotation(force=True) is True
+
+        tab.open_next_image()
+        qt_app.processEvents()
+        assert tab._doc is not None and (tab._doc.image_width, tab._doc.image_height) == (800, 600)
+        tab.copy_prev_boxes_btn.click()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 2
+        assert (tab._doc.boxes[0].x1, tab._doc.boxes[0].y1, tab._doc.boxes[0].x2, tab._doc.boxes[0].y2) == (
+            80.0,
+            60.0,
+            320.0,
+            420.0,
+        )
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+
 

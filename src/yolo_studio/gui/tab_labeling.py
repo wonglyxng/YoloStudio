@@ -52,10 +52,12 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from yolo_studio.core.annotation_io import (
@@ -313,6 +315,23 @@ class _LabelPickerDialog(QDialog):
 
     def selected_label(self) -> str:
         return self.combo.currentText().strip()
+
+
+def _rect_iou(a: RectAnnotation, b: RectAnnotation) -> float:
+    """计算两个轴对齐矩形标注框的交并比 IoU（取值 `0.0 ~ 1.0`），用于复用上帧框时自动去重。"""
+    ix1 = max(a.x1, b.x1)
+    iy1 = max(a.y1, b.y1)
+    ix2 = min(a.x2, b.x2)
+    iy2 = min(a.y2, b.y2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, a.width) * max(0.0, a.height)
+    area_b = max(0.0, b.width) * max(0.0, b.height)
+    union = area_a + area_b - inter
+    return inter / union if union > 1e-6 else 0.0
 
 
 _SAM_BGR_CACHE_MAX = 2
@@ -993,22 +1012,49 @@ class LabelingStudioTab(QWidget):
             "QFrame { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 4px; }"
             "QLabel { border: none; color: #57606a; font-size: 12px; }"
             "QPushButton { padding: 2px 7px; font-size: 11px; min-height: 20px; }"
+            "QPushButton#footerToggleBtn:checked { background-color: #ddf4ff; border-color: #0969da; color: #0550ae; font-weight: 600; }"
+            "QPushButton#footerEnhanceBtn:checked { background-color: #fff8c5; border-color: #bf8700; color: #7d4e00; font-weight: 600; }"
         )
         f_lay = QHBoxLayout(footer)
         f_lay.setContentsMargins(8, 3, 8, 3)
-        f_lay.setSpacing(8)
+        f_lay.setSpacing(6)
         self.mode_badge_label = _CompactFooterLabel("模式: 编辑", min_width=64)
         self.mode_badge_label.setStyleSheet("border: none; color: #0969da; font-weight: 600; font-size: 12px;")
         self.img_info_label = _CompactFooterLabel("分辨率: -", min_width=64)
         self.cursor_info_label = _CompactFooterLabel("坐标: -", min_width=52)
         self.hint_info_label = _ElidedStatusLabel(
-            "滚轮缩放 · 拖空白/右键/空格平移 · 方向键微调选中框",
+            "滚轮缩放 · 拖空白/右键/空格平移 · X准星 · B增亮 · Shift+V复用上帧",
             min_width=0,
         )
         self.hint_info_label.setStyleSheet("border: none; color: #8c959f; font-size: 11px;")
         self.zoom_info_label = QLabel("缩放: 100%", self)
         self.zoom_info_label.setVisible(False)
         self.save_state_label = _CompactFooterLabel("", min_width=32)
+
+        self.crosshair_btn = QPushButton("准星(X)")
+        self.crosshair_btn.setObjectName("footerToggleBtn")
+        self.crosshair_btn.setCheckable(True)
+        self.crosshair_btn.setToolTip("全模式常显双色高对比度十字准星，方便编辑对齐边缘 (快捷键 X)")
+
+        enhance_grp = QWidget()
+        enhance_lay = QHBoxLayout(enhance_grp)
+        enhance_lay.setContentsMargins(0, 0, 0, 0)
+        enhance_lay.setSpacing(0)
+        self.view_enhance_btn = QPushButton("增亮(B)")
+        self.view_enhance_btn.setObjectName("footerEnhanceBtn")
+        self.view_enhance_btn.setCheckable(True)
+        self.view_enhance_btn.setStyleSheet("border-top-right-radius: 0px; border-bottom-right-radius: 0px;")
+        self.view_enhance_btn.setToolTip(
+            "一键开关暗部/对比度临时视图增强（仅影响画布显示，绝不修改磁盘原图；快捷键 B）"
+        )
+        self.view_enhance_menu_btn = QPushButton("▾")
+        self.view_enhance_menu_btn.setFixedWidth(20)
+        self.view_enhance_menu_btn.setStyleSheet(
+            "border-top-left-radius: 0px; border-bottom-left-radius: 0px; border-left: none; padding: 2px 2px;"
+        )
+        self.view_enhance_menu_btn.setToolTip("调节临时视图增强参数（暗部 Gamma / 对比度 / 亮度）或切换预设")
+        enhance_lay.addWidget(self.view_enhance_btn)
+        enhance_lay.addWidget(self.view_enhance_menu_btn)
 
         self.zoom_out_btn = QPushButton("−")
         self.zoom_out_btn.setFixedWidth(26)
@@ -1023,6 +1069,9 @@ class LabelingStudioTab(QWidget):
         self.zoom_100_btn = QPushButton("1:1")
         self.zoom_100_btn.setToolTip("切换至 100% 原始像素比例 (Ctrl+1)")
         for zb in (
+            self.crosshair_btn,
+            self.view_enhance_btn,
+            self.view_enhance_menu_btn,
             self.zoom_out_btn,
             self.zoom_menu_btn,
             self.zoom_in_btn,
@@ -1036,6 +1085,9 @@ class LabelingStudioTab(QWidget):
         f_lay.addWidget(self.cursor_info_label)
         f_lay.addWidget(self.hint_info_label, 1)
         f_lay.addWidget(self.save_state_label)
+        f_lay.addWidget(self._make_vsep())
+        f_lay.addWidget(self.crosshair_btn)
+        f_lay.addWidget(enhance_grp)
         f_lay.addWidget(self._make_vsep())
         f_lay.addWidget(self.zoom_out_btn)
         f_lay.addWidget(self.zoom_menu_btn)
@@ -1113,14 +1165,22 @@ class LabelingStudioTab(QWidget):
         obj_lay.setSpacing(5)
 
         obj_hdr = QHBoxLayout()
+        obj_hdr.setSpacing(4)
         self.obj_title_label = QLabel("当前图目标框 (0)")
         self.obj_title_label.setStyleSheet("font-weight: 600; color: #24292f;")
+        self.copy_prev_boxes_btn = QPushButton("←上帧")
+        self.copy_prev_boxes_btn.setToolTip(
+            "一键复制上一张图片中的全部目标框到当前图（自动跳过已重合框，Ctrl+Z 可撤回；快捷键 Shift+V）"
+        )
+        self.copy_prev_boxes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.copy_prev_boxes_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
         self.clear_boxes_btn = QPushButton("清空")
         self.clear_boxes_btn.setToolTip("清空当前图片全部目标框")
         self.clear_boxes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.clear_boxes_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
         obj_hdr.addWidget(self.obj_title_label)
         obj_hdr.addStretch(1)
+        obj_hdr.addWidget(self.copy_prev_boxes_btn)
         obj_hdr.addWidget(self.clear_boxes_btn)
         obj_lay.addLayout(obj_hdr)
 
@@ -1289,6 +1349,7 @@ class LabelingStudioTab(QWidget):
         self.focus_box_btn.clicked.connect(self._focus_selected_box)
         self.box_sam_inline_btn.clicked.connect(self._on_sam_refine_clicked)
         self.box_llm_fix_inline_btn.clicked.connect(self._on_llm_fix_box_clicked)
+        self.copy_prev_boxes_btn.clicked.connect(self._copy_boxes_from_previous_image)
         self.clear_boxes_btn.clicked.connect(self._clear_all_boxes)
         self.undo_btn.clicked.connect(self._undo)
         self.redo_btn.clicked.connect(self._redo)
@@ -1300,6 +1361,9 @@ class LabelingStudioTab(QWidget):
         self.sam_refine_btn.clicked.connect(self._on_sam_refine_clicked)
         self.llm_fix_btn.clicked.connect(self._on_llm_fix_box_clicked)
         self.keep_view_chk.toggled.connect(self._on_keep_view_toggled)
+        self.crosshair_btn.toggled.connect(self._on_crosshair_toggled)
+        self.view_enhance_btn.toggled.connect(self._on_view_enhance_toggled)
+        self.view_enhance_menu_btn.clicked.connect(self._on_view_enhance_menu_clicked)
         self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_by(1.0 / 1.25))
         self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom_by(1.25))
         self.zoom_menu_btn.clicked.connect(self._on_zoom_menu_clicked)
@@ -1502,6 +1566,15 @@ class LabelingStudioTab(QWidget):
             return True
         if key == Qt.Key.Key_L:
             self.show_labels_chk.toggle()
+            return True
+        if key == Qt.Key.Key_X and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            self.crosshair_btn.toggle()
+            return True
+        if key == Qt.Key.Key_B and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            self.view_enhance_btn.toggle()
+            return True
+        if key == Qt.Key.Key_V and bool(mods & Qt.KeyboardModifier.ShiftModifier):
+            self._copy_boxes_from_previous_image()
             return True
         if key == Qt.Key.Key_A:
             self.open_prev_image()
@@ -2235,6 +2308,7 @@ class LabelingStudioTab(QWidget):
         self.box_del_inline_btn.setEnabled(has_sel)
         self.change_cls_btn.setEnabled(has_sel)
         self.focus_box_btn.setEnabled(has_sel)
+        self.copy_prev_boxes_btn.setEnabled(self._resolve_previous_image_path() is not None)
         self.clear_boxes_btn.setEnabled(has_boxes)
         self.undo_btn.setEnabled(len(self._undo_stack) > 0)
         self.redo_btn.setEnabled(len(self._redo_stack) > 0)
@@ -2618,6 +2692,100 @@ class LabelingStudioTab(QWidget):
         self._apply_boxes_change(selected_idx=len(self._doc.boxes) - 1)
         self.canvas.ensure_box_visible(len(self._doc.boxes) - 1)
         self.save_state_label.setText(f"已粘贴 {len(pasted)} 个目标框")
+
+    def _resolve_previous_image_path(self) -> Path | None:
+        """返回当前浏览列表中紧邻当前图片的上一张图片路径；位于首张或未打开图片时返回 `None`。"""
+        if self._doc is None:
+            return None
+        cur_path = self._doc.image_path
+        for img_list in (self._filtered_images, self._all_images):
+            for idx, p in enumerate(img_list):
+                if p == cur_path:
+                    return img_list[idx - 1] if idx > 0 else None
+        return None
+
+    def _copy_boxes_from_previous_image(self) -> bool:
+        """一键复用上一张图片的全部标注框到当前图（跨分辨率自动缩放、同类高重合自动去重、支持 Ctrl+Z 撤回）。"""
+        if self._doc is None:
+            return False
+        prev_path = self._resolve_previous_image_path()
+        if prev_path is None:
+            self.save_state_label.setText("当前已是第一张图片，无上一张可复用")
+            self.canvas.show_hud_message("当前已是第一张图片，无上一张可复用", color="#57606a", duration_ms=1300)
+            return False
+
+        prev_doc = load_image_annotation(prev_path)
+        if not prev_doc.boxes:
+            self.save_state_label.setText(f"上一张「{prev_path.name}」暂无目标框可复用")
+            self.canvas.show_hud_message("上一张图片暂无目标框可复用", color="#57606a", duration_ms=1300)
+            return False
+
+        cur_w = self._doc.image_width
+        cur_h = self._doc.image_height
+        prev_w = prev_doc.image_width
+        prev_h = prev_doc.image_height
+        scale_x = (
+            float(cur_w) / float(prev_w)
+            if (cur_w > 0 and prev_w > 0 and cur_w != prev_w)
+            else 1.0
+        )
+        scale_y = (
+            float(cur_h) / float(prev_h)
+            if (cur_h > 0 and prev_h > 0 and cur_h != prev_h)
+            else 1.0
+        )
+
+        imported: list[RectAnnotation] = []
+        skipped_dup = 0
+        unseen_labels: list[str] = []
+        existing = list(self._doc.boxes)
+
+        for src in prev_doc.boxes:
+            cand = RectAnnotation(
+                label=src.label,
+                x1=src.x1 * scale_x,
+                y1=src.y1 * scale_y,
+                x2=src.x2 * scale_x,
+                y2=src.y2 * scale_y,
+                difficult=src.difficult,
+                group_id=src.group_id,
+            )
+            if cur_w > 0 and cur_h > 0:
+                cand = cand.clamped(cur_w, cur_h)
+            if (
+                cand.width < AnnotationCanvasView.MIN_BOX_SIZE_PX
+                or cand.height < AnnotationCanvasView.MIN_BOX_SIZE_PX
+            ):
+                continue
+            if any(ex.label == cand.label and _rect_iou(ex, cand) >= 0.95 for ex in existing):
+                skipped_dup += 1
+                continue
+            imported.append(cand)
+            existing.append(cand)
+            if cand.label and cand.label not in self._classes and cand.label not in unseen_labels:
+                unseen_labels.append(cand.label)
+
+        if not imported:
+            msg = (
+                f"上一张的 {skipped_dup} 个框已全部存在，无需重复导入"
+                if skipped_dup > 0
+                else "上一张图片的框超出当前图有效范围"
+            )
+            self.save_state_label.setText(msg)
+            self.canvas.show_hud_message(msg, color="#57606a", duration_ms=1400)
+            return False
+
+        self._push_undo_snapshot()
+        if unseen_labels:
+            self._merge_classes(unseen_labels, replace_order=False)
+        self._doc.boxes.extend(imported)
+        self._apply_boxes_change(selected_idx=len(self._doc.boxes) - 1)
+        self.canvas.ensure_box_visible(len(self._doc.boxes) - 1)
+        extra = f"（已跳过 {skipped_dup} 个重合框）" if skipped_dup > 0 else ""
+        msg = f"已从上一张复用 {len(imported)} 个框{extra}（Ctrl+Z 可撤回）"
+        self.save_state_label.setText(msg)
+        self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1600)
+        return True
 
     def _on_canvas_box_drawn(self, x1: float, y1: float, x2: float, y2: float) -> None:
         if self._doc is None:
@@ -3438,6 +3606,8 @@ class LabelingStudioTab(QWidget):
         menu.addSeparator()
         paste_act = menu.addAction("粘贴目标框 (Ctrl+V)")
         paste_act.setEnabled(bool(self._clipboard_boxes))
+        copy_prev_act = menu.addAction("复用上一张图框 (Shift+V)")
+        copy_prev_act.setEnabled(self._resolve_previous_image_path() is not None)
         copy_all_act = menu.addAction("复制整图所有框 (Ctrl+C)")
         copy_all_act.setEnabled(bool(self._doc.boxes))
         menu.addSeparator()
@@ -3446,6 +3616,12 @@ class LabelingStudioTab(QWidget):
         toggle_lbl_act = menu.addAction("显示目标标签 (L)")
         toggle_lbl_act.setCheckable(True)
         toggle_lbl_act.setChecked(self.show_labels_chk.isChecked())
+        toggle_crosshair_act = menu.addAction("常显十字准星 (X)")
+        toggle_crosshair_act.setCheckable(True)
+        toggle_crosshair_act.setChecked(self.crosshair_btn.isChecked())
+        toggle_enhance_act = menu.addAction("暗部/对比度视图增强 (B)")
+        toggle_enhance_act.setCheckable(True)
+        toggle_enhance_act.setChecked(self.view_enhance_btn.isChecked())
 
         chosen = menu.exec(global_pos)
         if chosen is edit_act:
@@ -3458,6 +3634,8 @@ class LabelingStudioTab(QWidget):
             self.canvas.set_mode(AnnotationCanvasView.MODE_PAN)
         elif chosen is paste_act:
             self._paste_boxes_from_clipboard()
+        elif chosen is copy_prev_act:
+            self._copy_boxes_from_previous_image()
         elif chosen is copy_all_act:
             self.canvas.select_box(-1, emit_signal=True)
             self._copy_boxes_to_clipboard()
@@ -3467,6 +3645,165 @@ class LabelingStudioTab(QWidget):
             self.canvas.set_zoom(1.0)
         elif chosen is toggle_lbl_act:
             self.show_labels_chk.toggle()
+        elif chosen is toggle_crosshair_act:
+            self.crosshair_btn.toggle()
+        elif chosen is toggle_enhance_act:
+            self.view_enhance_btn.toggle()
+
+    def _on_crosshair_toggled(self, checked: bool) -> None:
+        self.canvas.set_always_show_crosshair(checked)
+        if self.isVisible() and self._doc is not None:
+            if checked:
+                self.canvas.show_hud_message(
+                    "已开启全模式十字准星（编辑拖拽也可精确对齐 · 再按 X 关闭）",
+                    color="#0969da",
+                    duration_ms=1500,
+                )
+            else:
+                self.canvas.show_hud_message(
+                    "已关闭编辑模式常显十字准星（画框/点选模式仍自带准星）",
+                    color="#57606a",
+                    duration_ms=1300,
+                )
+
+    def _on_view_enhance_toggled(self, checked: bool) -> None:
+        self.canvas.set_view_enhancement(checked)
+        if self.isVisible() and self._doc is not None:
+            if checked:
+                b, c, g = self.canvas.view_enhancement_params()
+                self.canvas.show_hud_message(
+                    f"已开启临时视图增强（Gamma {g:.2f} / 对比 {c:.2f} / 亮度 {b:+d} · 不改原图）",
+                    color="#bf8700",
+                    duration_ms=1700,
+                )
+            else:
+                self.canvas.show_hud_message(
+                    "已恢复原始画面显示", color="#57606a", duration_ms=1200
+                )
+
+    def _build_view_enhance_menu(self) -> QMenu:
+        """构建带实时滑块与快捷预设的临时视图增强弹出菜单（不改动原图像素）。"""
+        menu = QMenu(self)
+        panel = QWidget(menu)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+
+        title = QLabel("临时视图增强（仅显示，不改原图）")
+        title.setStyleSheet("font-weight: 600; color: #24292f; font-size: 12px;")
+        lay.addWidget(title)
+
+        cur_b, cur_c, cur_g = self.canvas.view_enhancement_params()
+
+        gamma_val_lbl = QLabel(f"{cur_g:.2f}")
+        contrast_val_lbl = QLabel(f"{cur_c:.2f}")
+        bright_val_lbl = QLabel(f"{cur_b:+d}")
+        for vl in (gamma_val_lbl, contrast_val_lbl, bright_val_lbl):
+            vl.setFixedWidth(36)
+            vl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            vl.setStyleSheet("color: #57606a; font-size: 11px;")
+
+        gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        gamma_slider.setRange(60, 240)
+        gamma_slider.setValue(int(round(cur_g * 100)))
+        contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        contrast_slider.setRange(60, 200)
+        contrast_slider.setValue(int(round(cur_c * 100)))
+        bright_slider = QSlider(Qt.Orientation.Horizontal)
+        bright_slider.setRange(-60, 80)
+        bright_slider.setValue(int(cur_b))
+        for sl in (gamma_slider, contrast_slider, bright_slider):
+            sl.setFixedWidth(150)
+
+        for name, slider, val_lbl in (
+            ("暗部提亮", gamma_slider, gamma_val_lbl),
+            ("对比度  ", contrast_slider, contrast_val_lbl),
+            ("亮度    ", bright_slider, bright_val_lbl),
+        ):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            lbl = QLabel(name)
+            lbl.setFixedWidth(52)
+            lbl.setStyleSheet("color: #24292f; font-size: 11px;")
+            row.addWidget(lbl)
+            row.addWidget(slider, 1)
+            row.addWidget(val_lbl)
+            lay.addLayout(row)
+
+        def _apply_sliders() -> None:
+            g = gamma_slider.value() / 100.0
+            c = contrast_slider.value() / 100.0
+            b = bright_slider.value()
+            gamma_val_lbl.setText(f"{g:.2f}")
+            contrast_val_lbl.setText(f"{c:.2f}")
+            bright_val_lbl.setText(f"{b:+d}")
+            if not self.view_enhance_btn.isChecked():
+                self.view_enhance_btn.blockSignals(True)
+                self.view_enhance_btn.setChecked(True)
+                self.view_enhance_btn.blockSignals(False)
+            self.canvas.set_view_enhancement(True, brightness=b, contrast=c, gamma=g)
+
+        gamma_slider.valueChanged.connect(lambda _v: _apply_sliders())
+        contrast_slider.valueChanged.connect(lambda _v: _apply_sliders())
+        bright_slider.valueChanged.connect(lambda _v: _apply_sliders())
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        presets: tuple[tuple[str, int, float, float], ...] = (
+            ("暗部提亮", 14, 1.18, 1.55),
+            ("高对比", 4, 1.45, 1.15),
+            ("强提亮", 24, 1.25, 1.95),
+        )
+        for p_label, pb, pc, pg in presets:
+            p_btn = QPushButton(p_label)
+            p_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+
+            def _apply_preset(_checked: bool = False, _b: int = pb, _c: float = pc, _g: float = pg) -> None:
+                for sl, val in (
+                    (gamma_slider, int(round(_g * 100))),
+                    (contrast_slider, int(round(_c * 100))),
+                    (bright_slider, int(_b)),
+                ):
+                    sl.blockSignals(True)
+                    sl.setValue(val)
+                    sl.blockSignals(False)
+                _apply_sliders()
+
+            p_btn.clicked.connect(_apply_preset)
+            preset_row.addWidget(p_btn)
+
+        reset_btn = QPushButton("重置")
+        reset_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+
+        def _reset_enhance() -> None:
+            for sl, val in (
+                (gamma_slider, int(round(AnnotationCanvasView.DEFAULT_ENHANCE_GAMMA * 100))),
+                (contrast_slider, int(round(AnnotationCanvasView.DEFAULT_ENHANCE_CONTRAST * 100))),
+                (bright_slider, AnnotationCanvasView.DEFAULT_ENHANCE_BRIGHTNESS),
+            ):
+                sl.blockSignals(True)
+                sl.setValue(val)
+                sl.blockSignals(False)
+            gamma_val_lbl.setText(f"{AnnotationCanvasView.DEFAULT_ENHANCE_GAMMA:.2f}")
+            contrast_val_lbl.setText(f"{AnnotationCanvasView.DEFAULT_ENHANCE_CONTRAST:.2f}")
+            bright_val_lbl.setText(f"{AnnotationCanvasView.DEFAULT_ENHANCE_BRIGHTNESS:+d}")
+            self.view_enhance_btn.blockSignals(True)
+            self.view_enhance_btn.setChecked(False)
+            self.view_enhance_btn.blockSignals(False)
+            self.canvas.reset_view_enhancement(disable=True)
+
+        reset_btn.clicked.connect(_reset_enhance)
+        preset_row.addWidget(reset_btn)
+        lay.addLayout(preset_row)
+
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(panel)
+        menu.addAction(act)
+        return menu
+
+    def _on_view_enhance_menu_clicked(self) -> None:
+        menu = self._build_view_enhance_menu()
+        menu.exec(self.view_enhance_menu_btn.mapToGlobal(QPoint(0, -menu.sizeHint().height())))
 
     def _on_zoom_menu_clicked(self) -> None:
         menu = QMenu(self)
