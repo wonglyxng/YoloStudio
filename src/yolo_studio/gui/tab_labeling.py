@@ -78,6 +78,7 @@ from yolo_studio.core.label_auditor import (
     ImageAuditReport,
     LabelAuditResult,
 )
+from yolo_studio.core.sam_tracker import SamTrackResult
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.annotation_canvas import AnnotationCanvasView, load_image_pixmap
 from yolo_studio.gui.app_settings import (
@@ -89,6 +90,7 @@ from yolo_studio.gui.app_settings import (
 )
 from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
 from yolo_studio.gui.label_audit_dialog import LabelAuditDialog
+from yolo_studio.gui.sam_track_dialog import SamTrackDialog
 
 _ADDED_DLL_HANDLES: list[object] = []
 _MAX_UNDO_STEPS = 80
@@ -876,6 +878,7 @@ class LabelingStudioTab(QWidget):
         self._audit_result: LabelAuditResult | None = None
         self._audit_report_map: dict[Path, ImageAuditReport] = {}
         self._audit_predictor_override: Any | None = None
+        self._sam_tracker_override: Any | None = None
         self._scoped_actions: list[QAction] = []
         self._clipboard_boxes: list[RectAnnotation] = []
         self._clipboard_source_image: Path | None = None
@@ -1306,6 +1309,12 @@ class LabelingStudioTab(QWidget):
         )
         self.copy_prev_boxes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.copy_prev_boxes_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
+        self.track_forward_btn = QPushButton("向后追踪")
+        self.track_forward_btn.setToolTip(
+            "使用本地 SAM 2.1 记忆库将当前帧目标框向后连续追踪传播多帧（适合连续抽帧）"
+        )
+        self.track_forward_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.track_forward_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
         self.clear_boxes_btn = QPushButton("清空")
         self.clear_boxes_btn.setToolTip("清空当前图片全部目标框")
         self.clear_boxes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1313,6 +1322,7 @@ class LabelingStudioTab(QWidget):
         obj_hdr.addWidget(self.obj_title_label)
         obj_hdr.addStretch(1)
         obj_hdr.addWidget(self.copy_prev_boxes_btn)
+        obj_hdr.addWidget(self.track_forward_btn)
         obj_hdr.addWidget(self.clear_boxes_btn)
         obj_lay.addLayout(obj_hdr)
 
@@ -1511,6 +1521,7 @@ class LabelingStudioTab(QWidget):
         self.box_sam_inline_btn.clicked.connect(self._on_sam_refine_clicked)
         self.box_llm_fix_inline_btn.clicked.connect(self._on_llm_fix_box_clicked)
         self.copy_prev_boxes_btn.clicked.connect(self._copy_boxes_from_previous_image)
+        self.track_forward_btn.clicked.connect(lambda: self._on_open_sam_track_dialog(prefer_selected=False))
         self.clear_boxes_btn.clicked.connect(self._clear_all_boxes)
         self.undo_btn.clicked.connect(self._undo)
         self.redo_btn.clicked.connect(self._redo)
@@ -2768,6 +2779,9 @@ class LabelingStudioTab(QWidget):
         self.change_cls_btn.setEnabled(has_sel)
         self.focus_box_btn.setEnabled(has_sel)
         self.copy_prev_boxes_btn.setEnabled(self._resolve_previous_image_path() is not None)
+        self.track_forward_btn.setEnabled(
+            has_boxes and bool(self._resolve_following_image_paths()) and not sam_busy and not sam_point_busy
+        )
         self.clear_boxes_btn.setEnabled(has_boxes)
         self.undo_btn.setEnabled(len(self._undo_stack) > 0)
         self.redo_btn.setEnabled(len(self._redo_stack) > 0)
@@ -3164,6 +3178,61 @@ class LabelingStudioTab(QWidget):
                 if p == cur_path:
                     return img_list[idx - 1] if idx > 0 else None
         return None
+
+    def _resolve_following_image_paths(self) -> list[Path]:
+        """返回当前浏览列表中位于当前图片之后的后续帧路径列表，供 SAM 2.1 向后追踪使用。"""
+        if self._doc is None:
+            return []
+        cur_path = self._doc.image_path
+        for img_list in (self._filtered_images, self._all_images):
+            for idx, p in enumerate(img_list):
+                if p == cur_path:
+                    return list(img_list[idx + 1 :])
+        return []
+
+    def _on_open_sam_track_dialog(self, *, prefer_selected: bool = False) -> None:
+        """打开 SAM 2.1 连续帧向后追踪对话框，并在追踪落盘后自动刷新工作台列表与数据集通知。"""
+        if self._doc is None or not self._doc.boxes:
+            QMessageBox.information(self, "提示", "请先在当前图片上至少标注 1 个目标框。")
+            return
+        following = self._resolve_following_image_paths()
+        if not following:
+            QMessageBox.information(self, "提示", "当前已是列表最后一张图片，后续没有可追踪的连续帧。")
+            return
+        if not self._may_continue():
+            return
+
+        sel = self.canvas.selected_index()
+        selected_box = self._doc.boxes[sel] if 0 <= sel < len(self._doc.boxes) else None
+        dlg = SamTrackDialog(
+            self._doc.image_path,
+            following,
+            list(self._doc.boxes),
+            selected_box=selected_box,
+            prefer_selected=prefer_selected,
+            sam_model_name=self._resolve_sam_model_name(),
+            device=self._resolve_sam_device(),
+            gpu_guard=self.gpu_guard,
+            tracker_override=self._sam_tracker_override,
+            parent=self,
+        )
+        dlg.exec()
+        if dlg.track_result is not None and dlg.track_result.written_frames > 0:
+            self._apply_sam_track_result(dlg.track_result)
+
+    def _apply_sam_track_result(self, result: SamTrackResult) -> None:
+        """同步刷新连续帧追踪写盘的各帧文件列表状态、进度条并通知数据集页更新。"""
+        written_paths = [o.image_path for o in result.outcomes if o.status == "written"]
+        for img_path in written_paths:
+            self._update_single_image_status(img_path)
+        if written_paths and self._current_dir is not None:
+            self.annotations_changed.emit(str(self._current_dir))
+        msg = (
+            f"SAM 2.1 已向后追踪 {result.processed_frames} 帧"
+            f"（写入 {result.written_frames} 帧、新增 {result.total_added_boxes} 个框），按 D 逐帧验收"
+        )
+        self.save_state_label.setText(msg)
+        self.canvas.show_hud_message(msg, color="#0d9488", duration_ms=2600)
 
     def _copy_boxes_from_previous_image(self) -> bool:
         """一键复用上一张图片的全部标注框到当前图（跨分辨率自动缩放、同类高重合自动去重、支持 Ctrl+Z 撤回）。"""
@@ -4066,6 +4135,8 @@ class LabelingStudioTab(QWidget):
             meta_tags.append(f"置信度 {b.score:.3f}")
         if isinstance(b.flags, dict) and b.flags.get("llm_added"):
             meta_tags.append("LLM 补标")
+        if isinstance(b.flags, dict) and b.flags.get("sam_tracked"):
+            meta_tags.append("SAM 2 追踪")
         if isinstance(b.flags, dict) and b.flags.get("box_refined"):
             meta_tags.append("已收框")
         if meta_tags:
@@ -4114,6 +4185,8 @@ class LabelingStudioTab(QWidget):
             self.sam_point_worker is not None and self.sam_point_worker.isRunning()
         )
         sam_act.setEnabled(not sam_busy)
+        track_act = menu.addAction("向后连续帧追踪此框...")
+        track_act.setEnabled(not sam_busy and bool(self._resolve_following_image_paths()))
         llm_act = menu.addAction("AI 精修此框 (G)")
         llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
         llm_act.setEnabled(not llm_busy)
@@ -4130,6 +4203,8 @@ class LabelingStudioTab(QWidget):
             self._copy_boxes_to_clipboard()
         elif chosen is sam_act:
             self._on_sam_refine_clicked()
+        elif chosen is track_act:
+            self._on_open_sam_track_dialog(prefer_selected=True)
         elif chosen is llm_act:
             self._on_llm_fix_box_clicked()
         elif chosen is del_act:
@@ -4151,6 +4226,8 @@ class LabelingStudioTab(QWidget):
                 self.sam_point_worker is not None and self.sam_point_worker.isRunning()
             )
             sam_act.setEnabled(not sam_busy)
+            track_act = menu.addAction("向后连续帧追踪此框...")
+            track_act.setEnabled(not sam_busy and bool(self._resolve_following_image_paths()))
             llm_act = menu.addAction("AI 精修此框 (G)")
             llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
             llm_act.setEnabled(not llm_busy)
@@ -4167,6 +4244,8 @@ class LabelingStudioTab(QWidget):
                 self._copy_boxes_to_clipboard()
             elif chosen is sam_act:
                 self._on_sam_refine_clicked()
+            elif chosen is track_act:
+                self._on_open_sam_track_dialog(prefer_selected=True)
             elif chosen is llm_act:
                 self._on_llm_fix_box_clicked()
             elif chosen is del_act:

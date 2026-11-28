@@ -2952,7 +2952,130 @@ def test_workbench_sam_hover_live_contour_preview_and_click_handoff(
         win.close()
 
 
+def test_workbench_sam_track_dialog_propagates_and_refreshes_status(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证工作台 SAM 2.1 连续帧向后追踪弹窗、落盘刷新列表圆点/进度、通知数据集页与详情标签展示。"""
+    import time
 
+    from yolo_studio.gui.sam_track_dialog import SamTrackDialog
 
+    frames_dir = tmp_path / "sam_track_frames"
+    f0 = frames_dir / "frame_000.jpg"
+    f1 = frames_dir / "frame_001.jpg"
+    f2 = frames_dir / "frame_002.jpg"
+    for p in (f0, f1, f2):
+        _write_sample_frame(p, (400, 300))
 
+    f0.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "player",
+                        "points": [[60.0, 50.0], [140.0, 150.0]],
+                        "group_id": None,
+                        "description": "",
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "monster",
+                        "points": [[220.0, 70.0], [300.0, 170.0]],
+                        "group_id": None,
+                        "description": "",
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                ],
+                "imagePath": f0.name,
+                "imageHeight": 300,
+                "imageWidth": 400,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
+    def _fake_tracker(_start, targets, seeds):
+        out = []
+        for step, _p in enumerate(targets, start=1):
+            row = []
+            for b in seeds:
+                row.append((b.x1 + step * 10.0, b.y1, b.x2 + step * 10.0, b.y2))
+            out.append(row)
+        return out
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    changed_dirs: list[str] = []
+    win.labeling_tab.annotations_changed.connect(changed_dirs.append)
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+
+        # 第 0 帧有 2 个框且后续还有 2 帧 -> 向后追踪按钮可用
+        assert tab.track_forward_btn.isEnabled() is True
+        assert len(tab._resolve_following_image_paths()) == 2
+
+        dlg = SamTrackDialog(
+            f0,
+            tab._resolve_following_image_paths(),
+            list(tab._doc.boxes),  # type: ignore[union-attr]
+            selected_box=tab._doc.boxes[0],  # type: ignore[union-attr]
+            sam_model_name="sam2.1_t.pt",
+            device="cpu",
+            gpu_guard=win.gpu_guard,
+            tracker_override=_fake_tracker,
+            parent=tab,
+        )
+        try:
+            dlg.show()
+            qt_app.processEvents()
+            assert dlg.frame_count_spin.value() == 2
+            dlg._on_start()
+            deadline = time.monotonic() + 5.0
+            while (
+                dlg.worker is not None
+                and dlg.worker.isRunning()
+                and time.monotonic() < deadline
+            ):
+                qt_app.processEvents()
+                time.sleep(0.015)
+            qt_app.processEvents()
+            assert dlg.track_result is not None
+            assert dlg.track_result.written_frames == 2
+            assert dlg.track_result.total_added_boxes == 4
+            assert dlg.done_btn.isVisible() is True
+            track_res = dlg.track_result
+        finally:
+            dlg.close()
+
+        # 应用追踪结果到工作台：列表状态刷新、发出目录变更通知、切至后续帧可见带追踪标签的新框
+        tab._apply_sam_track_result(track_res)
+        qt_app.processEvents()
+        assert len(changed_dirs) >= 1
+        assert "[2]" in tab.file_list.item(1).text()
+        assert "[2]" in tab.file_list.item(2).text()
+
+        tab.open_next_image()
+        qt_app.processEvents()
+        assert tab._doc is not None and len(tab._doc.boxes) == 2
+        assert tab._doc.boxes[0].x1 == 70.0
+        tab.canvas.select_box(0, emit_signal=True)
+        qt_app.processEvents()
+        assert "SAM 2 追踪" in tab.box_detail_label.text()
+
+        # 切到最后一张时无后续帧 -> 向后追踪按钮自动置灰防呆
+        tab.open_next_image()
+        qt_app.processEvents()
+        assert tab.track_forward_btn.isEnabled() is False
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
