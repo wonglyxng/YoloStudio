@@ -524,6 +524,7 @@ class MainWindow(QMainWindow):
             probes.append(self._device_probe_worker)
         for tab, method_name in (
             (self.extract_tab, "running_preview_workers"),
+            (self.labeling_tab, "running_sam_precompute_workers"),
             (self.eval_tab, "running_inspect_workers"),
         ):
             get_workers = getattr(tab, method_name, None)

@@ -3575,6 +3575,126 @@ def test_fix_single_box_with_mllm_relabel_refine_delete_and_keep(tmp_path: Path)
     assert (res4.x1, res4.y1, res4.x2, res4.y2) == (200.0, 150.0, 300.0, 250.0)
 
 
+def test_sam_refiner_feature_cache_hit_lru_eviction_and_clear() -> None:
+    """验证 UltralyticsSamBoxRefiner 图像特征 LRU 缓存命中、同图多次点选/收框免重编码、低分框不偏移及清理。"""
+    from collections import OrderedDict
+    import threading
+
+    import numpy as np
+    import torch
+
+    from yolo_studio.core.mllm_reviewer import CandidateBox, UltralyticsSamBoxRefiner
+
+    class _FakePredictor:
+        def __init__(self) -> None:
+            self.encode_calls = 0
+            self.decode_calls = 0
+            self.reset_calls = 0
+            self.non_overlap_masks = False
+            self.args = type("Args", (), {"conf": 0.25})()
+            self.model = type("InnerModel", (), {"mask_threshold": 0.0})()
+
+        def setup_source(self, _image_bgr: np.ndarray) -> None:
+            pass
+
+        def preprocess(self, imgs: list[np.ndarray]) -> torch.Tensor:
+            h, w = imgs[0].shape[:2]
+            return torch.zeros((1, 3, h, w), dtype=torch.float32)
+
+        def get_im_features(self, im: torch.Tensor) -> dict[str, torch.Tensor]:
+            self.encode_calls += 1
+            return {"image_embed": torch.full((1, 4, 8, 8), float(self.encode_calls))}
+
+        def reset_image(self) -> None:
+            self.reset_calls += 1
+
+        def _prepare_prompts(self, dst_shape, src_shape, bboxes=None, points=None, labels=None, masks=None):
+            return (dst_shape, src_shape, bboxes, points, labels, masks)
+
+        def _inference_features(self, features, dst_shape, src_shape, bboxes, points, labels, _masks, multimask_output=False):
+            self.decode_calls += 1
+            h, w = src_shape
+            if bboxes is not None:
+                # 第 0 个框低置信度(0.10 <= 0.25)应被跳过，第 1 个框高置信度(0.95)应精确落到 box_id=1 不发生索引错位
+                m = torch.full((len(bboxes), h, w), -1.0, dtype=torch.float32)
+                scores = torch.full((len(bboxes),), 0.95, dtype=torch.float32)
+                if len(bboxes) >= 1:
+                    scores[0] = 0.10
+                    m[0, 10:30, 10:30] = 2.0
+                if len(bboxes) >= 2:
+                    m[1, 60:110, 90:150] = 2.0
+                return m, scores
+
+            m = torch.full((1, h, w), -1.0, dtype=torch.float32)
+            m[0, 40:100, 70:140] = 2.0
+            return m, torch.tensor([0.92], dtype=torch.float32)
+
+    fake_pred = _FakePredictor()
+    refiner = object.__new__(UltralyticsSamBoxRefiner)
+    refiner.model_source = "sam2.1_t.pt"
+    refiner.device = "cpu"
+    refiner._lock = threading.Lock()
+    refiner._model = type("FakeSamWrapper", (), {"predictor": fake_pred})()
+    refiner._max_cached_images = 2
+    refiner._feature_cache = OrderedDict()
+    refiner._cache_hits = 0
+    refiner._cache_misses = 0
+    refiner._last_cache_hit = False
+
+    img_a = np.full((160, 200, 3), 30, dtype=np.uint8)
+    img_b = np.full((160, 200, 3), 90, dtype=np.uint8)
+    img_c = np.full((160, 200, 3), 180, dtype=np.uint8)
+
+    # 1) 首次预编码图 A -> 编码 1 次；重复预编码图 A -> 直接命中不重复编码
+    assert refiner.precompute_image(img_a, image_key="img_a") is True
+    assert fake_pred.encode_calls == 1
+    assert refiner.has_cached_image("img_a") is True
+    assert refiner.precompute_image(img_a, image_key="img_a") is False
+    assert fake_pred.encode_calls == 1
+
+    # 2) 同图连续点选分割与多框收紧全部复用缓存特征（encode_calls 保持 1）
+    pt_xyxy = refiner.segment_by_points(img_a, [(100.0, 70.0)], [1], image_key="img_a")
+    assert pt_xyxy == (70.0, 40.0, 140.0, 100.0)
+    assert refiner.last_cache_hit is True
+    assert fake_pred.encode_calls == 1
+
+    cands = [
+        CandidateBox(box_id=0, label="a", x1=8.0, y1=8.0, x2=35.0, y2=35.0, confidence=0.5),
+        CandidateBox(box_id=1, label="b", x1=85.0, y1=55.0, x2=155.0, y2=115.0, confidence=0.8),
+    ]
+    refined = refiner.refine_boxes(img_a, cands, image_key="img_a")
+    assert refined[0] is None  # 低分掩码过滤
+    assert refined[1] == (90.0, 60.0, 150.0, 110.0)  # 第 1 框坐标无错位
+    assert refiner.last_cache_hit is True
+    assert fake_pred.encode_calls == 1
+    assert fake_pred.decode_calls == 2
+    assert refiner.cache_stats()["hits"] == 3
+    assert refiner.cache_stats()["misses"] == 1
+
+    # 3) 容量=2 时顺序编码 B 与 C，最久未使用的 A 应被 LRU 淘汰
+    assert refiner.precompute_image(img_b, image_key="img_b") is True
+    assert refiner.precompute_image(img_c, image_key="img_c") is True
+    assert fake_pred.encode_calls == 3
+    assert refiner.has_cached_image("img_a") is False
+    assert refiner.has_cached_image("img_b") is True
+    assert refiner.has_cached_image("img_c") is True
+
+    # 4) 未显式传 image_key 时按像素内容指纹自动命中，不同像素数组不误命中
+    assert refiner.segment_by_points(img_a, [(100.0, 70.0)], [1]) == (70.0, 40.0, 140.0, 100.0)
+    assert refiner.last_cache_hit is False
+    assert fake_pred.encode_calls == 4
+    assert refiner.segment_by_points(img_a, [(105.0, 72.0)], [1]) == (70.0, 40.0, 140.0, 100.0)
+    assert refiner.last_cache_hit is True
+    assert fake_pred.encode_calls == 4
+
+    # 5) 清理缓存后释放特征条目并重置底层预测器引用
+    prev_resets = fake_pred.reset_calls
+    refiner.clear_image_cache()
+    assert refiner.cache_stats()["cached_images"] == 0
+    assert fake_pred.reset_calls > prev_resets
+
+
+
 
 
 

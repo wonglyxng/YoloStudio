@@ -2339,3 +2339,184 @@ def test_labeling_toolbar_places_ai_refine_between_modes_and_box_ops(qt_app, tmp
         win.close()
 
 
+def test_workbench_sam_feature_cache_precompute_and_stale_model_cleanup(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证工作台 SAM 图像特征预热、同图连点与收框复用缓存、预编码排队无缝衔接及切模型释放旧缓存。"""
+    import threading
+    import time
+
+    from yolo_studio.gui.annotation_canvas import AnnotationCanvasView
+
+    frames_dir = tmp_path / "sam_cache_frames"
+    f1 = frames_dir / "001.jpg"
+    f2 = frames_dir / "002.jpg"
+    _write_sample_frame(f1, (320, 240))
+    _write_sample_frame(f2, (320, 240))
+    f2.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "target",
+                        "points": [[40.0, 30.0], [180.0, 170.0]],
+                        "group_id": None,
+                        "description": "",
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    }
+                ],
+                "imagePath": f2.name,
+                "imageHeight": 240,
+                "imageWidth": 320,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class _CachingFakeSamRefiner:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.cached_keys: set[str] = set()
+            self.encode_count = 0
+            self.point_decode_count = 0
+            self.box_decode_count = 0
+            self.cleared = False
+            self.last_cache_hit = False
+            self.encode_delay_sec = 0.0
+
+        def has_cached_image(self, image_key: str) -> bool:
+            with self._lock:
+                return image_key in self.cached_keys
+
+        def precompute_image(self, _img_bgr, *, image_key: str = "") -> bool:
+            with self._lock:
+                if image_key in self.cached_keys:
+                    self.last_cache_hit = True
+                    return False
+                if self.encode_delay_sec > 0:
+                    time.sleep(self.encode_delay_sec)
+                self.cached_keys.add(image_key)
+                self.encode_count += 1
+                self.last_cache_hit = False
+                return True
+
+        def segment_by_points(self, _img_bgr, _points, _labels, *, image_key: str = ""):
+            with self._lock:
+                if image_key in self.cached_keys:
+                    self.last_cache_hit = True
+                else:
+                    self.cached_keys.add(image_key)
+                    self.encode_count += 1
+                    self.last_cache_hit = False
+                self.point_decode_count += 1
+                return (60.0, 45.0, 180.0, 165.0)
+
+        def refine_boxes(self, _img_bgr, boxes, *, image_key: str = ""):
+            with self._lock:
+                if image_key in self.cached_keys:
+                    self.last_cache_hit = True
+                else:
+                    self.cached_keys.add(image_key)
+                    self.encode_count += 1
+                    self.last_cache_hit = False
+                self.box_decode_count += 1
+                return {b.box_id: (55.0, 45.0, 165.0, 155.0) for b in boxes}
+
+        def clear_image_cache(self) -> None:
+            with self._lock:
+                self.cached_keys.clear()
+                self.cleared = True
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+
+        # 缩短防抖间隔以加速离线测试验证
+        tab._sam_precompute_timer.setInterval(30)
+        device = tab._resolve_sam_device()
+        fake_refiner = _CachingFakeSamRefiner()
+        tab._sam_refiner_cache[("sam2.1_t.pt", device)] = fake_refiner
+
+        def _wait_all_sam() -> None:
+            deadline = time.monotonic() + 5.0
+            idle_ticks = 0
+            while time.monotonic() < deadline:
+                qt_app.processEvents()
+                busy = any(
+                    w is not None and w.isRunning()
+                    for w in (tab.sam_precompute_worker, tab.sam_point_worker, tab.sam_worker)
+                )
+                pending = (
+                    tab._pending_sam_refine_request is not None
+                    or tab._pending_sam_point_request is not None
+                    or tab._sam_precompute_timer.isActive()
+                )
+                if not busy and not pending:
+                    idle_ticks += 1
+                    if idle_ticks >= 3:
+                        break
+                else:
+                    idle_ticks = 0
+                time.sleep(0.015)
+            qt_app.processEvents()
+
+        # 1) 按 Q 进入 SAM 点选模式立即触发图 1 后台预编码，随后连点两次均复用缓存
+        tab.canvas.set_mode(AnnotationCanvasView.MODE_SAM_POINT)
+        _wait_all_sam()
+        assert fake_refiner.encode_count == 1
+        assert tab.is_current_image_sam_cached() is True
+        assert "已预热" in tab.save_state_label.text()
+
+        tab._on_sam_points_changed([(100.0, 90.0, 1)])
+        _wait_all_sam()
+        assert fake_refiner.encode_count == 1
+        assert fake_refiner.point_decode_count == 1
+        assert fake_refiner.last_cache_hit is True
+        assert "复用特征缓存" in tab.save_state_label.text()
+
+        tab._on_sam_points_changed([(100.0, 90.0, 1), (190.0, 90.0, 0)])
+        _wait_all_sam()
+        assert fake_refiner.encode_count == 1
+        assert fake_refiner.point_decode_count == 2
+        assert fake_refiner.last_cache_hit is True
+
+        # 2) 切到图 2：预编码稍微延时，在预编码进行期间立即点击「SAM收框」，应无缝排队并在编完后命中缓存完成收框
+        fake_refiner.encode_delay_sec = 0.12
+        tab.open_next_image()
+        # 等待防抖触发预编码线程运行
+        deadline = time.monotonic() + 2.0
+        while (
+            (tab.sam_precompute_worker is None or not tab.sam_precompute_worker.isRunning())
+            and time.monotonic() < deadline
+        ):
+            qt_app.processEvents()
+            time.sleep(0.01)
+        tab._on_sam_refine_clicked()
+        _wait_all_sam()
+        assert fake_refiner.encode_count == 2
+        assert fake_refiner.box_decode_count == 1
+        assert fake_refiner.last_cache_hit is True
+        assert tab._doc is not None and tab._doc.boxes[0].x1 == 55.0
+        assert "复用特征缓存" in tab.save_state_label.text()
+
+        # 3) 切换全局 SAM 权重后自动清理旧模型缓存释放显存
+        win.settings_store.update(sam_model_name="sam2.1_s.pt")
+        qt_app.processEvents()
+        assert fake_refiner.cleared is True
+        assert ("sam2.1_t.pt", device) not in tab._sam_refiner_cache
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+

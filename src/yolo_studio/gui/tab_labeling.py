@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import copy
+import inspect
 import os
 import subprocess
 import sys
@@ -314,10 +315,97 @@ class _LabelPickerDialog(QDialog):
         return self.combo.currentText().strip()
 
 
-class _SamBoxRefineWorker(QThread):
-    """在后台线程中使用本地 SAM 2.1 对工作台中的指定框执行像素级轮廓收紧。"""
+_SAM_BGR_CACHE_MAX = 2
 
-    refined_ready = Signal(str, dict)  # 参数：(image_path_str, {box_idx: (x1, y1, x2, y2)})
+
+def _build_sam_image_key(image_path: Path) -> str:
+    """按规范化绝对路径、修改时间与文件大小构造 SAM 图像特征缓存键，文件变更时自动失效。"""
+    resolved = image_path.resolve()
+    try:
+        st = resolved.stat()
+        return f"{resolved}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
+    except OSError:
+        return str(resolved)
+
+
+def _decode_image_bgr_cached(
+    image_path: Path,
+    image_key: str,
+    bgr_cache: OrderedDict[str, Any] | None,
+    bgr_lock: Lock | None,
+) -> Any:
+    """线程安全解码图片为 BGR 数组并按 LRU 缓存近期图片，避免同图连点重复解码大图。"""
+    import cv2
+    import numpy as np
+
+    if bgr_cache is not None and bgr_lock is not None:
+        with bgr_lock:
+            cached = bgr_cache.get(image_key)
+            if cached is not None:
+                bgr_cache.move_to_end(image_key)
+                return cached
+
+    raw_bytes = np.fromfile(str(image_path), dtype=np.uint8)
+    img_bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return None
+
+    if bgr_cache is not None and bgr_lock is not None:
+        with bgr_lock:
+            bgr_cache[image_key] = img_bgr
+            bgr_cache.move_to_end(image_key)
+            while len(bgr_cache) > _SAM_BGR_CACHE_MAX:
+                bgr_cache.popitem(last=False)
+    return img_bgr
+
+
+def _get_or_create_sam_refiner(
+    model_name: str,
+    device: str,
+    refiner_cache: dict[tuple[str, str], Any],
+    cache_lock: Lock | None,
+) -> Any:
+    """线程安全地从缓存复用或惰性创建 `UltralyticsSamBoxRefiner` 实例。"""
+    from yolo_studio.core.mllm_reviewer import UltralyticsSamBoxRefiner
+
+    cache_key = (model_name, device)
+    if cache_lock is None:
+        refiner = refiner_cache.get(cache_key)
+        if refiner is None:
+            refiner = UltralyticsSamBoxRefiner(model_name=model_name, device=device)
+            refiner_cache[cache_key] = refiner
+        return refiner
+
+    with cache_lock:
+        refiner = refiner_cache.get(cache_key)
+        if refiner is not None:
+            return refiner
+    # 将耗时的权重加载放在字典锁外执行，再通过双重检查写回缓存避免阻塞其他读查询
+    created = UltralyticsSamBoxRefiner(model_name=model_name, device=device)
+    with cache_lock:
+        existing = refiner_cache.get(cache_key)
+        if existing is not None:
+            return existing
+        refiner_cache[cache_key] = created
+        return created
+
+
+def _supports_kwarg(fn: Any, param_name: str) -> bool:
+    """检测目标可调用对象是否接受指定关键字参数，兼容未升级签名的外部测试替身。"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == param_name:
+            return True
+    return False
+
+
+class _SamBoxRefineWorker(QThread):
+    """在后台线程中使用本地 SAM 2.1 对工作台中的指定框执行像素级轮廓收紧（复用图像特征缓存）。"""
+
+    refined_ready = Signal(str, dict, bool, int)  # 参数：(image_path_str, {box_idx: xyxy}, cache_hit, elapsed_ms)
     failed = Signal(str)
 
     def __init__(
@@ -325,36 +413,40 @@ class _SamBoxRefineWorker(QThread):
         image_path: Path,
         target_boxes: list[tuple[int, RectAnnotation]],
         *,
+        image_key: str = "",
         device: str = "0",
         model_name: str = "sam2.1_t.pt",
         refiner_cache: dict[tuple[str, str], Any] | None = None,
+        refiner_cache_lock: Lock | None = None,
+        bgr_cache: OrderedDict[str, Any] | None = None,
+        bgr_cache_lock: Lock | None = None,
     ) -> None:
         super().__init__()
         self.image_path = image_path
+        self.image_key = image_key or _build_sam_image_key(image_path)
         self.target_boxes = [(idx, b.clone()) for idx, b in target_boxes]
         self.device = device
         self.model_name = model_name
         self._refiner_cache = refiner_cache if refiner_cache is not None else {}
+        self._refiner_cache_lock = refiner_cache_lock
+        self._bgr_cache = bgr_cache
+        self._bgr_cache_lock = bgr_cache_lock
 
     def run(self) -> None:
         try:
-            import cv2
-            import numpy as np
+            from yolo_studio.core.mllm_reviewer import CandidateBox
 
-            from yolo_studio.core.mllm_reviewer import CandidateBox, UltralyticsSamBoxRefiner
-
-            raw_bytes = np.fromfile(str(self.image_path), dtype=np.uint8)
-            img_bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+            t0 = time.perf_counter()
+            img_bgr = _decode_image_bgr_cached(
+                self.image_path, self.image_key, self._bgr_cache, self._bgr_cache_lock
+            )
             if img_bgr is None:
                 self.failed.emit(f"无法读取图像像素：{self.image_path.name}")
                 return
 
-            cache_key = (self.model_name, self.device)
-            refiner = self._refiner_cache.get(cache_key)
-            if refiner is None:
-                refiner = UltralyticsSamBoxRefiner(model_name=self.model_name, device=self.device)
-                self._refiner_cache[cache_key] = refiner
-
+            refiner = _get_or_create_sam_refiner(
+                self.model_name, self.device, self._refiner_cache, self._refiner_cache_lock
+            )
             cands = [
                 CandidateBox(
                     box_id=idx,
@@ -367,22 +459,28 @@ class _SamBoxRefineWorker(QThread):
                 )
                 for idx, box in self.target_boxes
             ]
-            refined_map = refiner.refine_boxes(img_bgr, cands)
+            if _supports_kwarg(refiner.refine_boxes, "image_key"):
+                refined_map = refiner.refine_boxes(img_bgr, cands, image_key=self.image_key)
+            else:
+                refined_map = refiner.refine_boxes(img_bgr, cands)
+            cache_hit = bool(getattr(refiner, "last_cache_hit", False))
+            elapsed_ms = max(1, int(round((time.perf_counter() - t0) * 1000.0)))
+
             valid: dict[int, tuple[float, float, float, float]] = {}
             for idx, coords in refined_map.items():
                 if coords is not None:
                     x1, y1, x2, y2 = coords
                     if (x2 - x1) >= 2.0 and (y2 - y1) >= 2.0:
                         valid[idx] = (float(x1), float(y1), float(x2), float(y2))
-            self.refined_ready.emit(str(self.image_path.resolve()), valid)
+            self.refined_ready.emit(str(self.image_path.resolve()), valid, cache_hit, elapsed_ms)
         except Exception as exc:
             self.failed.emit(f"本地 SAM 贴边收紧失败：{exc}")
 
 
 class _SamPointSegmentWorker(QThread):
-    """在后台线程中使用本地 SAM 2.1 按单目标正/负点提示分割轮廓并返回最小外接矩形。"""
+    """在后台线程中使用本地 SAM 2.1 按单目标正/负点提示分割轮廓并返回最小外接矩形（复用图像特征缓存）。"""
 
-    segment_ready = Signal(int, str, object)  # 参数：(req_id, image_path_str, (x1, y1, x2, y2) | None)
+    segment_ready = Signal(int, str, object, bool, int)  # 参数：(req_id, image_path_str, xyxy | None, cache_hit, elapsed_ms)
     failed = Signal(int, str)
 
     def __init__(
@@ -391,43 +489,107 @@ class _SamPointSegmentWorker(QThread):
         image_path: Path,
         points: list[tuple[float, float, int]],
         *,
+        image_key: str = "",
         device: str = "0",
         model_name: str = "sam2.1_t.pt",
         refiner_cache: dict[tuple[str, str], Any] | None = None,
+        refiner_cache_lock: Lock | None = None,
+        bgr_cache: OrderedDict[str, Any] | None = None,
+        bgr_cache_lock: Lock | None = None,
     ) -> None:
         super().__init__()
         self.req_id = int(req_id)
         self.image_path = image_path
+        self.image_key = image_key or _build_sam_image_key(image_path)
         self.points = [(float(x), float(y), 1 if int(lbl) == 1 else 0) for x, y, lbl in points]
         self.device = device
         self.model_name = model_name
         self._refiner_cache = refiner_cache if refiner_cache is not None else {}
+        self._refiner_cache_lock = refiner_cache_lock
+        self._bgr_cache = bgr_cache
+        self._bgr_cache_lock = bgr_cache_lock
 
     def run(self) -> None:
         try:
-            import cv2
-            import numpy as np
-
-            from yolo_studio.core.mllm_reviewer import UltralyticsSamBoxRefiner
-
-            raw_bytes = np.fromfile(str(self.image_path), dtype=np.uint8)
-            img_bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+            t0 = time.perf_counter()
+            img_bgr = _decode_image_bgr_cached(
+                self.image_path, self.image_key, self._bgr_cache, self._bgr_cache_lock
+            )
             if img_bgr is None:
                 self.failed.emit(self.req_id, f"无法读取图像像素：{self.image_path.name}")
                 return
 
-            cache_key = (self.model_name, self.device)
-            refiner = self._refiner_cache.get(cache_key)
-            if refiner is None:
-                refiner = UltralyticsSamBoxRefiner(model_name=self.model_name, device=self.device)
-                self._refiner_cache[cache_key] = refiner
-
+            refiner = _get_or_create_sam_refiner(
+                self.model_name, self.device, self._refiner_cache, self._refiner_cache_lock
+            )
             pts_xy = [(x, y) for x, y, _ in self.points]
             pts_lbl = [lbl for _, _, lbl in self.points]
-            coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl)
-            self.segment_ready.emit(self.req_id, str(self.image_path.resolve()), coords)
+            if _supports_kwarg(refiner.segment_by_points, "image_key"):
+                coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl, image_key=self.image_key)
+            else:
+                coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl)
+            cache_hit = bool(getattr(refiner, "last_cache_hit", False))
+            elapsed_ms = max(1, int(round((time.perf_counter() - t0) * 1000.0)))
+            self.segment_ready.emit(
+                self.req_id, str(self.image_path.resolve()), coords, cache_hit, elapsed_ms
+            )
         except Exception as exc:
             self.failed.emit(self.req_id, f"本地 SAM 点选分割失败：{exc}")
+
+
+class _SamPrecomputeWorker(QThread):
+    """在后台线程中为当前查看的图片静默预编码 SAM 2.1 视觉特征，实现点选/收框首击即达。
+
+    安全边界：
+        仅在已热激活 SAM 模型后由防抖定时器按需触发；若外部测试替身未实现 `precompute_image`
+        或文件读取失败，静默退出且绝不向用户弹窗报错。
+    """
+
+    precomputed = Signal(str, str, bool, int)  # 参数：(image_path_str, image_key, encoded_new, elapsed_ms)
+
+    def __init__(
+        self,
+        image_path: Path,
+        image_key: str,
+        refiner: Any,
+        *,
+        bgr_cache: OrderedDict[str, Any] | None = None,
+        bgr_cache_lock: Lock | None = None,
+    ) -> None:
+        super().__init__()
+        self.image_path = image_path
+        self.image_key = image_key
+        self._refiner = refiner
+        self._bgr_cache = bgr_cache
+        self._bgr_cache_lock = bgr_cache_lock
+
+    def run(self) -> None:
+        precompute_fn = getattr(self._refiner, "precompute_image", None)
+        if not callable(precompute_fn):
+            return
+        try:
+            has_cached = getattr(self._refiner, "has_cached_image", None)
+            if callable(has_cached) and has_cached(self.image_key):
+                self.precomputed.emit(str(self.image_path.resolve()), self.image_key, False, 0)
+                return
+
+            t0 = time.perf_counter()
+            img_bgr = _decode_image_bgr_cached(
+                self.image_path, self.image_key, self._bgr_cache, self._bgr_cache_lock
+            )
+            if img_bgr is None:
+                return
+            if _supports_kwarg(precompute_fn, "image_key"):
+                encoded_new = bool(precompute_fn(img_bgr, image_key=self.image_key))
+            else:
+                encoded_new = bool(precompute_fn(img_bgr))
+            elapsed_ms = max(1, int(round((time.perf_counter() - t0) * 1000.0)))
+            self.precomputed.emit(
+                str(self.image_path.resolve()), self.image_key, encoded_new, elapsed_ms
+            )
+        except Exception:
+            # 预编码属于静默加速任务，异常时不打断正常标注流（前台点击仍会正常报错）
+            return
 
 
 class _SingleBoxLlmFixWorker(QThread):
@@ -600,10 +762,15 @@ class LabelingStudioTab(QWidget):
 
         self.sam_worker: _SamBoxRefineWorker | None = None
         self.sam_point_worker: _SamPointSegmentWorker | None = None
+        self.sam_precompute_worker: _SamPrecomputeWorker | None = None
         self.llm_fix_worker: _SingleBoxLlmFixWorker | None = None
         self._sam_refiner_cache: dict[tuple[str, str], Any] = {}
+        self._sam_refiner_lock = Lock()
+        self._sam_bgr_cache: OrderedDict[str, Any] = OrderedDict()
+        self._sam_bgr_lock = Lock()
         self._sam_point_req_id: int = 0
         self._pending_sam_point_request: tuple[int, Path, list[tuple[float, float, int]]] | None = None
+        self._pending_sam_refine_request: tuple[Path, list[tuple[int, RectAnnotation]]] | None = None
         self._llm_fix_client_override: Any | None = None
         self._scoped_actions: list[QAction] = []
         self._clipboard_boxes: list[RectAnnotation] = []
@@ -619,14 +786,18 @@ class LabelingStudioTab(QWidget):
         self._debounce_timer.setInterval(400)
         self._debounce_timer.timeout.connect(self._emit_annotations_changed)
 
+        # 切图后延迟 220ms 静默预编码当前图 SAM 视觉特征，快速翻图时自动防抖不白白编码
+        self._sam_precompute_timer = QTimer(self)
+        self._sam_precompute_timer.setSingleShot(True)
+        self._sam_precompute_timer.setInterval(220)
+        self._sam_precompute_timer.timeout.connect(self._trigger_sam_precompute)
+
         self._init_ui()
         self._init_shortcuts()
         self._set_shortcuts_active(self.isVisible())
         self.settings_store.llm_changed.connect(self._refresh_ai_tooltips)
-        self.settings_store.sam_changed.connect(self._refresh_ai_tooltips)
-        self.settings_store.general_changed.connect(
-            lambda: self.apply_general_preferences(self.settings_store.preferences)
-        )
+        self.settings_store.sam_changed.connect(self._on_sam_settings_changed)
+        self.settings_store.general_changed.connect(self._on_general_settings_changed)
         self._refresh_ai_tooltips()
         self._refresh_action_states()
 
@@ -1398,9 +1569,11 @@ class LabelingStudioTab(QWidget):
         super().showEvent(event)
         self._set_shortcuts_active(True)
         QTimer.singleShot(0, self._focus_canvas_if_ready)
+        self._schedule_sam_precompute()
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         super().hideEvent(event)
+        self._sam_precompute_timer.stop()
         self.canvas.set_space_pressed(False)
         self._set_shortcuts_active(False)
 
@@ -1430,6 +1603,58 @@ class LabelingStudioTab(QWidget):
         self.auto_save_chk.setChecked(bool(prefs.workbench_auto_save))
         self.show_labels_chk.setChecked(bool(prefs.workbench_show_labels))
         self.keep_view_chk.setChecked(bool(prefs.workbench_keep_view))
+
+    def _on_general_settings_changed(self) -> None:
+        self.apply_general_preferences(self.settings_store.preferences)
+        self._on_sam_settings_changed()
+
+    def _on_sam_settings_changed(self) -> None:
+        """响应全局 SAM 权重或 GPU 偏好切换：清理不再使用的旧模型缓存并刷新按钮提示。"""
+        self._refresh_ai_tooltips()
+        active_key = (self._resolve_sam_model_name(), self._resolve_sam_device())
+        stale_refiners: list[Any] = []
+        with self._sam_refiner_lock:
+            for key in list(self._sam_refiner_cache.keys()):
+                if key != active_key:
+                    stale_refiners.append(self._sam_refiner_cache.pop(key))
+        for refiner in stale_refiners:
+            clear_fn = getattr(refiner, "clear_image_cache", None)
+            if callable(clear_fn):
+                clear_fn()
+
+    def clear_sam_feature_cache(self, *, drop_models: bool = False) -> None:
+        """释放工作台本地 SAM 图像特征与解码像素缓存；`drop_models=True` 时一并卸载已缓存模型实例。"""
+        self._sam_precompute_timer.stop()
+        with self._sam_bgr_lock:
+            self._sam_bgr_cache.clear()
+        with self._sam_refiner_lock:
+            refiners = list(self._sam_refiner_cache.values())
+            if drop_models:
+                self._sam_refiner_cache.clear()
+        for refiner in refiners:
+            clear_fn = getattr(refiner, "clear_image_cache", None)
+            if callable(clear_fn):
+                clear_fn()
+
+    def is_current_image_sam_cached(self) -> bool:
+        """返回当前显示的图片是否已命中当前 SAM 模型的视觉特征缓存。"""
+        if self._doc is None:
+            return False
+        cache_key = (self._resolve_sam_model_name(), self._resolve_sam_device())
+        with self._sam_refiner_lock:
+            refiner = self._sam_refiner_cache.get(cache_key)
+        if refiner is None:
+            return False
+        has_fn = getattr(refiner, "has_cached_image", None)
+        if not callable(has_fn):
+            return False
+        return bool(has_fn(_build_sam_image_key(self._doc.image_path)))
+
+    def running_sam_precompute_workers(self) -> list[QThread]:
+        """返回仍在运行的只读后台 SAM 预编码线程列表，供主窗口退出时静默等待收尾。"""
+        if self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning():
+            return [self.sam_precompute_worker]
+        return []
 
     def _refresh_ai_tooltips(self) -> None:
         """按全局共享设置动态刷新 SAM 与 AI 修框按钮提示，一眼可见当前生效模型。"""
@@ -1489,6 +1714,7 @@ class LabelingStudioTab(QWidget):
         self._last_nudge_key = None
         self._sam_point_req_id += 1
         self._pending_sam_point_request = None
+        self._pending_sam_refine_request = None
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -1656,11 +1882,18 @@ class LabelingStudioTab(QWidget):
         """在主窗口退出前处理未保存标注修改并安全停止运行中的 SAM 与单框 AI 精修线程。"""
         if not self._may_continue():
             return False
+        self._sam_precompute_timer.stop()
         self._sam_point_req_id += 1
         self._pending_sam_point_request = None
+        self._pending_sam_refine_request = None
         if self.llm_fix_worker is not None and self.llm_fix_worker.isRunning():
             self.llm_fix_worker.cancel()
-        for worker in (self.sam_worker, self.sam_point_worker, self.llm_fix_worker):
+        for worker in (
+            self.sam_precompute_worker,
+            self.sam_worker,
+            self.sam_point_worker,
+            self.llm_fix_worker,
+        ):
             if worker is not None and worker.isRunning():
                 worker.wait(3000)
         return True
@@ -1867,6 +2100,7 @@ class LabelingStudioTab(QWidget):
         self._last_nudge_key = None
         self._sam_point_req_id += 1
         self._pending_sam_point_request = None
+        self._pending_sam_refine_request = None
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -1906,6 +2140,7 @@ class LabelingStudioTab(QWidget):
         self._refresh_footer_and_title()
         self._refresh_action_states()
         self._refresh_progress_summary()
+        self._schedule_sam_precompute()
 
     def _update_single_image_status(self, image_path: Path) -> None:
         resolved = image_path.resolve()
@@ -2529,31 +2764,112 @@ class LabelingStudioTab(QWidget):
             self.device_info = dev_info
         return dev_info.recommended_device
 
-    def _on_sam_refine_clicked(self) -> None:
-        if self._doc is None or not self._doc.boxes:
+    def _schedule_sam_precompute(self, *, immediate: bool = False) -> None:
+        """在已热激活 SAM 模型后按防抖策略调度当前图后台视觉特征预编码。
+
+        设计边界：
+            仅当当前工作台可见、已有打开图片且当前 `(sam_model, device)` 已驻留 `_sam_refiner_cache`
+            （即本会话已使用过 SAM，无冷启动/下载风险）时才调度；快速连按 A/D 翻图时通过 220ms
+            防抖合并跳过中间过渡图；有训练/评估等 GPU 互斥任务运行时自动静默跳过。
+        """
+        self._sam_precompute_timer.stop()
+        if self._doc is None or not self.isVisible():
             return
-        if (self.sam_worker is not None and self.sam_worker.isRunning()) or (
-            self.sam_point_worker is not None and self.sam_point_worker.isRunning()
+        cache_key = (self._resolve_sam_model_name(), self._resolve_sam_device())
+        with self._sam_refiner_lock:
+            refiner = self._sam_refiner_cache.get(cache_key)
+        if refiner is None or not callable(getattr(refiner, "precompute_image", None)):
+            return
+        image_key = _build_sam_image_key(self._doc.image_path)
+        has_fn = getattr(refiner, "has_cached_image", None)
+        if callable(has_fn) and has_fn(image_key):
+            return
+        if immediate:
+            self._trigger_sam_precompute()
+        else:
+            self._sam_precompute_timer.start()
+
+    def _trigger_sam_precompute(self) -> None:
+        if self._doc is None or not self.isVisible():
+            return
+        if (
+            (self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning())
+            or (self.sam_worker is not None and self.sam_worker.isRunning())
+            or (self.sam_point_worker is not None and self.sam_point_worker.isRunning())
         ):
             return
+        if self.gpu_guard is not None and self.gpu_guard.active_task_name() is not None:
+            return
+        cache_key = (self._resolve_sam_model_name(), self._resolve_sam_device())
+        with self._sam_refiner_lock:
+            refiner = self._sam_refiner_cache.get(cache_key)
+        if refiner is None or not callable(getattr(refiner, "precompute_image", None)):
+            return
+        image_path = self._doc.image_path
+        image_key = _build_sam_image_key(image_path)
+        has_fn = getattr(refiner, "has_cached_image", None)
+        if callable(has_fn) and has_fn(image_key):
+            return
+
+        self.sam_precompute_worker = _SamPrecomputeWorker(
+            image_path,
+            image_key,
+            refiner,
+            bgr_cache=self._sam_bgr_cache,
+            bgr_cache_lock=self._sam_bgr_lock,
+        )
+        self.sam_precompute_worker.precomputed.connect(self._on_sam_precompute_ready)
+        self.sam_precompute_worker.finished.connect(self._on_sam_precompute_done)
+        self.sam_precompute_worker.start()
+
+    def _on_sam_precompute_ready(
+        self, img_path_str: str, _image_key: str, encoded_new: bool, elapsed_ms: int
+    ) -> None:
+        if (
+            not encoded_new
+            or self._doc is None
+            or str(self._doc.image_path.resolve()) != img_path_str
+        ):
+            return
+        # 仅在当前没有进行中的点选草稿或排队任务时轻提示，避免覆盖操作反馈
+        if (
+            self._pending_sam_point_request is None
+            and self._pending_sam_refine_request is None
+            and not self.canvas.sam_points()
+        ):
+            self.save_state_label.setText(
+                f"SAM 特征已预热（{elapsed_ms} ms），当前图点选/收框近实时响应"
+            )
+
+    def _on_sam_precompute_done(self) -> None:
+        if self._drain_pending_sam_refine_request():
+            return
+        if self._pending_sam_point_request is not None:
+            self._drain_pending_sam_point_request()
+            return
+        # 预编码期间用户可能切到了另一张新图，补排一次当前图预编码
+        self._schedule_sam_precompute()
+
+    def _launch_sam_box_worker(
+        self, image_path: Path, targets: list[tuple[int, RectAnnotation]]
+    ) -> None:
         if self.gpu_guard is not None and not self.gpu_guard.try_acquire(self, "工作台本地 SAM 收框"):
             return
 
-        sel = self.canvas.selected_index()
-        if 0 <= sel < len(self._doc.boxes):
-            targets = [(sel, self._doc.boxes[sel])]
-        else:
-            targets = list(enumerate(self._doc.boxes))
-
         device = self._resolve_sam_device()
         sam_model = self._resolve_sam_model_name()
+        image_key = _build_sam_image_key(image_path)
 
         self.sam_worker = _SamBoxRefineWorker(
-            self._doc.image_path,
+            image_path,
             targets,
+            image_key=image_key,
             device=device,
             model_name=sam_model,
             refiner_cache=self._sam_refiner_cache,
+            refiner_cache_lock=self._sam_refiner_lock,
+            bgr_cache=self._sam_bgr_cache,
+            bgr_cache_lock=self._sam_bgr_lock,
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.sam_worker, "工作台本地 SAM 收框")
@@ -2564,11 +2880,55 @@ class LabelingStudioTab(QWidget):
         self.save_state_label.setText(f"正在用本地 SAM ({Path(sam_model).name}) 收紧 {len(targets)} 个框...")
         self.sam_worker.start()
 
+    def _drain_pending_sam_refine_request(self) -> bool:
+        if self._pending_sam_refine_request is None:
+            return False
+        if (
+            (self.sam_worker is not None and self.sam_worker.isRunning())
+            or (self.sam_point_worker is not None and self.sam_point_worker.isRunning())
+            or (self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning())
+        ):
+            return False
+        img_path, targets = self._pending_sam_refine_request
+        self._pending_sam_refine_request = None
+        if self._doc is None or self._doc.image_path != img_path or not targets:
+            return False
+        self._launch_sam_box_worker(img_path, targets)
+        return True
+
+    def _on_sam_refine_clicked(self) -> None:
+        if self._doc is None or not self._doc.boxes:
+            return
+        if (self.sam_worker is not None and self.sam_worker.isRunning()) or (
+            self.sam_point_worker is not None and self.sam_point_worker.isRunning()
+        ):
+            return
+        sel = self.canvas.selected_index()
+        if 0 <= sel < len(self._doc.boxes):
+            targets = [(sel, self._doc.boxes[sel])]
+        else:
+            targets = list(enumerate(self._doc.boxes))
+
+        self._sam_precompute_timer.stop()
+        if self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning():
+            self._pending_sam_refine_request = (
+                self._doc.image_path,
+                [(idx, b.clone()) for idx, b in targets],
+            )
+            self.save_state_label.setText("正在完成 SAM 图像特征编码，随后立即收紧目标框...")
+            return
+
+        self._launch_sam_box_worker(self._doc.image_path, targets)
+
     def _on_sam_box_worker_done(self) -> None:
         self._refresh_action_states()
+        if self._drain_pending_sam_refine_request():
+            return
         self._drain_pending_sam_point_request()
 
-    def _on_sam_refine_finished(self, img_path_str: str, refined_map: dict) -> None:
+    def _on_sam_refine_finished(
+        self, img_path_str: str, refined_map: dict, cache_hit: bool = False, elapsed_ms: int = 0
+    ) -> None:
         if self._doc is None or str(self._doc.image_path.resolve()) != img_path_str:
             return
         if not refined_map:
@@ -2596,7 +2956,11 @@ class LabelingStudioTab(QWidget):
                 ).clamped(self._doc.image_width, self._doc.image_height)
                 changed += 1
         self._apply_boxes_change(selected_idx=self.canvas.selected_index())
-        self.save_state_label.setText(f"SAM 已收紧 {changed} 个框（Ctrl+Z 可一键撤回）")
+        if elapsed_ms > 0:
+            cache_tag = f"复用特征缓存 · {elapsed_ms} ms" if cache_hit else f"已缓存特征 · {elapsed_ms} ms"
+            self.save_state_label.setText(f"SAM 已收紧 {changed} 个框（{cache_tag} · Ctrl+Z 可一键撤回）")
+        else:
+            self.save_state_label.setText(f"SAM 已收紧 {changed} 个框（Ctrl+Z 可一键撤回）")
 
     def _on_sam_refine_failed(self, msg: str) -> None:
         self.save_state_label.setText("SAM 收框失败")
@@ -2612,11 +2976,17 @@ class LabelingStudioTab(QWidget):
             self.canvas.set_sam_preview_rect(None, predicting=False)
             return
 
-        if (self.sam_point_worker is not None and self.sam_point_worker.isRunning()) or (
-            self.sam_worker is not None and self.sam_worker.isRunning()
+        self._sam_precompute_timer.stop()
+        if (
+            (self.sam_point_worker is not None and self.sam_point_worker.isRunning())
+            or (self.sam_worker is not None and self.sam_worker.isRunning())
+            or (self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning())
         ):
             self._pending_sam_point_request = (req_id, self._doc.image_path, points)
-            self.save_state_label.setText("已排队最新 SAM 点选分割请求...")
+            if self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning():
+                self.save_state_label.setText("正在完成 SAM 图像特征编码，随后立即分割...")
+            else:
+                self.save_state_label.setText("已排队最新 SAM 点选分割请求...")
             return
 
         self._launch_sam_point_worker(req_id, self._doc.image_path, points)
@@ -2630,13 +3000,18 @@ class LabelingStudioTab(QWidget):
 
         device = self._resolve_sam_device()
         sam_model = self._resolve_sam_model_name()
+        image_key = _build_sam_image_key(image_path)
         self.sam_point_worker = _SamPointSegmentWorker(
             req_id,
             image_path,
             points,
+            image_key=image_key,
             device=device,
             model_name=sam_model,
             refiner_cache=self._sam_refiner_cache,
+            refiner_cache_lock=self._sam_refiner_lock,
+            bgr_cache=self._sam_bgr_cache,
+            bgr_cache_lock=self._sam_bgr_lock,
         )
         if self.gpu_guard is not None:
             self.gpu_guard.bind(self.sam_point_worker, "工作台本地 SAM 点选标注")
@@ -2652,8 +3027,10 @@ class LabelingStudioTab(QWidget):
     def _drain_pending_sam_point_request(self) -> None:
         if self._pending_sam_point_request is None:
             return
-        if (self.sam_point_worker is not None and self.sam_point_worker.isRunning()) or (
-            self.sam_worker is not None and self.sam_worker.isRunning()
+        if (
+            (self.sam_point_worker is not None and self.sam_point_worker.isRunning())
+            or (self.sam_worker is not None and self.sam_worker.isRunning())
+            or (self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning())
         ):
             return
         req_id, img_path, points = self._pending_sam_point_request
@@ -2669,9 +3046,18 @@ class LabelingStudioTab(QWidget):
 
     def _on_sam_point_worker_done(self) -> None:
         self._refresh_action_states()
+        if self._drain_pending_sam_refine_request():
+            return
         self._drain_pending_sam_point_request()
 
-    def _on_sam_point_finished(self, req_id: int, img_path_str: str, coords: object) -> None:
+    def _on_sam_point_finished(
+        self,
+        req_id: int,
+        img_path_str: str,
+        coords: object,
+        cache_hit: bool = False,
+        elapsed_ms: int = 0,
+    ) -> None:
         if (
             self._doc is None
             or req_id != self._sam_point_req_id
@@ -2682,7 +3068,13 @@ class LabelingStudioTab(QWidget):
         if isinstance(coords, tuple) and len(coords) == 4:
             x1, y1, x2, y2 = (float(v) for v in coords)
             self.canvas.set_sam_preview_rect((x1, y1, x2, y2), predicting=False)
-            self.save_state_label.setText("SAM 预览就绪：Enter 确认落框，右键排除背景，Esc 取消")
+            if elapsed_ms > 0:
+                cache_tag = f"复用特征缓存 · {elapsed_ms} ms" if cache_hit else f"已缓存特征 · {elapsed_ms} ms"
+                self.save_state_label.setText(
+                    f"SAM 预览就绪（{cache_tag}）：Enter 确认落框，右键排除背景，Esc 取消"
+                )
+            else:
+                self.save_state_label.setText("SAM 预览就绪：Enter 确认落框，右键排除背景，Esc 取消")
         else:
             self.canvas.set_sam_preview_rect(None, predicting=False)
             self.save_state_label.setText("SAM 未分割出有效目标轮廓，可继续补点或 Esc 取消")
@@ -3147,6 +3539,7 @@ class LabelingStudioTab(QWidget):
                     color="#0d9488",
                     duration_ms=2600,
                 )
+                self._schedule_sam_precompute(immediate=True)
         elif is_pan:
             self.mode_badge_label.setText("模式: 抓手平移 (Esc返回)")
             self.mode_badge_label.setStyleSheet(

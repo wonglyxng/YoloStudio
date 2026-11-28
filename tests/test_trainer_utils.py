@@ -47,8 +47,12 @@ def test_line_assembler_treats_carriage_return_as_overwrite() -> None:
 def test_capture_is_thread_local_and_forwards_ultralytics_logger() -> None:
     """验证捕获仅作用于当前线程，其他线程输出不串入，且 `ultralytics` 日志被转发。"""
     logger = logging.getLogger("ultralytics")
+    old_handlers = list(logger.handlers)
+    old_level = logger.level
+    old_propagate = logger.propagate
     handler = logging.StreamHandler(sys.stdout)
-    logger.addHandler(handler)
+    logger.handlers = [handler]
+    logger.propagate = False
     logger.setLevel(logging.INFO)
     captured: list[str] = []
     other_thread_lines: list[str] = []
@@ -65,7 +69,9 @@ def test_capture_is_thread_local_and_forwards_ultralytics_logger() -> None:
             worker.join()
             logger.info("ultralytics 日志")
     finally:
-        logger.removeHandler(handler)
+        logger.handlers = old_handlers
+        logger.setLevel(old_level)
+        logger.propagate = old_propagate
 
     assert captured == ["主线程输出", "ultralytics 日志"]
     assert other_thread_lines == ["来自其他线程"]

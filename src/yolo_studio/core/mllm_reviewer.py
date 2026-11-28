@@ -27,7 +27,7 @@ import random
 import re
 import shutil
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -2116,15 +2116,49 @@ def _mask_to_point_prompt_xyxy(
     return nx1, ny1, nx2, ny2
 
 
-class UltralyticsSamBoxRefiner:
-    """基于 `ultralytics.SAM` 的本地像素级边框紧贴与点选分割引擎（支持 Box Prompt 收框与 Point Prompt 点选成框）。
+@dataclass
+class _SamCachedImageFeatures:
+    """单张图片经 SAM Image Encoder 提取后的可复用视觉特征快照。
 
-    线程安全与运行环境：
-        内部持有 `threading.Lock` 串行化 GPU/CPU 模型推理，保证多并发线程共享同一 SAM 实例时
-        不发生 CUDA 上下文争抢；若本地不存在权重，Ultralytics 会按模型名称自动下载。
+    生命周期与坐标系：
+        由 `UltralyticsSamBoxRefiner._feature_cache` 按 LRU 顺序托管，仅持有 `image_embed` /
+        `high_res_feats` 特征张量及输入/预处理尺寸 `(src_shape, dst_shape)`，不保留整张原始像素张量，
+        单张 SAM 2.1 Tiny 特征显存开销约 16 MB。
     """
 
-    def __init__(self, model_name: str = "sam2.1_t.pt", device: str = "0") -> None:
+    image_key: str
+    src_shape: tuple[int, int]
+    dst_shape: tuple[int, int]
+    features: object
+
+
+def _compute_image_cache_key(image_bgr: np.ndarray) -> str:
+    """为未显式提供缓存键的图像数组生成轻量内容指纹（形状 + 类型 + 稀疏像素网格摘要）。"""
+    h, w = int(image_bgr.shape[0]), int(image_bgr.shape[1])
+    step_y = max(1, h // 32)
+    step_x = max(1, w // 32)
+    sample = np.ascontiguousarray(image_bgr[::step_y, ::step_x])
+    digest = hashlib.blake2b(sample.tobytes(), digest_size=12).hexdigest()
+    return f"arr:{h}x{w}:{image_bgr.dtype}:{digest}"
+
+
+class UltralyticsSamBoxRefiner:
+    """基于 `ultralytics.SAM` 的本地像素级边框紧贴与点选分割引擎（支持图像特征 LRU 缓存）。
+
+    线程安全与运行环境：
+        内部持有 `threading.Lock` 串行化 GPU/CPU 模型推理与特征缓存读写，保证预编码线程、
+        点选线程与收框线程共享同一 SAM 实例时不发生 CUDA 上下文争抢。
+        同一张图片的多次点选加减点或分批收框直接复用缓存的 Image Encoder 特征，仅运行轻量
+        Mask Decoder；若底层预测器不具备特征缓存原语（如外部 mock 或旧版），自动回退至 `SAM.predict`。
+    """
+
+    def __init__(
+        self,
+        model_name: str = "sam2.1_t.pt",
+        device: str = "0",
+        *,
+        max_cached_images: int = 3,
+    ) -> None:
         from ultralytics import SAM
 
         from yolo_studio.core.trainer import ensure_torch_cpu_threads, resolve_pretrained_weights
@@ -2135,39 +2169,263 @@ class UltralyticsSamBoxRefiner:
         self.device = device
         self._lock = Lock()
         self._model = SAM(resolved)
+        self._max_cached_images = max(1, int(max_cached_images))
+        self._feature_cache: OrderedDict[str, _SamCachedImageFeatures] = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._last_cache_hit = False
+
+    @property
+    def last_cache_hit(self) -> bool:
+        """最近一次分割或收框调用是否命中图像特征缓存（跳过 Image Encoder）。"""
+        with self._lock:
+            return self._last_cache_hit
+
+    def cache_stats(self) -> dict[str, int]:
+        """返回图像特征缓存统计（`hits`、`misses`、`cached_images`、`capacity`）。"""
+        with self._lock:
+            return {
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "cached_images": len(self._feature_cache),
+                "capacity": self._max_cached_images,
+            }
+
+    def has_cached_image(self, image_key: str) -> bool:
+        """检查指定 `image_key` 的图像特征是否已驻留在当前 LRU 缓存中。"""
+        if not image_key:
+            return False
+        with self._lock:
+            return image_key in self._feature_cache
+
+    def clear_image_cache(self) -> None:
+        """清空全部缓存的图像特征并释放底层预测器残留张量引用（可用于切换模型或训练前释放显存）。"""
+        with self._lock:
+            self._feature_cache.clear()
+            predictor = getattr(self._model, "predictor", None)
+            if predictor is not None:
+                reset = getattr(predictor, "reset_image", None)
+                if callable(reset):
+                    try:
+                        reset()
+                    except Exception:
+                        pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _supports_feature_cache(predictor: object) -> bool:
+        """检查底层预测器是否暴露了可复用视觉特征的 SAM/SAM2 编解码原语。"""
+        if predictor is None or getattr(predictor, "model", None) is None:
+            return False
+        return all(
+            callable(getattr(predictor, attr, None))
+            for attr in (
+                "setup_source",
+                "preprocess",
+                "get_im_features",
+                "_prepare_prompts",
+                "_inference_features",
+            )
+        )
+
+    def _ensure_predictor_locked(self) -> object | None:
+        """在持锁状态下惰性初始化 Ultralytics SAM 预测器（与 `SAM.predict` 使用一致参数）。"""
+        predictor = getattr(self._model, "predictor", None)
+        if predictor is not None and getattr(predictor, "model", None) is not None:
+            return predictor
+        smart_load = getattr(self._model, "_smart_load", None)
+        if not callable(smart_load):
+            return None
+        try:
+            predictor_cls = smart_load("predictor")
+            base_overrides = dict(getattr(self._model, "overrides", None) or {})
+            overrides = {
+                **base_overrides,
+                "conf": 0.25,
+                "task": "segment",
+                "mode": "predict",
+                "imgsz": 1024,
+                "batch": 1,
+                "save": False,
+                "rect": True,
+                "embed": None,
+                "retina_masks": True,
+                "device": self.device,
+                "verbose": False,
+            }
+            callbacks = getattr(self._model, "callbacks", None)
+            predictor = predictor_cls(overrides=overrides, _callbacks=callbacks)
+            predictor.setup_model(model=self._model.model, verbose=False)
+            self._model.predictor = predictor
+            return predictor
+        except Exception:
+            return None
+
+    def _ensure_image_features_locked(
+        self,
+        predictor: object,
+        image_bgr: np.ndarray,
+        image_key: str | None,
+    ) -> tuple[_SamCachedImageFeatures, bool]:
+        """持锁获取或编码 `image_bgr` 的图像特征并维护 LRU 缓存，返回 `(特征快照, 是否命中缓存)`。"""
+        key = image_key or _compute_image_cache_key(image_bgr)
+        src_shape = (int(image_bgr.shape[0]), int(image_bgr.shape[1]))
+        cached = self._feature_cache.get(key)
+        if cached is not None and cached.src_shape == src_shape:
+            self._feature_cache.move_to_end(key)
+            self._cache_hits += 1
+            self._last_cache_hit = True
+            return cached, True
+
+        import torch
+
+        with torch.inference_mode():
+            predictor.setup_source(image_bgr)  # type: ignore[attr-defined]
+            im = predictor.preprocess([image_bgr])  # type: ignore[attr-defined]
+            features = predictor.get_im_features(im)  # type: ignore[attr-defined]
+            dst_shape = (int(im.shape[2]), int(im.shape[3]))
+            # 清理 predictor 内部短期引用，确保仅由本类 LRU 缓存决定显存生命周期
+            reset = getattr(predictor, "reset_image", None)
+            if callable(reset):
+                reset()
+
+        entry = _SamCachedImageFeatures(
+            image_key=key,
+            src_shape=src_shape,
+            dst_shape=dst_shape,
+            features=features,
+        )
+        self._feature_cache[key] = entry
+        self._feature_cache.move_to_end(key)
+        while len(self._feature_cache) > self._max_cached_images:
+            self._feature_cache.popitem(last=False)
+        self._cache_misses += 1
+        self._last_cache_hit = False
+        return entry, False
+
+    def _decode_masks_locked(
+        self,
+        predictor: object,
+        entry: _SamCachedImageFeatures,
+        *,
+        bboxes: list[list[float]] | None = None,
+        points: list[list[list[float]]] | None = None,
+        labels: list[list[int]] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """持锁在已缓存的图像特征上运行 Prompt Encoder 与 Mask Decoder，并按官方比例还原原图二值掩码。"""
+        import torch
+        from ultralytics.utils import ops
+
+        with torch.inference_mode():
+            prompts = predictor._prepare_prompts(  # type: ignore[attr-defined]
+                entry.dst_shape,
+                entry.src_shape,
+                bboxes=bboxes,
+                points=points,
+                labels=labels,
+            )
+            pred_masks, pred_scores = predictor._inference_features(  # type: ignore[attr-defined]
+                entry.features,
+                *prompts,
+                multimask_output=False,
+            )
+            if pred_masks.shape[0] == 0:
+                return np.zeros((0, entry.src_shape[0], entry.src_shape[1]), dtype=bool), np.zeros((0,), dtype=np.float32)
+
+            gain = min(i / o for i, o in zip(entry.dst_shape, entry.src_shape))
+            ratio = [
+                round(o * gain) * m / i / o
+                for o, m, i in zip(entry.src_shape, pred_masks.shape[1:], entry.dst_shape)
+            ]
+            scaled = ops.scale_masks(
+                pred_masks[None].float(),
+                entry.src_shape,
+                (ratio, (0, 0)),
+                padding=False,
+            )[0]
+            if getattr(predictor, "non_overlap_masks", False):
+                apply_non_overlap = getattr(predictor.model, "_apply_non_overlapping_constraints", None)  # type: ignore[attr-defined]
+                if callable(apply_non_overlap):
+                    scaled = apply_non_overlap(scaled[:, None])[:, 0]
+            mask_threshold = float(getattr(predictor.model, "mask_threshold", 0.0))  # type: ignore[attr-defined]
+            binary_masks = (scaled > mask_threshold).detach().cpu().numpy()
+            scores_np = pred_scores.detach().cpu().numpy()
+            return binary_masks, scores_np
+
+    def precompute_image(
+        self,
+        image_bgr: np.ndarray,
+        *,
+        image_key: str | None = None,
+    ) -> bool:
+        """提前编码并缓存 `image_bgr` 的 SAM 视觉特征，使后续同图点选与收框达到近实时响应。
+
+        返回值：
+            本次实际执行了图像编码并写入缓存时返回 `True`；若特征已命中缓存或底层预测器
+            不支持特征缓存快路径，则返回 `False`。
+        """
+        with self._lock:
+            predictor = self._ensure_predictor_locked()
+            if not self._supports_feature_cache(predictor):
+                return False
+            _, cache_hit = self._ensure_image_features_locked(predictor, image_bgr, image_key)
+            return not cache_hit
 
     def refine_boxes(
-        self, image_bgr: np.ndarray, boxes: list[CandidateBox]
+        self,
+        image_bgr: np.ndarray,
+        boxes: list[CandidateBox],
+        *,
+        image_key: str | None = None,
     ) -> dict[int, tuple[float, float, float, float] | None]:
         """对 `boxes` 执行 Box-Prompt 掩码分割并在原框容差范围内提取最小紧贴外接矩形。"""
         if not boxes:
             return {}
         img_h, img_w = image_bgr.shape[:2]
         bboxes_arg = [[float(b.x1), float(b.y1), float(b.x2), float(b.y2)] for b in boxes]
+
+        mask_arr: np.ndarray | None = None
+        scores_arr: np.ndarray | None = None
+        conf_threshold = 0.25
         with self._lock:
-            results = self._model.predict(
-                source=image_bgr,
-                bboxes=bboxes_arg,
-                device=self.device,
-                verbose=False,
-            )
+            predictor = self._ensure_predictor_locked()
+            if self._supports_feature_cache(predictor):
+                entry, _ = self._ensure_image_features_locked(predictor, image_bgr, image_key)
+                mask_arr, scores_arr = self._decode_masks_locked(predictor, entry, bboxes=bboxes_arg)
+                conf_threshold = float(getattr(getattr(predictor, "args", None), "conf", 0.25) or 0.25)
+            else:
+                self._last_cache_hit = False
+                results = self._model.predict(
+                    source=image_bgr,
+                    bboxes=bboxes_arg,
+                    device=self.device,
+                    verbose=False,
+                )
+                if results:
+                    masks = getattr(results[0], "masks", None)
+                    if masks is not None and getattr(masks, "data", None) is not None:
+                        mask_arr = masks.data.detach().cpu().numpy() > 0.5
 
         refined_map: dict[int, tuple[float, float, float, float] | None] = {b.box_id: None for b in boxes}
-        if not results:
-            return refined_map
-        masks = getattr(results[0], "masks", None)
-        if masks is None or getattr(masks, "data", None) is None:
+        if mask_arr is None or len(mask_arr) == 0:
             return refined_map
 
-        mask_arr = masks.data.detach().cpu().numpy()
         for idx, box in enumerate(boxes):
             if idx >= len(mask_arr):
                 break
+            if scores_arr is not None and idx < len(scores_arr) and float(scores_arr[idx]) <= conf_threshold:
+                continue
             mask = mask_arr[idx]
             mh, mw = mask.shape[:2]
             if mh != img_h or mw != img_w:
-                mask = cv2.resize(mask.astype(np.float32), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-            binary = mask > 0.5
+                mask = cv2.resize(mask.astype(np.float32), (img_w, img_h), interpolation=cv2.INTER_NEAREST) > 0.5
+            binary = mask.astype(bool, copy=False)
 
             # 限制在原框向外最多 5% 容差范围内取紧贴轮廓，防止分割泄漏到远处无关物体
             bw = max(1.0, box.x2 - box.x1)
@@ -2193,6 +2451,8 @@ class UltralyticsSamBoxRefiner:
         image_bgr: np.ndarray,
         points: list[tuple[float, float]],
         labels: list[int],
+        *,
+        image_key: str | None = None,
     ) -> tuple[float, float, float, float] | None:
         """按单目标多点正负提示（`1` 前景、`0` 排除背景）执行本地 SAM 掩码分割并返回最小外接矩形。
 
@@ -2208,24 +2468,40 @@ class UltralyticsSamBoxRefiner:
         img_h, img_w = image_bgr.shape[:2]
         points_arg = [[[float(x), float(y)] for x, y in points]]
         labels_arg = [[1 if int(lbl) == 1 else 0 for lbl in labels]]
-        with self._lock:
-            results = self._model.predict(
-                source=image_bgr,
-                points=points_arg,
-                labels=labels_arg,
-                device=self.device,
-                verbose=False,
-            )
 
-        if not results:
+        mask_arr: np.ndarray | None = None
+        scores_arr: np.ndarray | None = None
+        conf_threshold = 0.25
+        with self._lock:
+            predictor = self._ensure_predictor_locked()
+            if self._supports_feature_cache(predictor):
+                entry, _ = self._ensure_image_features_locked(predictor, image_bgr, image_key)
+                mask_arr, scores_arr = self._decode_masks_locked(
+                    predictor,
+                    entry,
+                    points=points_arg,
+                    labels=labels_arg,
+                )
+                conf_threshold = float(getattr(getattr(predictor, "args", None), "conf", 0.25) or 0.25)
+            else:
+                self._last_cache_hit = False
+                results = self._model.predict(
+                    source=image_bgr,
+                    points=points_arg,
+                    labels=labels_arg,
+                    device=self.device,
+                    verbose=False,
+                )
+                if results:
+                    masks = getattr(results[0], "masks", None)
+                    if masks is not None and getattr(masks, "data", None) is not None:
+                        mask_arr = masks.data.detach().cpu().numpy() > 0.5
+
+        if mask_arr is None or len(mask_arr) == 0:
             return None
-        masks = getattr(results[0], "masks", None)
-        if masks is None or getattr(masks, "data", None) is None:
+        if scores_arr is not None and len(scores_arr) > 0 and float(scores_arr[0]) <= conf_threshold:
             return None
-        mask_arr = masks.data.detach().cpu().numpy()
-        if len(mask_arr) == 0:
-            return None
-        return _mask_to_point_prompt_xyxy(mask_arr[0] > 0.5, points, labels, img_w, img_h)
+        return _mask_to_point_prompt_xyxy(mask_arr[0].astype(bool, copy=False), points, labels, img_w, img_h)
 
 
 class UltralyticsSam3Detector:
