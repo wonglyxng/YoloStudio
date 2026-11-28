@@ -3079,3 +3079,84 @@ def test_workbench_sam_track_dialog_propagates_and_refreshes_status(
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_crosshair_style_geometry_color_settings_and_workbench_sync(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证十字准星中心留空线段几何、颜色键规范化、设置弹窗选色、持久化往返及工作台画布即时同步。"""
+    from yolo_studio.gui.annotation_canvas import (
+        CROSSHAIR_COLOR_PRESETS,
+        DEFAULT_CROSSHAIR_COLOR,
+        crosshair_rgb,
+        crosshair_segments,
+        normalize_crosshair_color_key,
+    )
+    from yolo_studio.gui.app_settings import AppSettingsStore
+    from yolo_studio.gui.settings_dialog import PAGE_GENERAL, SettingsDialog
+
+    # 1) 中心留空几何：四段线均不覆盖光标周围 gap 区域，且裁剪在图像范围内
+    segs = crosshair_segments(100.0, 50.0, 400.0, 300.0, 6.0)
+    assert segs == [
+        (0.0, 50.0, 94.0, 50.0),
+        (106.0, 50.0, 400.0, 50.0),
+        (100.0, 0.0, 100.0, 44.0),
+        (100.0, 56.0, 100.0, 300.0),
+    ]
+    # 光标贴左上角时省略长度不足的两段
+    assert crosshair_segments(2.0, 3.0, 400.0, 300.0, 6.0) == [
+        (8.0, 3.0, 400.0, 3.0),
+        (2.0, 9.0, 2.0, 300.0),
+    ]
+
+    # 2) 颜色键规范化：大小写/空白容错，未知值回退默认白色
+    assert [k for k, _n, _rgb in CROSSHAIR_COLOR_PRESETS] == ["white", "yellow", "green", "magenta"]
+    assert DEFAULT_CROSSHAIR_COLOR == "white"
+    assert normalize_crosshair_color_key(" Yellow ") == "yellow"
+    assert normalize_crosshair_color_key("rainbow") == "white"
+    assert normalize_crosshair_color_key(None) == "white"
+    assert crosshair_rgb("magenta") == (255, 0, 255)
+
+    # 3) 持久化往返与非法值清洗
+    settings_file = tmp_path / "crosshair.ini"
+    store = AppSettingsStore(workspace_root=tmp_path)
+    assert store.preferences.workbench_crosshair_color == "white"
+    general_hits: list[int] = []
+    store.general_changed.connect(lambda: general_hits.append(1))
+    assert store.update(workbench_crosshair_color="green") is True
+    assert general_hits == [1]
+    assert store.update(workbench_crosshair_color="unknown-color") is True
+    assert store.preferences.workbench_crosshair_color == "white"
+    store.update(workbench_crosshair_color="yellow")
+    store.save(QSettings(str(settings_file), QSettings.Format.IniFormat), force=True)
+    restored = AppSettingsStore(workspace_root=tmp_path)
+    assert restored.restore(QSettings(str(settings_file), QSettings.Format.IniFormat)) is True
+    assert restored.preferences.workbench_crosshair_color == "yellow"
+
+    # 4) 设置弹窗：通用设置页提供带色块的颜色下拉，提交后工作台画布即时同步
+    win = _make_window(tmp_path)
+    win.show()
+    qt_app.processEvents()
+    try:
+        canvas = win.labeling_tab.canvas
+        assert canvas.crosshair_color() == "white"
+        dlg = SettingsDialog(win.settings_store, workspace_root=tmp_path, initial_page=PAGE_GENERAL, parent=win)
+        try:
+            combo = dlg.wb_crosshair_color_combo
+            assert combo.count() == len(CROSSHAIR_COLOR_PRESETS)
+            assert combo.currentData() == "white"
+            assert not combo.itemIcon(0).isNull()
+            combo.setCurrentIndex(combo.findData("magenta"))
+            dlg.apply_changes()
+        finally:
+            dlg.close()
+        qt_app.processEvents()
+        assert win.settings_store.preferences.workbench_crosshair_color == "magenta"
+        assert canvas.crosshair_color() == "magenta"
+
+        # 画布直接设置时同样做容错回退
+        canvas.set_crosshair_color("not-a-color")
+        assert canvas.crosshair_color() == "white"
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()

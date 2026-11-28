@@ -5,7 +5,7 @@
     - **AI 大模型**：配置模型接口、内置预设、Base URL、模型名称、思考/推理级别防呆联动、
       API Key 与环境变量检测状态以及一键连通性测试；
     - **本地视觉模型**：配置全局共享的 SAM 2.1 默认权重、SAM 3 权重路径与默认 GPU 加速偏好；
-    - **通用设置**：配置标注工作台默认行为（自动保存、显示标签、保持视野）、记住上次目录与恢复默认。
+    - **通用设置**：配置标注工作台默认行为（自动保存、显示标签、保持视野、十字准星颜色）、记住上次目录与恢复默认。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程，编辑期间仅操作临时控件副本；点击「应用」或「确定」时才原子写回
@@ -18,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal as Signal
-from PyQt6.QtGui import QCloseEvent, QStandardItemModel
+from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPen, QPixmap, QStandardItemModel
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -54,6 +54,7 @@ from yolo_studio.core.mllm_reviewer import (
     supported_reasoning_efforts,
 )
 from yolo_studio.core.trainer import DeviceInfo
+from yolo_studio.gui.annotation_canvas import CROSSHAIR_COLOR_PRESETS, normalize_crosshair_color_key
 from yolo_studio.gui.app_settings import (
     AppPreferences,
     AppSettingsStore,
@@ -396,6 +397,28 @@ class SettingsDialog(QDialog):
         wb_form.addRow("自动保存:", self.wb_auto_save_chk)
         wb_form.addRow("画布显示:", self.wb_show_labels_chk)
         wb_form.addRow("连续帧视野:", self.wb_keep_view_chk)
+
+        crosshair_box = QVBoxLayout()
+        crosshair_box.setContentsMargins(0, 0, 0, 0)
+        crosshair_box.setSpacing(3)
+        self.wb_crosshair_color_combo = QComboBox()
+        self.wb_crosshair_color_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.wb_crosshair_color_combo.setMinimumContentsLength(14)
+        for color_key, color_name, color_rgb in CROSSHAIR_COLOR_PRESETS:
+            self.wb_crosshair_color_combo.addItem(
+                self._make_color_swatch_icon(color_rgb), color_name, color_key
+            )
+        crosshair_hint = QLabel(
+            "画框 (R)、SAM 点选 (Q) 与准星 (X) 共用此颜色；线条自带黑色描边并在光标处留空，"
+            "模式由中心标记区分（方角=画框，圆圈=点选，圆点=编辑）。"
+        )
+        crosshair_hint.setWordWrap(True)
+        crosshair_hint.setStyleSheet("color: #57606a; font-size: 12px;")
+        crosshair_box.addWidget(self.wb_crosshair_color_combo)
+        crosshair_box.addWidget(crosshair_hint)
+        wb_form.addRow("十字准星颜色:", crosshair_box)
         lay.addWidget(wb_group)
 
         app_group = QGroupBox("工作区与启动行为")
@@ -424,6 +447,21 @@ class SettingsDialog(QDialog):
         lay.addWidget(app_group)
         lay.addStretch(1)
         return self._wrap_scroll(content)
+
+    @staticmethod
+    def _make_color_swatch_icon(rgb: tuple[int, int, int]) -> QIcon:
+        """生成带深色描边的 14×14 纯色方块图标，用于在下拉框中直观预览准星颜色。"""
+        pix = QPixmap(14, 14)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor(36, 41, 47), 1.0))
+            painter.setBrush(QColor(*rgb))
+            painter.drawRoundedRect(1, 1, 12, 12, 2, 2)
+        finally:
+            painter.end()
+        return QIcon(pix)
 
     def select_page(self, page_key: str) -> None:
         """按页面键名（`ai` / `local_models` / `general`）切换左侧导航与右侧堆栈页。"""
@@ -479,6 +517,10 @@ class SettingsDialog(QDialog):
             self.wb_auto_save_chk.setChecked(prefs.workbench_auto_save)
             self.wb_show_labels_chk.setChecked(prefs.workbench_show_labels)
             self.wb_keep_view_chk.setChecked(prefs.workbench_keep_view)
+            color_idx = self.wb_crosshair_color_combo.findData(
+                normalize_crosshair_color_key(prefs.workbench_crosshair_color)
+            )
+            self.wb_crosshair_color_combo.setCurrentIndex(max(0, color_idx))
             self.remember_last_dir_chk.setChecked(prefs.remember_last_dir)
         finally:
             self._loading_from_store = False
@@ -513,6 +555,9 @@ class SettingsDialog(QDialog):
             workbench_auto_save=self.wb_auto_save_chk.isChecked(),
             workbench_show_labels=self.wb_show_labels_chk.isChecked(),
             workbench_keep_view=self.wb_keep_view_chk.isChecked(),
+            workbench_crosshair_color=normalize_crosshair_color_key(
+                self.wb_crosshair_color_combo.currentData()
+            ),
             remember_last_dir=self.remember_last_dir_chk.isChecked(),
             default_prefer_gpu=self.default_prefer_gpu_chk.isChecked(),
         )

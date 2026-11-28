@@ -33,6 +33,7 @@ from yolo_studio.core.mllm_reviewer import (
     ReasoningEffort,
     resolve_effective_reasoning_effort,
 )
+from yolo_studio.gui.annotation_canvas import DEFAULT_CROSSHAIR_COLOR, normalize_crosshair_color_key
 
 APP_SETTINGS_KEY = "app/global_settings_json"
 LEGACY_REVIEW_SETTINGS_KEY = "review_tab/state_json"
@@ -71,7 +72,8 @@ class AppPreferences:
           `api_key` 仅驻留当前会话内存，保存至 `QSettings` 时强制置空。
         - 本地视觉模型：`sam_model_name` 同时驱动工作台 SAM 点选/收框与智能标注页 SAM 收紧；
           `sam3_weights_path` 留空时由 `resolve_sam3_weights()` 自动发现 `weights/sam3.pt`。
-        - 通用偏好：`workbench_*`、`remember_last_dir` 与 `default_prefer_gpu` 控制各页初始默认行为。
+        - 通用偏好：`workbench_*`、`remember_last_dir` 与 `default_prefer_gpu` 控制各页初始默认行为；
+          其中 `workbench_crosshair_color` 是十字准星颜色配置键，读写时都会规范化为合法预设。
     """
 
     # AI 大模型全局配置
@@ -90,6 +92,8 @@ class AppPreferences:
     workbench_auto_save: bool = True
     workbench_show_labels: bool = True
     workbench_keep_view: bool = False
+    # 十字准星颜色配置键，取值见 `annotation_canvas.CROSSHAIR_COLOR_PRESETS`，未知值回退白色
+    workbench_crosshair_color: str = DEFAULT_CROSSHAIR_COLOR
     remember_last_dir: bool = True
     default_prefer_gpu: bool = True
 
@@ -269,6 +273,7 @@ class AppSettingsStore(QObject):
         updated.model_name = updated.model_name.strip()
         updated.sam_model_name = updated.sam_model_name.strip() or "sam2.1_t.pt"
         updated.sam3_weights_path = updated.sam3_weights_path.strip()
+        updated.workbench_crosshair_color = normalize_crosshair_color_key(updated.workbench_crosshair_color)
 
         llm_diff = (
             old.provider != updated.provider
@@ -286,6 +291,7 @@ class AppSettingsStore(QObject):
             old.workbench_auto_save != updated.workbench_auto_save
             or old.workbench_show_labels != updated.workbench_show_labels
             or old.workbench_keep_view != updated.workbench_keep_view
+            or old.workbench_crosshair_color != updated.workbench_crosshair_color
             or old.remember_last_dir != updated.remember_last_dir
             or old.default_prefer_gpu != updated.default_prefer_gpu
         )
@@ -343,6 +349,7 @@ class AppSettingsStore(QObject):
             "workbench_auto_save": bool(p.workbench_auto_save),
             "workbench_show_labels": bool(p.workbench_show_labels),
             "workbench_keep_view": bool(p.workbench_keep_view),
+            "workbench_crosshair_color": normalize_crosshair_color_key(p.workbench_crosshair_color),
             "remember_last_dir": bool(p.remember_last_dir),
             "default_prefer_gpu": bool(p.default_prefer_gpu),
         }
@@ -406,6 +413,10 @@ class AppSettingsStore(QObject):
                 prefs.workbench_show_labels = bool(state["workbench_show_labels"])
             if "workbench_keep_view" in state:
                 prefs.workbench_keep_view = bool(state["workbench_keep_view"])
+            if "workbench_crosshair_color" in state:
+                prefs.workbench_crosshair_color = normalize_crosshair_color_key(
+                    state["workbench_crosshair_color"]
+                )
             if "remember_last_dir" in state:
                 prefs.remember_last_dir = bool(state["remember_last_dir"])
             if "default_prefer_gpu" in state:

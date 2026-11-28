@@ -1128,6 +1128,8 @@ class LabelingStudioTab(QWidget):
         center_lay.addWidget(self.audit_banner)
 
         self.canvas = AnnotationCanvasView()
+        # 启动即按全局设置应用准星颜色，后续变更由 `general_changed` 信号同步
+        self.canvas.set_crosshair_color(self.settings_store.preferences.workbench_crosshair_color)
         center_lay.addWidget(self.canvas, 1)
 
         footer = QFrame()
@@ -1859,10 +1861,11 @@ class LabelingStudioTab(QWidget):
         self._review_guidance_provider = provider
 
     def apply_general_preferences(self, prefs: AppPreferences) -> None:
-        """将全局通用设置中的工作台默认偏好应用到工具栏复选框。"""
+        """将全局通用设置中的工作台默认偏好应用到工具栏复选框与画布十字准星颜色。"""
         self.auto_save_chk.setChecked(bool(prefs.workbench_auto_save))
         self.show_labels_chk.setChecked(bool(prefs.workbench_show_labels))
         self.keep_view_chk.setChecked(bool(prefs.workbench_keep_view))
+        self.canvas.set_crosshair_color(prefs.workbench_crosshair_color)
 
     def _on_general_settings_changed(self) -> None:
         self.apply_general_preferences(self.settings_store.preferences)

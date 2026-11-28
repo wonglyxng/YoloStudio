@@ -3,7 +3,7 @@
 职责：
     提供基于 `QGraphicsView` 的高性能图像显示与矩形框交互画布，支持鼠标锚点无级缩放、
     高倍像素锐化显示、多通道顺滑平移（抓手模式 / 拖空白 / 右键拖拽 / 中键 / 空格+左键）、
-    拖拽+两点双模式画框、边缘自动滚屏、防误拖与自适应控制点、全画布双色高对比十字准星、
+    拖拽+两点双模式画框、边缘自动滚屏、防误拖与自适应控制点、中心留空双层描边十字准星（颜色可配置）、
     重叠框小面积优先点选、AI 置信度与审核角标渲染以及右键上下文菜单定位。
 
 运行环境与协作边界：
@@ -52,6 +52,56 @@ HANDLE_CURSORS: dict[str, Qt.CursorShape] = {
     "e": Qt.CursorShape.SizeHorCursor,
     "w": Qt.CursorShape.SizeHorCursor,
 }
+
+# 十字准星可选颜色预设：(配置键, 中文显示名, RGB)。配置键持久化在全局设置 `workbench_crosshair_color` 中，
+# 不可随意改名；新增预设只追加，未知键一律回退为 `DEFAULT_CROSSHAIR_COLOR`。
+CROSSHAIR_COLOR_PRESETS: tuple[tuple[str, str, tuple[int, int, int]], ...] = (
+    ("white", "白色（默认，通用性最好）", (255, 255, 255)),
+    ("yellow", "亮黄（适合偏蓝/偏暗画面）", (250, 204, 21)),
+    ("green", "荧光绿（适合偏红/偏暖画面）", (57, 255, 20)),
+    ("magenta", "品红（适合偏绿/植被画面）", (255, 0, 255)),
+)
+DEFAULT_CROSSHAIR_COLOR = "white"
+_CROSSHAIR_RGB_BY_KEY: dict[str, tuple[int, int, int]] = {k: rgb for k, _n, rgb in CROSSHAIR_COLOR_PRESETS}
+
+# 十字准星中心留空半径（屏幕像素），保证瞄准点像素不被线条遮挡
+CROSSHAIR_CENTER_GAP_PX = 6.0
+
+
+def normalize_crosshair_color_key(key: object) -> str:
+    """将任意输入规范化为合法的十字准星颜色配置键，未知或空值回退为默认白色。"""
+    text = str(key or "").strip().lower()
+    return text if text in _CROSSHAIR_RGB_BY_KEY else DEFAULT_CROSSHAIR_COLOR
+
+
+def crosshair_rgb(key: object) -> tuple[int, int, int]:
+    """返回颜色配置键对应的 `(R, G, B)`，未知键按默认白色处理。"""
+    return _CROSSHAIR_RGB_BY_KEY[normalize_crosshair_color_key(key)]
+
+
+def crosshair_segments(
+    cx: float,
+    cy: float,
+    width: float,
+    height: float,
+    gap: float,
+) -> list[tuple[float, float, float, float]]:
+    """计算中心留空的十字准星线段 `(x1, y1, x2, y2)` 列表（图像像素坐标系）。
+
+    横竖两条线各在光标两侧拆成两段，并裁剪到 `[0, width] × [0, height]` 图像范围内；
+    长度不足的段（光标贴边时）会被省略，因此返回 0~4 段。`gap` 为光标到线段起点的距离，单位同坐标。
+    """
+    segs: list[tuple[float, float, float, float]] = []
+    g = max(0.0, float(gap))
+    if cx - g > 0.0:
+        segs.append((0.0, cy, cx - g, cy))
+    if cx + g < width:
+        segs.append((cx + g, cy, width, cy))
+    if cy - g > 0.0:
+        segs.append((cx, 0.0, cx, cy - g))
+    if cy + g < height:
+        segs.append((cx, cy + g, cx, height))
+    return segs
 
 
 def build_view_enhancement_lut(
@@ -186,6 +236,8 @@ class AnnotationCanvasView(QGraphicsView):
         self._active_label: str = ""
         self._show_labels: bool = True
         self._always_show_crosshair: bool = False
+        # 十字准星颜色配置键（见 `CROSSHAIR_COLOR_PRESETS`），由工作台按全局设置写入
+        self._crosshair_color_key: str = DEFAULT_CROSSHAIR_COLOR
         self._view_enhance_enabled: bool = False
         self._view_enhance_brightness: int = self.DEFAULT_ENHANCE_BRIGHTNESS
         self._view_enhance_contrast: float = self.DEFAULT_ENHANCE_CONTRAST
@@ -430,11 +482,23 @@ class AnnotationCanvasView(QGraphicsView):
         return self._always_show_crosshair
 
     def set_always_show_crosshair(self, enabled: bool) -> None:
-        """切换是否在编辑与抓手等全模式下常显双色高对比度十字准星。"""
+        """切换是否在编辑与抓手等全模式下常显中心留空的双层描边十字准星。"""
         flag = bool(enabled)
         if flag == self._always_show_crosshair:
             return
         self._always_show_crosshair = flag
+        self.viewport().update()
+
+    def crosshair_color(self) -> str:
+        """返回当前十字准星颜色配置键（如 `white` / `yellow` / `green` / `magenta`）。"""
+        return self._crosshair_color_key
+
+    def set_crosshair_color(self, key: str) -> None:
+        """设置十字准星颜色；未知键回退为默认白色，取值未变化时不触发重绘。"""
+        normalized = normalize_crosshair_color_key(key)
+        if normalized == self._crosshair_color_key:
+            return
+        self._crosshair_color_key = normalized
         self.viewport().update()
 
     def view_enhancement_enabled(self) -> bool:
@@ -1749,14 +1813,15 @@ class AnnotationCanvasView(QGraphicsView):
         if self._audit_overlays_visible and (self._audit_overlays or self._audit_flagged_gt):
             self._paint_audit_overlays(painter, inv)
 
-        # 绘制模式：双色高对比十字准星与实时草稿框
+        # 绘制模式：中心留空十字准星（中心以当前类别色小方角标示“画框”）与实时草稿框
         if self._mode == self.MODE_DRAW:
             if self._cursor_scene_pos is not None:
+                marker_rgb = label_color_rgb(self._active_label) if self._active_label else None
                 self._paint_crosshair(
                     painter,
                     inv,
-                    outer_color=QColor(0, 0, 0, 145),
-                    inner_color=QColor(255, 255, 255, 225),
+                    marker="square",
+                    marker_color=QColor(*marker_rgb) if marker_rgb else None,
                 )
 
             if self._draw_state != "idle":
@@ -1781,11 +1846,12 @@ class AnnotationCanvasView(QGraphicsView):
         # SAM 点选标注模式：十字准星、悬停/草稿半透明轮廓掩码、实时预览框与正负提示点渲染
         if self._mode == self.MODE_SAM_POINT:
             if self._cursor_scene_pos is not None:
+                # SAM 点选：中心以青绿小圆圈标示“点选”，线条颜色与其它模式保持一致
                 self._paint_crosshair(
                     painter,
                     inv,
-                    outer_color=QColor(0, 0, 0, 115),
-                    inner_color=QColor(45, 212, 191, 215),
+                    marker="circle",
+                    marker_color=QColor(45, 212, 191),
                 )
 
             if not self._sam_points and self._sam_hover_rect is not None:
@@ -1847,19 +1913,14 @@ class AnnotationCanvasView(QGraphicsView):
                 if pt_lbl == 1:
                     painter.drawLine(QPointF(pt_x, pt_y - cross_r), QPointF(pt_x, pt_y + cross_r))
 
-        # 编辑或抓手模式下若开启全模式十字准星（X），在非平移态绘制双色辅助对齐线
+        # 编辑或抓手模式下若开启全模式十字准星（X），在非平移态绘制只带中心点的辅助对齐线
         if (
             self._always_show_crosshair
             and self._mode in (self.MODE_EDIT, self.MODE_PAN)
             and not self._panning
             and self._cursor_scene_pos is not None
         ):
-            self._paint_crosshair(
-                painter,
-                inv,
-                outer_color=QColor(0, 0, 0, 120),
-                inner_color=QColor(125, 211, 252, 220),
-            )
+            self._paint_crosshair(painter, inv, marker="dot")
 
         painter.restore()
         self._paint_hud_overlay(painter)
@@ -1869,20 +1930,65 @@ class AnnotationCanvasView(QGraphicsView):
         painter: QPainter,
         inv: float,
         *,
-        outer_color: QColor,
-        inner_color: QColor,
+        marker: str = "dot",
+        marker_color: QColor | None = None,
     ) -> None:
-        """在当前光标所在图像位置绘制横贯整张画面的双色高对比度十字准星。"""
+        """在光标位置绘制横贯整张图像、中心留空的双层描边十字准星。
+
+        样式约定（所有尺寸均为屏幕像素，乘以 `inv` 抵消缩放）：
+            - 底层 3px 黑色描边（不透明度约 170）+ 上层 1px 实线（用户所选颜色，不透明度约 235），
+              保证亮、暗、彩色背景上都清晰；不再使用虚线，避免在高频纹理上“碎掉”难以对齐；
+            - 光标周围留空 `CROSSHAIR_CENTER_GAP_PX`，只画 1px 中心点，瞄准像素不被遮挡；
+            - 模式不靠线条颜色区分，而靠中心标记形状：`dot` 编辑/抓手、`square` 画框、`circle` SAM 点选；
+              `marker_color` 为空时标记沿用线条颜色。
+        """
         if self._cursor_scene_pos is None:
             return
-        cx = max(0.0, min(float(self._image_width), self._cursor_scene_pos.x()))
-        cy = max(0.0, min(float(self._image_height), self._cursor_scene_pos.y()))
-        painter.setPen(QPen(outer_color, 2.2 * inv, Qt.PenStyle.SolidLine))
-        painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
-        painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
-        painter.setPen(QPen(inner_color, 1.0 * inv, Qt.PenStyle.DashLine))
-        painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
-        painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+        img_w = float(self._image_width)
+        img_h = float(self._image_height)
+        cx = max(0.0, min(img_w, self._cursor_scene_pos.x()))
+        cy = max(0.0, min(img_h, self._cursor_scene_pos.y()))
+        r, g, b = crosshair_rgb(self._crosshair_color_key)
+        line_color = QColor(r, g, b, 235)
+        halo_color = QColor(0, 0, 0, 170)
+        gap = CROSSHAIR_CENTER_GAP_PX * inv
+        segs = crosshair_segments(cx, cy, img_w, img_h, gap)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        halo_pen = QPen(halo_color, 3.0 * inv, Qt.PenStyle.SolidLine)
+        halo_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(halo_pen)
+        for x1, y1, x2, y2 in segs:
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        line_pen = QPen(line_color, 1.0 * inv, Qt.PenStyle.SolidLine)
+        line_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(line_pen)
+        for x1, y1, x2, y2 in segs:
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        center = QPointF(cx, cy)
+        mark_color = QColor(marker_color) if marker_color is not None else QColor(line_color)
+        mark_color.setAlpha(240)
+        if marker == "square":
+            half = 3.5 * inv
+            rect = QRectF(cx - half, cy - half, half * 2.0, half * 2.0)
+            painter.setPen(QPen(halo_color, 3.0 * inv))
+            painter.drawRect(rect)
+            painter.setPen(QPen(mark_color, 1.2 * inv))
+            painter.drawRect(rect)
+        elif marker == "circle":
+            radius = 4.0 * inv
+            painter.setPen(QPen(halo_color, 3.0 * inv))
+            painter.drawEllipse(center, radius, radius)
+            painter.setPen(QPen(mark_color, 1.4 * inv))
+            painter.drawEllipse(center, radius, radius)
+        # 所有模式都保留 1px 中心点，精确标示当前落点
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(halo_color))
+        painter.drawEllipse(center, 1.6 * inv, 1.6 * inv)
+        painter.setBrush(QBrush(QColor(r, g, b, 250)))
+        painter.drawEllipse(center, 0.8 * inv, 0.8 * inv)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def _paint_sam_contours(
         self,
