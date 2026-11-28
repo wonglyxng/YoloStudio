@@ -73,7 +73,8 @@ class AppPreferences:
         - 本地视觉模型：`sam_model_name` 同时驱动工作台 SAM 点选/收框与智能标注页 SAM 收紧；
           `sam3_weights_path` 留空时由 `resolve_sam3_weights()` 自动发现 `weights/sam3.pt`。
         - 通用偏好：`workbench_*`、`remember_last_dir` 与 `default_prefer_gpu` 控制各页初始默认行为；
-          其中 `workbench_crosshair_color` 是十字准星颜色配置键，读写时都会规范化为合法预设。
+          其中 `workbench_crosshair_color` 是十字准星颜色配置键，读写时都会规范化为合法预设；
+          `workbench_crosshair_dashed` / `workbench_crosshair_halo` 控制准星线型与黑色描边（默认细虚线、无描边）。
     """
 
     # AI 大模型全局配置
@@ -94,6 +95,10 @@ class AppPreferences:
     workbench_keep_view: bool = False
     # 十字准星颜色配置键，取值见 `annotation_canvas.CROSSHAIR_COLOR_PRESETS`，未知值回退白色
     workbench_crosshair_color: str = DEFAULT_CROSSHAIR_COLOR
+    # 十字准星线型：True 为细虚线（默认，视觉更轻），False 为实线
+    workbench_crosshair_dashed: bool = True
+    # 十字准星是否加黑色描边：默认关闭，复杂/高亮背景下可开启提高对比度
+    workbench_crosshair_halo: bool = False
     remember_last_dir: bool = True
     default_prefer_gpu: bool = True
 
@@ -292,6 +297,8 @@ class AppSettingsStore(QObject):
             or old.workbench_show_labels != updated.workbench_show_labels
             or old.workbench_keep_view != updated.workbench_keep_view
             or old.workbench_crosshair_color != updated.workbench_crosshair_color
+            or old.workbench_crosshair_dashed != updated.workbench_crosshair_dashed
+            or old.workbench_crosshair_halo != updated.workbench_crosshair_halo
             or old.remember_last_dir != updated.remember_last_dir
             or old.default_prefer_gpu != updated.default_prefer_gpu
         )
@@ -350,6 +357,8 @@ class AppSettingsStore(QObject):
             "workbench_show_labels": bool(p.workbench_show_labels),
             "workbench_keep_view": bool(p.workbench_keep_view),
             "workbench_crosshair_color": normalize_crosshair_color_key(p.workbench_crosshair_color),
+            "workbench_crosshair_dashed": bool(p.workbench_crosshair_dashed),
+            "workbench_crosshair_halo": bool(p.workbench_crosshair_halo),
             "remember_last_dir": bool(p.remember_last_dir),
             "default_prefer_gpu": bool(p.default_prefer_gpu),
         }
@@ -417,6 +426,10 @@ class AppSettingsStore(QObject):
                 prefs.workbench_crosshair_color = normalize_crosshair_color_key(
                     state["workbench_crosshair_color"]
                 )
+            if "workbench_crosshair_dashed" in state:
+                prefs.workbench_crosshair_dashed = bool(state["workbench_crosshair_dashed"])
+            if "workbench_crosshair_halo" in state:
+                prefs.workbench_crosshair_halo = bool(state["workbench_crosshair_halo"])
             if "remember_last_dir" in state:
                 prefs.remember_last_dir = bool(state["remember_last_dir"])
             if "default_prefer_gpu" in state:

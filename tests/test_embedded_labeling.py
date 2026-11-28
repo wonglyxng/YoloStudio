@@ -3084,7 +3084,7 @@ def test_workbench_sam_track_dialog_propagates_and_refreshes_status(
 def test_crosshair_style_geometry_color_settings_and_workbench_sync(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证十字准星中心留空线段几何、颜色键规范化、设置弹窗选色、持久化往返及工作台画布即时同步。"""
+    """验证十字准星中心留空线段几何、颜色键规范化、线型/描边默认值、设置弹窗选项、持久化往返及工作台画布即时同步。"""
     from yolo_studio.gui.annotation_canvas import (
         CROSSHAIR_COLOR_PRESETS,
         DEFAULT_CROSSHAIR_COLOR,
@@ -3121,17 +3121,24 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
     settings_file = tmp_path / "crosshair.ini"
     store = AppSettingsStore(workspace_root=tmp_path)
     assert store.preferences.workbench_crosshair_color == "white"
+    # 默认细虚线、无黑色描边
+    assert store.preferences.workbench_crosshair_dashed is True
+    assert store.preferences.workbench_crosshair_halo is False
     general_hits: list[int] = []
     store.general_changed.connect(lambda: general_hits.append(1))
     assert store.update(workbench_crosshair_color="green") is True
     assert general_hits == [1]
     assert store.update(workbench_crosshair_color="unknown-color") is True
     assert store.preferences.workbench_crosshair_color == "white"
-    store.update(workbench_crosshair_color="yellow")
+    store.update(
+        workbench_crosshair_color="yellow", workbench_crosshair_dashed=False, workbench_crosshair_halo=True
+    )
     store.save(QSettings(str(settings_file), QSettings.Format.IniFormat), force=True)
     restored = AppSettingsStore(workspace_root=tmp_path)
     assert restored.restore(QSettings(str(settings_file), QSettings.Format.IniFormat)) is True
     assert restored.preferences.workbench_crosshair_color == "yellow"
+    assert restored.preferences.workbench_crosshair_dashed is False
+    assert restored.preferences.workbench_crosshair_halo is True
 
     # 4) 设置弹窗：通用设置页提供带色块的颜色下拉，提交后工作台画布即时同步
     win = _make_window(tmp_path)
@@ -3140,19 +3147,25 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
     try:
         canvas = win.labeling_tab.canvas
         assert canvas.crosshair_color() == "white"
+        assert canvas.crosshair_style() == (True, False)
         dlg = SettingsDialog(win.settings_store, workspace_root=tmp_path, initial_page=PAGE_GENERAL, parent=win)
         try:
             combo = dlg.wb_crosshair_color_combo
             assert combo.count() == len(CROSSHAIR_COLOR_PRESETS)
             assert combo.currentData() == "white"
             assert not combo.itemIcon(0).isNull()
+            assert dlg.wb_crosshair_dashed_combo.currentData() is True
+            assert dlg.wb_crosshair_halo_chk.isChecked() is False
             combo.setCurrentIndex(combo.findData("magenta"))
+            dlg.wb_crosshair_dashed_combo.setCurrentIndex(dlg.wb_crosshair_dashed_combo.findData(False))
+            dlg.wb_crosshair_halo_chk.setChecked(True)
             dlg.apply_changes()
         finally:
             dlg.close()
         qt_app.processEvents()
         assert win.settings_store.preferences.workbench_crosshair_color == "magenta"
         assert canvas.crosshair_color() == "magenta"
+        assert canvas.crosshair_style() == (False, True)
 
         # 画布直接设置时同样做容错回退
         canvas.set_crosshair_color("not-a-color")

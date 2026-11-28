@@ -1128,8 +1128,12 @@ class LabelingStudioTab(QWidget):
         center_lay.addWidget(self.audit_banner)
 
         self.canvas = AnnotationCanvasView()
-        # 启动即按全局设置应用准星颜色，后续变更由 `general_changed` 信号同步
-        self.canvas.set_crosshair_color(self.settings_store.preferences.workbench_crosshair_color)
+        # 启动即按全局设置应用准星颜色、线型与描边，后续变更由 `general_changed` 信号同步
+        _init_prefs = self.settings_store.preferences
+        self.canvas.set_crosshair_color(_init_prefs.workbench_crosshair_color)
+        self.canvas.set_crosshair_style(
+            dashed=_init_prefs.workbench_crosshair_dashed, halo=_init_prefs.workbench_crosshair_halo
+        )
         center_lay.addWidget(self.canvas, 1)
 
         footer = QFrame()
@@ -1866,6 +1870,9 @@ class LabelingStudioTab(QWidget):
         self.show_labels_chk.setChecked(bool(prefs.workbench_show_labels))
         self.keep_view_chk.setChecked(bool(prefs.workbench_keep_view))
         self.canvas.set_crosshair_color(prefs.workbench_crosshair_color)
+        self.canvas.set_crosshair_style(
+            dashed=prefs.workbench_crosshair_dashed, halo=prefs.workbench_crosshair_halo
+        )
 
     def _on_general_settings_changed(self) -> None:
         self.apply_general_preferences(self.settings_store.preferences)

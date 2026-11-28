@@ -5,7 +5,7 @@
     - **AI 大模型**：配置模型接口、内置预设、Base URL、模型名称、思考/推理级别防呆联动、
       API Key 与环境变量检测状态以及一键连通性测试；
     - **本地视觉模型**：配置全局共享的 SAM 2.1 默认权重、SAM 3 权重路径与默认 GPU 加速偏好；
-    - **通用设置**：配置标注工作台默认行为（自动保存、显示标签、保持视野、十字准星颜色）、记住上次目录与恢复默认。
+    - **通用设置**：配置标注工作台默认行为（自动保存、显示标签、保持视野、十字准星颜色/线型/描边）、记住上次目录与恢复默认。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程，编辑期间仅操作临时控件副本；点击「应用」或「确定」时才原子写回
@@ -410,15 +410,26 @@ class SettingsDialog(QDialog):
             self.wb_crosshair_color_combo.addItem(
                 self._make_color_swatch_icon(color_rgb), color_name, color_key
             )
+        crosshair_style_row = QHBoxLayout()
+        crosshair_style_row.setContentsMargins(0, 0, 0, 0)
+        crosshair_style_row.setSpacing(10)
+        self.wb_crosshair_dashed_combo = QComboBox()
+        self.wb_crosshair_dashed_combo.addItem("细虚线（默认，更轻）", True)
+        self.wb_crosshair_dashed_combo.addItem("细实线（对齐更连贯）", False)
+        self.wb_crosshair_halo_chk = QCheckBox("黑色描边（复杂/高亮背景更清晰）")
+        crosshair_style_row.addWidget(self.wb_crosshair_dashed_combo)
+        crosshair_style_row.addWidget(self.wb_crosshair_halo_chk)
+        crosshair_style_row.addStretch(1)
         crosshair_hint = QLabel(
-            "画框 (R)、SAM 点选 (Q) 与准星 (X) 共用此颜色；线条自带黑色描边并在光标处留空，"
+            "画框 (R)、SAM 点选 (Q) 与准星 (X) 共用此样式；线条在光标处留空，"
             "模式由中心标记区分（方角=画框，圆圈=点选，圆点=编辑）。"
         )
         crosshair_hint.setWordWrap(True)
         crosshair_hint.setStyleSheet("color: #57606a; font-size: 12px;")
         crosshair_box.addWidget(self.wb_crosshair_color_combo)
+        crosshair_box.addLayout(crosshair_style_row)
         crosshair_box.addWidget(crosshair_hint)
-        wb_form.addRow("十字准星颜色:", crosshair_box)
+        wb_form.addRow("十字准星样式:", crosshair_box)
         lay.addWidget(wb_group)
 
         app_group = QGroupBox("工作区与启动行为")
@@ -521,6 +532,9 @@ class SettingsDialog(QDialog):
                 normalize_crosshair_color_key(prefs.workbench_crosshair_color)
             )
             self.wb_crosshair_color_combo.setCurrentIndex(max(0, color_idx))
+            dashed_idx = self.wb_crosshair_dashed_combo.findData(bool(prefs.workbench_crosshair_dashed))
+            self.wb_crosshair_dashed_combo.setCurrentIndex(max(0, dashed_idx))
+            self.wb_crosshair_halo_chk.setChecked(bool(prefs.workbench_crosshair_halo))
             self.remember_last_dir_chk.setChecked(prefs.remember_last_dir)
         finally:
             self._loading_from_store = False
@@ -558,6 +572,8 @@ class SettingsDialog(QDialog):
             workbench_crosshair_color=normalize_crosshair_color_key(
                 self.wb_crosshair_color_combo.currentData()
             ),
+            workbench_crosshair_dashed=bool(self.wb_crosshair_dashed_combo.currentData()),
+            workbench_crosshair_halo=self.wb_crosshair_halo_chk.isChecked(),
             remember_last_dir=self.remember_last_dir_chk.isChecked(),
             default_prefer_gpu=self.default_prefer_gpu_chk.isChecked(),
         )
