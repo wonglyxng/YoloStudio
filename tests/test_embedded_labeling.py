@@ -2836,6 +2836,123 @@ def test_workbench_label_audit_dialog_sorting_ghost_overlay_and_accept_missing(
         win.close()
 
 
+def test_workbench_sam_hover_live_contour_preview_and_click_handoff(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证 SAM 点选模式下鼠标悬停实时轮廓预览、点击无缝承接草稿轮廓以及开关与切模式清理。"""
+    import threading
+    import time
+
+    from yolo_studio.gui.annotation_canvas import AnnotationCanvasView
+
+    frames_dir = tmp_path / "sam_hover_frames"
+    f1 = frames_dir / "001.jpg"
+    _write_sample_frame(f1, (320, 240))
+
+    class _ContourFakeSamRefiner:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.cached_keys: set[str] = set()
+            self.calls: list[list[tuple[float, float]]] = []
+            self.last_cache_hit = True
+
+        def has_cached_image(self, image_key: str) -> bool:
+            with self._lock:
+                return image_key in self.cached_keys
+
+        def precompute_image(self, _img_bgr, *, image_key: str = "") -> bool:
+            with self._lock:
+                if image_key in self.cached_keys:
+                    return False
+                self.cached_keys.add(image_key)
+                return True
+
+        def segment_by_points_with_contours(self, _img_bgr, points, _labels, *, image_key: str = ""):
+            with self._lock:
+                self.cached_keys.add(image_key)
+                self.calls.append(list(points))
+                self.last_cache_hit = True
+            px, py = points[0]
+            x1, y1, x2, y2 = max(0.0, px - 35.0), max(0.0, py - 25.0), min(320.0, px + 35.0), min(240.0, py + 25.0)
+            poly = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+            return (x1, y1, x2, y2), [poly]
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+
+        tab._sam_hover_timer.setInterval(20)
+        tab._sam_precompute_timer.setInterval(20)
+        device = tab._resolve_sam_device()
+        fake = _ContourFakeSamRefiner()
+        tab._sam_refiner_cache[("sam2.1_t.pt", device)] = fake
+
+        # 非 SAM 点选模式时「悬停预览」复选框隐藏
+        assert tab.sam_hover_preview_chk.isVisible() is False
+
+        # 切入 Q 模式后复选框显示并预编码当前图特征
+        tab.canvas.set_mode(AnnotationCanvasView.MODE_SAM_POINT)
+        tab.sam_hover_preview_chk.setChecked(True)
+        qt_app.processEvents()
+        assert tab.sam_hover_preview_chk.isVisible() is True
+
+        def _wait_idle() -> None:
+            deadline = time.monotonic() + 4.0
+            idle = 0
+            while time.monotonic() < deadline:
+                qt_app.processEvents()
+                busy = any(
+                    w is not None and w.isRunning()
+                    for w in (tab.sam_precompute_worker, tab.sam_hover_worker, tab.sam_point_worker)
+                )
+                if not busy and not tab._sam_hover_timer.isActive() and not tab._sam_precompute_timer.isActive():
+                    idle += 1
+                    if idle >= 3:
+                        break
+                else:
+                    idle = 0
+                time.sleep(0.015)
+            qt_app.processEvents()
+
+        _wait_idle()
+        assert tab.is_current_image_sam_cached() is True
+
+        # 1) 模拟光标悬停在 (140, 110) -> 生成半透明轮廓与预览框，渲染无异常
+        tab._on_sam_hover_pos_changed(140.0, 110.0)
+        _wait_idle()
+        h_rect, h_polys = tab.canvas.sam_hover_preview()
+        assert h_rect == (105.0, 85.0, 175.0, 135.0)
+        assert len(h_polys) == 1 and len(h_polys[0]) == 4
+        assert not tab.canvas.grab().isNull()
+
+        # 2) 左键点击落点 -> 清空悬停层并生成带轮廓的正式点选草稿预览
+        tab.canvas._sam_points.append((140.0, 110.0, 1))
+        tab.canvas.clear_sam_hover_preview()
+        tab._on_sam_points_changed(list(tab.canvas._sam_points))
+        _wait_idle()
+        assert tab.canvas.sam_hover_preview()[0] is None
+        assert tab.canvas.sam_preview_rect() == (105.0, 85.0, 175.0, 135.0)
+        assert len(tab.canvas.sam_preview_contours()) == 1
+        assert not tab.canvas.grab().isNull()
+
+        # 3) 切回编辑模式 -> 隐藏「悬停预览」并清空残留轮廓
+        tab.canvas.set_mode(AnnotationCanvasView.MODE_EDIT)
+        qt_app.processEvents()
+        assert tab.sam_hover_preview_chk.isVisible() is False
+        assert tab.canvas.sam_hover_preview()[0] is None
+        assert tab.canvas.sam_preview_contours() == []
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+
 
 
 

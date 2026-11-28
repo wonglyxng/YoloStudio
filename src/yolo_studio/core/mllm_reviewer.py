@@ -2073,14 +2073,41 @@ def test_mllm_connection(config: MllmReviewConfig) -> tuple[bool, str]:
         return False, f"接口连接失败（耗时 {elapsed:.2f}s）: {_format_exception_detail(exc)}"
 
 
-def _mask_to_point_prompt_xyxy(
+def _extract_mask_polygons(
+    binary_mask: np.ndarray,
+    *,
+    max_polygons: int = 8,
+) -> list[list[tuple[float, float]]]:
+    """从清洗后的二值前景掩码提取轻量简化轮廓多边形，用于画布实时半透明轮廓预览。"""
+    mask_u8 = binary_mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    ranked = sorted(contours, key=cv2.contourArea, reverse=True)
+    polygons: list[list[tuple[float, float]]] = []
+    for cnt in ranked:
+        if len(polygons) >= max_polygons:
+            break
+        if len(cnt) < 3 or cv2.contourArea(cnt) < 4.0:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        eps = max(1.0, 0.0025 * peri)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        pts_arr = approx if len(approx) >= 3 else cnt
+        pts = [(float(pt[0][0]), float(pt[0][1])) for pt in pts_arr]
+        if len(pts) >= 3:
+            polygons.append(pts)
+    return polygons
+
+
+def _mask_to_point_prompt_result(
     binary_mask: np.ndarray,
     points: list[tuple[float, float]],
     labels: list[int],
     img_w: int,
     img_h: int,
-) -> tuple[float, float, float, float] | None:
-    """从点提示分割出的二值掩码提取紧贴目标的外接矩形，自动过滤远离前景点的孤立噪点连通域。"""
+) -> tuple[tuple[float, float, float, float], list[list[tuple[float, float]]]] | None:
+    """从点提示二值掩码提取去噪后的紧贴外接矩形与轻量轮廓多边形列表 `(xyxy, polygons)`。"""
     if binary_mask.ndim != 2 or not np.any(binary_mask):
         return None
     mh, mw = binary_mask.shape[:2]
@@ -2113,7 +2140,20 @@ def _mask_to_point_prompt_xyxy(
     ny2 = min(float(img_h), float(int(ys.max()) + 1))
     if (nx2 - nx1) <= 2.0 or (ny2 - ny1) <= 2.0:
         return None
-    return nx1, ny1, nx2, ny2
+    polygons = _extract_mask_polygons(filtered)
+    return (nx1, ny1, nx2, ny2), polygons
+
+
+def _mask_to_point_prompt_xyxy(
+    binary_mask: np.ndarray,
+    points: list[tuple[float, float]],
+    labels: list[int],
+    img_w: int,
+    img_h: int,
+) -> tuple[float, float, float, float] | None:
+    """从点提示分割出的二值掩码提取紧贴目标的外接矩形，自动过滤远离前景点的孤立噪点连通域。"""
+    res = _mask_to_point_prompt_result(binary_mask, points, labels, img_w, img_h)
+    return res[0] if res is not None else None
 
 
 @dataclass
@@ -2446,19 +2486,19 @@ class UltralyticsSamBoxRefiner:
                 refined_map[box.box_id] = (nx1, ny1, min(float(img_w), nx2), min(float(img_h), ny2))
         return refined_map
 
-    def segment_by_points(
+    def segment_by_points_with_contours(
         self,
         image_bgr: np.ndarray,
         points: list[tuple[float, float]],
         labels: list[int],
         *,
         image_key: str | None = None,
-    ) -> tuple[float, float, float, float] | None:
-        """按单目标多点正负提示（`1` 前景、`0` 排除背景）执行本地 SAM 掩码分割并返回最小外接矩形。
+    ) -> tuple[tuple[float, float, float, float], list[list[tuple[float, float]]]] | None:
+        """按单目标多点正负提示执行本地 SAM 分割，同时返回外接矩形与轻量轮廓多边形列表 `(xyxy, polygons)`。
 
         输入约定：
             `points` 为原图像素坐标列表 `[(x, y), ...]`，`labels` 为等长的 `1`/`0` 整数列表且至少含一个前景点；
-            内部按 Ultralytics `SAM2Predictor._prepare_prompts` 的单目标多点形状 `(1, K, 2)` 与 `(1, K)` 传入。
+            内部复用特征 LRU 缓存快路径，在工作台点选草稿与鼠标悬停预览中实现 ~20 ms 级近实时轮廓展示。
         """
         if not points or len(points) != len(labels):
             return None
@@ -2501,7 +2541,23 @@ class UltralyticsSamBoxRefiner:
             return None
         if scores_arr is not None and len(scores_arr) > 0 and float(scores_arr[0]) <= conf_threshold:
             return None
-        return _mask_to_point_prompt_xyxy(mask_arr[0].astype(bool, copy=False), points, labels, img_w, img_h)
+        return _mask_to_point_prompt_result(
+            mask_arr[0].astype(bool, copy=False), points, labels, img_w, img_h
+        )
+
+    def segment_by_points(
+        self,
+        image_bgr: np.ndarray,
+        points: list[tuple[float, float]],
+        labels: list[int],
+        *,
+        image_key: str | None = None,
+    ) -> tuple[float, float, float, float] | None:
+        """按单目标多点正负提示（`1` 前景、`0` 排除背景）执行本地 SAM 掩码分割并返回最小外接矩形。"""
+        res = self.segment_by_points_with_contours(
+            image_bgr, points, labels, image_key=image_key
+        )
+        return res[0] if res is not None else None
 
 
 class UltralyticsSam3Detector:

@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import copy
 import inspect
+import math
 import os
 import subprocess
 import sys
@@ -503,9 +504,9 @@ class _SamBoxRefineWorker(QThread):
 
 
 class _SamPointSegmentWorker(QThread):
-    """在后台线程中使用本地 SAM 2.1 按单目标正/负点提示分割轮廓并返回最小外接矩形（复用图像特征缓存）。"""
+    """在后台线程中使用本地 SAM 2.1 按单目标正/负点提示分割轮廓并返回最小外接矩形与轮廓多边形（复用图像特征缓存）。"""
 
-    segment_ready = Signal(int, str, object, bool, int)  # 参数：(req_id, image_path_str, xyxy | None, cache_hit, elapsed_ms)
+    segment_ready = Signal(int, str, object, object, bool, int)  # 参数：(req_id, image_path_str, xyxy | None, contours, cache_hit, elapsed_ms)
     failed = Signal(int, str)
 
     def __init__(
@@ -549,17 +550,86 @@ class _SamPointSegmentWorker(QThread):
             )
             pts_xy = [(x, y) for x, y, _ in self.points]
             pts_lbl = [lbl for _, _, lbl in self.points]
-            if _supports_kwarg(refiner.segment_by_points, "image_key"):
-                coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl, image_key=self.image_key)
+            coords: tuple[float, float, float, float] | None = None
+            contours: list[list[tuple[float, float]]] = []
+            seg_with_cnt = getattr(refiner, "segment_by_points_with_contours", None)
+            if callable(seg_with_cnt):
+                if _supports_kwarg(seg_with_cnt, "image_key"):
+                    res = seg_with_cnt(img_bgr, pts_xy, pts_lbl, image_key=self.image_key)
+                else:
+                    res = seg_with_cnt(img_bgr, pts_xy, pts_lbl)
+                if res is not None:
+                    coords, contours = res
             else:
-                coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl)
+                if _supports_kwarg(refiner.segment_by_points, "image_key"):
+                    coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl, image_key=self.image_key)
+                else:
+                    coords = refiner.segment_by_points(img_bgr, pts_xy, pts_lbl)
             cache_hit = bool(getattr(refiner, "last_cache_hit", False))
             elapsed_ms = max(1, int(round((time.perf_counter() - t0) * 1000.0)))
             self.segment_ready.emit(
-                self.req_id, str(self.image_path.resolve()), coords, cache_hit, elapsed_ms
+                self.req_id, str(self.image_path.resolve()), coords, contours, cache_hit, elapsed_ms
             )
         except Exception as exc:
             self.failed.emit(self.req_id, f"本地 SAM 点选分割失败：{exc}")
+
+
+class _SamHoverPreviewWorker(QThread):
+    """在已命中特征缓存前提下，按光标悬停单点执行超轻量 SAM 轮廓预览（绝不触发冷加载或弹窗报错）。"""
+
+    hover_ready = Signal(int, str, object, object)  # 参数：(req_id, image_path_str, xyxy | None, contours)
+
+    def __init__(
+        self,
+        req_id: int,
+        image_path: Path,
+        image_key: str,
+        hover_xy: tuple[float, float],
+        refiner: Any,
+        *,
+        bgr_cache: OrderedDict[str, Any] | None = None,
+        bgr_cache_lock: Lock | None = None,
+    ) -> None:
+        super().__init__()
+        self.req_id = int(req_id)
+        self.image_path = image_path
+        self.image_key = image_key
+        self.hover_xy = (float(hover_xy[0]), float(hover_xy[1]))
+        self._refiner = refiner
+        self._bgr_cache = bgr_cache
+        self._bgr_cache_lock = bgr_cache_lock
+
+    def run(self) -> None:
+        try:
+            has_fn = getattr(self._refiner, "has_cached_image", None)
+            if callable(has_fn) and not has_fn(self.image_key):
+                return
+            img_bgr = _decode_image_bgr_cached(
+                self.image_path, self.image_key, self._bgr_cache, self._bgr_cache_lock
+            )
+            if img_bgr is None:
+                return
+            coords: tuple[float, float, float, float] | None = None
+            contours: list[list[tuple[float, float]]] = []
+            seg_with_cnt = getattr(self._refiner, "segment_by_points_with_contours", None)
+            if callable(seg_with_cnt):
+                if _supports_kwarg(seg_with_cnt, "image_key"):
+                    res = seg_with_cnt(img_bgr, [self.hover_xy], [1], image_key=self.image_key)
+                else:
+                    res = seg_with_cnt(img_bgr, [self.hover_xy], [1])
+                if res is not None:
+                    coords, contours = res
+            else:
+                seg_fn = getattr(self._refiner, "segment_by_points", None)
+                if not callable(seg_fn):
+                    return
+                if _supports_kwarg(seg_fn, "image_key"):
+                    coords = seg_fn(img_bgr, [self.hover_xy], [1], image_key=self.image_key)
+                else:
+                    coords = seg_fn(img_bgr, [self.hover_xy], [1])
+            self.hover_ready.emit(self.req_id, str(self.image_path.resolve()), coords, contours)
+        except Exception:
+            return
 
 
 class _SamPrecomputeWorker(QThread):
@@ -788,12 +858,17 @@ class LabelingStudioTab(QWidget):
         self.sam_worker: _SamBoxRefineWorker | None = None
         self.sam_point_worker: _SamPointSegmentWorker | None = None
         self.sam_precompute_worker: _SamPrecomputeWorker | None = None
+        self.sam_hover_worker: _SamHoverPreviewWorker | None = None
         self.llm_fix_worker: _SingleBoxLlmFixWorker | None = None
         self._sam_refiner_cache: dict[tuple[str, str], Any] = {}
         self._sam_refiner_lock = Lock()
         self._sam_bgr_cache: OrderedDict[str, Any] = OrderedDict()
         self._sam_bgr_lock = Lock()
         self._sam_point_req_id: int = 0
+        self._sam_hover_req_id: int = 0
+        self._sam_hover_user_toggled: bool = False
+        self._pending_sam_hover_pos: tuple[float, float] | None = None
+        self._last_sam_hover_pos: tuple[float, float] | None = None
         self._pending_sam_point_request: tuple[int, Path, list[tuple[float, float, int]]] | None = None
         self._pending_sam_refine_request: tuple[Path, list[tuple[int, RectAnnotation]]] | None = None
         self._llm_fix_client_override: Any | None = None
@@ -820,6 +895,12 @@ class LabelingStudioTab(QWidget):
         self._sam_precompute_timer.setSingleShot(True)
         self._sam_precompute_timer.setInterval(220)
         self._sam_precompute_timer.timeout.connect(self._trigger_sam_precompute)
+
+        # SAM 点选模式下鼠标悬停 45ms 防抖后触发轻量轮廓预览（仅在当前图特征已命中缓存时执行）
+        self._sam_hover_timer = QTimer(self)
+        self._sam_hover_timer.setSingleShot(True)
+        self._sam_hover_timer.setInterval(45)
+        self._sam_hover_timer.timeout.connect(self._trigger_sam_hover_preview)
 
         self._init_ui()
         self._init_shortcuts()
@@ -1070,6 +1151,17 @@ class LabelingStudioTab(QWidget):
         self.zoom_info_label.setVisible(False)
         self.save_state_label = _CompactFooterLabel("", min_width=32)
 
+        self.sam_hover_preview_chk = QCheckBox("悬停预览")
+        self.sam_hover_preview_chk.setChecked(
+            bool(self.device_info is not None and self.device_info.cuda_available)
+        )
+        self.sam_hover_preview_chk.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sam_hover_preview_chk.setStyleSheet("font-size: 11px; color: #0f766e;")
+        self.sam_hover_preview_chk.setToolTip(
+            "SAM 点选模式 (Q) 下，当前图特征已预热时鼠标滑过物体实时预览半透明轮廓与外接框（GPU 默认开启）"
+        )
+        self.sam_hover_preview_chk.setVisible(False)
+
         self.crosshair_btn = QPushButton("准星(X)")
         self.crosshair_btn.setObjectName("footerToggleBtn")
         self.crosshair_btn.setCheckable(True)
@@ -1125,6 +1217,7 @@ class LabelingStudioTab(QWidget):
         f_lay.addWidget(self.hint_info_label, 1)
         f_lay.addWidget(self.save_state_label)
         f_lay.addWidget(self._make_vsep())
+        f_lay.addWidget(self.sam_hover_preview_chk)
         f_lay.addWidget(self.crosshair_btn)
         f_lay.addWidget(enhance_grp)
         f_lay.addWidget(self._make_vsep())
@@ -1467,6 +1560,8 @@ class LabelingStudioTab(QWidget):
         self.canvas.context_menu_requested.connect(self._on_canvas_context_menu)
         self.canvas.sam_points_changed.connect(self._on_sam_points_changed)
         self.canvas.sam_prompt_commit_requested.connect(self._commit_sam_point_preview)
+        self.canvas.sam_hover_pos_changed.connect(self._on_sam_hover_pos_changed)
+        self.sam_hover_preview_chk.clicked.connect(self._on_sam_hover_chk_clicked)
 
         # 在工作台自身与主要非文本子控件上安装键盘过滤器，保证全局空格平移与单键快捷键响应且绝不拦截文本输入
         for target in (self, self.canvas, self.file_list, self.shape_list, self.unique_label_list):
@@ -1715,6 +1810,9 @@ class LabelingStudioTab(QWidget):
     def hideEvent(self, event) -> None:  # type: ignore[override]
         super().hideEvent(event)
         self._sam_precompute_timer.stop()
+        self._sam_hover_timer.stop()
+        self._pending_sam_hover_pos = None
+        self.canvas.clear_sam_hover_preview()
         self.canvas.set_space_pressed(False)
         self._set_shortcuts_active(False)
 
@@ -1726,8 +1824,12 @@ class LabelingStudioTab(QWidget):
         return True
 
     def apply_device_info(self, info: DeviceInfo) -> None:
-        """接收主窗口后台硬件探测结果，供本地 SAM 贴边收框与点选标注自动选择 GPU 或 CPU。"""
+        """接收主窗口后台硬件探测结果，供本地 SAM 贴边收框、点选标注与悬停预览默认开关使用。"""
         self.device_info = info
+        if not self._sam_hover_user_toggled:
+            self.sam_hover_preview_chk.setChecked(
+                bool(info.cuda_available and self.settings_store.preferences.default_prefer_gpu)
+            )
 
     def set_audit_weights_path(self, weights_path: str) -> None:
         """记录最近一次训练产出的 `best.pt` 权重路径，供模型反查弹窗自动预填。"""
@@ -1798,10 +1900,12 @@ class LabelingStudioTab(QWidget):
         return bool(has_fn(_build_sam_image_key(self._doc.image_path)))
 
     def running_sam_precompute_workers(self) -> list[QThread]:
-        """返回仍在运行的只读后台 SAM 预编码线程列表，供主窗口退出时静默等待收尾。"""
-        if self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning():
-            return [self.sam_precompute_worker]
-        return []
+        """返回仍在运行的只读后台 SAM 预编码与悬停预览线程列表，供主窗口退出时静默等待收尾。"""
+        return [
+            w
+            for w in (self.sam_precompute_worker, self.sam_hover_worker)
+            if w is not None and w.isRunning()
+        ]
 
     def _refresh_ai_tooltips(self) -> None:
         """按全局共享设置动态刷新 SAM 与 AI 修框按钮提示，一眼可见当前生效模型。"""
@@ -1861,6 +1965,10 @@ class LabelingStudioTab(QWidget):
         self._dirty = False
         self._last_nudge_key = None
         self._sam_point_req_id += 1
+        self._sam_hover_req_id += 1
+        self._sam_hover_timer.stop()
+        self._pending_sam_hover_pos = None
+        self._last_sam_hover_pos = None
         self._pending_sam_point_request = None
         self._pending_sam_refine_request = None
         self._undo_stack.clear()
@@ -2031,13 +2139,17 @@ class LabelingStudioTab(QWidget):
         if not self._may_continue():
             return False
         self._sam_precompute_timer.stop()
+        self._sam_hover_timer.stop()
         self._sam_point_req_id += 1
+        self._sam_hover_req_id += 1
+        self._pending_sam_hover_pos = None
         self._pending_sam_point_request = None
         self._pending_sam_refine_request = None
         if self.llm_fix_worker is not None and self.llm_fix_worker.isRunning():
             self.llm_fix_worker.cancel()
         for worker in (
             self.sam_precompute_worker,
+            self.sam_hover_worker,
             self.sam_worker,
             self.sam_point_worker,
             self.llm_fix_worker,
@@ -2281,6 +2393,10 @@ class LabelingStudioTab(QWidget):
         self._dirty = False
         self._last_nudge_key = None
         self._sam_point_req_id += 1
+        self._sam_hover_req_id += 1
+        self._sam_hover_timer.stop()
+        self._pending_sam_hover_pos = None
+        self._last_sam_hover_pos = None
         self._pending_sam_point_request = None
         self._pending_sam_refine_request = None
         self._undo_stack.clear()
@@ -3360,6 +3476,8 @@ class LabelingStudioTab(QWidget):
         if self._pending_sam_point_request is not None:
             self._drain_pending_sam_point_request()
             return
+        if self._pending_sam_hover_pos is not None:
+            self._trigger_sam_hover_preview()
         # 预编码期间用户可能切到了另一张新图，补排一次当前图预编码
         self._schedule_sam_precompute()
 
@@ -3479,8 +3597,123 @@ class LabelingStudioTab(QWidget):
         self.save_state_label.setText("SAM 收框失败")
         QMessageBox.warning(self, "本地 SAM 收框失败", msg)
 
+    def _on_sam_hover_chk_clicked(self, checked: bool) -> None:
+        self._sam_hover_user_toggled = True
+        if not checked:
+            self._sam_hover_timer.stop()
+            self._sam_hover_req_id += 1
+            self._pending_sam_hover_pos = None
+            self.canvas.clear_sam_hover_preview()
+
+    def _on_sam_hover_pos_changed(self, x: float, y: float) -> None:
+        """响应 SAM 点选模式光标移动：防抖触发基于已缓存图像特征的实时轮廓预览。"""
+        if x < 0.0 or y < 0.0:
+            self._sam_hover_timer.stop()
+            self._sam_hover_req_id += 1
+            self._pending_sam_hover_pos = None
+            self._last_sam_hover_pos = None
+            self.canvas.clear_sam_hover_preview()
+            return
+        if (
+            not self.sam_hover_preview_chk.isChecked()
+            or self._doc is None
+            or not self.isVisible()
+            or not self.canvas.sam_pointing()
+            or bool(self.canvas.sam_points())
+        ):
+            return
+        if self._last_sam_hover_pos is not None:
+            if math.hypot(x - self._last_sam_hover_pos[0], y - self._last_sam_hover_pos[1]) < 4.0:
+                return
+        self._pending_sam_hover_pos = (float(x), float(y))
+        if not self._sam_hover_timer.isActive():
+            self._sam_hover_timer.start()
+
+    def _trigger_sam_hover_preview(self) -> None:
+        pos = self._pending_sam_hover_pos
+        if pos is None:
+            return
+        if (
+            not self.sam_hover_preview_chk.isChecked()
+            or self._doc is None
+            or not self.isVisible()
+            or not self.canvas.sam_pointing()
+            or bool(self.canvas.sam_points())
+        ):
+            self._pending_sam_hover_pos = None
+            return
+        if (
+            (self.sam_hover_worker is not None and self.sam_hover_worker.isRunning())
+            or (self.sam_point_worker is not None and self.sam_point_worker.isRunning())
+            or (self.sam_worker is not None and self.sam_worker.isRunning())
+            or (self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning())
+        ):
+            return
+        if self.gpu_guard is not None and self.gpu_guard.active_task_name() is not None:
+            return
+
+        cache_key = (self._resolve_sam_model_name(), self._resolve_sam_device())
+        with self._sam_refiner_lock:
+            refiner = self._sam_refiner_cache.get(cache_key)
+        if refiner is None:
+            return
+        image_path = self._doc.image_path
+        image_key = _build_sam_image_key(image_path)
+        has_fn = getattr(refiner, "has_cached_image", None)
+        if callable(has_fn) and not has_fn(image_key):
+            # 仅对已完成特征编码的图片启用实时悬停预览，避免阻塞编码或冷载模型
+            return
+
+        self._pending_sam_hover_pos = None
+        self._last_sam_hover_pos = pos
+        self._sam_hover_req_id += 1
+        req_id = self._sam_hover_req_id
+        self.sam_hover_worker = _SamHoverPreviewWorker(
+            req_id,
+            image_path,
+            image_key,
+            pos,
+            refiner,
+            bgr_cache=self._sam_bgr_cache,
+            bgr_cache_lock=self._sam_bgr_lock,
+        )
+        self.sam_hover_worker.hover_ready.connect(self._on_sam_hover_finished)
+        self.sam_hover_worker.finished.connect(self._on_sam_hover_worker_done)
+        self.sam_hover_worker.start()
+
+    def _on_sam_hover_finished(
+        self, req_id: int, img_path_str: str, coords: object, contours: object
+    ) -> None:
+        if (
+            req_id != self._sam_hover_req_id
+            or self._doc is None
+            or str(self._doc.image_path.resolve()) != img_path_str
+            or not self.canvas.sam_pointing()
+            or bool(self.canvas.sam_points())
+            or not self.sam_hover_preview_chk.isChecked()
+        ):
+            return
+        if isinstance(coords, tuple) and len(coords) == 4:
+            rect = (float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3]))
+            polys = contours if isinstance(contours, list) else []
+            self.canvas.set_sam_hover_preview(rect, polys)
+        else:
+            self.canvas.clear_sam_hover_preview()
+
+    def _on_sam_hover_worker_done(self) -> None:
+        if self._drain_pending_sam_refine_request():
+            return
+        if self._pending_sam_point_request is not None:
+            self._drain_pending_sam_point_request()
+            return
+        if self._pending_sam_hover_pos is not None:
+            self._trigger_sam_hover_preview()
+
     def _on_sam_points_changed(self, raw_points: list) -> None:
-        """响应画布点选提示点变更：按最新点集异步调用本地 SAM 2.1 更新预览框，防并发乱序覆盖。"""
+        """响应画布点选提示点变更：按最新点集异步调用本地 SAM 2.1 更新预览框与轮廓，防并发乱序覆盖。"""
+        self._sam_hover_timer.stop()
+        self._sam_hover_req_id += 1
+        self._pending_sam_hover_pos = None
         self._sam_point_req_id += 1
         req_id = self._sam_point_req_id
         points = [(float(x), float(y), 1 if int(lbl) == 1 else 0) for x, y, lbl in raw_points]
@@ -3494,6 +3727,7 @@ class LabelingStudioTab(QWidget):
             (self.sam_point_worker is not None and self.sam_point_worker.isRunning())
             or (self.sam_worker is not None and self.sam_worker.isRunning())
             or (self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning())
+            or (self.sam_hover_worker is not None and self.sam_hover_worker.isRunning())
         ):
             self._pending_sam_point_request = (req_id, self._doc.image_path, points)
             if self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning():
@@ -3544,6 +3778,7 @@ class LabelingStudioTab(QWidget):
             (self.sam_point_worker is not None and self.sam_point_worker.isRunning())
             or (self.sam_worker is not None and self.sam_worker.isRunning())
             or (self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning())
+            or (self.sam_hover_worker is not None and self.sam_hover_worker.isRunning())
         ):
             return
         req_id, img_path, points = self._pending_sam_point_request
@@ -3568,6 +3803,7 @@ class LabelingStudioTab(QWidget):
         req_id: int,
         img_path_str: str,
         coords: object,
+        contours: object = None,
         cache_hit: bool = False,
         elapsed_ms: int = 0,
     ) -> None:
@@ -3580,7 +3816,8 @@ class LabelingStudioTab(QWidget):
             return
         if isinstance(coords, tuple) and len(coords) == 4:
             x1, y1, x2, y2 = (float(v) for v in coords)
-            self.canvas.set_sam_preview_rect((x1, y1, x2, y2), predicting=False)
+            polys = contours if isinstance(contours, list) else []
+            self.canvas.set_sam_preview_rect((x1, y1, x2, y2), predicting=False, contours=polys)
             if elapsed_ms > 0:
                 cache_tag = f"复用特征缓存 · {elapsed_ms} ms" if cache_hit else f"已缓存特征 · {elapsed_ms} ms"
                 self.save_state_label.setText(
@@ -4201,6 +4438,12 @@ class LabelingStudioTab(QWidget):
         self.draw_mode_btn.setChecked(is_draw)
         self.sam_point_mode_btn.setChecked(is_sam_point)
         self.pan_mode_btn.setChecked(is_pan)
+        self.sam_hover_preview_chk.setVisible(is_sam_point)
+        if not is_sam_point:
+            self._sam_hover_timer.stop()
+            self._sam_hover_req_id += 1
+            self._pending_sam_hover_pos = None
+            self.canvas.clear_sam_hover_preview()
         if is_draw:
             self.mode_badge_label.setText("模式: 画框 (拖/两点 · Esc退出)")
             self.mode_badge_label.setStyleSheet(

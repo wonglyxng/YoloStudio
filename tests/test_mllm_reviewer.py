@@ -3421,11 +3421,19 @@ def test_sam_point_prompt_mask_and_refiner_shape() -> None:
     )
 
     # 1) 二值掩码含主目标块 [40:100, 60:140] 与远处孤立噪点 [5:12, 5:12]，前景点落在主目标上时应自动过滤噪点
+    from yolo_studio.core.mllm_reviewer import _mask_to_point_prompt_result
+
     mask = np.zeros((200, 300), dtype=bool)
     mask[40:100, 60:140] = True
     mask[5:12, 5:12] = True
     xyxy = _mask_to_point_prompt_xyxy(mask, points=[(100.0, 70.0), (10.0, 10.0)], labels=[1, 0], img_w=300, img_h=200)
     assert xyxy == (60.0, 40.0, 140.0, 100.0)
+    res_with_cnt = _mask_to_point_prompt_result(
+        mask, points=[(100.0, 70.0), (10.0, 10.0)], labels=[1, 0], img_w=300, img_h=200
+    )
+    assert res_with_cnt is not None
+    assert res_with_cnt[0] == (60.0, 40.0, 140.0, 100.0)
+    assert len(res_with_cnt[1]) == 1 and len(res_with_cnt[1][0]) >= 4
 
     # 2) 空掩码返回 None
     assert _mask_to_point_prompt_xyxy(np.zeros((200, 300), dtype=bool), [(100.0, 70.0)], [1], 300, 200) is None

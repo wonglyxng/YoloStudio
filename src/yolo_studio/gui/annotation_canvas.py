@@ -31,6 +31,7 @@ from PyQt6.QtGui import (
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QResizeEvent,
@@ -162,6 +163,7 @@ class AnnotationCanvasView(QGraphicsView):
     context_menu_requested = Signal(QPoint, int)  # 右键上下文菜单请求 (全局坐标, 命中框索引/-1)
     sam_points_changed = Signal(list)  # SAM 点选提示点变更：[(x, y, 1|0), ...]
     sam_prompt_commit_requested = Signal()  # 请求将当前 SAM 点选预览框落盘为正式矩形框
+    sam_hover_pos_changed = Signal(float, float)  # SAM 点选模式下鼠标悬停像素坐标（移出或无效时发 -1, -1）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -216,10 +218,13 @@ class AnnotationCanvasView(QGraphicsView):
         self._draw_start: QPointF = QPointF()
         self._draw_current: QPointF = QPointF()
 
-        # SAM 点选标注交互草稿状态（支持多前景正点 + 背景排除负点与实时预览框）
+        # SAM 点选标注交互草稿状态（支持多前景正点 + 背景排除负点、实时轮廓掩码与鼠标悬停预览）
         self._sam_points: list[tuple[float, float, int]] = []
         self._sam_preview_rect: tuple[float, float, float, float] | None = None
+        self._sam_preview_contours: list[list[tuple[float, float]]] = []
         self._sam_predicting: bool = False
+        self._sam_hover_rect: tuple[float, float, float, float] | None = None
+        self._sam_hover_contours: list[list[tuple[float, float]]] = []
 
         # 编辑拖拽状态（带最小移动阈值防手抖误改）
         self._edit_action: str = "none"  # "none" | "pending_handle" | "dragging_handle" | "pending_move" | "moving_box" | "pending_blank_pan" | "blank_panning"
@@ -300,15 +305,58 @@ class AnnotationCanvasView(QGraphicsView):
         """返回当前 SAM 点选分割生成的实时预览框 `(x1, y1, x2, y2)`；无则返回 `None`。"""
         return self._sam_preview_rect
 
+    def sam_preview_contours(self) -> list[list[tuple[float, float]]]:
+        """返回当前 SAM 点选草稿的简化掩码轮廓多边形列表。"""
+        return [list(poly) for poly in self._sam_preview_contours]
+
     def set_sam_preview_rect(
         self,
         rect: tuple[float, float, float, float] | None,
         *,
         predicting: bool = False,
+        contours: list[list[tuple[float, float]]] | None = None,
     ) -> None:
-        """更新画布上的 SAM 点选预览框与推理中提示状态。"""
+        """更新画布上的 SAM 点选预览框、掩码轮廓多边形与推理中提示状态。"""
         self._sam_preview_rect = rect
+        if rect is None:
+            self._sam_preview_contours = []
+        elif contours is not None:
+            self._sam_preview_contours = [
+                [(float(x), float(y)) for x, y in poly] for poly in contours if len(poly) >= 3
+            ]
         self._sam_predicting = bool(predicting)
+        self.viewport().update()
+
+    def sam_hover_preview(
+        self,
+    ) -> tuple[tuple[float, float, float, float] | None, list[list[tuple[float, float]]]]:
+        """返回当前鼠标悬停 SAM 实时预览的 `(rect, contours)`。"""
+        return self._sam_hover_rect, [list(poly) for poly in self._sam_hover_contours]
+
+    def set_sam_hover_preview(
+        self,
+        rect: tuple[float, float, float, float] | None,
+        contours: list[list[tuple[float, float]]] | None = None,
+    ) -> None:
+        """更新 SAM 点选模式下鼠标悬停的实时半透明轮廓与外接框预览（有正式草稿点时不覆盖草稿）。"""
+        if self._mode != self.MODE_SAM_POINT or self._sam_points:
+            rect = None
+            contours = None
+        self._sam_hover_rect = rect
+        if rect is None or not contours:
+            self._sam_hover_contours = []
+        else:
+            self._sam_hover_contours = [
+                [(float(x), float(y)) for x, y in poly] for poly in contours if len(poly) >= 3
+            ]
+        self.viewport().update()
+
+    def clear_sam_hover_preview(self) -> None:
+        """清空当前 SAM 鼠标悬停预览轮廓与框。"""
+        if self._sam_hover_rect is None and not self._sam_hover_contours:
+            return
+        self._sam_hover_rect = None
+        self._sam_hover_contours = []
         self.viewport().update()
 
     def clear_sam_prompt(self, *, emit_signal: bool = False) -> bool:
@@ -318,6 +366,7 @@ class AnnotationCanvasView(QGraphicsView):
             return False
         self._sam_points.clear()
         self._sam_preview_rect = None
+        self._sam_preview_contours = []
         self._sam_predicting = False
         self.viewport().update()
         if emit_signal:
@@ -336,6 +385,7 @@ class AnnotationCanvasView(QGraphicsView):
         else:
             self._sam_points.clear()
             self._sam_preview_rect = None
+            self._sam_preview_contours = []
             self._sam_predicting = False
             self.viewport().update()
             self.sam_points_changed.emit([])
@@ -1067,7 +1117,10 @@ class AnnotationCanvasView(QGraphicsView):
         self._draw_dragged = False
         self._sam_points.clear()
         self._sam_preview_rect = None
+        self._sam_preview_contours = []
         self._sam_predicting = False
+        self._sam_hover_rect = None
+        self._sam_hover_contours = []
         self._reset_edit_drag_state()
 
     def _update_cursor_for_hover(self) -> None:
@@ -1305,9 +1358,16 @@ class AnnotationCanvasView(QGraphicsView):
                 self._image_height
             ):
                 clamped = self._clamp_point(scene_pos)
+                # 首次落点时平滑承接当前悬停预览轮廓，消除视觉闪烁
+                if not self._sam_points and self._sam_hover_rect is not None:
+                    self._sam_preview_rect = self._sam_hover_rect
+                    self._sam_preview_contours = list(self._sam_hover_contours)
+                self._sam_hover_rect = None
+                self._sam_hover_contours = []
                 self._sam_points.append((clamped.x(), clamped.y(), 1))
                 self._sam_predicting = True
                 self.viewport().update()
+                self.sam_hover_pos_changed.emit(-1.0, -1.0)
                 self.sam_points_changed.emit(list(self._sam_points))
             event.accept()
             return
@@ -1400,6 +1460,15 @@ class AnnotationCanvasView(QGraphicsView):
             self._hover_idx = -1
             self._hover_handle = None
             self._update_cursor_for_hover()
+            if not self._sam_points and not self._panning:
+                if (
+                    0.0 <= scene_pos.x() <= float(self._image_width)
+                    and 0.0 <= scene_pos.y() <= float(self._image_height)
+                ):
+                    self.sam_hover_pos_changed.emit(float(scene_pos.x()), float(scene_pos.y()))
+                else:
+                    self.clear_sam_hover_preview()
+                    self.sam_hover_pos_changed.emit(-1.0, -1.0)
             self.viewport().update()
             return
 
@@ -1617,7 +1686,10 @@ class AnnotationCanvasView(QGraphicsView):
         self._cursor_scene_pos = None
         self._hover_idx = -1
         self._hover_handle = None
+        self._sam_hover_rect = None
+        self._sam_hover_contours = []
         self.cursor_pos_changed.emit(-1, -1)
+        self.sam_hover_pos_changed.emit(-1.0, -1.0)
         self.viewport().update()
         super().leaveEvent(event)
 
@@ -1706,7 +1778,7 @@ class AnnotationCanvasView(QGraphicsView):
                     size_tip = f"{self._active_label}  {size_tip}"
                 self._paint_tag_pill(painter, dx1, dy1, size_tip, QColor(r, g, b, 230), inv)
 
-        # SAM 点选标注模式：十字准星、实时预览框与正负提示点渲染
+        # SAM 点选标注模式：十字准星、悬停/草稿半透明轮廓掩码、实时预览框与正负提示点渲染
         if self._mode == self.MODE_SAM_POINT:
             if self._cursor_scene_pos is not None:
                 self._paint_crosshair(
@@ -1716,11 +1788,42 @@ class AnnotationCanvasView(QGraphicsView):
                     inner_color=QColor(45, 212, 191, 215),
                 )
 
+            if not self._sam_points and self._sam_hover_rect is not None:
+                hx1, hy1, hx2, hy2 = self._sam_hover_rect
+                r, g, b = label_color_rgb(self._active_label or "sam_preview")
+                if self._sam_hover_contours:
+                    self._paint_sam_contours(
+                        painter,
+                        self._sam_hover_contours,
+                        fill_color=QColor(r, g, b, 58),
+                        stroke_color=QColor(r, g, b, 215),
+                        inv=inv,
+                    )
+                hover_rect = QRectF(hx1, hy1, hx2 - hx1, hy2 - hy1)
+                painter.setBrush(Qt.BrushStyle.NoBrush if self._sam_hover_contours else QBrush(QColor(r, g, b, 34)))
+                painter.setPen(QPen(QColor(255, 255, 255, 195), 2.8 * inv, Qt.PenStyle.SolidLine))
+                painter.drawRect(hover_rect)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(r, g, b, 220), 1.6 * inv, Qt.PenStyle.DotLine))
+                painter.drawRect(hover_rect)
+                hover_tip = f"{int(round(hx2 - hx1))}×{int(round(hy2 - hy1))} · 点击锁定"
+                if self._active_label:
+                    hover_tip = f"{self._active_label}  {hover_tip}"
+                self._paint_tag_pill(painter, hx1, hy1, hover_tip, QColor(r, g, b, 200), inv)
+
             if self._sam_preview_rect is not None:
                 px1, py1, px2, py2 = self._sam_preview_rect
                 r, g, b = label_color_rgb(self._active_label or "sam_preview")
+                if self._sam_preview_contours:
+                    self._paint_sam_contours(
+                        painter,
+                        self._sam_preview_contours,
+                        fill_color=QColor(r, g, b, 78),
+                        stroke_color=QColor(255, 255, 255, 235),
+                        inv=inv,
+                    )
                 preview_rect = QRectF(px1, py1, px2 - px1, py2 - py1)
-                painter.setBrush(QBrush(QColor(r, g, b, 52)))
+                painter.setBrush(Qt.BrushStyle.NoBrush if self._sam_preview_contours else QBrush(QColor(r, g, b, 52)))
                 painter.setPen(QPen(QColor(255, 255, 255, 225), 3.6 * inv, Qt.PenStyle.SolidLine))
                 painter.drawRect(preview_rect)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1780,6 +1883,30 @@ class AnnotationCanvasView(QGraphicsView):
         painter.setPen(QPen(inner_color, 1.0 * inv, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self._image_height)))
         painter.drawLine(QPointF(0.0, cy), QPointF(float(self._image_width), cy))
+
+    def _paint_sam_contours(
+        self,
+        painter: QPainter,
+        polygons: list[list[tuple[float, float]]],
+        *,
+        fill_color: QColor,
+        stroke_color: QColor,
+        inv: float,
+    ) -> None:
+        """在画布上以半透明填充加细描边渲染 SAM 简化掩码轮廓，直观呈现分割边界。"""
+        path = QPainterPath()
+        for poly in polygons:
+            if len(poly) < 3:
+                continue
+            path.moveTo(poly[0][0], poly[0][1])
+            for px, py in poly[1:]:
+                path.lineTo(px, py)
+            path.closeSubpath()
+        if path.isEmpty():
+            return
+        painter.setBrush(QBrush(fill_color))
+        painter.setPen(QPen(stroke_color, 1.4 * inv, Qt.PenStyle.SolidLine))
+        painter.drawPath(path)
 
     def _paint_audit_overlays(self, painter: QPainter, inv: float) -> None:
         """绘制模型反查产出的预测幽灵虚线框与异常人工框右上角轻量预警角标。"""
