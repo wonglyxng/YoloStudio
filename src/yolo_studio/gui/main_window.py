@@ -15,13 +15,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, QThread, QTimer
-from PyQt6.QtGui import QCloseEvent
-from PyQt6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget
+from PyQt6.QtCore import QSettings, Qt, QThread, QTimer
+from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from yolo_studio._version import __version__
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
+from yolo_studio.gui.app_settings import AppSettingsStore
 from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
+from yolo_studio.gui.settings_dialog import PAGE_AI, SettingsDialog
 from yolo_studio.gui.tab_dataset import DatasetTab
 from yolo_studio.gui.tab_eval import EvalTab
 from yolo_studio.gui.tab_extract import ExtractTab
@@ -175,6 +185,7 @@ class MainWindow(QMainWindow):
         else:
             self.device_info = detect_compute_device()
         self.gpu_guard = GpuTaskGuard()
+        self.settings_store = AppSettingsStore(workspace_root=workspace_root, parent=self)
 
         self.tabs = QTabWidget()
         self.extract_tab = ExtractTab(workspace_root)
@@ -183,12 +194,16 @@ class MainWindow(QMainWindow):
             lazy_mount=lazy_init,
             device_info=self.device_info,
             gpu_guard=self.gpu_guard,
+            settings_store=self.settings_store,
         )
         self.dataset_tab = DatasetTab(workspace_root)
         self.review_tab = MllmReviewTab(
-            workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
+            workspace_root,
+            device_info=self.device_info,
+            gpu_guard=self.gpu_guard,
+            settings_store=self.settings_store,
         )
-        self.labeling_tab.set_review_config_provider(self.review_tab.build_current_config)
+        self.labeling_tab.set_review_guidance_provider(self.review_tab.get_review_guidance)
         self.train_tab = TrainTab(
             workspace_root, device_info=self.device_info, gpu_guard=self.gpu_guard
         )
@@ -205,6 +220,25 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.train_tab, "5. YOLO26 训练")
         self.tabs.addTab(self.eval_tab, "6. 验证、推理与导出")
 
+        # 右上角常驻全局设置入口（快捷键 Ctrl+,），集中管理 AI 大模型、本地 SAM 与通用偏好
+        corner = QWidget(self.tabs)
+        corner_lay = QHBoxLayout(corner)
+        corner_lay.setContentsMargins(0, 0, 2, 2)
+        corner_lay.setSpacing(4)
+        self.settings_btn = QPushButton("⚙ 设置")
+        self.settings_btn.setObjectName("settingsCornerBtn")
+        self.settings_btn.setToolTip("打开全局设置：AI 大模型、本地 SAM 模型与通用偏好 (Ctrl+,)")
+        self.settings_btn.setStyleSheet("padding: 3px 10px; font-size: 12px;")
+        self.settings_btn.clicked.connect(lambda: self.open_settings_dialog(PAGE_AI))
+        corner_lay.addWidget(self.settings_btn)
+        self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+
+        self.settings_action = QAction("全局设置", self)
+        self.settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        self.settings_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.settings_action.triggered.connect(lambda: self.open_settings_dialog(PAGE_AI))
+        self.addAction(self.settings_action)
+
         layout.addWidget(self.tabs)
         self.setCentralWidget(central)
 
@@ -214,8 +248,10 @@ class MainWindow(QMainWindow):
         self.labeling_tab.send_to_dataset.connect(self._on_labeling_to_dataset)
         self.labeling_tab.send_to_review.connect(self._on_labeling_to_review)
         self.labeling_tab.annotations_changed.connect(self._on_annotations_changed)
+        self.labeling_tab.open_settings_requested.connect(self.open_settings_dialog)
         self.review_tab.open_in_workbench.connect(self._on_open_in_workbench)
         self.review_tab.send_cleaned_dataset.connect(self._on_cleaned_ready)
+        self.review_tab.open_settings_requested.connect(self.open_settings_dialog)
         self.dataset_tab.send_data_yaml.connect(self._on_yaml_ready)
         self.dataset_tab.request_train_tab.connect(
             lambda: self.tabs.setCurrentWidget(self.train_tab)
@@ -340,17 +376,34 @@ class MainWindow(QMainWindow):
         self.eval_tab.set_weights_and_yaml(weights_path, yaml_path)
         self.review_tab.set_weights_path(weights_path)
 
+    def open_settings_dialog(self, initial_page: str = PAGE_AI) -> int:
+        """弹出全局「设置」分栏对话框（AI 大模型 / 本地视觉模型 / 通用设置），确认或应用时即刻落盘。"""
+        dlg = SettingsDialog(
+            self.settings_store,
+            self.workspace_root,
+            device_info=self.device_info,
+            initial_page=initial_page,
+            parent=self,
+        )
+        dlg.settings_applied.connect(lambda: self.settings_store.save(self.settings, force=True))
+        return dlg.exec()
+
     def _restore_settings(self) -> None:
-        """从持久化 `QSettings` 恢复上次保存的工作区目录、自动智能标注策略与训练超参数偏好（如存在）。"""
-        last_dir = self.settings.value("last_frames_dir", "")
-        if (
-            isinstance(last_dir, str)
-            and last_dir
-            and "pytest-of-" not in last_dir.lower()
-            and Path(last_dir).is_dir()
-        ):
-            self.dataset_tab.set_frames_dir(last_dir)
-            self.review_tab.set_images_dir(last_dir)
+        """从持久化 `QSettings` 恢复全局共享设置、上次目录、自动智能标注策略与训练超参数偏好。"""
+        self.settings_store.restore(self.settings)
+        prefs = self.settings_store.preferences
+        self.labeling_tab.apply_general_preferences(prefs)
+
+        if prefs.remember_last_dir:
+            last_dir = self.settings.value("last_frames_dir", "")
+            if (
+                isinstance(last_dir, str)
+                and last_dir
+                and "pytest-of-" not in last_dir.lower()
+                and Path(last_dir).is_dir()
+            ):
+                self.dataset_tab.set_frames_dir(last_dir)
+                self.review_tab.set_images_dir(last_dir)
         self.review_tab.restore_settings(self.settings)
         self.train_tab.restore_settings(self.settings)
 
@@ -448,9 +501,11 @@ class MainWindow(QMainWindow):
             self._close_wait_timer.start()
             return
 
-        cur_frames = self.dataset_tab.images_picker.text()
-        if cur_frames and "pytest-of-" not in cur_frames.lower():
-            self.settings.setValue("last_frames_dir", cur_frames)
+        if self.settings_store.preferences.remember_last_dir:
+            cur_frames = self.dataset_tab.images_picker.text()
+            if cur_frames and "pytest-of-" not in cur_frames.lower():
+                self.settings.setValue("last_frames_dir", cur_frames)
+        self.settings_store.save(self.settings)
         self.review_tab.save_settings(self.settings)
         self.train_tab.save_settings(self.settings)
         super().closeEvent(event)

@@ -2,26 +2,25 @@
 
 职责：
     配置候选框来源（基准 `.pt` 低阈值推理、已有 X-AnyLabeling `.json`、LLM 零样本直接标注
-    或本地 SAM 3 文本自动标注）、LLM 接口与预设、连通性测试、边框紧贴标准化修正与分流策略；
+    或本地 SAM 3 文本自动标注）、展示全局共享 AI 大模型摘要与一键连通性测试、配置边框紧贴标准化修正与分流策略；
     右侧提供带实时计数的分流状态筛选、语义配色结果表与运行日志（同区双页签）、自适应缩放的处理前后对比图、
     历史报告加载，并支持一键跳转「2. 标注工作台」精修或发送结果至数据集准备页；
     左右两栏置于可拖拽的水平分割条中，用户可按屏幕宽度调整比例。
 
 运行环境与协作边界：
-    运行于 PyQt6 主线程；后台智能标注由 `MllmReviewWorker` 执行，接口连通性测试由
-    `MllmConnectionTestWorker` 执行，`render_review_comparison` 在点击行时即时渲染对比图并做 LRU 缓存，
-    通过 `open_in_workbench` 与 `send_cleaned_dataset` 信号与 `MainWindow` 协同；
-    持久化配置通过 `save_settings` / `restore_settings` 接受外部注入的 `QSettings`（默认不保存明文 API Key）。
+    运行于 PyQt6 主线程；AI 接口/模型/Key/思考级别与默认本地 SAM 权重统一读取全局 `AppSettingsStore`
+    （通过右上角「⚙ 设置」弹窗集中修改，与「2. 标注工作台」单框 AI 精修共享）；
+    后台智能标注由 `MllmReviewWorker` 执行，接口连通性测试由 `MllmConnectionTestWorker` 执行，
+    `render_review_comparison` 在点击行时即时渲染对比图并做 LRU 缓存，
+    通过 `open_in_workbench`、`send_cleaned_dataset` 与 `open_settings_requested` 信号与 `MainWindow` 协同；
+    本页任务策略通过 `save_settings` / `restore_settings` 持久化至外部注入的 `QSettings`。
 """
 
 from __future__ import annotations
 
-import ipaddress
 import json
-import os
 from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import urlparse
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QColor, QFont, QPixmap, QResizeEvent, QStandardItemModel
@@ -59,30 +58,27 @@ from yolo_studio.core.mllm_reviewer import (
     BUCKET_AUTO_PASSED,
     BUCKET_LLM_FIXED,
     BUCKET_NEED_REVIEW,
-    GEMINI_MODELS,
-    OPENAI_MODELS,
-    OPENAI_PRESETS,
-    REASONING_EFFORT_HINTS,
-    REASONING_EFFORT_ITEMS,
     SAM_REFINE_MODELS,
     SOURCE_MODE_HINTS,
     SOURCE_MODE_ITEMS,
     BoxRefineMode,
     ImageReviewRecord,
-    MllmProvider,
     MllmReviewConfig,
     MllmReviewResult,
-    ReasoningEffort,
     ReviewSourceMode,
     count_review_images,
     format_record_detail_summary,
     load_review_report,
     render_review_comparison,
-    resolve_effective_reasoning_effort,
     resolve_sam3_weights,
-    supported_reasoning_efforts,
 )
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
+from yolo_studio.gui.app_settings import (
+    AppSettingsStore,
+    describe_api_key_status,
+    format_llm_summary,
+    validate_llm_credentials,
+)
 from yolo_studio.gui.common import (
     LOG_MAX_LINES,
     ComputeDeviceControl,
@@ -93,31 +89,12 @@ from yolo_studio.gui.common import (
     configure_form_layout,
     open_local_path,
 )
+from yolo_studio.gui.settings_dialog import PAGE_AI
 from yolo_studio.gui.workers import MllmConnectionTestWorker, MllmReviewWorker
 
 # 左右对比预览 JPEG 字节流的 LRU 缓存容量上限（按结果表行号索引，每次重新开始审核或加载报告时清空）
 _PREVIEW_CACHE_MAX = 64
 _REVIEW_SETTINGS_KEY = "review_tab/state_json"
-_CUSTOM_PRESET_KEY = "__custom__"
-_CUSTOM_PRESET_LABEL = "自定义（当前手动指定）"
-
-
-def _is_local_or_lan_url(base_url: str) -> bool:
-    """判断接口 Base URL 是否指向本机或局域网服务（如 Ollama / vLLM，通常免填 API Key）。"""
-    raw = base_url.strip()
-    if not raw:
-        return False
-    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
-    host = (parsed.hostname or "").strip().lower()
-    if not host:
-        return False
-    if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-        return ip.is_loopback or ip.is_private or ip.is_link_local
-    except ValueError:
-        return False
 
 
 class _ScaledPreviewLabel(QLabel):
@@ -181,6 +158,7 @@ class MllmReviewTab(QWidget):
 
     send_cleaned_dataset = Signal(str, str, bool)  # 信号参数：(输出目录, classes.txt 路径, 是否按子目录递归扫描)
     open_in_workbench = Signal(str, str, str)  # 信号参数：(目标目录, classes.txt 路径, 可选指定图片路径)
+    open_settings_requested = Signal(str)  # 信号参数：设置弹窗目标分组键（如 "ai" / "local_models"）
 
     def __init__(
         self,
@@ -188,11 +166,18 @@ class MllmReviewTab(QWidget):
         parent: QWidget | None = None,
         device_info: DeviceInfo | None = None,
         gpu_guard: GpuTaskGuard | None = None,
+        settings_store: AppSettingsStore | None = None,
     ) -> None:
         super().__init__(parent)
         self.workspace_root = workspace_root
         self.device_info = device_info or detect_compute_device()
         self.gpu_guard = gpu_guard
+        self._owns_settings_store = settings_store is None
+        self.settings_store = (
+            settings_store
+            if settings_store is not None
+            else AppSettingsStore(workspace_root=workspace_root, parent=self)
+        )
         self.worker: MllmReviewWorker | None = None
         self.conn_test_worker: MllmConnectionTestWorker | None = None
         self._records: list[ImageReviewRecord] = []
@@ -201,8 +186,7 @@ class MllmReviewTab(QWidget):
         self._selected_row: int = -1
         self._restoring_state: bool = False
         self._settings_dirty: bool = False
-        self._applying_preset: bool = False
-        self._effort_fallback_notice: str = ""
+        self._syncing_global_sam: bool = False
         self._last_output_dir: Path = workspace_root / "data" / "smart_labeled"
         self._last_classes_txt: str = ""
         self._last_yolo_weights: str = ""
@@ -212,6 +196,10 @@ class MllmReviewTab(QWidget):
         self._count_timer.setInterval(150)
         self._count_timer.timeout.connect(self._refresh_images_count)
         self._init_ui()
+        self.settings_store.llm_changed.connect(self._on_global_llm_changed)
+        self.settings_store.sam_changed.connect(self._on_global_sam_changed)
+        self._on_global_sam_changed()
+        self._refresh_api_key_status()
 
     def apply_device_info(self, info: DeviceInfo) -> None:
         """异步硬件探测完成后刷新基准推理设备开关与提示（保留用户已手动修改的选择）。"""
@@ -381,81 +369,39 @@ class MllmReviewTab(QWidget):
         s_form.addRow("标注输出目录:", self.output_picker)
         form_stack.addWidget(src_group)
 
-        # 2. 大语言模型 (LLM) 配置
-        self.llm_group = QGroupBox("2. 大语言模型 (LLM) 配置")
+        # 2. AI 大模型配置（全局共享：与「2. 标注工作台」单框 AI 精修统一使用右上角「⚙ 设置」）
+        self.llm_group = QGroupBox("2. AI 大模型配置（全局共享）")
         l_form = QFormLayout(self.llm_group)
         self._tune_form(l_form)
         self._llm_form = l_form
 
-        self.provider_combo = QComboBox()
-        self.provider_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.provider_combo.setMinimumContentsLength(12)
-        self.provider_combo.addItem("Google Gemini API (google-genai)", MllmProvider.GEMINI)
-        self.provider_combo.addItem("OpenAI 官方 API (api.openai.com)", MllmProvider.OPENAI)
-        self.provider_combo.addItem(
-            "OpenAI 兼容接口 (Qwen-VL / 硅基流动 / Ollama / vLLM)", MllmProvider.OPENAI_COMPAT
+        model_row = QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(6)
+        self.llm_summary_label = QLabel()
+        self.llm_summary_label.setWordWrap(True)
+        self.llm_summary_label.setStyleSheet("color: #24292f; font-weight: 500; font-size: 12px;")
+        self.open_ai_settings_btn = QPushButton("修改 AI 设置...")
+        self.open_ai_settings_btn.setStyleSheet("padding: 3px 10px; font-size: 12px;")
+        self.open_ai_settings_btn.setToolTip(
+            "打开右上角「⚙ 设置 → AI 大模型」修改模型接口、预设、思考级别与 API Key (Ctrl+,)"
         )
-        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        l_form.addRow("模型接口:", self.provider_combo)
+        model_row.addWidget(self.llm_summary_label, 1)
+        model_row.addWidget(self.open_ai_settings_btn)
+        l_form.addRow("当前模型:", model_row)
 
-        self.preset_combo = QComboBox()
-        self.preset_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.preset_combo.setMinimumContentsLength(12)
-        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
-        l_form.addRow("常用预设:", self.preset_combo)
-
-        self.base_url_edit = QLineEdit()
-        self.base_url_edit.setPlaceholderText("OpenAI 兼容接口 Base URL（Gemini / OpenAI 官方模式无需填写）")
-        l_form.addRow("Base URL:", self.base_url_edit)
-
-        self.model_edit = QLineEdit(GEMINI_MODELS[0][0])
-        l_form.addRow("模型名称:", self.model_edit)
-
-        effort_box = QVBoxLayout()
-        effort_box.setContentsMargins(0, 0, 0, 0)
-        effort_box.setSpacing(3)
-        self.reasoning_effort_combo = QComboBox()
-        self.reasoning_effort_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.reasoning_effort_combo.setMinimumContentsLength(12)
-        for effort, effort_label in REASONING_EFFORT_ITEMS:
-            self.reasoning_effort_combo.addItem(effort_label, effort)
-        self.reasoning_effort_combo.setToolTip(
-            "统一控制模型思考/推理深度：默认遵循服务端模型配置，也可显式指定以平衡耗时与准确率"
-        )
-        self.reasoning_effort_hint_label = QLabel()
-        self.reasoning_effort_hint_label.setWordWrap(True)
-        self.reasoning_effort_hint_label.setStyleSheet("color: #57606a; font-size: 12px;")
-        effort_box.addWidget(self.reasoning_effort_combo)
-        effort_box.addWidget(self.reasoning_effort_hint_label)
-        l_form.addRow("思考/推理级别:", effort_box)
-
-        key_box = QVBoxLayout()
-        key_box.setContentsMargins(0, 0, 0, 0)
-        key_box.setSpacing(4)
-        key_row = QHBoxLayout()
-        key_row.setSpacing(6)
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_edit.setPlaceholderText("留空则自动读取环境变量 GEMINI_API_KEY / OPENAI_API_KEY")
-        self.show_key_chk = QCheckBox("显示")
-        self.show_key_chk.toggled.connect(
-            lambda checked: self.api_key_edit.setEchoMode(
-                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
-            )
-        )
-        self.test_conn_btn = QPushButton("测试连接")
-        self.test_conn_btn.setStyleSheet("padding: 4px 10px;")
-        self.test_conn_btn.setToolTip("发送极简纯文本探针测试当前接口、Key 与模型名是否畅通（不上传图片）")
-        key_row.addWidget(self.api_key_edit, 1)
-        key_row.addWidget(self.show_key_chk)
-        key_row.addWidget(self.test_conn_btn)
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(6)
         self.api_key_status_label = QLabel()
+        self.api_key_status_label.setWordWrap(True)
         self.api_key_status_label.setStyleSheet("color: #57606a; font-size: 12px;")
-        key_box.addLayout(key_row)
-        key_box.addWidget(self.api_key_status_label)
-        l_form.addRow("API Key:", key_box)
+        self.test_conn_btn = QPushButton("测试连接")
+        self.test_conn_btn.setStyleSheet("padding: 3px 10px; font-size: 12px;")
+        self.test_conn_btn.setToolTip("发送极简纯文本探针测试当前全局 AI 接口、Key 与模型名是否畅通（不上传图片）")
+        status_row.addWidget(self.api_key_status_label, 1)
+        status_row.addWidget(self.test_conn_btn)
+        l_form.addRow("接口状态:", status_row)
         form_stack.addWidget(self.llm_group)
 
         # 3. 智能标注、收框与分流策略
@@ -792,19 +738,13 @@ class MllmReviewTab(QWidget):
         self.output_picker.line_edit.textChanged.connect(self._schedule_images_count)
         self.max_images_spin.valueChanged.connect(self._on_max_images_changed)
         self.trial_5_btn.toggled.connect(self._on_trial_5_toggled)
+        self.open_ai_settings_btn.clicked.connect(lambda: self.open_settings_requested.emit(PAGE_AI))
         self.test_conn_btn.clicked.connect(self._on_test_connection)
         self.import_classes_btn.clicked.connect(self._on_import_classes_file)
         self.pick_sam_btn.clicked.connect(self._on_pick_sam_pt)
+        self.sam_model_combo.currentTextChanged.connect(self._on_local_sam_combo_changed)
         self.load_report_btn.clicked.connect(self._on_load_report_dialog)
         self.open_selected_btn.clicked.connect(self._on_open_selected_in_xal)
-        self.api_key_edit.textChanged.connect(self._refresh_api_key_status)
-        self.base_url_edit.textChanged.connect(self._refresh_api_key_status)
-        self.base_url_edit.textChanged.connect(self._sync_preset_combo_from_fields)
-        self.model_edit.textChanged.connect(self._sync_preset_combo_from_fields)
-        self.model_edit.textChanged.connect(self._sync_reasoning_effort_guard)
-        self.reasoning_effort_combo.currentIndexChanged.connect(
-            lambda *_args: self._sync_reasoning_effort_guard(clear_notice=True)
-        )
         self.refine_mode_combo.currentIndexChanged.connect(self._sync_strategy_states)
         self.sam_refine_all_chk.toggled.connect(self._sync_strategy_states)
         self.sam3_llm_review_chk.toggled.connect(self._sync_strategy_states)
@@ -819,7 +759,6 @@ class MllmReviewTab(QWidget):
 
         self._bind_settings_dirty_watchers()
         self._on_source_mode_changed()
-        self._on_provider_changed()
         self._sync_strategy_states()
         self._refresh_api_key_status()
         self._refresh_images_count()
@@ -828,14 +767,11 @@ class MllmReviewTab(QWidget):
         """监听配置改动置位持久化脏标记，避免空打开/关闭窗口或测试覆写用户偏好。"""
         for combo in (
             self.source_mode_combo,
-            self.provider_combo,
-            self.preset_combo,
-            self.reasoning_effort_combo,
             self.refine_mode_combo,
         ):
             combo.currentIndexChanged.connect(self._mark_settings_dirty)
         self.sam_model_combo.currentTextChanged.connect(self._mark_settings_dirty)
-        for edit in (self.base_url_edit, self.model_edit, self.classes_edit, self.guideline_edit):
+        for edit in (self.classes_edit, self.guideline_edit):
             edit.textChanged.connect(self._mark_settings_dirty)
         for spin in (
             self.yolo_conf_spin,
@@ -963,8 +899,11 @@ class MllmReviewTab(QWidget):
                 self._last_yolo_weights = cur_w
             if not cur_w or "sam3" not in Path(cur_w).name.lower():
                 auto_sam3: str = ""
+                configured_sam3 = self.settings_store.preferences.sam3_weights_path
                 if self._last_sam3_weights and Path(self._last_sam3_weights).is_file():
                     auto_sam3 = self._last_sam3_weights
+                elif configured_sam3 and Path(configured_sam3).is_file():
+                    auto_sam3 = configured_sam3
                 else:
                     found = resolve_sam3_weights(workspace_root=self.workspace_root)
                     if found is not None:
@@ -998,223 +937,60 @@ class MllmReviewTab(QWidget):
         self._src_form.setRowVisible(self.ann_picker, is_existing_json)
         self._sync_strategy_states()
 
-    def _on_provider_changed(self) -> None:
-        """切换 Gemini、OpenAI 官方与 OpenAI 兼容接口时更新常用预设并按需折叠 Base URL 行。"""
-        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-        is_gemini = provider == MllmProvider.GEMINI
-        is_openai_official = provider == MllmProvider.OPENAI
-        is_compat = provider == MllmProvider.OPENAI_COMPAT
-
-        self._applying_preset = True
-        self.preset_combo.blockSignals(True)
-        try:
-            self.preset_combo.clear()
-            if is_gemini:
-                for model_id, label in GEMINI_MODELS:
-                    self.preset_combo.addItem(label, (model_id, ""))
-                self.base_url_edit.setEnabled(False)
-                self.base_url_edit.clear()
-                self.model_edit.setText(GEMINI_MODELS[0][0])
-            elif is_openai_official:
-                for model_id, label in OPENAI_MODELS:
-                    self.preset_combo.addItem(label, (model_id, ""))
-                self.base_url_edit.setEnabled(False)
-                self.base_url_edit.clear()
-                self.model_edit.setText(OPENAI_MODELS[0][0])
-            else:
-                for name, url, model_id in OPENAI_PRESETS:
-                    self.preset_combo.addItem(name, (model_id, url))
-                self.base_url_edit.setEnabled(True)
-                self.base_url_edit.setText(OPENAI_PRESETS[0][1])
-                self.model_edit.setText(OPENAI_PRESETS[0][2])
-            self.preset_combo.addItem(_CUSTOM_PRESET_LABEL, _CUSTOM_PRESET_KEY)
-            self.preset_combo.setCurrentIndex(0)
-            self._llm_form.setRowVisible(self.base_url_edit, is_compat)
-        finally:
-            self.preset_combo.blockSignals(False)
-            self._applying_preset = False
+    def _on_global_llm_changed(self) -> None:
+        """响应全局 AI 设置变更并即时刷新摘要与凭据状态显示。"""
         self._refresh_api_key_status()
-        self._sync_reasoning_effort_guard()
 
-    def _on_preset_changed(self) -> None:
-        """选择内置预设时回填模型名称与 Base URL；切至自定义项时保留当前手动输入。"""
-        data = self.preset_combo.currentData()
-        if not isinstance(data, tuple) or len(data) != 2:
-            return
-        model_id, url = data
-        self._applying_preset = True
+    def _on_global_sam_changed(self) -> None:
+        """响应全局本地 SAM 模型设置变更并同步至本页 SAM 下拉框与 SAM 3 默认路径。"""
+        prefs = self.settings_store.preferences
+        self._syncing_global_sam = True
+        prev_restore = self._restoring_state
+        self._restoring_state = True
         try:
-            self.model_edit.setText(model_id)
-            if url:
-                self.base_url_edit.setText(url)
-        finally:
-            self._applying_preset = False
-        self._refresh_api_key_status()
-        self._sync_reasoning_effort_guard()
-
-    def _sync_preset_combo_from_fields(self, *_args: object) -> None:
-        """根据当前模型名称与 Base URL 自动对齐常用预设下拉框（无匹配时切为自定义）。"""
-        if self._applying_preset:
-            return
-        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-        cur_model = self.model_edit.text().strip()
-        cur_url = self.base_url_edit.text().strip().rstrip("/")
-        matched_idx = -1
-        for idx in range(self.preset_combo.count()):
-            data = self.preset_combo.itemData(idx)
-            if not isinstance(data, tuple) or len(data) != 2:
-                continue
-            preset_model, preset_url = data
-            if provider == MllmProvider.OPENAI_COMPAT:
-                if preset_model == cur_model and preset_url.strip().rstrip("/") == cur_url:
-                    matched_idx = idx
-                    break
-            elif preset_model == cur_model:
-                matched_idx = idx
-                break
-        if matched_idx < 0:
-            matched_idx = self.preset_combo.findData(_CUSTOM_PRESET_KEY)
-        if matched_idx >= 0 and self.preset_combo.currentIndex() != matched_idx:
-            # 反向对齐仅反映输入框当前状态，不能触发 _on_preset_changed 或污染脏标记
-            prev_restore = self._restoring_state
-            self._restoring_state = True
-            self.preset_combo.blockSignals(True)
-            try:
-                self.preset_combo.setCurrentIndex(matched_idx)
-            finally:
-                self.preset_combo.blockSignals(False)
-                self._restoring_state = prev_restore
-
-    def _sync_reasoning_effort_guard(self, *_args: object, clear_notice: bool = False) -> None:
-        """按当前模型能力置灰不支持的思考级别，并在已选中项不再受支持时自动平滑回退。"""
-        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-        model_name = self.model_edit.text().strip()
-        supported = supported_reasoning_efforts(provider, model_name)
-        supported_set = set(supported)
-
-        combo_model = self.reasoning_effort_combo.model()
-        if isinstance(combo_model, QStandardItemModel):
-            for idx in range(self.reasoning_effort_combo.count()):
-                effort_data = self.reasoning_effort_combo.itemData(idx)
-                item = combo_model.item(idx)
-                if item is not None and isinstance(effort_data, ReasoningEffort):
-                    item.setEnabled(effort_data in supported_set)
-
-        self.reasoning_effort_combo.setEnabled(len(supported) > 1)
-
-        cur_effort: ReasoningEffort = self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
-        if cur_effort not in supported_set:
-            effective, notice = resolve_effective_reasoning_effort(provider, model_name, cur_effort)
-            target_idx = self.reasoning_effort_combo.findData(effective)
-            if target_idx >= 0:
-                prev_restore = self._restoring_state
-                self._restoring_state = True
-                self.reasoning_effort_combo.blockSignals(True)
-                try:
-                    self.reasoning_effort_combo.setCurrentIndex(target_idx)
-                finally:
-                    self.reasoning_effort_combo.blockSignals(False)
-                    self._restoring_state = prev_restore
-            self._effort_fallback_notice = "" if self._restoring_state else (notice or "")
-        elif clear_notice:
-            self._effort_fallback_notice = ""
-
-        self._refresh_reasoning_effort_hint()
-
-    def _refresh_reasoning_effort_hint(self, *_args: object) -> None:
-        """结合当前接口、模型名称、受支持范围与自动纠偏提示实时更新说明文案。"""
-        effort: ReasoningEffort = self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
-        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-        model_name = self.model_edit.text().strip()
-        model_lower = model_name.lower()
-        supported = supported_reasoning_efforts(provider, model_name)
-
-        if supported == (ReasoningEffort.AUTO,):
-            base_text = "当前为非思考直出模型，不支持思考/推理级别调节（已自动锁定为模型默认）。"
-        elif effort == ReasoningEffort.AUTO:
-            if provider == MllmProvider.GEMINI:
-                if "flash-lite" in model_lower:
-                    base_text = "当前 Gemini 模型默认处于 minimal 极简思考（高吞吐低延迟）。"
-                elif "gemini-4-hydrogen" in model_lower or "gemini-4-neon" in model_lower:
-                    base_text = "当前 Gemini 4 模型服务端默认思考级别为 high（追求更快速度可调至 low / medium）。"
-                elif "gemini-3.8" in model_lower or "gemini-4" in model_lower:
-                    base_text = "当前 Gemini 模型服务端默认思考级别为 medium（均衡模式）。"
-                else:
-                    base_text = "不显式传入 thinking_level，遵循 Gemini 服务端模型默认思考级别。"
+            sam_name = prefs.sam_model_name or "sam2.1_t.pt"
+            idx = self.sam_model_combo.findData(sam_name)
+            if idx >= 0:
+                self.sam_model_combo.setCurrentIndex(idx)
             else:
-                if model_lower.startswith(("o1", "o3", "o4")):
-                    base_text = "当前 OpenAI o 系列模型服务端默认推理级别为 medium。"
-                elif model_lower.startswith("gpt-6"):
-                    base_text = "当前 GPT-6.2 原生推理模型遵循服务端默认推理配置（最低可手动调至 low，不支持 none）。"
-                elif model_lower.startswith("gpt-5.1") or model_lower.startswith("gpt-5.2"):
-                    base_text = "当前模型服务端默认推理级别为 none（低延迟直出，需思考可手动调高）。"
-                elif model_lower.startswith("gpt-5"):
-                    base_text = "遵循当前模型服务端默认推理配置（通常为 medium 或模型默认）。"
-                else:
-                    base_text = REASONING_EFFORT_HINTS[ReasoningEffort.AUTO]
-        else:
-            base_text = REASONING_EFFORT_HINTS.get(effort, "")
+                self.sam_model_combo.setCurrentText(sam_name)
+            if (
+                self.source_mode_combo.currentData() == ReviewSourceMode.SAM3_TEXT
+                and prefs.sam3_weights_path
+                and Path(prefs.sam3_weights_path).is_file()
+                and not self.weights_picker.text().strip()
+            ):
+                self.weights_picker.setText(prefs.sam3_weights_path)
+        finally:
+            self._restoring_state = prev_restore
+            self._syncing_global_sam = False
 
-        if len(supported) > 1 and len(supported) < len(REASONING_EFFORT_ITEMS):
-            names = [
-                "默认" if item == ReasoningEffort.AUTO else ("极简" if item == ReasoningEffort.OFF else item.value)
-                for item in supported
-            ]
-            base_text = f"{base_text} 支持：{' / '.join(names)}。"
-
-        if self._effort_fallback_notice:
-            self.reasoning_effort_hint_label.setText(f"{self._effort_fallback_notice}；{base_text}")
-        else:
-            self.reasoning_effort_hint_label.setText(base_text)
+    def _on_local_sam_combo_changed(self, *_args: object) -> None:
+        """在本页切换 SAM 2.1 模型时同步更新全局共享设置，保证工作台与本页一致。"""
+        if self._syncing_global_sam or self._restoring_state:
+            return
+        self._syncing_global_sam = True
+        try:
+            self.settings_store.update(sam_model_name=self._resolve_sam_model_name(), mark_dirty=True)
+        finally:
+            self._syncing_global_sam = False
 
     def _refresh_api_key_status(self, *_args: object) -> None:
-        """实时检测手动 Key 或系统环境变量是否已就绪，减少启动任务后才报鉴权失败的挫败感。"""
+        """根据当前工作模式与全局 `AppSettingsStore` 刷新 AI 模型摘要及凭据就绪提示。"""
         source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
         if source_mode == ReviewSourceMode.SAM3_TEXT and not self.sam3_llm_review_chk.isChecked():
+            self.llm_summary_label.setText("纯本地 SAM 3 模式（不调用 LLM）")
             self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 12px;")
             self.api_key_status_label.setText(
                 "当前为纯本地 SAM 3 自动标注模式，无需配置 LLM 与 API Key（勾选「启用 LLM 二次质检」后激活）"
             )
             return
 
-        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-        manual_key = self.api_key_edit.text().strip()
-        if manual_key:
-            self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
-            self.api_key_status_label.setText("已使用上方手动填写的 API Key（默认不落盘明文保存）")
-            return
-
-        if provider == MllmProvider.GEMINI:
-            has_env = bool(os.environ.get("GEMINI_API_KEY", "").strip())
-            if has_env:
-                self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
-                self.api_key_status_label.setText("已检测到环境变量 GEMINI_API_KEY，上方输入框可保持留空")
-            else:
-                self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 12px;")
-                self.api_key_status_label.setText("未检测到环境变量 GEMINI_API_KEY，请在上方填写或配置环境变量")
-            return
-
-        has_env = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-        if provider == MllmProvider.OPENAI:
-            if has_env:
-                self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
-                self.api_key_status_label.setText("已检测到环境变量 OPENAI_API_KEY，上方输入框可保持留空")
-            else:
-                self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 12px;")
-                self.api_key_status_label.setText("未检测到环境变量 OPENAI_API_KEY，请在上方填写或配置环境变量")
-            return
-
-        base_url = self.base_url_edit.text().strip()
-        is_local = _is_local_or_lan_url(base_url)
-        if has_env:
-            self.api_key_status_label.setStyleSheet("color: #1a7f37; font-size: 12px;")
-            self.api_key_status_label.setText("已检测到环境变量 OPENAI_API_KEY，上方输入框可保持留空")
-        elif is_local:
-            self.api_key_status_label.setStyleSheet("color: #0969da; font-size: 12px;")
-            self.api_key_status_label.setText("当前为本地/局域网服务地址（如 Ollama / vLLM），API Key 可留空直接连接")
-        else:
-            self.api_key_status_label.setStyleSheet("color: #9a6700; font-size: 12px;")
-            self.api_key_status_label.setText("未检测到环境变量 OPENAI_API_KEY，请在上方填写或配置环境变量")
+        prefs = self.settings_store.preferences
+        self.llm_summary_label.setText(format_llm_summary(prefs))
+        status_text, color = describe_api_key_status(prefs)
+        self.api_key_status_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self.api_key_status_label.setText(status_text)
 
     def _sync_strategy_states(self, *_args: object) -> None:
         """同步来源模式、边框修正模式、漏标开关、局部裁剪、高置信度阈值与分流目录按钮之间的防呆联动状态。"""
@@ -1445,17 +1221,23 @@ class MllmReviewTab(QWidget):
             return
         self.classes_edit.setText(", ".join(classes))
 
+    def get_review_guidance(self) -> tuple[list[str], str]:
+        """返回本页填写的目标类别清单与辅助判定规则，供标注工作台单框 AI 精修复用业务口径。"""
+        raw_classes = self.classes_edit.text().replace("，", ",")
+        classes = [c.strip() for c in raw_classes.split(",") if c.strip()]
+        return classes, self.guideline_edit.text().strip()
+
     def build_current_config(self) -> MllmReviewConfig:
-        """按当前表单控件组装 `MllmReviewConfig`（供标注工作台单框 AI 精修等跨页能力复用接口与规则）。"""
+        """按当前表单与全局 AI 设置组装 `MllmReviewConfig`。"""
         return self._build_current_config()
 
     def _build_current_config(self) -> MllmReviewConfig:
-        """按当前表单控件组装 `MllmReviewConfig`（不校验目录磁盘存在性，供测试连接与智能标注启动复用）。"""
-        raw_classes = self.classes_edit.text().replace("，", ",")
-        allowed_classes = [c.strip() for c in raw_classes.split(",") if c.strip()]
+        """按当前表单控件与全局 `settings_store` 组装 `MllmReviewConfig`（不校验目录存在性）。"""
+        allowed_classes, custom_guideline = self.get_review_guidance()
         ann_text = self.ann_picker.text()
         weights_text = self.weights_picker.text()
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
+        prefs = self.settings_store.preferences
         return MllmReviewConfig(
             images_dir=Path(self.images_picker.text() or "."),
             output_dir=Path(self.output_picker.text() or (self.workspace_root / "data" / "smart_labeled")),
@@ -1466,13 +1248,13 @@ class MllmReviewTab(QWidget):
             yolo_iou=self.yolo_iou_spin.value(),
             yolo_imgsz=self.yolo_imgsz_spin.value(),
             yolo_device=self.yolo_device_ctrl.device(),
-            provider=self.provider_combo.currentData(),
-            model_name=self.model_edit.text().strip(),
-            api_key=self.api_key_edit.text().strip(),
-            base_url=self.base_url_edit.text().strip(),
-            reasoning_effort=self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO,
+            provider=prefs.provider,
+            model_name=prefs.model_name.strip(),
+            api_key=prefs.api_key.strip(),
+            base_url=prefs.base_url.strip(),
+            reasoning_effort=prefs.reasoning_effort,
             allowed_classes=allowed_classes,
-            custom_guideline=self.guideline_edit.text().strip(),
+            custom_guideline=custom_guideline,
             high_conf_skip=self.high_conf_spin.value(),
             check_missing=self.check_missing_chk.isChecked(),
             add_missing_boxes=self.check_missing_chk.isChecked() and self.add_missing_chk.isChecked(),
@@ -1518,27 +1300,19 @@ class MllmReviewTab(QWidget):
             QMessageBox.warning(self, "LLM 连接测试失败", message)
 
     def save_settings(self, settings: QSettings, *, force: bool = False) -> None:
-        """将当前自动智能标注策略配置序列化写入 `settings`（默认不保存明文 API Key）。"""
+        """将当前自动智能标注任务策略配置序列化写入 `settings`；若独立持有 `settings_store` 则一并保存。"""
+        if self._owns_settings_store:
+            self.settings_store.save(settings, force=force)
         if not force and not self._settings_dirty:
             return
-        provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
         source_mode: ReviewSourceMode = self.source_mode_combo.currentData() or ReviewSourceMode.YOLO_PREDICT
         refine_mode: BoxRefineMode = self.refine_mode_combo.currentData() or BoxRefineMode.OFF
-        reasoning_effort: ReasoningEffort = (
-            self.reasoning_effort_combo.currentData() or ReasoningEffort.AUTO
-        )
         state: dict[str, object] = {
-            "version": 2,
+            "version": 3,
             "source_mode": source_mode.value,
             "yolo_conf": self.yolo_conf_spin.value(),
             "yolo_iou": self.yolo_iou_spin.value(),
             "yolo_imgsz": self.yolo_imgsz_spin.value(),
-            "provider": provider.value,
-            "base_url": self.base_url_edit.text().strip(),
-            "model_name": self.model_edit.text().strip(),
-            # 记录用户是否显式处于自定义模型状态，避免预设列表升级时把旧默认模型误留为自定义
-            "custom_model": self.preset_combo.currentData() == _CUSTOM_PRESET_KEY,
-            "reasoning_effort": reasoning_effort.value,
             "classes": self.classes_edit.text().strip(),
             "guideline": self.guideline_edit.text().strip(),
             "high_conf_skip": self.high_conf_spin.value(),
@@ -1560,8 +1334,13 @@ class MllmReviewTab(QWidget):
 
     def restore_settings(self, settings: QSettings) -> None:
         """从 `settings` 恢复上次保存的自动智能标注策略配置；数据缺失或损坏时静默保持默认。"""
+        if self._owns_settings_store:
+            self.settings_store.restore(settings)
+
         raw = settings.value(_REVIEW_SETTINGS_KEY, "")
         if not isinstance(raw, str) or not raw.strip():
+            self._on_global_sam_changed()
+            self._refresh_api_key_status()
             return
         try:
             state = json.loads(raw)
@@ -1585,54 +1364,6 @@ class MllmReviewTab(QWidget):
                 self.yolo_iou_spin.setValue(float(state["yolo_iou"]))
             if "yolo_imgsz" in state:
                 self.yolo_imgsz_spin.setValue(int(state["yolo_imgsz"]))
-
-            prov_val = str(state.get("provider") or "")
-            for i in range(self.provider_combo.count()):
-                item = self.provider_combo.itemData(i)
-                if isinstance(item, MllmProvider) and item.value == prov_val:
-                    self.provider_combo.setCurrentIndex(i)
-                    break
-
-            try:
-                state_version = int(state.get("version") or 1)
-            except (TypeError, ValueError):
-                state_version = 1
-            explicit_custom = state_version >= 2 and bool(state.get("custom_model", False))
-
-            restored_provider: MllmProvider = self.provider_combo.currentData() or MllmProvider.GEMINI
-            saved_url = str(state.get("base_url") or "").strip()
-            saved_model = str(state.get("model_name") or "").strip()
-            if restored_provider == MllmProvider.OPENAI_COMPAT:
-                if saved_url:
-                    self.base_url_edit.setText(saved_url)
-                if saved_model:
-                    self.model_edit.setText(saved_model)
-            else:
-                builtin_models = {
-                    model_id
-                    for model_id, _ in (
-                        GEMINI_MODELS if restored_provider == MllmProvider.GEMINI else OPENAI_MODELS
-                    )
-                }
-                default_model = (
-                    GEMINI_MODELS[0][0]
-                    if restored_provider == MllmProvider.GEMINI
-                    else OPENAI_MODELS[0][0]
-                )
-                if saved_model in builtin_models:
-                    self.model_edit.setText(saved_model)
-                elif saved_model and explicit_custom:
-                    self.model_edit.setText(saved_model)
-                else:
-                    # 旧版缓存或已下线内置预设统一自动迁移到当前接口默认预设，由预设带出模型名称
-                    self.model_edit.setText(default_model)
-            self._sync_preset_combo_from_fields()
-            effort_val = str(state.get("reasoning_effort") or "")
-            for i in range(self.reasoning_effort_combo.count()):
-                item = self.reasoning_effort_combo.itemData(i)
-                if isinstance(item, ReasoningEffort) and item.value == effort_val:
-                    self.reasoning_effort_combo.setCurrentIndex(i)
-                    break
             if "classes" in state:
                 self.classes_edit.setText(str(state.get("classes") or ""))
             if "guideline" in state:
@@ -1663,27 +1394,19 @@ class MllmReviewTab(QWidget):
                     self.refine_mode_combo.setCurrentIndex(i)
                     break
 
-            sam_model = str(state.get("sam_model_name") or "").strip()
-            if sam_model:
-                idx = self.sam_model_combo.findData(sam_model)
-                if idx >= 0:
-                    self.sam_model_combo.setCurrentIndex(idx)
-                else:
-                    self.sam_model_combo.setCurrentText(sam_model)
             if "sam_refine_all" in state:
                 self.sam_refine_all_chk.setChecked(bool(state["sam_refine_all"]))
             if "sam3_enable_llm_review" in state:
                 self.sam3_llm_review_chk.setChecked(bool(state["sam3_enable_llm_review"]))
-            self._sync_reasoning_effort_guard()
         except Exception:
             pass
         finally:
             self._restoring_state = False
 
+        self._on_global_sam_changed()
         self._on_source_mode_changed()
         self._sync_strategy_states()
         self._refresh_api_key_status()
-        self._sync_reasoning_effort_guard()
         self._refresh_images_count()
 
     def _on_start(self) -> None:
@@ -1715,16 +1438,21 @@ class MllmReviewTab(QWidget):
             return
         if is_sam3:
             if not cfg.weights_path:
-                auto_sam3 = resolve_sam3_weights(workspace_root=self.workspace_root)
-                if auto_sam3 is not None:
-                    cfg.weights_path = auto_sam3
-                    self.weights_picker.setText(str(auto_sam3))
+                configured_sam3 = self.settings_store.preferences.sam3_weights_path
+                if configured_sam3 and Path(configured_sam3).is_file():
+                    cfg.weights_path = Path(configured_sam3)
+                    self.weights_picker.setText(configured_sam3)
+                else:
+                    auto_sam3 = resolve_sam3_weights(workspace_root=self.workspace_root)
+                    if auto_sam3 is not None:
+                        cfg.weights_path = auto_sam3
+                        self.weights_picker.setText(str(auto_sam3))
             if not cfg.weights_path or not cfg.weights_path.is_file():
                 QMessageBox.warning(
                     self,
                     "提示",
                     "未找到有效的本地 SAM 3 权重文件（如 weights/sam3.pt 或 sam3.1_multiplex.pt；"
-                    "可从魔搭社区 facebook/sam3 免审批下载放入 weights/ 目录自动识别，或在上方手动选择）。",
+                    "可从魔搭社区 facebook/sam3 免审批下载放入 weights/ 目录自动识别，或在「⚙ 设置 → 本地视觉模型」中指定）。",
                 )
                 return
         if cfg.source_mode in {ReviewSourceMode.LLM_ZERO_SHOT, ReviewSourceMode.SAM3_TEXT} and not cfg.allowed_classes:
@@ -1736,45 +1464,12 @@ class MllmReviewTab(QWidget):
             QMessageBox.warning(self, "提示", mode_tip)
             return
 
-        # 前置校验 LLM 必填参数与凭据（纯本地 SAM 3 模式跳过，免填 API Key）
+        # 前置校验全局 LLM 必填参数与凭据（纯本地 SAM 3 模式跳过，免填 API Key）
         if needs_llm:
-            if not cfg.model_name:
-                QMessageBox.warning(self, "提示", "请在「2. 大语言模型 (LLM) 配置」中填写模型名称。")
+            ok, err_msg = validate_llm_credentials(self.settings_store.preferences)
+            if not ok:
+                QMessageBox.warning(self, "提示", err_msg)
                 return
-            if cfg.provider == MllmProvider.GEMINI:
-                if not (cfg.api_key or os.environ.get("GEMINI_API_KEY", "").strip()):
-                    QMessageBox.warning(
-                        self,
-                        "提示",
-                        "未检测到 Gemini API Key：请在「2. 大语言模型 (LLM) 配置」中填写 API Key，"
-                        "或配置环境变量 GEMINI_API_KEY。",
-                    )
-                    return
-            elif cfg.provider == MllmProvider.OPENAI:
-                if not (cfg.api_key or os.environ.get("OPENAI_API_KEY", "").strip()):
-                    QMessageBox.warning(
-                        self,
-                        "提示",
-                        "未检测到 OpenAI API Key：请在「2. 大语言模型 (LLM) 配置」中填写 API Key，"
-                        "或配置环境变量 OPENAI_API_KEY。",
-                    )
-                    return
-            else:
-                if not cfg.base_url:
-                    QMessageBox.warning(self, "提示", "请填写 OpenAI 兼容接口的 Base URL。")
-                    return
-                if (
-                    not cfg.api_key
-                    and not os.environ.get("OPENAI_API_KEY", "").strip()
-                    and not _is_local_or_lan_url(cfg.base_url)
-                ):
-                    QMessageBox.warning(
-                        self,
-                        "提示",
-                        "未检测到 API Key 或环境变量 OPENAI_API_KEY。\n"
-                        "如使用云端接口请在上方填写 API Key；如使用本地服务请确认 Base URL 为本地或局域网地址。",
-                    )
-                    return
 
         if uses_local_gpu_model and self.gpu_guard is not None:
             if is_sam3:

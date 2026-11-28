@@ -74,7 +74,10 @@ def test_mainwindow_mounts_native_workbench_and_scopes_shortcuts(
         review_group_titles = [
             box.title() for box in win.review_tab.findChildren(QGroupBox)
         ]
-        assert "2. 大语言模型 (LLM) 配置" in review_group_titles
+        assert "2. AI 大模型配置（全局共享）" in review_group_titles
+        assert win.settings_btn.text() == "⚙ 设置"
+        assert win.labeling_tab.settings_store is win.settings_store
+        assert win.review_tab.settings_store is win.settings_store
         assert win.labeling_tab.ensure_mounted() is True
 
         # 初始位于第 1 页（视频抽帧），工作台不可见，快捷键处于停用隔离态
@@ -1035,6 +1038,7 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
     from yolo_studio.gui.tab_review import MllmReviewTab
 
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     ini_path = tmp_path / "review_settings.ini"
     settings = QSettings(str(ini_path), QSettings.Format.IniFormat)
     gpu_info = DeviceInfo(
@@ -1108,14 +1112,15 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
 
     tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=gpu_info)
     try:
-        # 1) 默认输出目录、工作模式说明、环境变量缺失提示、目录计数与按模式自动隐藏无关置灰行
+        # 1) 默认输出目录、工作模式说明、环境变量缺失提示、目录计数与全局 AI 摘要卡片
         assert Path(tab1.output_picker.text()) == (tmp_path / "data" / "smart_labeled").resolve()
         assert tab1.start_btn.text() == "开始 LLM 智能标注"
         assert "基准 .pt" in tab1.source_mode_hint_label.text()
+        assert "Google Gemini" in tab1.llm_summary_label.text()
+        assert "AI 设置" in tab1.open_ai_settings_btn.text()
         assert "未检测到环境变量 GEMINI_API_KEY" in tab1.api_key_status_label.text()
         assert tab1.high_conf_spin.minimumWidth() >= 100  # 防止 Win11 并排箭头截断两位小数
         assert tab1.ann_picker.isHidden() is True
-        assert tab1.base_url_edit.isHidden() is True
 
         tab1.set_images_dir(str(in_dir))
         assert "3 张图片" in tab1.images_count_label.text()
@@ -1134,19 +1139,24 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         tab1.recursive_chk.setChecked(True)
         tab1.set_images_dir(str(in_dir))
 
-        # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行并更新模式提示；切到 OpenAI 兼容接口显示 Base URL
+        # 切到 EXISTING_JSON 隐藏权重与推理参数行、显示已有标注目录行并更新模式提示；
+        # 更新全局 AI 配置为 OpenAI 兼容本地接口时，摘要与凭据提示即时联动刷新
         tab1.source_mode_combo.setCurrentIndex(1)
-        compat_idx = tab1.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
-        assert compat_idx >= 0
-        tab1.provider_combo.setCurrentIndex(compat_idx)
+        tab1.settings_store.update(
+            provider=MllmProvider.OPENAI_COMPAT,
+            base_url="http://127.0.0.1:11434/v1",
+            model_name="qwen2.5-vl",
+        )
         qt_app.processEvents()
         assert ".json" in tab1.source_mode_hint_label.text()
         assert tab1.weights_picker.isHidden() is True
         assert tab1.yolo_params_widget.isHidden() is True
         assert tab1.ann_picker.isHidden() is False
-        assert tab1.base_url_edit.isHidden() is False
+        assert "OpenAI 兼容" in tab1.llm_summary_label.text()
+        assert "127.0.0.1:11434" in tab1.llm_summary_label.text()
+        assert "本地/局域网" in tab1.api_key_status_label.text()
         tab1.source_mode_combo.setCurrentIndex(0)
-        tab1.provider_combo.setCurrentIndex(0)
+        tab1.settings_store.reset_defaults()
         qt_app.processEvents()
 
         # 2) 默认开启漏标检查 + 局部裁剪 -> 阈值角色为“优先裁剪 <”；关掉裁剪 -> 禁用；关掉漏标 -> 恢复“免审阈值 ≥”
@@ -1222,7 +1232,7 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         tab1.max_images_spin.setValue(5)
         tab1.classes_edit.setText("hero, boss")
         tab1.guideline_edit.setText("紧贴主体边缘")
-        tab1.api_key_edit.setText("secret-key-should-not-persist")
+        tab1.settings_store.update(api_key="secret-key-should-not-persist")
         tab1.save_settings(settings)
         settings.sync()
     finally:
@@ -1238,7 +1248,7 @@ def test_review_tab_box_refine_filters_history_report_and_persistence(
         assert tab2.trial_5_btn.isChecked() is True
         assert tab2.classes_edit.text() == "hero, boss"
         assert tab2.guideline_edit.text() == "紧贴主体边缘"
-        assert tab2.api_key_edit.text() == ""  # 明文 API Key 绝不持久化
+        assert tab2.settings_store.preferences.api_key == ""  # 明文 API Key 绝不持久化
     finally:
         tab2.close()
 
@@ -2029,9 +2039,7 @@ def test_workbench_single_box_llm_fix_reuses_review_config_and_undo(
         )
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        idx_openai = win.review_tab.provider_combo.findData(MllmProvider.OPENAI)
-        win.review_tab.provider_combo.setCurrentIndex(idx_openai)
-        win.review_tab.api_key_edit.clear()
+        win.settings_store.update(provider=MllmProvider.OPENAI, api_key="")
         tab._on_llm_fix_box_clicked()
         assert len(warnings) == 1
         assert "API Key" in warnings[0]
@@ -2114,4 +2122,175 @@ def test_workbench_single_box_llm_fix_reuses_review_config_and_undo(
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_global_settings_dialog_syncs_ai_sam_and_general_preferences_across_tabs(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证右上角全局设置弹窗对 AI 大模型、本地 SAM 与通用偏好的取消隔离、跨页实时同步与持久化往返。"""
+    from yolo_studio.core.mllm_reviewer import MllmProvider, ReasoningEffort
+    from yolo_studio.core.trainer import DeviceInfo
+    from yolo_studio.gui.settings_dialog import (
+        PAGE_AI,
+        PAGE_GENERAL,
+        PAGE_LOCAL_MODELS,
+        SettingsDialog,
+    )
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    settings_file = tmp_path / "global_sync.ini"
+    frames_dir = tmp_path / "remember_frames"
+    _write_sample_frame(frames_dir / "img0.jpg")
+    fake_sam3 = tmp_path / "weights" / "custom_sam3.pt"
+    fake_sam3.parent.mkdir(parents=True, exist_ok=True)
+    fake_sam3.write_bytes(b"sam3-weights")
+
+    settings1 = QSettings(str(settings_file), QSettings.Format.IniFormat)
+    win = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=settings1)
+    win.device_info = DeviceInfo(
+        cuda_available=True,
+        device_count=1,
+        device_name="Mock RTX 4090",
+        vram_gb=24.0,
+        recommended_device="0",
+    )
+    win.labeling_tab.device_info = win.device_info
+    win.review_tab.device_info = win.device_info
+    win.show()
+    qt_app.processEvents()
+    try:
+        # 1) 验证取消对话框不污染任何全局配置
+        dlg_cancel = SettingsDialog(
+            win.settings_store,
+            workspace_root=tmp_path,
+            device_info=win.device_info,
+            initial_page=PAGE_AI,
+            parent=win,
+        )
+        try:
+            dlg_cancel.provider_combo.setCurrentIndex(
+                dlg_cancel.provider_combo.findData(MllmProvider.OPENAI)
+            )
+            dlg_cancel.wb_auto_save_chk.setChecked(False)
+            dlg_cancel.reject()
+        finally:
+            dlg_cancel.close()
+        assert win.settings_store.preferences.provider == MllmProvider.GEMINI
+        assert win.settings_store.preferences.workbench_auto_save is True
+
+        # 2) 打开全局设置弹窗修改三页配置并点击「确定」提交，验证跨页即时生效
+        dlg = SettingsDialog(
+            win.settings_store,
+            workspace_root=tmp_path,
+            device_info=win.device_info,
+            initial_page=PAGE_LOCAL_MODELS,
+            parent=win,
+        )
+        dlg.settings_applied.connect(lambda: win.settings_store.save(win.settings, force=True))
+        try:
+            assert dlg.page_stack.currentIndex() == 1  # PAGE_LOCAL_MODELS
+            # 切至 AI 页修改模型、推理级别与仅驻留内存的 API Key
+            dlg.select_page(PAGE_AI)
+            dlg.provider_combo.setCurrentIndex(dlg.provider_combo.findData(MllmProvider.OPENAI))
+            dlg.reasoning_effort_combo.setCurrentIndex(
+                dlg.reasoning_effort_combo.findData(ReasoningEffort.HIGH)
+            )
+            dlg.api_key_edit.setText("sk-session-only-secret")
+
+            # 切至本地视觉模型页修改 SAM 2.1 权重、SAM 3 路径与默认 GPU 偏好
+            dlg.select_page(PAGE_LOCAL_MODELS)
+            sam_s_idx = dlg.sam_model_combo.findData("sam2.1_s.pt")
+            assert sam_s_idx >= 0
+            dlg.sam_model_combo.setCurrentIndex(sam_s_idx)
+            dlg.sam3_weights_picker.setText(str(fake_sam3))
+            dlg.default_prefer_gpu_chk.setChecked(False)
+
+            # 切至通用设置页修改工作台默认项与记住上次目录开关
+            dlg.select_page(PAGE_GENERAL)
+            dlg.wb_auto_save_chk.setChecked(False)
+            dlg.wb_show_labels_chk.setChecked(False)
+            dlg.wb_keep_view_chk.setChecked(True)
+            dlg.remember_last_dir_chk.setChecked(False)
+
+            dlg.ok_btn.click()
+            qt_app.processEvents()
+        finally:
+            dlg.close()
+
+        # 验证 Tab 3（自动智能标注）与 Tab 2（标注工作台）共用同一套 AI 与 SAM 配置
+        assert "OpenAI 官方" in win.review_tab.llm_summary_label.text()
+        assert "high" in win.review_tab.llm_summary_label.text()
+        assert "手动填写的 API Key" in win.review_tab.api_key_status_label.text()
+        cfg = win.review_tab._build_current_config()
+        assert cfg.provider == MllmProvider.OPENAI
+        assert cfg.reasoning_effort == ReasoningEffort.HIGH
+        assert cfg.api_key == "sk-session-only-secret"
+        assert cfg.sam_model_name == "sam2.1_s.pt"
+        assert win.review_tab._resolve_sam_model_name() == "sam2.1_s.pt"
+
+        assert "OpenAI 官方" in win.labeling_tab.llm_fix_btn.toolTip()
+        assert win.labeling_tab._resolve_sam_model_name() == "sam2.1_s.pt"
+        assert win.labeling_tab._resolve_sam_device() == "cpu"
+        assert win.labeling_tab.auto_save_chk.isChecked() is False
+        assert win.labeling_tab.show_labels_chk.isChecked() is False
+        assert win.labeling_tab.keep_view_chk.isChecked() is True
+
+        # 验证 Tab 3 切到 SAM 3 时沿用全局 SAM 3 权重路径
+        from yolo_studio.core.mllm_reviewer import ReviewSourceMode
+
+        sam3_idx = win.review_tab.source_mode_combo.findData(ReviewSourceMode.SAM3_TEXT)
+        win.review_tab.source_mode_combo.setCurrentIndex(sam3_idx)
+        qt_app.processEvents()
+        assert Path(win.review_tab.weights_picker.text()) == fake_sam3
+
+        # 验证切回非纯本地 SAM 3 模式后点击 Tab 3 内「修改 AI 设置...」会发射请求信号并打开设置弹窗；
+        # 且设置目录后因 remember_last_dir=False 退出时不恢复
+        win.review_tab.source_mode_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+        opened_pages: list[str] = []
+        exec_called: list[str] = []
+        win.review_tab.open_settings_requested.connect(opened_pages.append)
+        monkeypatch.setattr(
+            SettingsDialog,
+            "exec",
+            lambda self_dlg: (exec_called.append(self_dlg.nav_list.currentItem().data(Qt.ItemDataRole.UserRole)), 0)[1],
+        )
+        win.review_tab.open_ai_settings_btn.click()
+        assert opened_pages == [PAGE_AI]
+        assert exec_called == [PAGE_AI]
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+    # 3) 重建主窗口：验证除明文 API Key 外全部持久化恢复，且 remember_last_dir=False 时不回填上次目录
+    settings2 = QSettings(str(settings_file), QSettings.Format.IniFormat)
+    sentinel_dir = str((Path(__file__).resolve().parent).resolve())
+    settings2.setValue("last_frames_dir", sentinel_dir)
+    settings2.sync()
+    win2 = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=settings2)
+    try:
+        prefs2 = win2.settings_store.preferences
+        assert prefs2.provider == MllmProvider.OPENAI
+        assert prefs2.reasoning_effort == ReasoningEffort.HIGH
+        assert prefs2.api_key == ""  # 明文 API Key 绝不落盘
+        assert prefs2.sam_model_name == "sam2.1_s.pt"
+        assert Path(prefs2.sam3_weights_path) == fake_sam3
+        assert prefs2.default_prefer_gpu is False
+        assert prefs2.workbench_auto_save is False
+        assert prefs2.workbench_show_labels is False
+        assert prefs2.workbench_keep_view is True
+        assert prefs2.remember_last_dir is False
+
+        assert win2.labeling_tab.auto_save_chk.isChecked() is False
+        assert win2.labeling_tab.show_labels_chk.isChecked() is False
+        assert win2.labeling_tab.keep_view_chk.isChecked() is True
+        assert win2.dataset_tab.images_picker.text() != sentinel_dir
+        assert win2.review_tab.images_picker.text() != sentinel_dir
+        assert win2.review_tab._resolve_sam_model_name() == "sam2.1_s.pt"
+    finally:
+        assert win2.labeling_tab.prepare_for_close() is True
+        win2.close()
+
 

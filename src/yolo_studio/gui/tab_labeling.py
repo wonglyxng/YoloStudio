@@ -11,8 +11,9 @@
 运行环境与协作边界：
     运行于 PyQt6 主线程，仅依赖 `PyQt6`、`Pillow` 及 `core.annotation_io`；
     完全不依赖 X-AnyLabeling 或 `PyQt6-WebEngine`。本地 SAM 贴边收框与点选分割按需在后台 `QThread`
-    中延迟加载 `core.mllm_reviewer.UltralyticsSamBoxRefiner` 并遵守 `GpuTaskGuard` 互斥保护；
-    单框局部 AI 精修复用第 3 页 LLM 配置在后台 `QThread` 中仅上传单目标周边局部裁剪图执行，支持取消与 `Ctrl+Z` 撤回。
+    中延迟加载 `core.mllm_reviewer.UltralyticsSamBoxRefiner`（权重与 GPU 偏好统一读取全局 `AppSettingsStore`）
+    并遵守 `GpuTaskGuard` 互斥保护；单框局部 AI 精修读取全局 `AppSettingsStore`（右上角「⚙ 设置」）
+    并在后台 `QThread` 中仅上传单目标周边局部裁剪图执行，支持取消与 `Ctrl+Z` 撤回。
     保存格式 100% 兼容标准 LabelMe / X-AnyLabeling `.json` 矩形标注协议。
 """
 
@@ -20,7 +21,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import copy
-import ipaddress
 import os
 import subprocess
 import sys
@@ -28,7 +28,6 @@ from threading import Event, Lock
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
 
 from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QIntValidator, QKeyEvent, QKeySequence, QPainter, QPen, QPixmap
@@ -72,6 +71,13 @@ from yolo_studio.core.annotation_io import (
 )
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
 from yolo_studio.gui.annotation_canvas import AnnotationCanvasView, load_image_pixmap
+from yolo_studio.gui.app_settings import (
+    AppPreferences,
+    AppSettingsStore,
+    build_llm_probe_config,
+    format_llm_summary,
+    validate_llm_credentials,
+)
 from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
 
 _ADDED_DLL_HANDLES: list[object] = []
@@ -373,24 +379,6 @@ class _SamBoxRefineWorker(QThread):
             self.failed.emit(f"本地 SAM 贴边收紧失败：{exc}")
 
 
-def _is_local_or_lan_url(base_url: str) -> bool:
-    """判断 OpenAI 兼容接口 Base URL 是否指向本机或局域网服务（如 Ollama / vLLM，通常免填 API Key）。"""
-    raw = base_url.strip()
-    if not raw:
-        return False
-    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
-    host = (parsed.hostname or "").strip().lower()
-    if not host:
-        return False
-    if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-        return ip.is_loopback or ip.is_private or ip.is_link_local
-    except ValueError:
-        return False
-
-
 class _SamPointSegmentWorker(QThread):
     """在后台线程中使用本地 SAM 2.1 按单目标正/负点提示分割轮廓并返回最小外接矩形。"""
 
@@ -567,6 +555,7 @@ class LabelingStudioTab(QWidget):
     send_to_dataset = Signal(str, str)  # 参数：(标注图片目录, classes.txt 路径)
     send_to_review = Signal(str)  # 参数：(图片目录)
     annotations_changed = Signal(str)  # 参数：(发生 .json 写入/修改的目录)
+    open_settings_requested = Signal(str)  # 参数：设置弹窗目标分组键（如 "ai" / "local_models"）
 
     def __init__(
         self,
@@ -575,7 +564,9 @@ class LabelingStudioTab(QWidget):
         lazy_mount: bool = False,
         device_info: DeviceInfo | None = None,
         gpu_guard: GpuTaskGuard | None = None,
+        settings_store: AppSettingsStore | None = None,
         review_config_provider: Callable[[], Any] | None = None,
+        review_guidance_provider: Callable[[], tuple[list[str], str]] | None = None,
     ) -> None:
         super().__init__(parent)
         install_combobox_wheel_guard()
@@ -583,7 +574,13 @@ class LabelingStudioTab(QWidget):
         self._lazy_mount = lazy_mount
         self.device_info = device_info
         self.gpu_guard = gpu_guard
+        self.settings_store = (
+            settings_store
+            if settings_store is not None
+            else AppSettingsStore(workspace_root=workspace_root, parent=self)
+        )
         self._review_config_provider = review_config_provider
+        self._review_guidance_provider = review_guidance_provider
 
         self._current_dir: Path | None = None
         self._last_classes_file: Path | None = None
@@ -625,6 +622,12 @@ class LabelingStudioTab(QWidget):
         self._init_ui()
         self._init_shortcuts()
         self._set_shortcuts_active(self.isVisible())
+        self.settings_store.llm_changed.connect(self._refresh_ai_tooltips)
+        self.settings_store.sam_changed.connect(self._refresh_ai_tooltips)
+        self.settings_store.general_changed.connect(
+            lambda: self.apply_general_preferences(self.settings_store.preferences)
+        )
+        self._refresh_ai_tooltips()
         self._refresh_action_states()
 
     # ------------------------------------------------------------------
@@ -1413,8 +1416,38 @@ class LabelingStudioTab(QWidget):
         self.device_info = info
 
     def set_review_config_provider(self, provider: Callable[[], Any] | None) -> None:
-        """注入第 3 页 LLM 配置获取回调，供工作台单框 AI 精修复用模型、Key 与辅助判定规则。"""
+        """注入历史兼容的审阅配置回调（优先使用全局 `settings_store` 与 `review_guidance_provider`）。"""
         self._review_config_provider = provider
+
+    def set_review_guidance_provider(
+        self, provider: Callable[[], tuple[list[str], str]] | None
+    ) -> None:
+        """注入第 3 页类别清单与辅助判定规则获取回调，供单框 AI 精修同步业务口径。"""
+        self._review_guidance_provider = provider
+
+    def apply_general_preferences(self, prefs: AppPreferences) -> None:
+        """将全局通用设置中的工作台默认偏好应用到工具栏复选框。"""
+        self.auto_save_chk.setChecked(bool(prefs.workbench_auto_save))
+        self.show_labels_chk.setChecked(bool(prefs.workbench_show_labels))
+        self.keep_view_chk.setChecked(bool(prefs.workbench_keep_view))
+
+    def _refresh_ai_tooltips(self) -> None:
+        """按全局共享设置动态刷新 SAM 与 AI 修框按钮提示，一眼可见当前生效模型。"""
+        prefs = self.settings_store.preferences
+        sam_name = prefs.sam_model_name or "sam2.1_t.pt"
+        llm_summary = format_llm_summary(prefs)
+        self.sam_refine_btn.setToolTip(
+            f"调用本地 SAM ({sam_name}) 对当前选中框（未选中时对整图全部框）执行像素级轮廓贴边收紧；可在右上角「⚙ 设置」更换权重"
+        )
+        self.box_sam_inline_btn.setToolTip(f"使用本地 SAM ({sam_name}) 对当前选中框做像素级贴边收紧")
+        self.sam_point_mode_btn.setToolTip(
+            f"本地 SAM ({sam_name}) 点选标注模式 (Q)：左键点击漏标目标生成贴边预览框，右键排除武器/特效，Enter 确认落框，Backspace 撤点，Esc 取消"
+        )
+        ai_tip = (
+            f"使用全局 AI 模型（{llm_summary}）对当前选中框做局部放大精修（极省 Token；快捷键 G；可在右上角「⚙ 设置」修改模型与 Key）"
+        )
+        self.llm_fix_btn.setToolTip(ai_tip)
+        self.box_llm_fix_inline_btn.setToolTip(ai_tip)
 
     def current_directory(self) -> Path | None:
         """返回工作台当前打开的图片目录；若尚未打开任何目录则返回 `None`。"""
@@ -2482,8 +2515,14 @@ class LabelingStudioTab(QWidget):
     # ------------------------------------------------------------------
     # 本地 SAM 像素级贴边收紧、SAM 点选标注与单框局部 AI 精修
     # ------------------------------------------------------------------
+    def _resolve_sam_model_name(self) -> str:
+        """从全局共享设置读取工作台本地 SAM 2.1 点选与收框模型权重名或路径。"""
+        return (self.settings_store.preferences.sam_model_name or "").strip() or "sam2.1_t.pt"
+
     def _resolve_sam_device(self) -> str:
-        """获取本地 SAM 使用的推理设备，若后台硬件探测尚未完成则同步兜底检测。"""
+        """获取本地 SAM 使用的推理设备（遵守全局 GPU 加速偏好；若硬件探测未完则同步兜底）。"""
+        if not self.settings_store.preferences.default_prefer_gpu:
+            return "cpu"
         dev_info = self.device_info
         if dev_info is None or dev_info.probing:
             dev_info = detect_compute_device()
@@ -2507,12 +2546,13 @@ class LabelingStudioTab(QWidget):
             targets = list(enumerate(self._doc.boxes))
 
         device = self._resolve_sam_device()
+        sam_model = self._resolve_sam_model_name()
 
         self.sam_worker = _SamBoxRefineWorker(
             self._doc.image_path,
             targets,
             device=device,
-            model_name="sam2.1_t.pt",
+            model_name=sam_model,
             refiner_cache=self._sam_refiner_cache,
         )
         if self.gpu_guard is not None:
@@ -2521,7 +2561,7 @@ class LabelingStudioTab(QWidget):
         self.sam_worker.failed.connect(self._on_sam_refine_failed)
         self.sam_worker.finished.connect(self._on_sam_box_worker_done)
         self._refresh_action_states()
-        self.save_state_label.setText(f"正在用本地 SAM 2.1 收紧 {len(targets)} 个框...")
+        self.save_state_label.setText(f"正在用本地 SAM ({Path(sam_model).name}) 收紧 {len(targets)} 个框...")
         self.sam_worker.start()
 
     def _on_sam_box_worker_done(self) -> None:
@@ -2589,12 +2629,13 @@ class LabelingStudioTab(QWidget):
             return
 
         device = self._resolve_sam_device()
+        sam_model = self._resolve_sam_model_name()
         self.sam_point_worker = _SamPointSegmentWorker(
             req_id,
             image_path,
             points,
             device=device,
-            model_name="sam2.1_t.pt",
+            model_name=sam_model,
             refiner_cache=self._sam_refiner_cache,
         )
         if self.gpu_guard is not None:
@@ -2603,7 +2644,9 @@ class LabelingStudioTab(QWidget):
         self.sam_point_worker.failed.connect(self._on_sam_point_failed)
         self.sam_point_worker.finished.connect(self._on_sam_point_worker_done)
         self._refresh_action_states()
-        self.save_state_label.setText(f"正在用本地 SAM 2.1 分割点选目标（{len(points)} 个提示点）...")
+        self.save_state_label.setText(
+            f"正在用本地 SAM ({Path(sam_model).name}) 分割点选目标（{len(points)} 个提示点）..."
+        )
         self.sam_point_worker.start()
 
     def _drain_pending_sam_point_request(self) -> None:
@@ -2698,7 +2741,7 @@ class LabelingStudioTab(QWidget):
         )
 
     def _on_llm_fix_box_clicked(self) -> None:
-        """对当前选中的单个目标框发起局部裁剪 AI 精修（复用第 3 页 LLM 配置与辅助判定规则）。"""
+        """对当前选中的单个目标框发起局部裁剪 AI 精修（读取全局 AI 设置，并复用当前辅助判定规则）。"""
         if self._doc is None:
             return
         sel = self.canvas.selected_index()
@@ -2707,68 +2750,32 @@ class LabelingStudioTab(QWidget):
             return
         if self.llm_fix_worker is not None and self.llm_fix_worker.isRunning():
             return
-        if self._review_config_provider is None:
-            QMessageBox.warning(
-                self,
-                "未连接 LLM 配置",
-                "工作台尚未连接「3. 自动智能标注」的 LLM 配置来源，请先在「3. 自动智能标注」完成模型与凭据配置。",
-            )
-            return
 
-        cfg = self._review_config_provider()
+        prefs = self.settings_store.preferences
         if self._llm_fix_client_override is None:
-            from yolo_studio.core.mllm_reviewer import MllmProvider
-
-            if not (cfg.model_name or "").strip():
-                QMessageBox.warning(
-                    self,
-                    "缺少 LLM 模型配置",
-                    "请先在「3. 自动智能标注 → 2. 大语言模型 (LLM) 配置」中填写模型名称。",
-                )
+            ok, err_msg = validate_llm_credentials(prefs)
+            if not ok:
+                QMessageBox.warning(self, "缺少 AI 大模型配置", err_msg)
                 return
-            if cfg.provider == MllmProvider.GEMINI:
-                if not ((cfg.api_key or "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()):
-                    QMessageBox.warning(
-                        self,
-                        "缺少 Gemini API Key",
-                        "未检测到 Gemini API Key：请先在「3. 自动智能标注」中填写 API Key，或配置环境变量 GEMINI_API_KEY。",
-                    )
-                    return
-            elif cfg.provider == MllmProvider.OPENAI:
-                if not ((cfg.api_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()):
-                    QMessageBox.warning(
-                        self,
-                        "缺少 OpenAI API Key",
-                        "未检测到 OpenAI API Key：请先在「3. 自动智能标注」中填写 API Key，或配置环境变量 OPENAI_API_KEY。",
-                    )
-                    return
-            else:
-                if not (cfg.base_url or "").strip():
-                    QMessageBox.warning(
-                        self,
-                        "缺少接口地址",
-                        "请先在「3. 自动智能标注」中填写 OpenAI 兼容接口的 Base URL。",
-                    )
-                    return
-                if (
-                    not (cfg.api_key or "").strip()
-                    and not os.environ.get("OPENAI_API_KEY", "").strip()
-                    and not _is_local_or_lan_url(cfg.base_url)
-                ):
-                    QMessageBox.warning(
-                        self,
-                        "缺少 API Key",
-                        "未检测到 API Key 或环境变量 OPENAI_API_KEY，请先在「3. 自动智能标注」中配置凭据。",
-                    )
-                    return
+
+        cfg = build_llm_probe_config(prefs, self.workspace_root)
+        extra_classes: list[str] = []
+        if self._review_guidance_provider is not None:
+            extra_classes, guideline = self._review_guidance_provider()
+            cfg.custom_guideline = guideline
+        elif self._review_config_provider is not None:
+            legacy_cfg = self._review_config_provider()
+            extra_classes = list(getattr(legacy_cfg, "allowed_classes", []) or [])
+            cfg.custom_guideline = str(getattr(legacy_cfg, "custom_guideline", "") or "").strip()
 
         merged_classes: list[str] = []
         seen: set[str] = set()
-        for raw_cls in list(self._classes) + list(getattr(cfg, "allowed_classes", []) or []):
+        for raw_cls in list(self._classes) + extra_classes:
             name = str(raw_cls).strip()
             if name and name not in seen:
                 seen.add(name)
                 merged_classes.append(name)
+        cfg.allowed_classes = merged_classes
 
         target_box = self._doc.boxes[sel].clone()
         self.llm_fix_worker = _SingleBoxLlmFixWorker(

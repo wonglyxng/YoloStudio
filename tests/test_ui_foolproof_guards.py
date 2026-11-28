@@ -40,6 +40,15 @@ from yolo_studio.core.mllm_reviewer import (
     ReasoningEffort,
 )
 from yolo_studio.core.trainer import DeviceInfo
+from yolo_studio.gui.app_settings import (
+    LEGACY_REVIEW_SETTINGS_KEY,
+    AppSettingsStore,
+)
+from yolo_studio.gui.settings_dialog import (
+    CUSTOM_PRESET_KEY,
+    CUSTOM_PRESET_LABEL,
+    SettingsDialog,
+)
 from yolo_studio.gui.tab_dataset import DatasetTab
 from yolo_studio.gui.tab_eval import EvalTab
 from yolo_studio.gui.tab_extract import ExtractTab
@@ -467,26 +476,25 @@ def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
         assert len(started_configs) == 0
         assert any("GEMINI_API_KEY" in m for m in warnings)
 
-        tab.api_key_edit.setText("dummy-key")
-        tab.model_edit.clear()
+        tab.settings_store.update(api_key="dummy-key", model_name="")
         warnings.clear()
         tab._on_start()
         assert len(started_configs) == 0
         assert any("模型名称" in m for m in warnings)
 
         # OpenAI 兼容模式：云端地址缺 Key 拦截，局域网/本地地址免 Key 放行
-        compat_idx = tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
-        assert compat_idx >= 0
-        tab.provider_combo.setCurrentIndex(compat_idx)
-        tab.api_key_edit.clear()
-        tab.base_url_edit.setText("https://dashscope.aliyuncs.com/compatible-mode/v1")
-        tab.model_edit.setText("qwen-vl-max-latest")
+        tab.settings_store.update(
+            provider=MllmProvider.OPENAI_COMPAT,
+            api_key="",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model_name="qwen-vl-max-latest",
+        )
         warnings.clear()
         tab._on_start()
         assert len(started_configs) == 0
         assert any("OPENAI_API_KEY" in m for m in warnings)
 
-        tab.base_url_edit.setText("http://192.168.1.50:11434/v1")
+        tab.settings_store.update(base_url="http://192.168.1.50:11434/v1")
         qt_app.processEvents()
         assert "本地/局域网" in tab.api_key_status_label.text()
         tab._on_start()
@@ -603,8 +611,12 @@ def test_review_tab_sam_device_visibility_precheck_and_busy_report_lock(
         assert Path(tab.weights_picker.text()) == fake_sam3_pt
 
         # 清空 API Key 并切到 Gemini（无环境变量），纯本地 SAM 3 无需 Key 即可直接启动
-        tab.provider_combo.setCurrentIndex(0)
-        tab.api_key_edit.clear()
+        tab.settings_store.update(
+            provider=MllmProvider.GEMINI,
+            base_url="",
+            model_name=GEMINI_MODELS[0][0],
+            api_key="",
+        )
         tab.classes_edit.setText("人物=person, 安全帽=safety helmet")
         prev_started = len(started_configs)
         tab._on_start()
@@ -802,7 +814,7 @@ def test_eval_tab_dynamic_batch_tooltip_and_engine_cpu_button_guard(
 def test_review_tab_official_openai_and_reasoning_effort_persistence(
     qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """验证独立 OpenAI 官方提供方表单联动、Key 校验及思考/推理级别配置组装与持久化往返。"""
+    """验证全局设置弹窗中独立 OpenAI 官方提供方联动、Key 校验及思考/推理级别同步到智能标注页与持久化往返。"""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
@@ -835,26 +847,38 @@ def test_review_tab_official_openai_and_reasoning_effort_persistence(
     in_dir.mkdir()
     settings = QSettings(str(tmp_path / "review_openai.ini"), QSettings.Format.IniFormat)
 
-    tab1 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store1 = AppSettingsStore(workspace_root=tmp_path)
+    tab1 = MllmReviewTab(
+        workspace_root=tmp_path,
+        device_info=_gpu_device_info(),
+        settings_store=store1,
+    )
+    dlg1 = SettingsDialog(store1, workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        assert tab1.model_edit.text() == GEMINI_MODELS[0][0]
-        assert tab1.preset_combo.count() == len(GEMINI_MODELS) + 1
-        assert tab1.preset_combo.itemData(tab1.preset_combo.count() - 1) == tab_review_mod._CUSTOM_PRESET_KEY
-        tab1.source_mode_combo.setCurrentIndex(tab1.source_mode_combo.findData(tab_review_mod.ReviewSourceMode.EXISTING_JSON))
+        assert dlg1.model_edit.text() == GEMINI_MODELS[0][0]
+        assert dlg1.preset_combo.count() == len(GEMINI_MODELS) + 1
+        assert dlg1.preset_combo.itemData(dlg1.preset_combo.count() - 1) == CUSTOM_PRESET_KEY
+        tab1.source_mode_combo.setCurrentIndex(
+            tab1.source_mode_combo.findData(tab_review_mod.ReviewSourceMode.EXISTING_JSON)
+        )
         tab1.set_images_dir(str(in_dir))
         tab1.output_picker.setText(str(tmp_path / "out"))
 
         # 切换到 OpenAI 官方：隐藏 Base URL，填充官方模型预设，缺 OPENAI_API_KEY 拦截启动
-        openai_idx = tab1.provider_combo.findData(MllmProvider.OPENAI)
+        openai_idx = dlg1.provider_combo.findData(MllmProvider.OPENAI)
         assert openai_idx >= 0
-        tab1.provider_combo.setCurrentIndex(openai_idx)
+        dlg1.provider_combo.setCurrentIndex(openai_idx)
         qt_app.processEvents()
 
-        assert tab1.base_url_edit.isHidden() is True
-        assert tab1.base_url_edit.text() == ""
-        assert tab1.model_edit.text() == OPENAI_MODELS[0][0]
-        assert tab1.preset_combo.count() == len(OPENAI_MODELS) + 1
-        assert tab1.preset_combo.itemData(tab1.preset_combo.count() - 1) == tab_review_mod._CUSTOM_PRESET_KEY
+        assert dlg1.base_url_edit.isHidden() is True
+        assert dlg1.base_url_edit.text() == ""
+        assert dlg1.model_edit.text() == OPENAI_MODELS[0][0]
+        assert dlg1.preset_combo.count() == len(OPENAI_MODELS) + 1
+        assert dlg1.preset_combo.itemData(dlg1.preset_combo.count() - 1) == CUSTOM_PRESET_KEY
+        assert "OPENAI_API_KEY" in dlg1.api_key_status_label.text()
+
+        dlg1.apply_changes()
+        qt_app.processEvents()
         assert "OPENAI_API_KEY" in tab1.api_key_status_label.text()
 
         warnings.clear()
@@ -863,34 +887,43 @@ def test_review_tab_official_openai_and_reasoning_effort_persistence(
         assert any("OpenAI API Key" in w for w in warnings)
 
         # 填写 Key 并选择 HIGH 推理级别后无需 Base URL 即可启动，且构建配置正确
-        tab1.api_key_edit.setText("sk-test-official")
-        high_idx = tab1.reasoning_effort_combo.findData(ReasoningEffort.HIGH)
+        dlg1.api_key_edit.setText("sk-test-official")
+        high_idx = dlg1.reasoning_effort_combo.findData(ReasoningEffort.HIGH)
         assert high_idx >= 0
-        tab1.reasoning_effort_combo.setCurrentIndex(high_idx)
+        dlg1.reasoning_effort_combo.setCurrentIndex(high_idx)
         qt_app.processEvents()
-        assert "high" in tab1.reasoning_effort_hint_label.text()
+        assert "high" in dlg1.reasoning_effort_hint_label.text()
+
+        dlg1.apply_changes()
+        qt_app.processEvents()
+        assert "OpenAI 官方" in tab1.llm_summary_label.text()
+        assert "high" in tab1.llm_summary_label.text()
 
         tab1._on_start()
         assert len(started_configs) == 1
         assert started_configs[0].provider == MllmProvider.OPENAI
         assert started_configs[0].reasoning_effort == ReasoningEffort.HIGH
 
+        store1.save(settings, force=True)
         tab1.save_settings(settings)
         settings.sync()
     finally:
+        dlg1.close()
         tab1.close()
 
-    # 重建页面恢复配置：OpenAI 官方、模型与 HIGH 推理级别完整还原，且 Base URL 保持隐藏
-    tab2 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    # 重建全局配置与设置弹窗：OpenAI 官方、模型与 HIGH 推理级别完整还原，且 Base URL 保持隐藏、Key 不落盘
+    store2 = AppSettingsStore(workspace_root=tmp_path)
+    assert store2.restore(settings) is True
+    dlg2 = SettingsDialog(store2, workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        tab2.restore_settings(settings)
         qt_app.processEvents()
-        assert tab2.provider_combo.currentData() == MllmProvider.OPENAI
-        assert tab2.base_url_edit.isHidden() is True
-        assert tab2.model_edit.text() == OPENAI_MODELS[0][0]
-        assert tab2.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
+        assert dlg2.provider_combo.currentData() == MllmProvider.OPENAI
+        assert dlg2.base_url_edit.isHidden() is True
+        assert dlg2.model_edit.text() == OPENAI_MODELS[0][0]
+        assert dlg2.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
+        assert dlg2.api_key_edit.text() == ""
     finally:
-        tab2.close()
+        dlg2.close()
 
 
 def test_combobox_wheel_guard_blocks_accidental_change_and_forwards_scroll(
@@ -991,25 +1024,26 @@ def test_combobox_wheel_guard_blocks_accidental_change_and_forwards_scroll(
 def test_review_tab_reasoning_effort_model_foolproof_guards(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证 Gemini 4 与 OpenAI 模型的思考/推理级别防呆：禁用不支持项、切模型平滑回退及历史非法配置静默纠偏。"""
+    """验证全局设置弹窗中 Gemini 4 与 OpenAI 模型的思考/推理级别防呆、切模型平滑回退及历史非法配置静默纠偏。"""
     import json
 
     from PyQt6.QtGui import QStandardItemModel
 
-    tab = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store = AppSettingsStore(workspace_root=tmp_path)
+    dlg = SettingsDialog(store, workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        model = tab.reasoning_effort_combo.model()
+        model = dlg.reasoning_effort_combo.model()
         assert isinstance(model, QStandardItemModel)
 
         def _item_enabled(effort: ReasoningEffort) -> bool:
-            idx = tab.reasoning_effort_combo.findData(effort)
+            idx = dlg.reasoning_effort_combo.findData(effort)
             assert idx >= 0
             item = model.item(idx)
             assert item is not None
             return item.isEnabled()
 
         # 1) 默认 gemini-4-hydrogen：OFF 置灰禁用，LOW/MEDIUM/HIGH/XHIGH 启用
-        assert tab.model_edit.text() == "gemini-4-hydrogen"
+        assert dlg.model_edit.text() == "gemini-4-hydrogen"
         assert _item_enabled(ReasoningEffort.AUTO) is True
         assert _item_enabled(ReasoningEffort.OFF) is False
         assert _item_enabled(ReasoningEffort.LOW) is True
@@ -1022,68 +1056,72 @@ def test_review_tab_reasoning_effort_model_foolproof_guards(
         def _preset_index(model_id: str) -> int:
             return next(
                 i
-                for i in range(tab.preset_combo.count())
-                if (tab.preset_combo.itemData(i) or ("", ""))[0] == model_id
+                for i in range(dlg.preset_combo.count())
+                if (dlg.preset_combo.itemData(i) or ("", ""))[0] == model_id
             )
 
-        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-neon"))
-        tab.reasoning_effort_combo.setCurrentIndex(tab.reasoning_effort_combo.findData(ReasoningEffort.XHIGH))
+        dlg.preset_combo.setCurrentIndex(_preset_index("gemini-4-neon"))
+        dlg.reasoning_effort_combo.setCurrentIndex(
+            dlg.reasoning_effort_combo.findData(ReasoningEffort.XHIGH)
+        )
         qt_app.processEvents()
-        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.XHIGH
+        assert dlg.reasoning_effort_combo.currentData() == ReasoningEffort.XHIGH
 
-        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-carbon"))
+        dlg.preset_combo.setCurrentIndex(_preset_index("gemini-4-carbon"))
         qt_app.processEvents()
         assert _item_enabled(ReasoningEffort.OFF) is False
         assert _item_enabled(ReasoningEffort.XHIGH) is False
-        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
-        assert "xhigh" in tab.reasoning_effort_hint_label.text()
-        assert "不支持" in tab.reasoning_effort_hint_label.text()
+        assert dlg.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
+        assert "xhigh" in dlg.reasoning_effort_hint_label.text()
+        assert "不支持" in dlg.reasoning_effort_hint_label.text()
 
         # 同样验证 gemini-4-argon 禁用 XHIGH
-        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-argon"))
+        dlg.preset_combo.setCurrentIndex(_preset_index("gemini-4-argon"))
         qt_app.processEvents()
         assert _item_enabled(ReasoningEffort.XHIGH) is False
 
         # 切回 gemini-4-hydrogen 后 XHIGH 恢复启用
-        tab.preset_combo.setCurrentIndex(_preset_index("gemini-4-hydrogen"))
+        dlg.preset_combo.setCurrentIndex(_preset_index("gemini-4-hydrogen"))
         qt_app.processEvents()
         assert _item_enabled(ReasoningEffort.XHIGH) is True
 
         # 3) 切到 OpenAI 官方（gpt-6.2-sol / gpt-6.2-astra）：OFF 置灰，LOW..XHIGH 启用；
         #    手输 gpt-4o 后自动锁回 AUTO 并禁用下拉框
-        tab.provider_combo.setCurrentIndex(tab.provider_combo.findData(MllmProvider.OPENAI))
+        dlg.provider_combo.setCurrentIndex(dlg.provider_combo.findData(MllmProvider.OPENAI))
         qt_app.processEvents()
         assert _item_enabled(ReasoningEffort.OFF) is False
         assert _item_enabled(ReasoningEffort.XHIGH) is True
-        tab.reasoning_effort_combo.setCurrentIndex(tab.reasoning_effort_combo.findData(ReasoningEffort.HIGH))
+        dlg.reasoning_effort_combo.setCurrentIndex(
+            dlg.reasoning_effort_combo.findData(ReasoningEffort.HIGH)
+        )
         qt_app.processEvents()
 
-        tab.model_edit.setText("gpt-4o")
+        dlg.model_edit.setText("gpt-4o")
         qt_app.processEvents()
-        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.AUTO
-        assert tab.reasoning_effort_combo.isEnabled() is False
-        assert "非思考直出" in tab.reasoning_effort_hint_label.text()
+        assert dlg.reasoning_effort_combo.currentData() == ReasoningEffort.AUTO
+        assert dlg.reasoning_effort_combo.isEnabled() is False
+        assert "非思考直出" in dlg.reasoning_effort_hint_label.text()
 
         # 4) 切到 OpenAI 兼容的硅基流动预设（Qwen2.5-VL）同样锁定为默认；切到 DashScope 后恢复可用
-        tab.provider_combo.setCurrentIndex(tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT))
+        dlg.provider_combo.setCurrentIndex(dlg.provider_combo.findData(MllmProvider.OPENAI_COMPAT))
         qt_app.processEvents()
-        assert tab.reasoning_effort_combo.isEnabled() is True  # 默认第 1 项为 DashScope qwen-vl-max-latest
+        assert dlg.reasoning_effort_combo.isEnabled() is True  # 默认第 1 项为 DashScope qwen-vl-max-latest
         sf_idx = next(
             i
-            for i in range(tab.preset_combo.count())
-            if "Qwen2.5-VL" in str((tab.preset_combo.itemData(i) or ("", ""))[0])
+            for i in range(dlg.preset_combo.count())
+            if "Qwen2.5-VL" in str((dlg.preset_combo.itemData(i) or ("", ""))[0])
         )
-        tab.preset_combo.setCurrentIndex(sf_idx)
+        dlg.preset_combo.setCurrentIndex(sf_idx)
         qt_app.processEvents()
-        assert tab.reasoning_effort_combo.currentData() == ReasoningEffort.AUTO
-        assert tab.reasoning_effort_combo.isEnabled() is False
+        assert dlg.reasoning_effort_combo.currentData() == ReasoningEffort.AUTO
+        assert dlg.reasoning_effort_combo.isEnabled() is False
     finally:
-        tab.close()
+        dlg.close()
 
-    # 5) 恢复历史非法组合（gemini-4-carbon + xhigh）时静默纠偏为 HIGH 且不误置脏标记
+    # 5) 恢复旧版 review_tab 历史非法组合（gemini-4-carbon + xhigh）时静默纠偏为 HIGH 且不误置脏标记
     settings = QSettings(str(tmp_path / "legacy_illegal_effort.ini"), QSettings.Format.IniFormat)
     settings.setValue(
-        tab_review_mod._REVIEW_SETTINGS_KEY,
+        LEGACY_REVIEW_SETTINGS_KEY,
         json.dumps(
             {
                 "version": 1,
@@ -1095,31 +1133,34 @@ def test_review_tab_reasoning_effort_model_foolproof_guards(
     )
     settings.sync()
 
-    tab_restore = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store_restore = AppSettingsStore(workspace_root=tmp_path)
+    assert store_restore.restore(settings) is True
+    assert store_restore.is_dirty is False
+    dlg_restore = SettingsDialog(
+        store_restore, workspace_root=tmp_path, device_info=_gpu_device_info()
+    )
     try:
-        tab_restore.restore_settings(settings)
         qt_app.processEvents()
-        assert tab_restore.model_edit.text() == "gemini-4-carbon"
-        assert tab_restore.preset_combo.currentData() == ("gemini-4-carbon", "")
-        assert tab_restore.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
-        assert tab_restore._settings_dirty is False
+        assert dlg_restore.model_edit.text() == "gemini-4-carbon"
+        assert dlg_restore.preset_combo.currentData() == ("gemini-4-carbon", "")
+        assert dlg_restore.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
     finally:
-        tab_restore.close()
+        dlg_restore.close()
 
 
 def test_review_tab_preset_combo_bidirectional_sync_and_legacy_restore(
     qt_app: QApplication, tmp_path: Path
 ) -> None:
-    """验证旧版缓存模型自动迁移至当前默认预设、v2 显式自定义模型往返保留及预设双向联动。"""
+    """验证旧版缓存模型无损迁移至全局设置默认预设、显式自定义模型往返保留及设置弹窗预设双向联动。"""
     import json
 
     from yolo_studio.core.mllm_reviewer import OPENAI_PRESETS
 
-    # 1) 旧版（version: 1）缓存了已下线模型：恢复时自动迁移到当前接口第 0 项默认内置预设，
-    #    由预设带出模型名称，且保留其余参数并保持 _settings_dirty=False
+    # 1) 旧版（version: 1）缓存了已下线模型：迁移恢复时自动升级到当前接口第 0 项默认内置预设，
+    #    由预设带出模型名称，且保留其余参数并保持 is_dirty=False
     legacy_gemini = QSettings(str(tmp_path / "legacy_gemini_v1.ini"), QSettings.Format.IniFormat)
     legacy_gemini.setValue(
-        tab_review_mod._REVIEW_SETTINGS_KEY,
+        LEGACY_REVIEW_SETTINGS_KEY,
         json.dumps(
             {
                 "version": 1,
@@ -1131,21 +1172,22 @@ def test_review_tab_preset_combo_bidirectional_sync_and_legacy_restore(
     )
     legacy_gemini.sync()
 
-    tab_legacy_g = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store_g = AppSettingsStore(workspace_root=tmp_path)
+    assert store_g.restore(legacy_gemini) is True
+    assert store_g.is_dirty is False
+    dlg_legacy_g = SettingsDialog(store_g, workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        tab_legacy_g.restore_settings(legacy_gemini)
         qt_app.processEvents()
-        assert tab_legacy_g.preset_combo.currentIndex() == 0
-        assert tab_legacy_g.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
-        assert tab_legacy_g.model_edit.text() == GEMINI_MODELS[0][0]
-        assert tab_legacy_g.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
-        assert tab_legacy_g._settings_dirty is False
+        assert dlg_legacy_g.preset_combo.currentIndex() == 0
+        assert dlg_legacy_g.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
+        assert dlg_legacy_g.model_edit.text() == GEMINI_MODELS[0][0]
+        assert dlg_legacy_g.reasoning_effort_combo.currentData() == ReasoningEffort.HIGH
     finally:
-        tab_legacy_g.close()
+        dlg_legacy_g.close()
 
     legacy_openai = QSettings(str(tmp_path / "legacy_openai_v1.ini"), QSettings.Format.IniFormat)
     legacy_openai.setValue(
-        tab_review_mod._REVIEW_SETTINGS_KEY,
+        LEGACY_REVIEW_SETTINGS_KEY,
         json.dumps(
             {
                 "version": 1,
@@ -1156,85 +1198,91 @@ def test_review_tab_preset_combo_bidirectional_sync_and_legacy_restore(
     )
     legacy_openai.sync()
 
-    tab_legacy_o = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store_o = AppSettingsStore(workspace_root=tmp_path)
+    assert store_o.restore(legacy_openai) is True
+    assert store_o.is_dirty is False
+    dlg_legacy_o = SettingsDialog(store_o, workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        tab_legacy_o.restore_settings(legacy_openai)
         qt_app.processEvents()
-        assert tab_legacy_o.preset_combo.currentIndex() == 0
-        assert tab_legacy_o.preset_combo.currentData() == (OPENAI_MODELS[0][0], "")
-        assert tab_legacy_o.model_edit.text() == OPENAI_MODELS[0][0]
-        assert tab_legacy_o._settings_dirty is False
+        assert dlg_legacy_o.preset_combo.currentIndex() == 0
+        assert dlg_legacy_o.preset_combo.currentData() == (OPENAI_MODELS[0][0], "")
+        assert dlg_legacy_o.model_edit.text() == OPENAI_MODELS[0][0]
     finally:
-        tab_legacy_o.close()
+        dlg_legacy_o.close()
 
-    # 2) 新版（version: 2）显式手动指定的自定义模型能完整往返保存并恢复为「自定义」，
+    # 2) 新版显式手动指定的自定义模型能完整往返保存并恢复为「自定义」，
     #    且从「自定义」点击回第 0 项预设时能够顺利回填对应模型名称
     v2_custom_settings = QSettings(str(tmp_path / "v2_custom_sync.ini"), QSettings.Format.IniFormat)
-    tab = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store1 = AppSettingsStore(workspace_root=tmp_path)
+    dlg1 = SettingsDialog(store1, workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        tab.model_edit.setText("gemini-3.8-flash")
+        dlg1.model_edit.setText("gemini-3.8-flash")
         qt_app.processEvents()
-        assert tab.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
-        assert tab.preset_combo.currentText() == tab_review_mod._CUSTOM_PRESET_LABEL
-        tab.save_settings(v2_custom_settings)
+        assert dlg1.preset_combo.currentData() == CUSTOM_PRESET_KEY
+        assert dlg1.preset_combo.currentText() == CUSTOM_PRESET_LABEL
+        dlg1.apply_changes()
+        assert store1.is_dirty is True
+        store1.save(v2_custom_settings)
         v2_custom_settings.sync()
     finally:
-        tab.close()
+        dlg1.close()
 
-    tab_v2 = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store2 = AppSettingsStore(workspace_root=tmp_path)
+    assert store2.restore(v2_custom_settings) is True
+    assert store2.is_dirty is False
+    dlg_v2 = SettingsDialog(store2, workspace_root=tmp_path, device_info=_gpu_device_info())
     try:
-        tab_v2.restore_settings(v2_custom_settings)
         qt_app.processEvents()
-        assert tab_v2.model_edit.text() == "gemini-3.8-flash"
-        assert tab_v2.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
-        assert tab_v2._settings_dirty is False
+        assert dlg_v2.model_edit.text() == "gemini-3.8-flash"
+        assert dlg_v2.preset_combo.currentData() == CUSTOM_PRESET_KEY
 
-        # 从自定义点选回第 0 项 Built-in 预设（Gemini 4 Hydrogen）能够顺利触发回填
-        tab_v2.preset_combo.setCurrentIndex(0)
+        # 从自定义点选回第 0 项内置预设（Gemini 4 Hydrogen）能够顺利触发回填
+        dlg_v2.preset_combo.setCurrentIndex(0)
         qt_app.processEvents()
-        assert tab_v2.model_edit.text() == GEMINI_MODELS[0][0]
-        assert tab_v2.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
-        assert tab_v2._settings_dirty is True
+        assert dlg_v2.model_edit.text() == GEMINI_MODELS[0][0]
+        assert dlg_v2.preset_combo.currentData() == (GEMINI_MODELS[0][0], "")
+        dlg_v2.apply_changes()
+        assert store2.is_dirty is True
 
         # 3) 下拉选中「自定义」本身不清空当前模型名称
-        custom_idx = tab_v2.preset_combo.findData(tab_review_mod._CUSTOM_PRESET_KEY)
+        custom_idx = dlg_v2.preset_combo.findData(CUSTOM_PRESET_KEY)
         assert custom_idx >= 0
-        tab_v2.preset_combo.setCurrentIndex(custom_idx)
+        dlg_v2.preset_combo.setCurrentIndex(custom_idx)
         qt_app.processEvents()
-        assert tab_v2.model_edit.text() == GEMINI_MODELS[0][0]
+        assert dlg_v2.model_edit.text() == GEMINI_MODELS[0][0]
 
         # 4) 手动输入非预设模型名自动切至自定义，输入准确内置模型名自动跳回对应预设
-        tab_v2.model_edit.setText("gemini-custom-test")
+        dlg_v2.model_edit.setText("gemini-custom-test")
         qt_app.processEvents()
-        assert tab_v2.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+        assert dlg_v2.preset_combo.currentData() == CUSTOM_PRESET_KEY
 
-        tab_v2.model_edit.setText("gemini-4-neon")
+        dlg_v2.model_edit.setText("gemini-4-neon")
         qt_app.processEvents()
-        assert tab_v2.preset_combo.currentData() == ("gemini-4-neon", "")
+        assert dlg_v2.preset_combo.currentData() == ("gemini-4-neon", "")
 
         # 5) OpenAI 兼容接口同时比对 Base URL（含末尾斜杠归一化）与模型名称
-        compat_idx = tab_v2.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
+        compat_idx = dlg_v2.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
         assert compat_idx >= 0
-        tab_v2.provider_combo.setCurrentIndex(compat_idx)
+        dlg_v2.provider_combo.setCurrentIndex(compat_idx)
         qt_app.processEvents()
         expected_url = OPENAI_PRESETS[0][1]
         expected_model = OPENAI_PRESETS[0][2]
-        assert tab_v2.preset_combo.currentData() == (expected_model, expected_url)
+        assert dlg_v2.preset_combo.currentData() == (expected_model, expected_url)
 
-        tab_v2.base_url_edit.setText("https://custom-gateway.example.com/v1")
+        dlg_v2.base_url_edit.setText("https://custom-gateway.example.com/v1")
         qt_app.processEvents()
-        assert tab_v2.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+        assert dlg_v2.preset_combo.currentData() == CUSTOM_PRESET_KEY
 
-        tab_v2.base_url_edit.setText(expected_url.rstrip("/") + "/")
+        dlg_v2.base_url_edit.setText(expected_url.rstrip("/") + "/")
         qt_app.processEvents()
-        assert tab_v2.preset_combo.currentData() == (expected_model, expected_url)
+        assert dlg_v2.preset_combo.currentData() == (expected_model, expected_url)
     finally:
-        tab_v2.close()
+        dlg_v2.close()
 
     # 6) 旧版 version: 1 下 OpenAI 兼容接口的自定义地址与模型仍原样保留
     legacy_compat = QSettings(str(tmp_path / "legacy_compat_v1.ini"), QSettings.Format.IniFormat)
     legacy_compat.setValue(
-        tab_review_mod._REVIEW_SETTINGS_KEY,
+        LEGACY_REVIEW_SETTINGS_KEY,
         json.dumps(
             {
                 "version": 1,
@@ -1246,15 +1294,18 @@ def test_review_tab_preset_combo_bidirectional_sync_and_legacy_restore(
     )
     legacy_compat.sync()
 
-    tab_compat = MllmReviewTab(workspace_root=tmp_path, device_info=_gpu_device_info())
+    store_compat = AppSettingsStore(workspace_root=tmp_path)
+    assert store_compat.restore(legacy_compat) is True
+    dlg_compat = SettingsDialog(
+        store_compat, workspace_root=tmp_path, device_info=_gpu_device_info()
+    )
     try:
-        tab_compat.restore_settings(legacy_compat)
         qt_app.processEvents()
-        assert tab_compat.base_url_edit.text() == "http://127.0.0.1:8080/v1"
-        assert tab_compat.model_edit.text() == "my-local-vlm"
-        assert tab_compat.preset_combo.currentData() == tab_review_mod._CUSTOM_PRESET_KEY
+        assert dlg_compat.base_url_edit.text() == "http://127.0.0.1:8080/v1"
+        assert dlg_compat.model_edit.text() == "my-local-vlm"
+        assert dlg_compat.preset_combo.currentData() == CUSTOM_PRESET_KEY
     finally:
-        tab_compat.close()
+        dlg_compat.close()
 
 
 def test_review_tab_resume_checkbox_persistence_and_circuit_breaker_summary(

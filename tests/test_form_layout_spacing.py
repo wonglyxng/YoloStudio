@@ -150,11 +150,8 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
                 assert len(field_xs) == 1
 
         # 验证多分组页面的字段列左边缘沿同页最长标签精确垂直对齐（含样式表生效后的最终布局）
-        # 1) Tab 3（自动智能标注）：切出 OpenAI 兼容接口 Base URL 与 SAM 隐藏行后三组依然对齐，且最长标签紧邻控件
+        # 1) Tab 3（自动智能标注）：展开 SAM 隐藏行后三组（含全局共享 AI 摘要卡片）依然对齐，且最长标签紧邻控件
         win.tabs.setCurrentIndex(2)
-        compat_idx = win.review_tab.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
-        assert compat_idx >= 0
-        win.review_tab.provider_combo.setCurrentIndex(compat_idx)
         win.review_tab.refine_mode_combo.setCurrentIndex(win.review_tab.refine_mode_combo.count() - 1)
         qt_app.processEvents()
         review_forms = (win.review_tab._src_form, win.review_tab._llm_form, win.review_tab._pol_form)
@@ -175,6 +172,31 @@ def test_all_config_tabs_form_and_inline_label_spacing(qt_app: QApplication, tmp
             and form.itemAt(r, QFormLayout.ItemRole.LabelRole).widget().text()
         )
         assert FORM_LABEL_SPACING - 2 <= review_min_gap <= FORM_LABEL_SPACING + 4
+
+        # 1b) 全局「设置」对话框三页（AI 大模型 / 本地视觉模型 / 通用设置）表单同样左对齐且紧凑对齐
+        from yolo_studio.gui.settings_dialog import PAGE_AI, PAGE_GENERAL, PAGE_LOCAL_MODELS, SettingsDialog
+
+        dlg = SettingsDialog(
+            win.settings_store, tmp_path, device_info=_make_device_info(gpu_count=1), parent=win
+        )
+        try:
+            dlg.show()
+            compat_idx = dlg.provider_combo.findData(MllmProvider.OPENAI_COMPAT)
+            assert compat_idx >= 0
+            dlg.provider_combo.setCurrentIndex(compat_idx)
+            for page_key in (PAGE_AI, PAGE_LOCAL_MODELS, PAGE_GENERAL):
+                dlg.select_page(page_key)
+                qt_app.processEvents()
+                cur_page = dlg.page_stack.currentWidget()
+                page_forms = cur_page.findChildren(QFormLayout)
+                assert page_forms
+                page_field_xs = {
+                    form.itemAt(0, QFormLayout.ItemRole.FieldRole).geometry().x()
+                    for form in page_forms
+                }
+                assert len(page_field_xs) == 1
+        finally:
+            dlg.close()
 
         # 2) Tab 4（数据集准备）：来源分组与划分分组字段列沿最长标签精确对齐
         win.tabs.setCurrentIndex(3)
