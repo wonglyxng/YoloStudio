@@ -1134,6 +1134,7 @@ class LabelingStudioTab(QWidget):
         self.canvas.set_crosshair_style(
             dashed=_init_prefs.workbench_crosshair_dashed, halo=_init_prefs.workbench_crosshair_halo
         )
+        self.canvas.set_crosshair_dash(_init_prefs.workbench_crosshair_dash)
         center_lay.addWidget(self.canvas, 1)
 
         footer = QFrame()
@@ -1873,6 +1874,7 @@ class LabelingStudioTab(QWidget):
         self.canvas.set_crosshair_style(
             dashed=prefs.workbench_crosshair_dashed, halo=prefs.workbench_crosshair_halo
         )
+        self.canvas.set_crosshair_dash(prefs.workbench_crosshair_dash)
 
     def _on_general_settings_changed(self) -> None:
         self.apply_general_preferences(self.settings_store.preferences)

@@ -3089,8 +3089,10 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
         CROSSHAIR_COLOR_PRESETS,
         DEFAULT_CROSSHAIR_COLOR,
         crosshair_rgb,
+        crosshair_dash_pattern,
         crosshair_segments,
         normalize_crosshair_color_key,
+        normalize_crosshair_dash_key,
     )
     from yolo_studio.gui.app_settings import AppSettingsStore
     from yolo_studio.gui.settings_dialog import PAGE_GENERAL, SettingsDialog
@@ -3124,6 +3126,10 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
     # 默认细虚线、无黑色描边
     assert store.preferences.workbench_crosshair_dashed is True
     assert store.preferences.workbench_crosshair_halo is False
+    assert store.preferences.workbench_crosshair_dash == "medium"
+    assert crosshair_dash_pattern("medium") == (8.0, 4.0)
+    assert normalize_crosshair_dash_key(" LONG ") == "long"
+    assert normalize_crosshair_dash_key("huge") == "medium"
     general_hits: list[int] = []
     store.general_changed.connect(lambda: general_hits.append(1))
     assert store.update(workbench_crosshair_color="green") is True
@@ -3131,7 +3137,10 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
     assert store.update(workbench_crosshair_color="unknown-color") is True
     assert store.preferences.workbench_crosshair_color == "white"
     store.update(
-        workbench_crosshair_color="yellow", workbench_crosshair_dashed=False, workbench_crosshair_halo=True
+        workbench_crosshair_color="yellow",
+        workbench_crosshair_dashed=False,
+        workbench_crosshair_halo=True,
+        workbench_crosshair_dash="long",
     )
     store.save(QSettings(str(settings_file), QSettings.Format.IniFormat), force=True)
     restored = AppSettingsStore(workspace_root=tmp_path)
@@ -3139,6 +3148,7 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
     assert restored.preferences.workbench_crosshair_color == "yellow"
     assert restored.preferences.workbench_crosshair_dashed is False
     assert restored.preferences.workbench_crosshair_halo is True
+    assert restored.preferences.workbench_crosshair_dash == "long"
 
     # 4) 设置弹窗：通用设置页提供带色块的颜色下拉，提交后工作台画布即时同步
     win = _make_window(tmp_path)
@@ -3148,6 +3158,7 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
         canvas = win.labeling_tab.canvas
         assert canvas.crosshair_color() == "white"
         assert canvas.crosshair_style() == (True, False)
+        assert canvas.crosshair_dash() == "medium"
         dlg = SettingsDialog(win.settings_store, workspace_root=tmp_path, initial_page=PAGE_GENERAL, parent=win)
         try:
             combo = dlg.wb_crosshair_color_combo
@@ -3156,8 +3167,13 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
             assert not combo.itemIcon(0).isNull()
             assert dlg.wb_crosshair_dashed_combo.currentData() is True
             assert dlg.wb_crosshair_halo_chk.isChecked() is False
+            assert dlg.wb_crosshair_dash_combo.currentData() == "medium"
+            assert dlg.wb_crosshair_dash_combo.isEnabled() is True
+            dlg.wb_crosshair_dash_combo.setCurrentIndex(dlg.wb_crosshair_dash_combo.findData("short"))
             combo.setCurrentIndex(combo.findData("magenta"))
             dlg.wb_crosshair_dashed_combo.setCurrentIndex(dlg.wb_crosshair_dashed_combo.findData(False))
+            # 切到实线后虚线长度下拉置灰
+            assert dlg.wb_crosshair_dash_combo.isEnabled() is False
             dlg.wb_crosshair_halo_chk.setChecked(True)
             dlg.apply_changes()
         finally:
@@ -3166,6 +3182,7 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
         assert win.settings_store.preferences.workbench_crosshair_color == "magenta"
         assert canvas.crosshair_color() == "magenta"
         assert canvas.crosshair_style() == (False, True)
+        assert canvas.crosshair_dash() == "short"
 
         # 画布直接设置时同样做容错回退
         canvas.set_crosshair_color("not-a-color")

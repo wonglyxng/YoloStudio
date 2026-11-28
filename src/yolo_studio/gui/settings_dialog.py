@@ -5,7 +5,7 @@
     - **AI 大模型**：配置模型接口、内置预设、Base URL、模型名称、思考/推理级别防呆联动、
       API Key 与环境变量检测状态以及一键连通性测试；
     - **本地视觉模型**：配置全局共享的 SAM 2.1 默认权重、SAM 3 权重路径与默认 GPU 加速偏好；
-    - **通用设置**：配置标注工作台默认行为（自动保存、显示标签、保持视野、十字准星颜色/线型/描边）、记住上次目录与恢复默认。
+    - **通用设置**：配置标注工作台默认行为（自动保存、显示标签、保持视野、十字准星颜色/线型/虚线长度/描边）、记住上次目录与恢复默认。
 
 运行环境与协作边界：
     运行于 PyQt6 主线程，编辑期间仅操作临时控件副本；点击「应用」或「确定」时才原子写回
@@ -54,7 +54,12 @@ from yolo_studio.core.mllm_reviewer import (
     supported_reasoning_efforts,
 )
 from yolo_studio.core.trainer import DeviceInfo
-from yolo_studio.gui.annotation_canvas import CROSSHAIR_COLOR_PRESETS, normalize_crosshair_color_key
+from yolo_studio.gui.annotation_canvas import (
+    CROSSHAIR_COLOR_PRESETS,
+    CROSSHAIR_DASH_PRESETS,
+    normalize_crosshair_color_key,
+    normalize_crosshair_dash_key,
+)
 from yolo_studio.gui.app_settings import (
     AppPreferences,
     AppSettingsStore,
@@ -416,9 +421,20 @@ class SettingsDialog(QDialog):
         self.wb_crosshair_dashed_combo = QComboBox()
         self.wb_crosshair_dashed_combo.addItem("细虚线（默认，更轻）", True)
         self.wb_crosshair_dashed_combo.addItem("细实线（对齐更连贯）", False)
+        self.wb_crosshair_dash_combo = QComboBox()
+        self.wb_crosshair_dash_combo.setToolTip("虚线每段实线与空隙的长度（屏幕像素），仅虚线线型下生效")
+        for dash_key, dash_name, _dash_pat in CROSSHAIR_DASH_PRESETS:
+            self.wb_crosshair_dash_combo.addItem(dash_name, dash_key)
         self.wb_crosshair_halo_chk = QCheckBox("黑色描边（复杂/高亮背景更清晰）")
         crosshair_style_row.addWidget(self.wb_crosshair_dashed_combo)
+        crosshair_style_row.addWidget(self.wb_crosshair_dash_combo)
         crosshair_style_row.addWidget(self.wb_crosshair_halo_chk)
+        # 选择实线时虚线长度无意义，置灰防呆
+        self.wb_crosshair_dashed_combo.currentIndexChanged.connect(
+            lambda *_a: self.wb_crosshair_dash_combo.setEnabled(
+                bool(self.wb_crosshair_dashed_combo.currentData())
+            )
+        )
         crosshair_style_row.addStretch(1)
         crosshair_hint = QLabel(
             "画框 (R)、SAM 点选 (Q) 与准星 (X) 共用此样式；线条在光标处留空，交点由鼠标指针标示。"
@@ -533,6 +549,11 @@ class SettingsDialog(QDialog):
             self.wb_crosshair_color_combo.setCurrentIndex(max(0, color_idx))
             dashed_idx = self.wb_crosshair_dashed_combo.findData(bool(prefs.workbench_crosshair_dashed))
             self.wb_crosshair_dashed_combo.setCurrentIndex(max(0, dashed_idx))
+            dash_idx = self.wb_crosshair_dash_combo.findData(
+                normalize_crosshair_dash_key(prefs.workbench_crosshair_dash)
+            )
+            self.wb_crosshair_dash_combo.setCurrentIndex(max(0, dash_idx))
+            self.wb_crosshair_dash_combo.setEnabled(bool(prefs.workbench_crosshair_dashed))
             self.wb_crosshair_halo_chk.setChecked(bool(prefs.workbench_crosshair_halo))
             self.remember_last_dir_chk.setChecked(prefs.remember_last_dir)
         finally:
@@ -573,6 +594,7 @@ class SettingsDialog(QDialog):
             ),
             workbench_crosshair_dashed=bool(self.wb_crosshair_dashed_combo.currentData()),
             workbench_crosshair_halo=self.wb_crosshair_halo_chk.isChecked(),
+            workbench_crosshair_dash=normalize_crosshair_dash_key(self.wb_crosshair_dash_combo.currentData()),
             remember_last_dir=self.remember_last_dir_chk.isChecked(),
             default_prefer_gpu=self.default_prefer_gpu_chk.isChecked(),
         )

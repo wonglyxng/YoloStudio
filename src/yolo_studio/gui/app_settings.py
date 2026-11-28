@@ -33,7 +33,12 @@ from yolo_studio.core.mllm_reviewer import (
     ReasoningEffort,
     resolve_effective_reasoning_effort,
 )
-from yolo_studio.gui.annotation_canvas import DEFAULT_CROSSHAIR_COLOR, normalize_crosshair_color_key
+from yolo_studio.gui.annotation_canvas import (
+    DEFAULT_CROSSHAIR_COLOR,
+    DEFAULT_CROSSHAIR_DASH,
+    normalize_crosshair_color_key,
+    normalize_crosshair_dash_key,
+)
 
 APP_SETTINGS_KEY = "app/global_settings_json"
 LEGACY_REVIEW_SETTINGS_KEY = "review_tab/state_json"
@@ -74,7 +79,8 @@ class AppPreferences:
           `sam3_weights_path` 留空时由 `resolve_sam3_weights()` 自动发现 `weights/sam3.pt`。
         - 通用偏好：`workbench_*`、`remember_last_dir` 与 `default_prefer_gpu` 控制各页初始默认行为；
           其中 `workbench_crosshair_color` 是十字准星颜色配置键，读写时都会规范化为合法预设；
-          `workbench_crosshair_dashed` / `workbench_crosshair_halo` 控制准星线型与黑色描边（默认细虚线、无描边）。
+          `workbench_crosshair_dashed` / `workbench_crosshair_halo` 控制准星线型与黑色描边（默认细虚线、无描边），
+          `workbench_crosshair_dash` 为虚线长度预设键（默认 medium：实 8 / 空 4 屏幕像素）。
     """
 
     # AI 大模型全局配置
@@ -99,6 +105,8 @@ class AppPreferences:
     workbench_crosshair_dashed: bool = True
     # 十字准星是否加黑色描边：默认关闭，复杂/高亮背景下可开启提高对比度
     workbench_crosshair_halo: bool = False
+    # 十字准星虚线长度配置键（short / medium / long），仅虚线线型下生效，未知值回退 medium
+    workbench_crosshair_dash: str = DEFAULT_CROSSHAIR_DASH
     remember_last_dir: bool = True
     default_prefer_gpu: bool = True
 
@@ -279,6 +287,7 @@ class AppSettingsStore(QObject):
         updated.sam_model_name = updated.sam_model_name.strip() or "sam2.1_t.pt"
         updated.sam3_weights_path = updated.sam3_weights_path.strip()
         updated.workbench_crosshair_color = normalize_crosshair_color_key(updated.workbench_crosshair_color)
+        updated.workbench_crosshair_dash = normalize_crosshair_dash_key(updated.workbench_crosshair_dash)
 
         llm_diff = (
             old.provider != updated.provider
@@ -299,6 +308,7 @@ class AppSettingsStore(QObject):
             or old.workbench_crosshair_color != updated.workbench_crosshair_color
             or old.workbench_crosshair_dashed != updated.workbench_crosshair_dashed
             or old.workbench_crosshair_halo != updated.workbench_crosshair_halo
+            or old.workbench_crosshair_dash != updated.workbench_crosshair_dash
             or old.remember_last_dir != updated.remember_last_dir
             or old.default_prefer_gpu != updated.default_prefer_gpu
         )
@@ -359,6 +369,7 @@ class AppSettingsStore(QObject):
             "workbench_crosshair_color": normalize_crosshair_color_key(p.workbench_crosshair_color),
             "workbench_crosshair_dashed": bool(p.workbench_crosshair_dashed),
             "workbench_crosshair_halo": bool(p.workbench_crosshair_halo),
+            "workbench_crosshair_dash": normalize_crosshair_dash_key(p.workbench_crosshair_dash),
             "remember_last_dir": bool(p.remember_last_dir),
             "default_prefer_gpu": bool(p.default_prefer_gpu),
         }
@@ -430,6 +441,8 @@ class AppSettingsStore(QObject):
                 prefs.workbench_crosshair_dashed = bool(state["workbench_crosshair_dashed"])
             if "workbench_crosshair_halo" in state:
                 prefs.workbench_crosshair_halo = bool(state["workbench_crosshair_halo"])
+            if "workbench_crosshair_dash" in state:
+                prefs.workbench_crosshair_dash = normalize_crosshair_dash_key(state["workbench_crosshair_dash"])
             if "remember_last_dir" in state:
                 prefs.remember_last_dir = bool(state["remember_last_dir"])
             if "default_prefer_gpu" in state:

@@ -67,6 +67,27 @@ _CROSSHAIR_RGB_BY_KEY: dict[str, tuple[int, int, int]] = {k: rgb for k, _n, rgb 
 # 十字准星中心留空半径（屏幕像素），保证瞄准点像素不被线条遮挡
 CROSSHAIR_CENTER_GAP_PX = 6.0
 
+# 十字准星虚线长度预设：(配置键, 中文显示名, (实线段像素, 空隙像素))，像素均为屏幕像素。
+# 配置键持久化在全局设置 `workbench_crosshair_dash` 中，不可随意改名；未知键回退 `DEFAULT_CROSSHAIR_DASH`。
+CROSSHAIR_DASH_PRESETS: tuple[tuple[str, str, tuple[float, float]], ...] = (
+    ("short", "短（实 4 / 空 3 px）", (4.0, 3.0)),
+    ("medium", "中（默认，实 8 / 空 4 px）", (8.0, 4.0)),
+    ("long", "长（实 12 / 空 6 px）", (12.0, 6.0)),
+)
+DEFAULT_CROSSHAIR_DASH = "medium"
+_CROSSHAIR_DASH_BY_KEY: dict[str, tuple[float, float]] = {k: pat for k, _n, pat in CROSSHAIR_DASH_PRESETS}
+
+
+def normalize_crosshair_dash_key(key: object) -> str:
+    """将任意输入规范化为合法的虚线长度配置键，未知或空值回退为默认“中”。"""
+    text = str(key or "").strip().lower()
+    return text if text in _CROSSHAIR_DASH_BY_KEY else DEFAULT_CROSSHAIR_DASH
+
+
+def crosshair_dash_pattern(key: object) -> tuple[float, float]:
+    """返回虚线长度配置键对应的 `(实线段, 空隙)` 屏幕像素长度，未知键按默认“中”处理。"""
+    return _CROSSHAIR_DASH_BY_KEY[normalize_crosshair_dash_key(key)]
+
 
 def normalize_crosshair_color_key(key: object) -> str:
     """将任意输入规范化为合法的十字准星颜色配置键，未知或空值回退为默认白色。"""
@@ -241,6 +262,8 @@ class AnnotationCanvasView(QGraphicsView):
         # 十字准星线型与描边：默认细虚线、无黑色描边（视觉最轻），由工作台按全局设置写入
         self._crosshair_dashed: bool = True
         self._crosshair_halo: bool = False
+        # 虚线长度配置键（见 `CROSSHAIR_DASH_PRESETS`），仅虚线线型下生效
+        self._crosshair_dash_key: str = DEFAULT_CROSSHAIR_DASH
         self._view_enhance_enabled: bool = False
         self._view_enhance_brightness: int = self.DEFAULT_ENHANCE_BRIGHTNESS
         self._view_enhance_contrast: float = self.DEFAULT_ENHANCE_CONTRAST
@@ -514,6 +537,18 @@ class AnnotationCanvasView(QGraphicsView):
         if style == (self._crosshair_dashed, self._crosshair_halo):
             return
         self._crosshair_dashed, self._crosshair_halo = style
+        self.viewport().update()
+
+    def crosshair_dash(self) -> str:
+        """返回当前虚线长度配置键（`short` / `medium` / `long`）。"""
+        return self._crosshair_dash_key
+
+    def set_crosshair_dash(self, key: str) -> None:
+        """设置虚线长度预设；未知键回退为默认“中”，取值未变化时不触发重绘。实线线型下保存但不影响显示。"""
+        normalized = normalize_crosshair_dash_key(key)
+        if normalized == self._crosshair_dash_key:
+            return
+        self._crosshair_dash_key = normalized
         self.viewport().update()
 
     def view_enhancement_enabled(self) -> bool:
@@ -1932,8 +1967,8 @@ class AnnotationCanvasView(QGraphicsView):
         """在光标位置绘制横贯整张图像、中心留空的细十字准星。
 
         样式约定（所有尺寸均为屏幕像素，乘以 `inv` 抵消缩放）：
-            - 默认 1px 细虚线、无描边，视觉最轻；线型（虚线/实线）与是否加黑色描边由
-              `set_crosshair_style` 按全局设置控制，复杂背景下可开启描边提高对比度；
+            - 默认 1px 细虚线（实 8 / 空 4 px）、无描边，视觉最轻；线型（虚线/实线）、虚线长度与是否加黑色描边
+              由 `set_crosshair_style` / `set_crosshair_dash` 按全局设置控制，复杂背景下可开启描边提高对比度；
             - 线条关闭抗锯齿绘制，避免 1px 线落在半像素位置时被抗锯齿扩散成 2px 发虚变粗；
             - 右/下两段从图像边缘反向绘制，使虚线相位锚定在图像边缘，移动光标时虚线不会“爬动”；
             - 光标周围留空 `CROSSHAIR_CENTER_GAP_PX` 且不画任何中心标记：交点由系统指针标示，
@@ -1968,8 +2003,9 @@ class AnnotationCanvasView(QGraphicsView):
                     painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
             line_pen = QPen(line_color, 1.0 * inv, Qt.PenStyle.SolidLine)
             if self._crosshair_dashed:
-                # 虚线图案以线宽为单位：4px 实 + 3px 空
-                line_pen.setDashPattern([4.0, 3.0])
+                # 虚线图案以线宽为单位（线宽 1 屏幕像素，故即屏幕像素），长度取自用户所选预设
+                dash_on, dash_off = crosshair_dash_pattern(self._crosshair_dash_key)
+                line_pen.setDashPattern([dash_on, dash_off])
             line_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
             painter.setPen(line_pen)
             for x1, y1, x2, y2 in segs:
