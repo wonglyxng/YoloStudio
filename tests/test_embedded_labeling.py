@@ -3785,3 +3785,170 @@ def test_workbench_onion_skin_confidence_filter_and_multi_select_batch_ops(
         win.labeling_tab._dirty = False
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_workbench_dataset_health_issue_notes_and_cursor_loupe(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证问题标记与备注(I/Shift+I/筛选/通过清除)、健康体检面板跳转聚焦，以及光标放大镜(M)渲染。"""
+    from PyQt6.QtCore import QPointF
+
+    frames_dir = tmp_path / "batch4_frames"
+    f0 = frames_dir / "f0.jpg"
+    f1 = frames_dir / "f1.jpg"
+    f2 = frames_dir / "f2.jpg"
+    for p in (f0, f1, f2):
+        _write_sample_frame(p, (400, 300))
+
+    f0.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "hero",
+                        "points": [[40.0, 40.0], [140.0, 140.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    }
+                ],
+                "imagePath": f0.name,
+                "imageHeight": 300,
+                "imageWidth": 400,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    f1.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "hero",
+                        "points": [[60.0, 60.0], [160.0, 160.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "hero",
+                        "points": [[62.0, 62.0], [160.0, 160.0]],  # 重复框
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "monster",
+                        "points": [[220.0, 80.0], [225.0, 85.0]],  # 过小框
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                ],
+                "imagePath": f1.name,
+                "imageHeight": 300,
+                "imageWidth": 400,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    f2.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {"issue_flag": True, "issue_note": "背景烟雾遮挡不确定"},
+                "shapes": [
+                    {
+                        "label": "hero",
+                        "points": [[100.0, 80.0], [180.0, 160.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    }
+                ],
+                "imagePath": f2.name,
+                "imageHeight": 300,
+                "imageWidth": 400,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+
+        # 1) 问题标记与备注 + 筛选 + Shift+I 跳下一个问题 + F 通过自动清除
+        assert tab.current_image_path() == f0.resolve()
+        assert tab.set_current_image_issue(True, "脚部截断需确认") is True
+        qt_app.processEvents()
+        assert tab.review_banner.isVisible() is True
+        assert "脚部截断需确认" in tab.review_banner_label.text()
+        assert "⚑" in tab.file_list.item(0).text()
+
+        # 按「待确认问题」筛选应只显示 f0 与 f2
+        issue_idx = tab.status_filter_combo.findData("issue")
+        assert issue_idx >= 0
+        tab.status_filter_combo.setCurrentIndex(issue_idx)
+        qt_app.processEvents()
+        assert tab.file_list.count() == 2
+
+        # Shift+I 跳到下一张问题图 f2
+        assert tab.open_next_issue_image() is True
+        qt_app.processEvents()
+        assert tab.current_image_path() == f2.resolve()
+        assert "背景烟雾遮挡不确定" in tab.review_banner_label.text()
+
+        # F 确认通过 f2 自动清除 issue_flag 与 issue_note
+        tab._verify_and_next()
+        qt_app.processEvents()
+        f2_saved = json.loads(f2.with_suffix(".json").read_text(encoding="utf-8"))
+        assert f2_saved["flags"].get("issue_flag") is False
+        assert f2_saved["flags"].get("issue_note") == ""
+
+        # 切回全部查看健康体检面板
+        tab.status_filter_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+
+        # 2) 健康体检面板：检出 f1 的重复框与过小框、f0 的问题标记，双击跳转并自动选中该框
+        dlg = tab.open_dataset_health_dialog()
+        assert dlg is not None and dlg.isVisible()
+        qt_app.processEvents()
+        assert len(dlg.report().issues) >= 3
+        dup_row = next(
+            i for i, it in enumerate(dlg._visible_issues) if it.image_path == f1.resolve() and it.box_index is not None
+        )
+        expected_box_idx = dlg._visible_issues[dup_row].box_index
+        dlg.issue_table.selectRow(dup_row)
+        dlg.jump_issue_btn.click()
+        qt_app.processEvents()
+        assert tab.current_image_path() == f1.resolve()
+        assert tab.canvas.selected_index() == expected_box_idx
+        dlg.close()
+
+        # 3) 光标局部放大镜 (M)：快捷键开关与离屏视口绘制无异常
+        assert tab.loupe_btn.isChecked() is False
+        assert tab.canvas.loupe_enabled() is False
+        QTest.keyClick(tab.canvas, Qt.Key.Key_M)
+        qt_app.processEvents()
+        assert tab.loupe_btn.isChecked() is True
+        assert tab.canvas.loupe_enabled() is True
+        tab.canvas._cursor_scene_pos = QPointF(100.0, 100.0)
+        tab.canvas._last_cursor_view_pos = QPointF(120.0, 120.0)
+        tab.canvas.viewport().update()
+        shot = tab.canvas.viewport().grab()
+        assert not shot.isNull()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_M)
+        qt_app.processEvents()
+        assert tab.canvas.loupe_enabled() is False
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()

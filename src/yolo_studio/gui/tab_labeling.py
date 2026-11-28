@@ -79,6 +79,7 @@ from yolo_studio.core.label_batch_ops import (
     rename_label_in_json_files,
     scan_label_usage,
 )
+from yolo_studio.core.dataset_health import DatasetHealthReport, analyze_dataset_health
 from yolo_studio.core.label_auditor import (
     AuditIssueKind,
     ImageAuditReport,
@@ -102,6 +103,7 @@ from yolo_studio.gui.app_settings import (
 from yolo_studio.gui.class_picker_dialog import ClassPickerDialog
 from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
 from yolo_studio.gui.class_rename_dialog import ClassRenameDialog
+from yolo_studio.gui.dataset_health_dialog import DatasetHealthDialog
 from yolo_studio.gui.label_audit_dialog import LabelAuditDialog
 from yolo_studio.gui.sam_track_dialog import SamTrackDialog
 from yolo_studio.gui.shortcut_help_dialog import ShortcutHelpDialog
@@ -285,6 +287,65 @@ class _EmptyHintListWidget(QListWidget):
 
 # 兼容旧名称：统一复用独立的可搜索类别快速选择弹窗
 _LabelPickerDialog = ClassPickerDialog
+
+
+class _IssueNoteDialog(QDialog):
+    """当前图片「待确认问题」标记与备注输入弹窗（按 I 呼出，直接回车即标记待确认）。"""
+
+    def __init__(
+        self,
+        image_name: str,
+        *,
+        flagged: bool = False,
+        note: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"问题标记与备注 — {image_name}")
+        self.setMinimumWidth(420)
+        self._cleared = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+
+        self.flag_chk = QCheckBox("标记当前图片为「待确认问题」（可在列表中筛选，按 Shift+I 逐张排查）")
+        self.flag_chk.setChecked(True)
+        lay.addWidget(self.flag_chk)
+
+        self.note_edit = QLineEdit(note)
+        self.note_edit.setPlaceholderText("可选：写一句备注，如“右上角目标遮挡不确定类别”（直接回车确认）")
+        lay.addWidget(self.note_edit)
+
+        btn_row = QHBoxLayout()
+        self.clear_btn = QPushButton("清除问题标记")
+        self.clear_btn.setVisible(flagged or bool(note.strip()))
+        self.clear_btn.clicked.connect(self._on_clear)
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addStretch(1)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("保存标记")
+        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        btn_row.addWidget(btns)
+        lay.addLayout(btn_row)
+
+        self.note_edit.selectAll()
+        self.note_edit.setFocus()
+
+    def _on_clear(self) -> None:
+        self._cleared = True
+        self.flag_chk.setChecked(False)
+        self.note_edit.clear()
+        self.accept()
+
+    def result_issue(self) -> tuple[bool, str]:
+        if self._cleared or not self.flag_chk.isChecked():
+            return False, ""
+        return True, self.note_edit.text().strip()
 
 
 def _rect_iou(a: RectAnnotation, b: RectAnnotation) -> float:
@@ -846,6 +907,8 @@ class LabelingStudioTab(QWidget):
         self._sam_tracker_override: Any | None = None
         # 快捷键速查面板（首次按 ? / F1 时创建并复用）
         self._shortcut_help_dlg: ShortcutHelpDialog | None = None
+        # 数据集健康体检非模态面板
+        self._health_dialog: DatasetHealthDialog | None = None
         self._scoped_actions: list[QAction] = []
         self._clipboard_boxes: list[RectAnnotation] = []
         self._clipboard_source_image: Path | None = None
@@ -1058,10 +1121,20 @@ class LabelingStudioTab(QWidget):
         self.review_banner_label = QLabel("")
         self.review_banner_label.setWordWrap(True)
         self.review_banner_label.setStyleSheet("border: none; color: #6f4e00; font-weight: 500; font-size: 12px;")
+        self.edit_issue_btn = QPushButton("备注(I)")
+        self.edit_issue_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.edit_issue_btn.setStyleSheet("padding: 2px 8px; font-size: 12px;")
+        self.edit_issue_btn.setToolTip("编辑当前图的问题标记与备注 (快捷键 I)")
+        self.next_issue_banner_btn = QPushButton("下问题")
+        self.next_issue_banner_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.next_issue_banner_btn.setStyleSheet("padding: 2px 8px; font-size: 12px;")
+        self.next_issue_banner_btn.setToolTip("跳转到下一张带问题标记或待复核的图片 (快捷键 Shift+I)")
         self.clear_hint_btn = QPushButton("已核查，清除提醒")
         self.clear_hint_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.clear_hint_btn.setStyleSheet("padding: 2px 8px; font-size: 12px;")
         banner_lay.addWidget(self.review_banner_label, 1)
+        banner_lay.addWidget(self.edit_issue_btn)
+        banner_lay.addWidget(self.next_issue_banner_btn)
         banner_lay.addWidget(self.clear_hint_btn)
         self.review_banner.setVisible(False)
         center_lay.addWidget(self.review_banner)
@@ -1113,17 +1186,17 @@ class LabelingStudioTab(QWidget):
         footer.setStyleSheet(
             "QFrame { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 4px; }"
             "QLabel { border: none; color: #57606a; font-size: 12px; }"
-            "QPushButton { padding: 2px 7px; font-size: 11px; min-height: 20px; }"
+            "QPushButton { padding: 2px 5px; font-size: 11px; min-height: 20px; }"
             "QPushButton#footerToggleBtn:checked { background-color: #ddf4ff; border-color: #0969da; color: #0550ae; font-weight: 600; }"
             "QPushButton#footerEnhanceBtn:checked { background-color: #fff8c5; border-color: #bf8700; color: #7d4e00; font-weight: 600; }"
         )
         f_lay = QHBoxLayout(footer)
-        f_lay.setContentsMargins(8, 3, 8, 3)
-        f_lay.setSpacing(6)
-        self.mode_badge_label = _CompactFooterLabel("模式: 编辑", min_width=64)
+        f_lay.setContentsMargins(6, 3, 6, 3)
+        f_lay.setSpacing(4)
+        self.mode_badge_label = _CompactFooterLabel("模式: 编辑", min_width=44)
         self.mode_badge_label.setStyleSheet("border: none; color: #0969da; font-weight: 600; font-size: 12px;")
-        self.img_info_label = _CompactFooterLabel("分辨率: -", min_width=64)
-        self.cursor_info_label = _CompactFooterLabel("坐标: -", min_width=52)
+        self.img_info_label = _CompactFooterLabel("分辨率: -", min_width=0)
+        self.cursor_info_label = _CompactFooterLabel("坐标: -", min_width=0)
         self.hint_info_label = _ElidedStatusLabel(
             "滚轮缩放 · 拖空白/右键/空格平移 · X准星 · B增亮 · Shift+V复用上帧 · ?快捷键",
             min_width=0,
@@ -1131,7 +1204,7 @@ class LabelingStudioTab(QWidget):
         self.hint_info_label.setStyleSheet("border: none; color: #8c959f; font-size: 11px;")
         self.zoom_info_label = QLabel("缩放: 100%", self)
         self.zoom_info_label.setVisible(False)
-        self.save_state_label = _CompactFooterLabel("", min_width=32)
+        self.save_state_label = _CompactFooterLabel("", min_width=0)
 
         self.sam_hover_preview_chk = QCheckBox("悬停预览")
         self.sam_hover_preview_chk.setChecked(
@@ -1149,7 +1222,8 @@ class LabelingStudioTab(QWidget):
         self.crosshair_btn.setCheckable(True)
         self.crosshair_btn.setToolTip("全模式常显中心留空的细十字准星，方便编辑对齐边缘；样式可在「⚙ 设置 → 通用设置」中调整 (快捷键 X)")
 
-        self.shortcut_help_btn = QPushButton("快捷键(?)")
+        self.shortcut_help_btn = QPushButton("?")
+        self.shortcut_help_btn.setFixedWidth(24)
         self.shortcut_help_btn.setToolTip("打开工作台快捷键速查面板 (? / F1)")
 
         enhance_grp = QWidget()
@@ -1172,7 +1246,7 @@ class LabelingStudioTab(QWidget):
         enhance_lay.addWidget(self.view_enhance_btn)
         enhance_lay.addWidget(self.view_enhance_menu_btn)
 
-        self.box_opacity_btn = QPushButton("框透明 ▾")
+        self.box_opacity_btn = QPushButton("透明 ▾")
         self.box_opacity_btn.setObjectName("footerToggleBtn")
         self.box_opacity_btn.setCheckable(True)
         self.box_opacity_btn.setToolTip(
@@ -1184,6 +1258,12 @@ class LabelingStudioTab(QWidget):
         self.onion_skin_btn.setToolTip(
             "以淡色虚影叠加显示上一张图片的目标框（洋葱皮参考，不参与选中与保存；快捷键 O）"
         )
+        self.loupe_btn = QPushButton("放大(M)")
+        self.loupe_btn.setObjectName("footerToggleBtn")
+        self.loupe_btn.setCheckable(True)
+        self.loupe_btn.setToolTip(
+            "开启光标局部 3.5× 像素放大镜，低倍率浏览整图时也可精准贴边拖角点 (快捷键 M)"
+        )
 
         self.zoom_out_btn = QPushButton("−")
         self.zoom_out_btn.setFixedWidth(26)
@@ -1193,7 +1273,7 @@ class LabelingStudioTab(QWidget):
         self.zoom_in_btn = QPushButton("+")
         self.zoom_in_btn.setFixedWidth(26)
         self.zoom_in_btn.setToolTip("放大画布 (+ / Ctrl+=)")
-        self.fit_btn = QPushButton("适应 (0)")
+        self.fit_btn = QPushButton("适应(0)")
         self.fit_btn.setToolTip("将整张图片居中适配到画布可视区域 (0 / Ctrl+0 / 双击空白)")
         self.zoom_100_btn = QPushButton("1:1")
         self.zoom_100_btn.setToolTip("切换至 100% 原始像素比例 (Ctrl+1)")
@@ -1201,6 +1281,7 @@ class LabelingStudioTab(QWidget):
             self.crosshair_btn,
             self.box_opacity_btn,
             self.onion_skin_btn,
+            self.loupe_btn,
             self.shortcut_help_btn,
             self.view_enhance_btn,
             self.view_enhance_menu_btn,
@@ -1223,6 +1304,7 @@ class LabelingStudioTab(QWidget):
         f_lay.addWidget(enhance_grp)
         f_lay.addWidget(self.box_opacity_btn)
         f_lay.addWidget(self.onion_skin_btn)
+        f_lay.addWidget(self.loupe_btn)
         f_lay.addWidget(self._make_vsep())
         f_lay.addWidget(self.zoom_out_btn)
         f_lay.addWidget(self.zoom_menu_btn)
@@ -1479,18 +1561,25 @@ class LabelingStudioTab(QWidget):
         file_title.setStyleSheet("font-weight: 600; color: #24292f;")
         self.status_label = _ElidedStatusLabel("未打开目录")
         self.status_label.setStyleSheet("border: none; color: #57606a; font-size: 11px;")
-        self.audit_btn = QPushButton("模型反查")
+        self.health_check_btn = QPushButton("体检")
+        self.health_check_btn.setToolTip(
+            "数据集标注健康体检：纯离线扫描当前目录全部标注（类别不平衡、过小框、极端长宽比、重复框与待确认问题），点击一键跳转修复"
+        )
+        self.health_check_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.health_check_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+        self.audit_btn = QPushButton("反查")
         self.audit_btn.setToolTip(
-            "使用已训练的 YOLO .pt 权重扫描当前标注目录，按异常严重度置顶疑似漏标、错类、误标与偏移框"
+            "模型反查：使用已训练的 YOLO .pt 权重扫描当前标注目录，按异常严重度置顶疑似漏标、错类、误标与偏移框"
         )
         self.audit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.audit_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
+        self.audit_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.setToolTip("重新扫描当前目录中的图片与 .json 标注状态")
         self.refresh_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.refresh_btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
+        self.refresh_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
         file_hdr.addWidget(file_title)
         file_hdr.addWidget(self.status_label, 1)
+        file_hdr.addWidget(self.health_check_btn)
         file_hdr.addWidget(self.audit_btn)
         file_hdr.addWidget(self.refresh_btn)
         file_lay.addLayout(file_hdr)
@@ -1523,6 +1612,7 @@ class LabelingStudioTab(QWidget):
         self.status_filter_combo.addItem("已标注", "labeled")
         self.status_filter_combo.addItem("空图 (0框)", "empty")
         self.status_filter_combo.addItem("待复核", "review")
+        self.status_filter_combo.addItem("待确认问题", "issue")
         self.status_filter_combo.setMinimumWidth(88)
         self.status_filter_combo.setMaximumWidth(112)
         self.status_filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1622,6 +1712,9 @@ class LabelingStudioTab(QWidget):
         self.save_btn.clicked.connect(lambda: self.save_current_annotation(force=True))
         self.verify_next_btn.clicked.connect(self._verify_and_next)
         self.clear_hint_btn.clicked.connect(self._clear_missing_hint)
+        self.edit_issue_btn.clicked.connect(self._prompt_issue_note)
+        self.next_issue_banner_btn.clicked.connect(self.open_next_issue_image)
+        self.health_check_btn.clicked.connect(self.open_dataset_health_dialog)
         self.sam_refine_btn.clicked.connect(self._on_sam_refine_clicked)
         self.llm_fix_btn.clicked.connect(self._on_llm_fix_box_clicked)
         self.keep_view_chk.toggled.connect(self._on_keep_view_toggled)
@@ -1631,6 +1724,7 @@ class LabelingStudioTab(QWidget):
         self.view_enhance_menu_btn.clicked.connect(self._on_view_enhance_menu_clicked)
         self.box_opacity_btn.clicked.connect(self._on_box_opacity_menu_clicked)
         self.onion_skin_btn.toggled.connect(self._on_onion_skin_toggled)
+        self.loupe_btn.toggled.connect(self._on_loupe_toggled)
         self.conf_threshold_slider.valueChanged.connect(self._on_conf_threshold_changed)
         self.prune_low_conf_btn.clicked.connect(self._prune_low_confidence_boxes)
         self.conf_reset_btn.clicked.connect(lambda: self.conf_threshold_slider.setValue(0))
@@ -1859,6 +1953,15 @@ class LabelingStudioTab(QWidget):
             return True
         if key == Qt.Key.Key_O and not (mods & Qt.KeyboardModifier.ShiftModifier):
             self.onion_skin_btn.toggle()
+            return True
+        if key == Qt.Key.Key_M and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            self.loupe_btn.toggle()
+            return True
+        if key == Qt.Key.Key_I:
+            if mods & Qt.KeyboardModifier.ShiftModifier:
+                self.open_next_issue_image()
+            elif self._doc is not None:
+                self._prompt_issue_note()
             return True
         if key == Qt.Key.Key_X and not (mods & Qt.KeyboardModifier.ShiftModifier):
             self.crosshair_btn.toggle()
@@ -2320,6 +2423,10 @@ class LabelingStudioTab(QWidget):
         ):
             if worker is not None and worker.isRunning():
                 worker.wait(3000)
+        if self._health_dialog is not None:
+            self._health_dialog.close()
+        if self._shortcut_help_dlg is not None:
+            self._shortcut_help_dlg.close()
         return True
 
     # ------------------------------------------------------------------
@@ -2380,6 +2487,8 @@ class LabelingStudioTab(QWidget):
             base_text = f"{rel}  [{summary.box_count}]"
         elif key == "empty":
             base_text = f"{rel}  [0]"
+        if summary.has_issue:
+            base_text = f"{base_text}  ⚑"
 
         report = self._audit_report_map.get(img_path.resolve())
         if report is not None and report.has_issues:
@@ -2417,6 +2526,9 @@ class LabelingStudioTab(QWidget):
             if mode == "audit":
                 report = self._audit_report_map.get(img_path.resolve())
                 if report is None or not report.has_issues:
+                    continue
+            elif mode == "issue":
+                if not summary.has_issue:
                     continue
             elif mode != "all" and summary.status_key != mode:
                 continue
@@ -2468,11 +2580,13 @@ class LabelingStudioTab(QWidget):
                     self._format_file_item_text(img_path, summary),
                 )
                 item.setData(Qt.ItemDataRole.UserRole, str(img_path))
+                tip_lines = [str(img_path)]
+                if summary.has_issue:
+                    tip_lines.append(f"待确认问题：{summary.issue_note or '已标记待确认'}")
                 report = self._audit_report_map.get(img_path.resolve())
                 if report is not None and report.has_issues:
-                    item.setToolTip(f"{img_path}\n{report.headline_summary()}")
-                else:
-                    item.setToolTip(str(img_path))
+                    tip_lines.append(report.headline_summary())
+                item.setToolTip("\n".join(tip_lines))
                 self._style_file_item(item, summary, img_path)
                 self.file_list.addItem(item)
                 if cur_img is not None and img_path == cur_img:
@@ -2665,9 +2779,14 @@ class LabelingStudioTab(QWidget):
         if self._doc is None:
             self.review_banner.setVisible(False)
             return
+        parts: list[str] = []
+        if self._doc.has_issue:
+            parts.append(f"⚑ 待确认问题：{self._doc.issue_note or '已标记待人工确认'}")
         if self._doc.has_missing_hint or self._doc.missing_note:
             note = self._doc.missing_note or "上游 LLM 怀疑本图可能存在漏标或待确认目标，请人工检查。"
-            self.review_banner_label.setText(f"⚠ AI 复核提醒：{note}")
+            parts.append(f"⚠ AI 复核提醒：{note}")
+        if parts:
+            self.review_banner_label.setText("\n".join(parts))
             self.review_banner.setVisible(True)
         else:
             self.review_banner.setVisible(False)
@@ -2964,6 +3083,7 @@ class LabelingStudioTab(QWidget):
         self.next_img_btn.setEnabled(len(self._filtered_images) > 1)
         self.jump_index_edit.setEnabled(len(self._filtered_images) > 0)
         self.next_unlabeled_btn.setEnabled(len(self._filtered_images) > 0)
+        self.health_check_btn.setEnabled(len(self._all_images) > 0)
         self.audit_btn.setEnabled(len(self._all_images) > 0)
         self.sam_point_mode_btn.setEnabled(has_img)
         self.sam_refine_btn.setEnabled(
@@ -3931,15 +4051,19 @@ class LabelingStudioTab(QWidget):
         self._push_undo_snapshot()
         self._doc.flags["has_missing_hint"] = False
         self._doc.flags["missing_note"] = ""
+        self._doc.flags["issue_flag"] = False
+        self._doc.flags["issue_note"] = ""
         self._apply_boxes_change(selected_idx=self.canvas.selected_index())
 
     def _verify_and_next(self) -> None:
-        """标记当前图已复核通过（自动清除漏标提醒并保存 .json，0 框时保存为显式空图负样本），再自动切下一张。"""
+        """标记当前图已复核通过（自动清除漏标与问题标记并保存 .json，0 框保存为空图负样本），再切下一张。"""
         if self._doc is None:
             return
         self._doc.flags["verified"] = True
         self._doc.flags["has_missing_hint"] = False
         self._doc.flags["missing_note"] = ""
+        self._doc.flags["issue_flag"] = False
+        self._doc.flags["issue_note"] = ""
         self._dirty = True
         if self.save_current_annotation(force=True):
             self._refresh_review_banner()
@@ -4974,6 +5098,10 @@ class LabelingStudioTab(QWidget):
         toggle_onion_act = menu.addAction("上一帧框淡色参考 (O)")
         toggle_onion_act.setCheckable(True)
         toggle_onion_act.setChecked(self.onion_skin_btn.isChecked())
+        toggle_loupe_act = menu.addAction("光标局部放大镜 (M)")
+        toggle_loupe_act.setCheckable(True)
+        toggle_loupe_act.setChecked(self.loupe_btn.isChecked())
+        mark_issue_act = menu.addAction("标记 / 编辑本图问题备注... (I)")
         select_all_act = menu.addAction("全选可见目标框 (Ctrl+A)")
         select_all_act.setEnabled(bool(self._doc.boxes))
         show_all_vis_act = None
@@ -5011,6 +5139,10 @@ class LabelingStudioTab(QWidget):
             self.view_enhance_btn.toggle()
         elif chosen is toggle_onion_act:
             self.onion_skin_btn.toggle()
+        elif chosen is toggle_loupe_act:
+            self.loupe_btn.toggle()
+        elif chosen is mark_issue_act:
+            self._prompt_issue_note()
         elif chosen is select_all_act:
             self._select_all_visible_boxes()
         elif show_all_vis_act is not None and chosen is show_all_vis_act:
@@ -5486,6 +5618,147 @@ class LabelingStudioTab(QWidget):
         else:
             self.canvas.show_hud_message("已关闭上一帧洋葱皮参考", color="#57606a", duration_ms=1200)
 
+    def _on_loupe_toggled(self, checked: bool) -> None:
+        self.canvas.set_loupe_enabled(checked)
+        if self.isVisible() and self._doc is not None:
+            msg = (
+                "已开启光标局部放大镜（3.5× 像素级贴边瞄准 · 再按 M 关闭）"
+                if checked
+                else "已关闭光标局部放大镜"
+            )
+            self.canvas.show_hud_message(
+                msg, color="#0969da" if checked else "#57606a", duration_ms=1400
+            )
+
+    def set_current_image_issue(self, flagged: bool, note: str = "") -> bool:
+        """设置或清除当前图片的「待确认问题」标记与备注（支持 Ctrl+Z 撤回，自动保存时即时写盘）。"""
+        if self._doc is None:
+            return False
+        clean_note = note.strip() if flagged else ""
+        is_flagged = bool(flagged) or bool(clean_note)
+        self._push_undo_snapshot()
+        self._doc.flags["issue_flag"] = is_flagged
+        self._doc.flags["issue_note"] = clean_note
+        if is_flagged:
+            self._doc.flags["verified"] = False
+        self._apply_boxes_change(
+            selected_idx=self.canvas.selected_index(),
+            selected_indices=self.canvas.selected_indices(),
+        )
+        if self.auto_save_chk.isChecked():
+            self.save_current_annotation(force=True)
+        msg = (
+            f"已标记待确认问题：{clean_note}" if clean_note else "已标记当前图为「待确认问题」"
+        ) if is_flagged else "已清除当前图问题标记"
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(
+                msg, color="#bf8700" if is_flagged else "#1a7f37", duration_ms=1500
+            )
+        return True
+
+    def _prompt_issue_note(self) -> None:
+        if self._doc is None:
+            return
+        dlg = _IssueNoteDialog(
+            self._doc.image_path.name,
+            flagged=self._doc.has_issue,
+            note=self._doc.issue_note,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        flagged, note = dlg.result_issue()
+        self.set_current_image_issue(flagged, note)
+
+    def open_next_issue_image(self) -> bool:
+        """按顺序循环跳转到下一张带「待确认问题」或 AI 复核提醒的图片（快捷键 Shift+I）。"""
+        if not self._all_images:
+            return False
+
+        def _is_issue_img(p: Path) -> bool:
+            s = self._status_map.get(p) or inspect_image_status(p)
+            return bool(s.has_issue or s.has_missing_hint)
+
+        pool = self._filtered_images if self._filtered_images else self._all_images
+        cur = self._doc.image_path if self._doc is not None else None
+        start_idx = pool.index(cur) if (cur is not None and cur in pool) else -1
+        candidates = pool[start_idx + 1 :] + pool[: max(0, start_idx)]
+        target = next((p for p in candidates if _is_issue_img(p)), None)
+
+        # 当前筛选列表内找不到时，退回全目录搜索并重置筛选定位
+        if target is None:
+            all_start = self._all_images.index(cur) if (cur is not None and cur in self._all_images) else -1
+            all_cands = self._all_images[all_start + 1 :] + self._all_images[: max(0, all_start)]
+            target = next((p for p in all_cands if _is_issue_img(p)), None)
+            if target is not None:
+                self._syncing_lists = True
+                try:
+                    self.file_search.clear()
+                    self.status_filter_combo.setCurrentIndex(0)
+                finally:
+                    self._syncing_lists = False
+                self._apply_file_filter(keep_current=False)
+
+        if target is None:
+            msg = "当前目录没有其他带问题标记或待复核的图片"
+            self.save_state_label.setText(msg)
+            if self.isVisible():
+                self.canvas.show_hud_message(msg, color="#1a7f37", duration_ms=1500)
+            return False
+
+        if self._may_continue():
+            self._load_image(target)
+            self._select_image_in_list(target)
+            return True
+        return False
+
+    def _build_dataset_health_report(self) -> DatasetHealthReport:
+        """基于当前目录图片与类别清单运行纯离线健康体检（若当前图有未保存改动先落盘同步）。"""
+        if self._doc is not None and self._dirty and self.auto_save_chk.isChecked():
+            self.save_current_annotation(force=True)
+        return analyze_dataset_health(self._all_images, known_classes=self._classes)
+
+    def open_dataset_health_dialog(self) -> DatasetHealthDialog | None:
+        """打开（或刷新并置顶）数据集标注健康体检面板。"""
+        if not self._all_images:
+            QMessageBox.information(self, "提示", "请先打开包含图片的标注目录。")
+            return None
+        report = self._build_dataset_health_report()
+        if self._health_dialog is None:
+            self._health_dialog = DatasetHealthDialog(
+                report,
+                rescan_provider=self._build_dataset_health_report,
+                parent=self,
+            )
+            self._health_dialog.jump_to_target.connect(self._jump_to_health_target)
+        else:
+            self._health_dialog.update_report(report)
+        self._health_dialog.show()
+        self._health_dialog.raise_()
+        self._health_dialog.activateWindow()
+        return self._health_dialog
+
+    def _jump_to_health_target(self, image_path: Path, box_idx: int) -> None:
+        """响应健康体检面板跳转信号：定位至目标图片，并在指定了有效框索引时自动选中聚焦。"""
+        resolved = image_path.resolve()
+        if self._doc is None or self._doc.image_path != resolved:
+            if not self._may_continue():
+                return
+            if resolved not in self._filtered_images:
+                self._syncing_lists = True
+                try:
+                    self.file_search.clear()
+                    self.status_filter_combo.setCurrentIndex(0)
+                finally:
+                    self._syncing_lists = False
+                self._apply_file_filter(keep_current=False)
+            self._load_image(resolved)
+            self._select_image_in_list(resolved)
+        if self._doc is not None and 0 <= box_idx < len(self._doc.boxes):
+            self.canvas.select_box(box_idx, emit_signal=True)
+            self.canvas.focus_box(box_idx)
+
     def _refresh_confidence_filter_bar(self) -> None:
         """按需显隐置信度过滤条并刷新隐藏低分框计数与一键清理按钮状态。"""
         boxes = self._doc.boxes if self._doc is not None else []
@@ -5564,9 +5837,9 @@ class LabelingStudioTab(QWidget):
             if fill_pct == 0:
                 self.box_opacity_btn.setText("仅描边 ▾")
             elif is_custom:
-                self.box_opacity_btn.setText(f"透明 {fill_pct}% ▾")
+                self.box_opacity_btn.setText(f"透明{fill_pct}% ▾")
             else:
-                self.box_opacity_btn.setText("框透明 ▾")
+                self.box_opacity_btn.setText("透明 ▾")
         finally:
             self.box_opacity_btn.blockSignals(False)
 

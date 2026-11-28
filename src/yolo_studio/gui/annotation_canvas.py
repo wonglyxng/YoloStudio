@@ -299,6 +299,10 @@ class AnnotationCanvasView(QGraphicsView):
         # 上一帧“洋葱皮”淡色参考框（已映射至当前图分辨率，纯背景参考不参与命中）
         self._onion_skin_boxes: list[RectAnnotation] = []
         self._onion_skin_visible: bool = False
+        # 光标局部像素放大镜（默认 3.5×，低倍率浏览整图时辅助角点像素级贴边）
+        self._loupe_enabled: bool = False
+        self._loupe_zoom: float = 3.5
+        self._loupe_size_px: int = 164
         # 目标框填充与描边不透明度（百分比：`fill ∈ [0,80]`, `stroke ∈ [20,100]`）
         self._box_fill_opacity: int = DEFAULT_BOX_FILL_OPACITY
         self._box_stroke_opacity: int = DEFAULT_BOX_STROKE_OPACITY
@@ -694,6 +698,31 @@ class AnnotationCanvasView(QGraphicsView):
         """更新上一帧映射后的参考框列表（纯视觉参照，不参与命中测试与保存）。"""
         self._onion_skin_boxes = [b.clone() for b in boxes]
         if self._onion_skin_visible:
+            self.viewport().update()
+
+    def loupe_enabled(self) -> bool:
+        """返回光标局部放大镜开关状态。"""
+        return self._loupe_enabled
+
+    def set_loupe_enabled(self, enabled: bool) -> None:
+        """切换是否开启光标局部像素放大镜（快捷键 M）。"""
+        flag = bool(enabled)
+        if flag == self._loupe_enabled:
+            return
+        self._loupe_enabled = flag
+        self.viewport().update()
+
+    def loupe_zoom(self) -> float:
+        """返回局部放大镜基础放大倍率（范围 `2.0 ~ 12.0`）。"""
+        return self._loupe_zoom
+
+    def set_loupe_zoom(self, zoom: float) -> None:
+        """设置局部放大镜基础放大倍率（自动夹紧在 `2.0 ~ 12.0`）。"""
+        clamped = max(2.0, min(12.0, round(float(zoom), 2)))
+        if abs(clamped - self._loupe_zoom) < 1e-6:
+            return
+        self._loupe_zoom = clamped
+        if self._loupe_enabled:
             self.viewport().update()
 
     def box_opacity(self) -> tuple[int, int]:
@@ -1910,7 +1939,7 @@ class AnnotationCanvasView(QGraphicsView):
             self._hover_idx = -1
             self._hover_handle = None
             self._update_cursor_for_hover()
-            if self._always_show_crosshair:
+            if self._always_show_crosshair or self._loupe_enabled:
                 self.viewport().update()
             return
 
@@ -1991,7 +2020,11 @@ class AnnotationCanvasView(QGraphicsView):
         self._hover_handle = self._hit_test_handle(scene_pos)
         self._hover_idx = self._selected_idx if self._hover_handle else self._hit_test_box(scene_pos)
         self._update_cursor_for_hover()
-        if (self._hover_idx, self._hover_handle) != prev_hover or self._always_show_crosshair:
+        if (
+            (self._hover_idx, self._hover_handle) != prev_hover
+            or self._always_show_crosshair
+            or self._loupe_enabled
+        ):
             self.viewport().update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
@@ -2383,6 +2416,7 @@ class AnnotationCanvasView(QGraphicsView):
             self._paint_crosshair(painter, inv)
 
         painter.restore()
+        self._paint_loupe_overlay(painter)
         self._paint_hud_overlay(painter)
 
     def _paint_crosshair(self, painter: QPainter, inv: float) -> None:
@@ -2532,6 +2566,137 @@ class AnnotationCanvasView(QGraphicsView):
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
         painter.restore()
+
+    def _paint_loupe_overlay(self, painter: QPainter) -> None:
+        """在光标旁避让绘制锐利像素级局部放大镜（叠加可见目标框与实时草稿框，辅助贴边对齐）。"""
+        if (
+            not self._loupe_enabled
+            or self._panning
+            or self._cursor_scene_pos is None
+            or self._last_cursor_view_pos is None
+            or self._image_width <= 0
+            or self._image_height <= 0
+        ):
+            return
+        cx = float(self._cursor_scene_pos.x())
+        cy = float(self._cursor_scene_pos.y())
+        if not (0.0 <= cx <= float(self._image_width) and 0.0 <= cy <= float(self._image_height)):
+            return
+        pix = self._pixmap_item.pixmap()
+        if pix.isNull():
+            return
+
+        vw = self.viewport().width()
+        vh = self.viewport().height()
+        size = float(self._loupe_size_px)
+        if vw < int(size) + 40 or vh < int(size) + 40:
+            return
+
+        # 默认偏移到光标右下方，贴边时自动镜像翻到左/上方避让，绝不遮挡当前瞄准点
+        vx = float(self._last_cursor_view_pos.x())
+        vy = float(self._last_cursor_view_pos.y())
+        offset = 24.0
+        lx = vx + offset
+        ly = vy + offset
+        if lx + size + 10.0 > float(vw):
+            lx = vx - offset - size
+        if ly + size + 10.0 > float(vh):
+            ly = vy - offset - size
+        lx = max(8.0, min(float(vw) - size - 8.0, lx))
+        ly = max(8.0, min(float(vh) - size - 8.0, ly))
+        loupe_rect = QRectF(lx, ly, size, size)
+
+        # 有效放大倍率至少为当前视口倍率的 2 倍，确保放大后依然看得更细
+        eff_zoom = min(16.0, max(self._loupe_zoom, self._logical_scale() * 2.0))
+        half_src = (size * 0.5) / eff_zoom
+        src_x0 = cx - half_src
+        src_y0 = cy - half_src
+        src_rect = QRectF(src_x0, src_y0, half_src * 2.0, half_src * 2.0)
+
+        painter.save()
+        try:
+            painter.setWorldMatrixEnabled(False)
+            clip_path = QPainterPath()
+            clip_path.addRoundedRect(loupe_rect, 10.0, 10.0)
+            painter.setClipPath(clip_path)
+
+            painter.fillRect(loupe_rect, QColor(22, 27, 34))
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            painter.drawPixmap(loupe_rect, pix, src_rect)
+
+            # 叠加绘制当前可见目标框与实时拖拽/画框预览，让角点对齐一目了然
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for idx, box in enumerate(self._boxes):
+                if not self.is_box_visible(idx):
+                    continue
+                if (
+                    idx == self._dragging_box_idx
+                    and self._edit_action in ("dragging_handle", "moving_box")
+                    and self._drag_preview_rect is not None
+                ):
+                    bx1, by1, bx2, by2 = self._drag_preview_rect
+                elif self._edit_action == "moving_multi" and idx in self._multi_drag_previews:
+                    bx1, by1, bx2, by2 = self._multi_drag_previews[idx]
+                else:
+                    bx1, by1, bx2, by2 = box.x1, box.y1, box.x2, box.y2
+                if bx2 < src_x0 or bx1 > (src_x0 + half_src * 2.0) or by2 < src_y0 or by1 > (src_y0 + half_src * 2.0):
+                    continue
+                r, g, b = label_color_rgb(box.label)
+                mapped = QRectF(
+                    lx + (bx1 - src_x0) * eff_zoom,
+                    ly + (by1 - src_y0) * eff_zoom,
+                    (bx2 - bx1) * eff_zoom,
+                    (by2 - by1) * eff_zoom,
+                )
+                w = 2.0 if idx in self._selected_indices else 1.4
+                painter.setPen(QPen(QColor(r, g, b, 235), w))
+                painter.drawRect(mapped)
+
+            if self._mode == self.MODE_DRAW and self._draw_state != "idle":
+                dx1, dx2 = sorted((self._draw_start.x(), self._draw_current.x()))
+                dy1, dy2 = sorted((self._draw_start.y(), self._draw_current.y()))
+                r, g, b = label_color_rgb(self._active_label or "draft")
+                mapped_draft = QRectF(
+                    lx + (dx1 - src_x0) * eff_zoom,
+                    ly + (dy1 - src_y0) * eff_zoom,
+                    (dx2 - dx1) * eff_zoom,
+                    (dy2 - dy1) * eff_zoom,
+                )
+                painter.setPen(QPen(QColor(r, g, b, 240), 1.6, Qt.PenStyle.DashLine))
+                painter.drawRect(mapped_draft)
+
+            # 镜心细十字准线（中心留空 4px，不遮挡中心像素）
+            mcx = lx + size * 0.5
+            mcy = ly + size * 0.5
+            painter.setPen(QPen(QColor(255, 255, 255, 210), 1.0))
+            painter.drawLine(QPointF(lx, mcy), QPointF(mcx - 4.0, mcy))
+            painter.drawLine(QPointF(mcx + 4.0, mcy), QPointF(lx + size, mcy))
+            painter.drawLine(QPointF(mcx, ly), QPointF(mcx, mcy - 4.0))
+            painter.drawLine(QPointF(mcx, mcy + 4.0), QPointF(mcx, ly + size))
+
+            # 镜底半透明像素坐标与倍率条
+            bar_h = 20.0
+            bar_rect = QRectF(lx, ly + size - bar_h, size, bar_h)
+            painter.fillRect(bar_rect, QColor(22, 27, 34, 200))
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor(240, 246, 252)))
+            painter.setFont(QFont("Consolas", 8))
+            painter.drawText(
+                bar_rect,
+                Qt.AlignmentFlag.AlignCenter,
+                f"({int(cx)}, {int(cy)}) · {eff_zoom:.1f}×",
+            )
+
+            # 外边框
+            painter.setClipping(False)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(22, 27, 34, 230), 2.4))
+            painter.drawRoundedRect(loupe_rect, 10.0, 10.0)
+            painter.setPen(QPen(QColor(255, 255, 255, 190), 1.0))
+            painter.drawRoundedRect(loupe_rect.adjusted(1.0, 1.0, -1.0, -1.0), 9.0, 9.0)
+        finally:
+            painter.restore()
 
     def _paint_hud_overlay(self, painter: QPainter) -> None:
         """在画布视口顶部中央按需绘制轻量悬浮提示胶囊（不遮挡目标且不拦截鼠标事件）。"""

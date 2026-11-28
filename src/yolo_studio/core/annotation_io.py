@@ -193,6 +193,16 @@ class ImageAnnotationDoc:
     def is_verified(self) -> bool:
         return bool(self.flags.get("verified"))
 
+    @property
+    def has_issue(self) -> bool:
+        """是否被人工标记为“待确认问题”（含仅有备注文本的情况）。"""
+        return bool(self.flags.get("issue_flag")) or bool(self.issue_note)
+
+    @property
+    def issue_note(self) -> str:
+        val = self.flags.get("issue_note")
+        return str(val).strip() if val else ""
+
 
 @dataclass(frozen=True)
 class ImageStatusSummary:
@@ -205,11 +215,13 @@ class ImageStatusSummary:
     has_missing_hint: bool
     is_verified: bool
     labels: tuple[str, ...] = ()
+    has_issue: bool = False
+    issue_note: str = ""
 
     @property
     def status_key(self) -> str:
-        """归类状态：`review`（含漏标提示）、`labeled`（含框）、`empty`（显式 0 框负样本）、`unlabeled`（无标注文件）。"""
-        if self.has_missing_hint:
+        """归类状态：`review`（含漏标提示或问题标记）、`labeled`（含框）、`empty`（显式 0 框负样本）、`unlabeled`（无标注文件）。"""
+        if self.has_missing_hint or self.has_issue:
             return "review"
         if not self.has_json:
             return "unlabeled"
@@ -436,6 +448,8 @@ def inspect_image_status(image_path: Path) -> ImageStatusSummary:
                 labels.append(lbl)
 
     flags = data.get("flags") if isinstance(data.get("flags"), dict) else {}
+    issue_note = str(flags.get("issue_note") or "").strip()
+    has_issue = bool(flags.get("issue_flag")) or bool(issue_note)
     return ImageStatusSummary(
         image_path=resolved_img,
         json_path=json_path,
@@ -444,6 +458,8 @@ def inspect_image_status(image_path: Path) -> ImageStatusSummary:
         has_missing_hint=bool(flags.get("has_missing_hint")),
         is_verified=bool(flags.get("verified")),
         labels=tuple(labels),
+        has_issue=has_issue,
+        issue_note=issue_note,
     )
 
 

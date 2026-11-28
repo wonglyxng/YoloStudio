@@ -24,6 +24,7 @@ WORKBENCH_SHORTCUT_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] =
         (
             ("A / D", "上一张 / 下一张图片"),
             ("F", "确认通过当前图并跳到下一张（0 框保存为空图负样本）"),
+            ("I / Shift+I", "标记或编辑当前图问题备注 / 跳到下一张问题图"),
             ("Ctrl+S", "立即保存当前图片标注"),
             ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
         ),
@@ -78,6 +79,7 @@ WORKBENCH_SHORTCUT_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] =
             ("O", "显示 / 隐藏上一帧框淡色参考（洋葱皮）"),
             ("X", "常显十字准星"),
             ("B", "暗部 / 对比度临时增强"),
+            ("M", "光标局部放大镜（3.5× 像素级贴边瞄准）"),
             ("? / F1", "打开 / 关闭本面板"),
         ),
     ),
