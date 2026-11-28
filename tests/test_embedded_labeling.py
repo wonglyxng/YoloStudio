@@ -3591,3 +3591,197 @@ def test_workbench_box_opacity_panel_and_searchable_class_picker(
         assert win2.labeling_tab.prompt_label_after_draw_chk.isChecked() is True
     finally:
         win2.close()
+
+
+def test_workbench_onion_skin_confidence_filter_and_multi_select_batch_ops(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证上一帧洋葱皮参考(O)、置信度阈值过滤与删低分、以及多选框(Ctrl/Shift/Ctrl+A)批量改类/平移/锁定/删除。"""
+    from PyQt6.QtCore import QPointF
+
+    frames_dir = tmp_path / "batch3_frames"
+    f0 = frames_dir / "f0.jpg"
+    f1 = frames_dir / "f1.jpg"
+    # f0 与 f1 不同分辨率，顺便验证洋葱皮跨分辨率等比映射
+    _write_sample_frame(f0, (200, 150))
+    _write_sample_frame(f1, (400, 300))
+
+    f0.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "hero",
+                        "points": [[20.0, 30.0], [60.0, 90.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    }
+                ],
+                "imagePath": f0.name,
+                "imageHeight": 150,
+                "imageWidth": 200,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    f1.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "version": "2.5.4",
+                "flags": {},
+                "shapes": [
+                    {
+                        "label": "hero",
+                        "score": 0.92,
+                        "points": [[40.0, 60.0], [120.0, 180.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "monster",
+                        "score": 0.28,
+                        "points": [[160.0, 60.0], [220.0, 140.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "monster",
+                        "score": 0.35,
+                        "points": [[260.0, 60.0], [320.0, 140.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                    {
+                        "label": "item",
+                        "score": None,  # 人工手画无置信度框，永远不受阈值过滤与删低分影响
+                        "points": [[160.0, 180.0], [240.0, 250.0]],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                    },
+                ],
+                "imagePath": f1.name,
+                "imageHeight": 300,
+                "imageWidth": 400,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+
+        # f0 无带分框 -> 置信度过滤条默认隐藏，且无上一帧洋葱皮
+        assert tab.conf_filter_bar.isVisible() is False
+
+        # 切到 f1：含 3 个带分框 + 1 个人工框 -> 置信度过滤条自动出现
+        tab.open_next_image()
+        qt_app.processEvents()
+        assert tab._doc is not None and tab._doc.image_path == f1.resolve()
+        assert tab.conf_filter_bar.isVisible() is True
+
+        # 1) 上一帧洋葱皮参考 (O)：跨分辨率等比映射 f0 的 hero (20,30,60,90) -> (40,60,120,180)
+        QTest.keyClick(tab.canvas, Qt.Key.Key_O)
+        qt_app.processEvents()
+        assert tab.onion_skin_btn.isChecked() is True
+        assert tab.canvas.onion_skin_visible() is True
+        assert len(tab.canvas._onion_skin_boxes) == 1
+        ob = tab.canvas._onion_skin_boxes[0]
+        assert (ob.x1, ob.y1, ob.x2, ob.y2) == (40.0, 60.0, 120.0, 180.0)
+        QTest.keyClick(tab.canvas, Qt.Key.Key_O)
+        qt_app.processEvents()
+        assert tab.canvas.onion_skin_visible() is False
+
+        # 2) 置信度阈值实时过滤与一键删低分：拉到 0.50 隐藏 0.28 & 0.35，但绝不隐藏人工框 item
+        tab.conf_threshold_slider.setValue(50)
+        qt_app.processEvents()
+        assert tab.canvas.is_box_visible(0) is True   # 0.92
+        assert tab.canvas.is_box_visible(1) is False  # 0.28
+        assert tab.canvas.is_box_visible(2) is False  # 0.35
+        assert tab.canvas.is_box_visible(3) is True   # None（人工框不受影响）
+        assert "[低分]" in tab.shape_list.item(1).text()
+        assert "删低分(2)" in tab.prune_low_conf_btn.text()
+
+        # 锁定其中一个低分框 (#2) 后点击删低分 -> 仅删未锁定低分框 (#1)，保留锁定框 (#2) 且可 Ctrl+Z 撤回
+        tab._toggle_box_locked(2)
+        pruned = tab._prune_low_confidence_boxes()
+        qt_app.processEvents()
+        assert pruned == 1
+        assert len(tab._doc.boxes) == 3
+        assert tab.canvas.is_box_locked(1) is True  # 原 #2 重排到 #1
+        tab._undo()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 4
+        tab._unlock_all_boxes()
+        tab.conf_reset_btn.click()
+        qt_app.processEvents()
+        assert tab.canvas.min_confidence() == 0.0
+        assert all(tab.canvas.is_box_visible(i) for i in range(4))
+
+        # 3) 多选批量操作：Ctrl+A 全选可见框 -> 批量改类、整组平移、批量锁定、批量删除（跳过锁定）
+        tab.canvas.setFocus()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        qt_app.processEvents()
+        assert tab.canvas.selected_indices() == [0, 1, 2, 3]
+        assert "已多选 4 个目标框" in tab.box_detail_label.text()
+        assert tab.change_cls_btn.text() == "批量改类"
+        assert tab.box_del_inline_btn.text() == "批量删除"
+
+        # 单独锁定 #0 后，多选 [0, 1, 2] 整组微调 +10px：仅未锁定的 #1/#2 移动，#0 不动，且单次撤销回退
+        tab._toggle_box_locked(0)
+        tab.canvas.select_boxes([0, 1, 2], primary=2, emit_signal=True)
+        qt_app.processEvents()
+        orig_x = [b.x1 for b in tab._doc.boxes]
+        tab._nudge_selected_box(10, 0)
+        qt_app.processEvents()
+        assert tab._doc.boxes[0].x1 == orig_x[0]        # 锁定框不动
+        assert tab._doc.boxes[1].x1 == orig_x[1] + 10.0
+        assert tab._doc.boxes[2].x1 == orig_x[2] + 10.0
+
+        # 多选批量改类（跳过锁定 #0，把 #1/#2 一次改为 item）
+        changed = tab._relabel_boxes(tab.canvas.selected_indices(), "item")
+        qt_app.processEvents()
+        assert changed == 2
+        assert tab._doc.boxes[0].label == "hero"
+        assert tab._doc.boxes[1].label == "item"
+        assert tab._doc.boxes[2].label == "item"
+
+        # 多选整组拖拽（boxes_geometry_committed 信号）：同时更新多个框坐标并单次撤销
+        tab.canvas.boxes_geometry_committed.emit(
+            [
+                (1, 180.0, 70.0, 240.0, 150.0),
+                (2, 280.0, 70.0, 340.0, 150.0),
+            ]
+        )
+        qt_app.processEvents()
+        assert tab._doc.boxes[1].x1 == 180.0 and tab._doc.boxes[2].x1 == 280.0
+
+        # 多选批量删除：选中 [0, 1, 2] 时自动保留锁定框 #0，一次性删掉 #1/#2
+        tab.canvas.select_boxes([0, 1, 2], primary=2, emit_signal=True)
+        tab._delete_selected_box()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 2
+        assert [b.label for b in tab._doc.boxes] == ["hero", "item"]
+        assert tab.canvas.is_box_locked(0) is True
+
+        # 验证整组夹紧工具不挤变形
+        moved = tab.canvas._compute_multi_moved_rects(
+            {0: (10.0, 10.0, 50.0, 50.0), 1: (300.0, 10.0, 380.0, 50.0)},
+            QPointF(100.0, 0.0),  # 图像宽 400，最多右移 20
+        )
+        assert moved[0] == (30.0, 10.0, 70.0, 50.0)
+        assert moved[1] == (320.0, 10.0, 400.0, 50.0)
+    finally:
+        win.labeling_tab._dirty = False
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()

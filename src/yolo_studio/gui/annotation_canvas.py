@@ -249,7 +249,9 @@ class AnnotationCanvasView(QGraphicsView):
     # 画布交互信号
     box_drawn = Signal(float, float, float, float)  # 新绘制矩形框 (x1, y1, x2, y2)
     box_geometry_committed = Signal(int, float, float, float, float)  # 拖拽/调大小提交 (index, x1, y1, x2, y2)
-    selection_changed = Signal(int)  # 选中框索引变更，无选中为 -1
+    boxes_geometry_committed = Signal(object)  # 多选整组平移提交：list[tuple[int, x1, y1, x2, y2]]
+    selection_changed = Signal(int)  # 主选中框索引变更，无选中为 -1
+    multi_selection_changed = Signal(object)  # 全部选中框索引变更（升序 list[int]）
     mode_changed = Signal(str)  # 交互模式变更 ("edit" | "draw" | "sam_point" | "pan")
     zoom_changed = Signal(float)  # 缩放倍率变更 (1.0 = 100%)
     cursor_pos_changed = Signal(int, int)  # 鼠标图像像素坐标变更（移出图像时发 -1, -1）
@@ -274,6 +276,7 @@ class AnnotationCanvasView(QGraphicsView):
         self._source_pixmap: QPixmap = QPixmap()
         self._boxes: list[RectAnnotation] = []
         self._selected_idx: int = -1
+        self._selected_indices: set[int] = set()
         self._hover_idx: int = -1
         self._hover_handle: str | None = None
         self._mode: str = self.MODE_EDIT
@@ -291,6 +294,11 @@ class AnnotationCanvasView(QGraphicsView):
         self._hidden_classes: set[str] = set()
         self._hidden_box_indices: set[int] = set()
         self._locked_box_indices: set[int] = set()
+        # AI 预标注置信度下限过滤（0.0=不过滤；仅过滤 score 非空的框，永不隐藏人工手画框）
+        self._min_confidence_threshold: float = 0.0
+        # 上一帧“洋葱皮”淡色参考框（已映射至当前图分辨率，纯背景参考不参与命中）
+        self._onion_skin_boxes: list[RectAnnotation] = []
+        self._onion_skin_visible: bool = False
         # 目标框填充与描边不透明度（百分比：`fill ∈ [0,80]`, `stroke ∈ [20,100]`）
         self._box_fill_opacity: int = DEFAULT_BOX_FILL_OPACITY
         self._box_stroke_opacity: int = DEFAULT_BOX_STROKE_OPACITY
@@ -334,14 +342,20 @@ class AnnotationCanvasView(QGraphicsView):
         self._sam_hover_rect: tuple[float, float, float, float] | None = None
         self._sam_hover_contours: list[list[tuple[float, float]]] = []
 
-        # 编辑拖拽状态（带最小移动阈值防手抖误改）
-        self._edit_action: str = "none"  # "none" | "pending_handle" | "dragging_handle" | "pending_move" | "moving_box" | "pending_blank_pan" | "blank_panning"
+        # 编辑拖拽状态（带最小移动阈值防手抖误改；含多框整体平移与 Shift/Ctrl 橡皮筋框选）
+        self._edit_action: str = "none"
         self._edit_press_view_pos: QPointF = QPointF()
         self._dragging_box_idx: int = -1
         self._dragging_handle: str | None = None
         self._drag_origin_rect: tuple[float, float, float, float] | None = None
         self._drag_start_scene: QPointF = QPointF()
         self._drag_preview_rect: tuple[float, float, float, float] | None = None
+        self._multi_drag_origins: dict[int, tuple[float, float, float, float]] = {}
+        self._multi_drag_previews: dict[int, tuple[float, float, float, float]] = {}
+        self._multi_click_candidate: int = -1
+        self._marquee_start: QPointF = QPointF()
+        self._marquee_current: QPointF = QPointF()
+        self._marquee_additive: bool = False
 
         self._cursor_scene_pos: QPointF | None = None
         self._last_cursor_view_pos: QPointF | None = None
@@ -629,16 +643,58 @@ class AnnotationCanvasView(QGraphicsView):
         self.viewport().update()
 
     def is_box_visible(self, idx: int) -> bool:
-        """判断指定索引目标框当前在画布上是否可见（未被单框隐藏且所属类别未被隐藏）。"""
+        """判断指定索引目标框当前在画布上是否可见（未单框隐藏、类别未隐藏且满足置信度下限）。"""
         if not (0 <= idx < len(self._boxes)):
             return False
         if idx in self._hidden_box_indices:
             return False
-        return self._boxes[idx].label not in self._hidden_classes
+        box = self._boxes[idx]
+        if box.label in self._hidden_classes:
+            return False
+        if (
+            self._min_confidence_threshold > 0.0
+            and box.score is not None
+            and box.score < self._min_confidence_threshold
+        ):
+            return False
+        return True
 
     def is_box_locked(self, idx: int) -> bool:
         """判断指定索引目标框是否已锁定。"""
         return 0 <= idx < len(self._boxes) and idx in self._locked_box_indices
+
+    def min_confidence(self) -> float:
+        """返回当前 AI 预标注置信度下限阈值（`0.0 ~ 0.99`；`0.0` 表示不过滤）。"""
+        return self._min_confidence_threshold
+
+    def set_min_confidence(self, threshold: float) -> None:
+        """设置 AI 预标注置信度过滤下限（仅隐藏低于阈值且带 `score` 的框，不影响人工框）。"""
+        clamped = max(0.0, min(0.99, round(float(threshold), 3)))
+        if abs(clamped - self._min_confidence_threshold) < 1e-6:
+            return
+        self._min_confidence_threshold = clamped
+        if self._hover_idx >= 0 and not self.is_box_visible(self._hover_idx):
+            self._hover_idx = -1
+            self._hover_handle = None
+        self.viewport().update()
+
+    def onion_skin_visible(self) -> bool:
+        """返回上一帧“洋葱皮”淡色参考框叠层的显隐状态。"""
+        return self._onion_skin_visible
+
+    def set_onion_skin_visible(self, visible: bool) -> None:
+        """切换是否绘制上一帧映射框的淡色虚影参考层。"""
+        flag = bool(visible)
+        if flag == self._onion_skin_visible:
+            return
+        self._onion_skin_visible = flag
+        self.viewport().update()
+
+    def set_onion_skin_boxes(self, boxes: list[RectAnnotation]) -> None:
+        """更新上一帧映射后的参考框列表（纯视觉参照，不参与命中测试与保存）。"""
+        self._onion_skin_boxes = [b.clone() for b in boxes]
+        if self._onion_skin_visible:
+            self.viewport().update()
 
     def box_opacity(self) -> tuple[int, int]:
         """返回当前目标框 `(填充不透明度%, 描边不透明度%)`。"""
@@ -836,7 +892,9 @@ class AnnotationCanvasView(QGraphicsView):
         self._boxes = []
         self._hidden_box_indices.clear()
         self._locked_box_indices.clear()
+        self._onion_skin_boxes.clear()
         self._selected_idx = -1
+        self._selected_indices.clear()
         self._hover_idx = -1
         self._hover_handle = None
         self._audit_overlays.clear()
@@ -873,7 +931,9 @@ class AnnotationCanvasView(QGraphicsView):
         self._boxes = []
         self._hidden_box_indices.clear()
         self._locked_box_indices.clear()
+        self._onion_skin_boxes.clear()
         self._selected_idx = -1
+        self._selected_indices.clear()
         self._hover_idx = -1
         self._hover_handle = None
         self._audit_overlays.clear()
@@ -886,30 +946,78 @@ class AnnotationCanvasView(QGraphicsView):
         self.zoom_changed.emit(1.0)
         self.viewport().update()
 
-    def set_boxes(self, boxes: list[RectAnnotation], selected_index: int = -1) -> None:
-        """整体刷新画布显示的矩形框列表并同步选中索引（不触发 `selection_changed`）。"""
+    def set_boxes(
+        self,
+        boxes: list[RectAnnotation],
+        selected_index: int = -1,
+        *,
+        selected_indices: list[int] | set[int] | None = None,
+    ) -> None:
+        """整体刷新画布显示的矩形框列表并同步选中状态（不触发 `selection_changed`）。"""
         self._cancel_transient_interactions()
         self._boxes = [b.clone() for b in boxes]
         box_count = len(self._boxes)
         self._hidden_box_indices = {i for i in self._hidden_box_indices if 0 <= i < box_count}
         self._locked_box_indices = {i for i in self._locked_box_indices if 0 <= i < box_count}
-        if 0 <= selected_index < box_count:
+        if selected_indices is not None:
+            valid = {int(i) for i in selected_indices if 0 <= int(i) < box_count}
+            self._selected_indices = valid
+            if 0 <= selected_index < box_count and selected_index in valid:
+                self._selected_idx = selected_index
+            elif valid:
+                self._selected_idx = max(valid)
+            else:
+                self._selected_idx = -1
+        elif 0 <= selected_index < box_count:
             self._selected_idx = selected_index
+            self._selected_indices = {selected_index}
         else:
             self._selected_idx = -1
+            self._selected_indices = set()
         self._hover_idx = -1
         self._hover_handle = None
         self.viewport().update()
 
-    def select_box(self, idx: int, *, emit_signal: bool = True) -> None:
-        """选中指定索引的矩形框（越界或 `< 0` 则清除选中）。"""
-        target = idx if 0 <= idx < len(self._boxes) else -1
-        if target == self._selected_idx:
+    def selected_indices(self) -> list[int]:
+        """返回当前全部选中框的升序索引列表（空列表表示未选中）。"""
+        return sorted(i for i in self._selected_indices if 0 <= i < len(self._boxes))
+
+    def select_boxes(
+        self,
+        indices: list[int] | set[int] | tuple[int, ...],
+        *,
+        primary: int = -1,
+        emit_signal: bool = True,
+    ) -> None:
+        """设置多选框索引集合，同步更新主选中框 `_selected_idx` 并按需发射变更信号。"""
+        valid = {int(i) for i in indices if 0 <= int(i) < len(self._boxes)}
+        if 0 <= primary < len(self._boxes) and primary in valid:
+            next_primary = primary
+        elif valid:
+            next_primary = max(valid)
+        else:
+            next_primary = -1
+        if valid == self._selected_indices and next_primary == self._selected_idx:
             return
-        self._selected_idx = target
+        self._selected_indices = valid
+        self._selected_idx = next_primary
         self.viewport().update()
         if emit_signal:
             self.selection_changed.emit(self._selected_idx)
+            self.multi_selection_changed.emit(sorted(self._selected_indices))
+
+    def select_box(self, idx: int, *, emit_signal: bool = True) -> None:
+        """单选指定索引的矩形框（越界或 `< 0` 则清除全部选中）。"""
+        target = idx if 0 <= idx < len(self._boxes) else -1
+        target_set = {target} if target >= 0 else set()
+        if target == self._selected_idx and target_set == self._selected_indices:
+            return
+        self._selected_idx = target
+        self._selected_indices = target_set
+        self.viewport().update()
+        if emit_signal:
+            self.selection_changed.emit(self._selected_idx)
+            self.multi_selection_changed.emit(sorted(self._selected_indices))
 
     # ------------------------------------------------------------------
     # 精准锚点缩放、动态边界与视口状态管理
@@ -1193,6 +1301,7 @@ class AnnotationCanvasView(QGraphicsView):
     def _hit_test_handle(self, scene_pos: QPointF) -> str | None:
         if (
             self._mode != self.MODE_EDIT
+            or len(self._selected_indices) > 1
             or not (0 <= self._selected_idx < len(self._boxes))
             or not self.is_box_visible(self._selected_idx)
             or self.is_box_locked(self._selected_idx)
@@ -1235,6 +1344,10 @@ class AnnotationCanvasView(QGraphicsView):
         self._dragging_handle = None
         self._drag_origin_rect = None
         self._drag_preview_rect = None
+        self._multi_drag_origins.clear()
+        self._multi_drag_previews.clear()
+        self._multi_click_candidate = -1
+        self._marquee_additive = False
 
     def _start_pan(self, view_pos: QPointF, trigger: str) -> None:
         self._zoom_anchor_cache = None
@@ -1425,6 +1538,33 @@ class AnnotationCanvasView(QGraphicsView):
             ny1 = max(0.0, min(float(self._image_height) - bh, ny1))
         return nx1, ny1, nx1 + bw, ny1 + bh
 
+    def _compute_multi_moved_rects(
+        self,
+        origins: dict[int, tuple[float, float, float, float]],
+        delta: QPointF,
+    ) -> dict[int, tuple[float, float, float, float]]:
+        """将多选框整组按同一位移平移并整体夹紧在图像边界内，保持各框相对位置不变。"""
+        if not origins:
+            return {}
+        min_x = min(r[0] for r in origins.values())
+        min_y = min(r[1] for r in origins.values())
+        max_x = max(r[2] for r in origins.values())
+        max_y = max(r[3] for r in origins.values())
+        dx = float(delta.x())
+        dy = float(delta.y())
+        if self._image_width > 0:
+            dx = max(-min_x, min(float(self._image_width) - max_x, dx))
+        else:
+            dx = max(-min_x, dx)
+        if self._image_height > 0:
+            dy = max(-min_y, min(float(self._image_height) - max_y, dy))
+        else:
+            dy = max(-min_y, dy)
+        return {
+            idx: (r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy)
+            for idx, r in origins.items()
+        }
+
     def _emit_drawn_box_if_valid(self, p1: QPointF, p2: QPointF) -> None:
         x1, x2 = sorted((p1.x(), p2.x()))
         y1, y2 = sorted((p1.y(), p2.y()))
@@ -1612,10 +1752,14 @@ class AnnotationCanvasView(QGraphicsView):
             event.accept()
             return
 
-        # 5) 编辑模式：先检手柄，再检框，最后落入空白平移待判定
+        # 5) 编辑模式：先检手柄，再检框（支持 Ctrl/Shift 多选与整组平移），最后空白框选或空白平移
         self._edit_press_view_pos = view_pos
+        mods = event.modifiers()
+        has_ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        has_shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
         handle = self._hit_test_handle(scene_pos)
-        if handle is not None and 0 <= self._selected_idx < len(self._boxes):
+        if handle is not None and 0 <= self._selected_idx < len(self._boxes) and not has_ctrl and not has_shift:
             b = self._boxes[self._selected_idx]
             self._edit_action = "pending_handle"
             self._dragging_box_idx = self._selected_idx
@@ -1629,6 +1773,42 @@ class AnnotationCanvasView(QGraphicsView):
 
         hit_idx = self._hit_test_box(scene_pos)
         if hit_idx >= 0:
+            if has_ctrl:
+                next_set = set(self._selected_indices)
+                if hit_idx in next_set:
+                    next_set.discard(hit_idx)
+                    next_primary = max(next_set) if next_set else -1
+                else:
+                    next_set.add(hit_idx)
+                    next_primary = hit_idx
+                self.select_boxes(next_set, primary=next_primary, emit_signal=True)
+                event.accept()
+                return
+            if has_shift:
+                next_set = set(self._selected_indices)
+                next_set.add(hit_idx)
+                self.select_boxes(next_set, primary=hit_idx, emit_signal=True)
+                event.accept()
+                return
+
+            if hit_idx in self._selected_indices and len(self._selected_indices) > 1:
+                unlocked_origins = {
+                    i: (self._boxes[i].x1, self._boxes[i].y1, self._boxes[i].x2, self._boxes[i].y2)
+                    for i in sorted(self._selected_indices)
+                    if 0 <= i < len(self._boxes) and not self.is_box_locked(i) and self.is_box_visible(i)
+                }
+                self._multi_click_candidate = hit_idx
+                if unlocked_origins:
+                    self._edit_action = "pending_multi_move"
+                    self._multi_drag_origins = unlocked_origins
+                    self._multi_drag_previews = dict(unlocked_origins)
+                    self._drag_start_scene = scene_pos
+                else:
+                    self.select_box(hit_idx, emit_signal=True)
+                self.viewport().update()
+                event.accept()
+                return
+
             self.select_box(hit_idx, emit_signal=True)
             if self.is_box_locked(hit_idx):
                 self.viewport().update()
@@ -1641,6 +1821,16 @@ class AnnotationCanvasView(QGraphicsView):
             self._drag_origin_rect = (b.x1, b.y1, b.x2, b.y2)
             self._drag_preview_rect = self._drag_origin_rect
             self._drag_start_scene = scene_pos
+            self.viewport().update()
+            event.accept()
+            return
+
+        if has_shift or has_ctrl:
+            clamped = self._clamp_point(scene_pos)
+            self._edit_action = "marquee_select"
+            self._marquee_start = clamped
+            self._marquee_current = clamped
+            self._marquee_additive = has_ctrl
             self.viewport().update()
             event.accept()
             return
@@ -1725,6 +1915,29 @@ class AnnotationCanvasView(QGraphicsView):
             return
 
         # 编辑模式拖拽判定与更新
+        if self._edit_action == "marquee_select":
+            self._marquee_current = self._clamp_point(scene_pos)
+            self.viewport().update()
+            event.accept()
+            return
+
+        if self._edit_action in ("pending_multi_move", "moving_multi") and self._multi_drag_origins:
+            if self._edit_action == "pending_multi_move":
+                dist = math.hypot(
+                    view_pos.x() - self._edit_press_view_pos.x(),
+                    view_pos.y() - self._edit_press_view_pos.y(),
+                )
+                if dist < self.DRAG_THRESHOLD_PX:
+                    event.accept()
+                    return
+                self._edit_action = "moving_multi"
+            self._multi_drag_previews = self._compute_multi_moved_rects(
+                self._multi_drag_origins, scene_pos - self._drag_start_scene
+            )
+            self.viewport().update()
+            event.accept()
+            return
+
         if self._edit_action == "pending_blank_pan":
             dist = math.hypot(
                 view_pos.x() - self._edit_press_view_pos.x(),
@@ -1804,7 +2017,15 @@ class AnnotationCanvasView(QGraphicsView):
                 self.viewport().update()
                 event.accept()
                 return
-            if self._edit_action in ("pending_handle", "dragging_handle", "pending_move", "moving_box"):
+            if self._edit_action in (
+                "pending_handle",
+                "dragging_handle",
+                "pending_move",
+                "moving_box",
+                "pending_multi_move",
+                "moving_multi",
+                "marquee_select",
+            ):
                 self._reset_edit_drag_state()
                 self._stop_edge_scroll()
                 self._update_cursor_for_hover()
@@ -1863,6 +2084,54 @@ class AnnotationCanvasView(QGraphicsView):
         # 编辑模式左键松手
         if self._mode == self.MODE_EDIT:
             self._stop_edge_scroll()
+            if self._edit_action == "marquee_select":
+                mx1, mx2 = sorted((self._marquee_start.x(), self._marquee_current.x()))
+                my1, my2 = sorted((self._marquee_start.y(), self._marquee_current.y()))
+                additive = self._marquee_additive
+                self._reset_edit_drag_state()
+                self._update_cursor_for_hover()
+                if (mx2 - mx1) >= 2.0 or (my2 - my1) >= 2.0:
+                    picked = [
+                        idx
+                        for idx, b in enumerate(self._boxes)
+                        if self.is_box_visible(idx)
+                        and b.x2 >= mx1
+                        and b.x1 <= mx2
+                        and b.y2 >= my1
+                        and b.y1 <= my2
+                    ]
+                    target_set = (set(self._selected_indices) | set(picked)) if additive else set(picked)
+                    primary = picked[-1] if picked else (self._selected_idx if additive else -1)
+                    self.select_boxes(target_set, primary=primary, emit_signal=True)
+                elif not additive:
+                    self.select_box(-1, emit_signal=True)
+                self.viewport().update()
+                event.accept()
+                return
+            if self._edit_action == "pending_multi_move":
+                candidate = self._multi_click_candidate
+                self._reset_edit_drag_state()
+                self._update_cursor_for_hover()
+                if candidate >= 0:
+                    self.select_box(candidate, emit_signal=True)
+                self.viewport().update()
+                event.accept()
+                return
+            if self._edit_action == "moving_multi":
+                origins = dict(self._multi_drag_origins)
+                previews = dict(self._multi_drag_previews)
+                self._reset_edit_drag_state()
+                self._update_cursor_for_hover()
+                self.viewport().update()
+                committed: list[tuple[int, float, float, float, float]] = []
+                for idx, orig in origins.items():
+                    prev = previews.get(idx)
+                    if prev is not None and any(abs(a - b) >= 0.5 for a, b in zip(orig, prev)):
+                        committed.append((idx, prev[0], prev[1], prev[2], prev[3]))
+                if committed:
+                    self.boxes_geometry_committed.emit(committed)
+                event.accept()
+                return
             if self._edit_action == "pending_blank_pan":
                 self._edit_action = "none"
                 self.select_box(-1, emit_signal=True)
@@ -1957,27 +2226,36 @@ class AnnotationCanvasView(QGraphicsView):
         painter.setPen(QPen(QColor(255, 255, 255, 78), 1.0 * inv))
         painter.drawRect(img_rect)
 
+        # 上一帧“洋葱皮”半透明参考层（绘制在正式框下方，纯背景参考不遮挡当前标注）
+        if self._onion_skin_visible and self._onion_skin_boxes:
+            self._paint_onion_skin_boxes(painter, inv)
+
         # 绘制全部已有矩形框（选中框置顶后绘，确保手柄与高亮不被覆盖）
-        order = [i for i in range(len(self._boxes)) if i != self._selected_idx]
-        if 0 <= self._selected_idx < len(self._boxes):
-            order.append(self._selected_idx)
+        order = [i for i in range(len(self._boxes)) if i not in self._selected_indices]
+        order.extend(sorted(i for i in self._selected_indices if 0 <= i < len(self._boxes)))
 
         for idx in order:
             if not self.is_box_visible(idx):
                 continue
             box = self._boxes[idx]
-            is_sel = idx == self._selected_idx
+            is_sel = idx in self._selected_indices
             is_hover = idx == self._hover_idx
             is_locked = self.is_box_locked(idx)
-            is_active_edit = (
+            is_single_drag = (
                 is_sel
                 and not is_locked
                 and self._edit_action in ("dragging_handle", "moving_box")
                 and self._dragging_box_idx == idx
                 and self._drag_preview_rect is not None
             )
-            if is_active_edit and self._drag_preview_rect is not None:
+            is_multi_drag = (
+                self._edit_action == "moving_multi"
+                and idx in self._multi_drag_previews
+            )
+            if is_single_drag and self._drag_preview_rect is not None:
                 x1, y1, x2, y2 = self._drag_preview_rect
+            elif is_multi_drag:
+                x1, y1, x2, y2 = self._multi_drag_previews[idx]
             else:
                 x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
             self._paint_box(
@@ -1991,8 +2269,17 @@ class AnnotationCanvasView(QGraphicsView):
                 is_sel=is_sel,
                 is_hover=is_hover,
                 is_locked=is_locked,
-                show_live_size=is_active_edit,
+                show_live_size=is_single_drag,
             )
+
+        # 编辑模式 Shift/Ctrl 橡皮筋框选视觉反馈
+        if self._edit_action == "marquee_select":
+            mx1, mx2 = sorted((self._marquee_start.x(), self._marquee_current.x()))
+            my1, my2 = sorted((self._marquee_start.y(), self._marquee_current.y()))
+            mrect = QRectF(mx1, my1, mx2 - mx1, my2 - my1)
+            painter.setBrush(QBrush(QColor(9, 105, 218, 36)))
+            painter.setPen(QPen(QColor(9, 105, 218, 220), 1.6 * inv, Qt.PenStyle.DashLine))
+            painter.drawRect(mrect)
 
         # 模型反查非破坏性预测幽灵参考框与疑似异常人工框角标
         if self._audit_overlays_visible and (self._audit_overlays or self._audit_flagged_gt):
@@ -2172,6 +2459,24 @@ class AnnotationCanvasView(QGraphicsView):
         painter.setPen(QPen(stroke_color, 1.4 * inv, Qt.PenStyle.SolidLine))
         painter.drawPath(path)
 
+    def _paint_onion_skin_boxes(self, painter: QPainter, inv: float) -> None:
+        """在正式目标框下方绘制上一帧映射框的淡色虚影，辅助连续帧核对位置与漏标。"""
+        for box in self._onion_skin_boxes:
+            if box.label in self._hidden_classes:
+                continue
+            r, g, b = label_color_rgb(box.label)
+            rect_f = QRectF(box.x1, box.y1, box.width, box.height)
+            painter.setBrush(QBrush(QColor(r, g, b, 18)))
+            painter.setPen(QPen(QColor(255, 255, 255, 110), 2.4 * inv, Qt.PenStyle.SolidLine))
+            painter.drawRect(rect_f)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(r, g, b, 150), 1.4 * inv, Qt.PenStyle.DotLine))
+            painter.drawRect(rect_f)
+            if self._show_labels and box.label:
+                self._paint_tag_pill(
+                    painter, box.x1, box.y1, f"上帧·{box.label}", QColor(r, g, b, 128), inv
+                )
+
     def _paint_audit_overlays(self, painter: QPainter, inv: float) -> None:
         """绘制模型反查产出的预测幽灵虚线框与异常人工框右上角轻量预警角标。"""
         kind_colors: dict[str, QColor] = {
@@ -2350,8 +2655,8 @@ class AnnotationCanvasView(QGraphicsView):
         elif is_sel and is_locked:
             self._paint_tag_pill(painter, x1, y1, f"{box.label} [锁]", QColor(87, 96, 106, 220), inv)
 
-        # 仅在编辑模式下为未锁定选中框渲染控制手柄，避免锁定框或画框/抓手模式下误导拖动
-        if is_sel and self._mode == self.MODE_EDIT and not is_locked:
+        # 仅在编辑模式下为单选且未锁定框渲染控制手柄，避免多选/锁定/画框模式下误导拖动
+        if is_sel and len(self._selected_indices) <= 1 and self._mode == self.MODE_EDIT and not is_locked:
             scale = max(self._logical_scale(), 1e-4)
             min_dim_px = min((x2 - x1) * scale, (y2 - y1) * scale)
             hs = (3.4 if min_dim_px < 22.0 else 4.6) * inv

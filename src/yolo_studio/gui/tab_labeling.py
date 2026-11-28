@@ -34,6 +34,7 @@ from typing import Any, Callable
 from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer, pyqtSignal as Signal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QIntValidator, QKeyEvent, QKeySequence, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -1177,6 +1178,12 @@ class LabelingStudioTab(QWidget):
         self.box_opacity_btn.setToolTip(
             "调节目标框填充与描边不透明度，或一键切换「仅描边」以看清密集细节"
         )
+        self.onion_skin_btn = QPushButton("上帧(O)")
+        self.onion_skin_btn.setObjectName("footerToggleBtn")
+        self.onion_skin_btn.setCheckable(True)
+        self.onion_skin_btn.setToolTip(
+            "以淡色虚影叠加显示上一张图片的目标框（洋葱皮参考，不参与选中与保存；快捷键 O）"
+        )
 
         self.zoom_out_btn = QPushButton("−")
         self.zoom_out_btn.setFixedWidth(26)
@@ -1193,6 +1200,7 @@ class LabelingStudioTab(QWidget):
         for zb in (
             self.crosshair_btn,
             self.box_opacity_btn,
+            self.onion_skin_btn,
             self.shortcut_help_btn,
             self.view_enhance_btn,
             self.view_enhance_menu_btn,
@@ -1214,6 +1222,7 @@ class LabelingStudioTab(QWidget):
         f_lay.addWidget(self.crosshair_btn)
         f_lay.addWidget(enhance_grp)
         f_lay.addWidget(self.box_opacity_btn)
+        f_lay.addWidget(self.onion_skin_btn)
         f_lay.addWidget(self._make_vsep())
         f_lay.addWidget(self.zoom_out_btn)
         f_lay.addWidget(self.zoom_menu_btn)
@@ -1356,9 +1365,42 @@ class LabelingStudioTab(QWidget):
         obj_hdr.addWidget(self.clear_boxes_btn)
         obj_lay.addLayout(obj_hdr)
 
+        # 按需显示的 AI 预标注置信度阈值过滤条（仅当前图存在带 score 的框或阈值 > 0 时显示）
+        self.conf_filter_bar = QFrame()
+        self.conf_filter_bar.setStyleSheet(
+            "QFrame { background-color: #f6f8fa; border: 1px solid #d8dee4; border-radius: 4px; }"
+            "QLabel { border: none; color: #57606a; font-size: 11px; }"
+            "QPushButton { padding: 1px 6px; font-size: 11px; }"
+        )
+        conf_lay = QHBoxLayout(self.conf_filter_bar)
+        conf_lay.setContentsMargins(6, 3, 6, 3)
+        conf_lay.setSpacing(4)
+        self.conf_threshold_label = QLabel("置信≥0.00")
+        self.conf_threshold_label.setFixedWidth(60)
+        self.conf_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.conf_threshold_slider.setRange(0, 95)
+        self.conf_threshold_slider.setValue(0)
+        self.conf_threshold_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.conf_threshold_slider.setToolTip(
+            "拖动滑块实时隐藏低于阈值的 AI 预标注框（不影响无置信度的人工手画框）"
+        )
+        self.prune_low_conf_btn = QPushButton("删低分")
+        self.prune_low_conf_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.prune_low_conf_btn.setToolTip("一键删除当前图中低于当前置信度阈值的未锁定 AI 框（Ctrl+Z 可撤回）")
+        self.conf_reset_btn = QPushButton("重置")
+        self.conf_reset_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.conf_reset_btn.setToolTip("将置信度过滤阈值归零")
+        conf_lay.addWidget(self.conf_threshold_label)
+        conf_lay.addWidget(self.conf_threshold_slider, 1)
+        conf_lay.addWidget(self.prune_low_conf_btn)
+        conf_lay.addWidget(self.conf_reset_btn)
+        self.conf_filter_bar.setVisible(False)
+        obj_lay.addWidget(self.conf_filter_bar)
+
         self.shape_list = _EmptyHintListWidget(
             "当前图暂无目标框\n按 R 画框，或按 Q 使用本地 SAM 点选标注"
         )
+        self.shape_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.shape_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.shape_list.setStyleSheet(
             "QListWidget { border: 1px solid #d0d7de; border-radius: 4px; font-size: 12px; }"
@@ -1588,6 +1630,10 @@ class LabelingStudioTab(QWidget):
         self.view_enhance_btn.toggled.connect(self._on_view_enhance_toggled)
         self.view_enhance_menu_btn.clicked.connect(self._on_view_enhance_menu_clicked)
         self.box_opacity_btn.clicked.connect(self._on_box_opacity_menu_clicked)
+        self.onion_skin_btn.toggled.connect(self._on_onion_skin_toggled)
+        self.conf_threshold_slider.valueChanged.connect(self._on_conf_threshold_changed)
+        self.prune_low_conf_btn.clicked.connect(self._prune_low_confidence_boxes)
+        self.conf_reset_btn.clicked.connect(lambda: self.conf_threshold_slider.setValue(0))
         self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_by(1.0 / 1.25))
         self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom_by(1.25))
         self.zoom_menu_btn.clicked.connect(self._on_zoom_menu_clicked)
@@ -1613,12 +1659,15 @@ class LabelingStudioTab(QWidget):
         self.unique_label_list.customContextMenuRequested.connect(self._on_class_list_context_menu)
 
         self.shape_list.currentRowChanged.connect(self._on_shape_row_changed)
+        self.shape_list.itemSelectionChanged.connect(self._on_shape_selection_changed)
         self.shape_list.itemDoubleClicked.connect(self._on_shape_double_clicked)
         self.shape_list.customContextMenuRequested.connect(self._on_shape_list_context_menu)
 
         self.canvas.box_drawn.connect(self._on_canvas_box_drawn)
         self.canvas.box_geometry_committed.connect(self._on_canvas_box_geometry_committed)
+        self.canvas.boxes_geometry_committed.connect(self._on_canvas_boxes_geometry_committed)
         self.canvas.selection_changed.connect(self._on_canvas_selection_changed)
+        self.canvas.multi_selection_changed.connect(self._on_canvas_multi_selection_changed)
         self.canvas.mode_changed.connect(self._on_canvas_mode_changed)
         self.canvas.zoom_changed.connect(self._on_canvas_zoom_changed)
         self.canvas.cursor_pos_changed.connect(self._on_canvas_cursor_changed)
@@ -1703,6 +1752,13 @@ class LabelingStudioTab(QWidget):
                     | Qt.KeyboardModifier.MetaModifier
                 )
             )
+            if (
+                key == Qt.Key.Key_A
+                and bool(mods & Qt.KeyboardModifier.ControlModifier)
+                and not (mods & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier | Qt.KeyboardModifier.ShiftModifier))
+            ):
+                self._select_all_visible_boxes()
+                return True
             if key == Qt.Key.Key_Space and not has_cmd:
                 if not event.isAutoRepeat():
                     self.canvas.set_space_pressed(True)
@@ -1800,6 +1856,9 @@ class LabelingStudioTab(QWidget):
             return True
         if key == Qt.Key.Key_L:
             self.show_labels_chk.toggle()
+            return True
+        if key == Qt.Key.Key_O and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            self.onion_skin_btn.toggle()
             return True
         if key == Qt.Key.Key_X and not (mods & Qt.KeyboardModifier.ShiftModifier):
             self.crosshair_btn.toggle()
@@ -2542,8 +2601,11 @@ class LabelingStudioTab(QWidget):
         self.canvas.set_hidden_classes(self._hidden_classes)
         self.canvas.set_hidden_box_indices(self._hidden_box_indices)
         self.canvas.set_locked_box_indices(self._locked_box_indices)
+        self.canvas.set_min_confidence(self.conf_threshold_slider.value() / 100.0)
+        self._refresh_onion_skin_overlay()
         self._refresh_class_counts()
         self._refresh_shape_list()
+        self._refresh_confidence_filter_bar()
         self._refresh_review_banner()
         self._refresh_audit_banner_and_overlays()
         self._refresh_footer_and_title()
@@ -2866,9 +2928,12 @@ class LabelingStudioTab(QWidget):
 
     def _refresh_action_states(self) -> None:
         has_img = self._doc is not None
+        sel_indices = self.canvas.selected_indices() if has_img else []
         sel_idx = self.canvas.selected_index() if has_img else -1
-        has_sel = has_img and sel_idx >= 0
-        sel_locked = has_sel and self._is_box_locked(sel_idx)
+        has_sel = has_img and len(sel_indices) > 0
+        is_multi = len(sel_indices) > 1
+        has_unlocked_sel = any(not self._is_box_locked(i) for i in sel_indices)
+        sel_locked = has_sel and not has_unlocked_sel
         has_boxes = has_img and self._doc is not None and len(self._doc.boxes) > 0
         has_unlocked_boxes = (
             has_boxes
@@ -2880,10 +2945,10 @@ class LabelingStudioTab(QWidget):
         llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
 
         self.dup_box_btn.setEnabled(has_sel)
-        self.del_box_btn.setEnabled(has_sel and not sel_locked)
-        self.box_del_inline_btn.setEnabled(has_sel and not sel_locked)
-        self.change_cls_btn.setEnabled(has_sel and not sel_locked)
-        self.focus_box_btn.setEnabled(has_sel)
+        self.del_box_btn.setEnabled(has_unlocked_sel)
+        self.box_del_inline_btn.setEnabled(has_unlocked_sel)
+        self.change_cls_btn.setEnabled(has_unlocked_sel)
+        self.focus_box_btn.setEnabled(has_sel and not is_multi)
         self.toggle_hide_box_btn.setEnabled(has_sel)
         self.toggle_lock_box_btn.setEnabled(has_sel)
         self.copy_prev_boxes_btn.setEnabled(self._resolve_previous_image_path() is not None)
@@ -2902,14 +2967,14 @@ class LabelingStudioTab(QWidget):
         self.audit_btn.setEnabled(len(self._all_images) > 0)
         self.sam_point_mode_btn.setEnabled(has_img)
         self.sam_refine_btn.setEnabled(
-            has_unlocked_boxes and not sel_locked and not sam_busy and not sam_point_busy
+            (has_unlocked_sel if has_sel else has_unlocked_boxes) and not sam_busy and not sam_point_busy
         )
         self.sam_refine_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
-        self.box_sam_inline_btn.setEnabled(has_sel and not sel_locked and not sam_busy and not sam_point_busy)
+        self.box_sam_inline_btn.setEnabled(has_unlocked_sel and not sam_busy and not sam_point_busy)
         self.box_sam_inline_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
-        self.llm_fix_btn.setEnabled(has_sel and not sel_locked and not llm_busy)
+        self.llm_fix_btn.setEnabled(has_sel and not is_multi and not sel_locked and not llm_busy)
         self.llm_fix_btn.setText("AI精修中" if llm_busy else "AI修框(G)")
-        self.box_llm_fix_inline_btn.setEnabled(has_sel and not sel_locked and not llm_busy)
+        self.box_llm_fix_inline_btn.setEnabled(has_sel and not is_multi and not sel_locked and not llm_busy)
         self.box_llm_fix_inline_btn.setText("AI精修中" if llm_busy else "AI精修(G)")
 
     # ------------------------------------------------------------------
@@ -3011,9 +3076,9 @@ class LabelingStudioTab(QWidget):
         if not cls_name:
             return
         self._set_active_class(cls_name)
-        sel = self.canvas.selected_index()
-        if self._doc is not None and 0 <= sel < len(self._doc.boxes):
-            self._relabel_box(sel, cls_name)
+        sel_indices = self.canvas.selected_indices()
+        if self._doc is not None and sel_indices:
+            self._relabel_boxes(sel_indices, cls_name)
 
     def _apply_class_shortcut(self, cls_idx: int) -> None:
         if not (0 <= cls_idx < len(self._classes)):
@@ -3023,9 +3088,9 @@ class LabelingStudioTab(QWidget):
         # 点选标注模式下数字键仅切换待落框类别（同步刷新预览色与标签），避免误改此前刚落盘的框
         if self.canvas.sam_pointing():
             return
-        sel = self.canvas.selected_index()
-        if self._doc is not None and 0 <= sel < len(self._doc.boxes):
-            self._relabel_box(sel, cls_name)
+        sel_indices = self.canvas.selected_indices()
+        if self._doc is not None and sel_indices:
+            self._relabel_boxes(sel_indices, cls_name)
 
     def _on_save_classes_txt(self) -> None:
         if not self._classes:
@@ -3244,19 +3309,32 @@ class LabelingStudioTab(QWidget):
             self._undo_stack.pop(0)
         self._redo_stack.clear()
 
-    def _apply_boxes_change(self, selected_idx: int = -1) -> None:
+    def _apply_boxes_change(
+        self,
+        selected_idx: int = -1,
+        *,
+        selected_indices: list[int] | set[int] | None = None,
+    ) -> None:
         if self._doc is None:
             return
         self._dirty = True
         box_count = len(self._doc.boxes)
         self._hidden_box_indices = {i for i in self._hidden_box_indices if 0 <= i < box_count}
         self._locked_box_indices = {i for i in self._locked_box_indices if 0 <= i < box_count}
-        self.canvas.set_boxes(self._doc.boxes, selected_index=selected_idx)
+        self.canvas.set_boxes(
+            self._doc.boxes,
+            selected_index=selected_idx,
+            selected_indices=selected_indices,
+        )
         self.canvas.set_hidden_classes(self._hidden_classes)
         self.canvas.set_hidden_box_indices(self._hidden_box_indices)
         self.canvas.set_locked_box_indices(self._locked_box_indices)
         self._refresh_class_counts()
-        self._refresh_shape_list(selected_idx=selected_idx)
+        self._refresh_shape_list(
+            selected_idx=self.canvas.selected_index(),
+            selected_indices=self.canvas.selected_indices(),
+        )
+        self._refresh_confidence_filter_bar()
         self._refresh_review_banner()
         self._refresh_audit_banner_and_overlays()
         self._refresh_footer_and_title()
@@ -3304,65 +3382,79 @@ class LabelingStudioTab(QWidget):
         self.canvas.ensure_box_visible(next_idx)
 
     def _nudge_selected_box(self, dx: int, dy: int) -> None:
-        """使用方向键对选中框执行像素级平移（600 ms 内连续微调同一框合并为单次撤销记录）。"""
-        idx = self.canvas.selected_index()
-        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+        """使用方向键对选中框（单选或多选整组）执行像素级平移（600 ms 内连续微调合并为单次撤销）。"""
+        if self._doc is None:
             return
-        if self._is_box_locked(idx):
-            self._warn_locked_box(idx)
+        sel_indices = self.canvas.selected_indices()
+        if not sel_indices:
             return
-        old = self._doc.boxes[idx]
-        bw = old.width
-        bh = old.height
-        nx1 = old.x1 + float(dx)
-        ny1 = old.y1 + float(dy)
-        if self._doc.image_width > 0:
-            nx1 = max(0.0, min(float(self._doc.image_width) - bw, nx1))
-        else:
-            nx1 = max(0.0, nx1)
-        if self._doc.image_height > 0:
-            ny1 = max(0.0, min(float(self._doc.image_height) - bh, ny1))
-        else:
-            ny1 = max(0.0, ny1)
+        movable = [i for i in sel_indices if not self._is_box_locked(i)]
+        if not movable:
+            self._warn_locked_box(sel_indices[0])
+            return
 
-        if abs(nx1 - old.x1) < 1e-6 and abs(ny1 - old.y1) < 1e-6:
+        # 以可移动集合的整体包围盒做边界夹紧，多选靠边时保持各框相对位置不变形
+        min_x = min(self._doc.boxes[i].x1 for i in movable)
+        min_y = min(self._doc.boxes[i].y1 for i in movable)
+        max_x = max(self._doc.boxes[i].x2 for i in movable)
+        max_y = max(self._doc.boxes[i].y2 for i in movable)
+        eff_dx = float(dx)
+        eff_dy = float(dy)
+        if self._doc.image_width > 0:
+            eff_dx = max(-min_x, min(float(self._doc.image_width) - max_x, eff_dx))
+        else:
+            eff_dx = max(-min_x, eff_dx)
+        if self._doc.image_height > 0:
+            eff_dy = max(-min_y, min(float(self._doc.image_height) - max_y, eff_dy))
+        else:
+            eff_dy = max(-min_y, eff_dy)
+
+        if abs(eff_dx) < 1e-6 and abs(eff_dy) < 1e-6:
             return
 
         now = time.monotonic()
-        nudge_key = (self._doc.image_path, idx)
+        nudge_key = (self._doc.image_path, tuple(movable))  # type: ignore[assignment]
         if (
             self._last_nudge_key != nudge_key
             or (now - self._last_nudge_ts) > 0.6
             or not self._undo_stack
         ):
             self._push_undo_snapshot()
-        self._last_nudge_key = nudge_key
+        self._last_nudge_key = nudge_key  # type: ignore[assignment]
         self._last_nudge_ts = now
 
-        self._doc.boxes[idx] = RectAnnotation(
-            label=old.label,
-            x1=nx1,
-            y1=ny1,
-            x2=nx1 + bw,
-            y2=ny1 + bh,
-            score=old.score,
-            description=old.description,
-            difficult=old.difficult,
-            group_id=old.group_id,
-            flags=copy.deepcopy(old.flags),
-        )
-        self._apply_boxes_change(selected_idx=idx)
-        self.canvas.ensure_box_visible(idx)
+        for idx in movable:
+            old = self._doc.boxes[idx]
+            self._doc.boxes[idx] = RectAnnotation(
+                label=old.label,
+                x1=old.x1 + eff_dx,
+                y1=old.y1 + eff_dy,
+                x2=old.x2 + eff_dx,
+                y2=old.y2 + eff_dy,
+                score=old.score,
+                description=old.description,
+                difficult=old.difficult,
+                group_id=old.group_id,
+                flags=copy.deepcopy(old.flags),
+            )
+        primary = self.canvas.selected_index()
+        self._apply_boxes_change(selected_idx=primary, selected_indices=sel_indices)
+        if 0 <= primary < len(self._doc.boxes):
+            self.canvas.ensure_box_visible(primary)
 
     def _copy_boxes_to_clipboard(self) -> None:
-        """复制当前选中框（无选中时复制整图全部框）到工作台剪贴板，支持跨图粘贴。"""
+        """复制当前选中框（支持多选；无选中时复制整图全部框）到工作台剪贴板，支持跨图粘贴。"""
         if self._doc is None or not self._doc.boxes:
             self.save_state_label.setText("当前图无可复制目标框")
             return
-        sel = self.canvas.selected_index()
-        if 0 <= sel < len(self._doc.boxes):
+        sel_indices = self.canvas.selected_indices()
+        if len(sel_indices) == 1:
+            sel = sel_indices[0]
             self._clipboard_boxes = [self._doc.boxes[sel].clone()]
             msg = f"已复制 1 个「{self._doc.boxes[sel].label}」框"
+        elif len(sel_indices) > 1:
+            self._clipboard_boxes = [self._doc.boxes[i].clone() for i in sel_indices]
+            msg = f"已复制选中的 {len(self._clipboard_boxes)} 个框"
         else:
             self._clipboard_boxes = [b.clone() for b in self._doc.boxes]
             msg = f"已复制整图 {len(self._clipboard_boxes)} 个框"
@@ -3645,84 +3737,165 @@ class LabelingStudioTab(QWidget):
         self._doc.boxes[idx] = updated
         self._apply_boxes_change(selected_idx=idx)
 
-    def _relabel_box(self, idx: int, new_label: str) -> None:
-        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+    def _on_canvas_boxes_geometry_committed(
+        self, updates: list[tuple[int, float, float, float, float]]
+    ) -> None:
+        """提交画布多选整组平移结果，合并为单次撤销快照并保持多选高亮。"""
+        if self._doc is None or not updates:
             return
-        if self._is_box_locked(idx):
-            self._warn_locked_box(idx)
+        valid_updates = [
+            (idx, x1, y1, x2, y2)
+            for idx, x1, y1, x2, y2 in updates
+            if 0 <= idx < len(self._doc.boxes) and not self._is_box_locked(idx)
+        ]
+        if not valid_updates:
             return
-        clean = new_label.strip()
-        if not clean or self._doc.boxes[idx].label == clean:
-            return
+        sel_indices = self.canvas.selected_indices()
+        primary = self.canvas.selected_index()
         self._push_undo_snapshot()
-        self._doc.boxes[idx].label = clean
+        for idx, x1, y1, x2, y2 in valid_updates:
+            old = self._doc.boxes[idx]
+            updated = RectAnnotation(
+                label=old.label,
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                score=old.score,
+                description=old.description,
+                difficult=old.difficult,
+                group_id=old.group_id,
+                flags=copy.deepcopy(old.flags),
+            )
+            if self._doc.image_width > 0 and self._doc.image_height > 0:
+                updated = updated.clamped(self._doc.image_width, self._doc.image_height)
+            self._doc.boxes[idx] = updated
+        self._apply_boxes_change(selected_idx=primary, selected_indices=sel_indices)
+
+    def _relabel_boxes(self, indices: list[int], new_label: str) -> int:
+        """批量修改多个目标框的类别（自动跳过已锁定框，合并为单次撤销），返回实际改动数。"""
+        if self._doc is None:
+            return 0
+        clean = new_label.strip()
+        if not clean:
+            return 0
+        valid = [i for i in indices if 0 <= i < len(self._doc.boxes)]
+        if not valid:
+            return 0
+        unlocked = [i for i in valid if not self._is_box_locked(i)]
+        skipped_locked = len(valid) - len(unlocked)
+        if not unlocked:
+            self._warn_locked_box(valid[0])
+            return 0
+        to_change = [i for i in unlocked if self._doc.boxes[i].label != clean]
+        if not to_change:
+            return 0
+        primary = self.canvas.selected_index()
+        self._push_undo_snapshot()
+        for idx in to_change:
+            self._doc.boxes[idx].label = clean
         if clean not in self._classes:
             self._classes.append(clean)
-        self._apply_boxes_change(selected_idx=idx)
+        self._apply_boxes_change(selected_idx=primary, selected_indices=valid)
+        if len(valid) > 1:
+            extra = f"（已跳过 {skipped_locked} 个锁定框）" if skipped_locked else ""
+            msg = f"已批量将 {len(to_change)} 个框改为「{clean}」{extra}"
+            self.save_state_label.setText(msg)
+            if self.isVisible():
+                self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1400)
+        return len(to_change)
+
+    def _relabel_box(self, idx: int, new_label: str) -> None:
+        self._relabel_boxes([idx], new_label)
 
     def _prompt_relabel_selected_box(self) -> None:
-        idx = self.canvas.selected_index()
-        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+        sel_indices = self.canvas.selected_indices()
+        if self._doc is None or not sel_indices:
             return
-        if self._is_box_locked(idx):
-            self._warn_locked_box(idx)
+        unlocked = [i for i in sel_indices if not self._is_box_locked(i)]
+        if not unlocked:
+            self._warn_locked_box(sel_indices[0])
             return
-        cur_label = self._doc.boxes[idx].label
+        cur_label = self._doc.boxes[unlocked[0]].label
+        title = (
+            f"批量修改 {len(unlocked)} 个选中框类别"
+            if len(sel_indices) > 1
+            else "修改选中框类别"
+        )
         dlg = ClassPickerDialog(
             self._classes,
             current_label=cur_label,
             counts=self._current_class_counts(),
-            title="修改选中框类别",
+            title=title,
             parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             chosen = dlg.selected_label()
             self._set_active_class(chosen)
-            self._relabel_box(idx, chosen)
+            self._relabel_boxes(sel_indices, chosen)
 
     def _duplicate_selected_box(self) -> None:
-        idx = self.canvas.selected_index()
-        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+        sel_indices = self.canvas.selected_indices()
+        if self._doc is None or not sel_indices:
             return
         self._push_undo_snapshot()
-        src = self._doc.boxes[idx]
         offset = 14.0
-        bw = src.width
-        bh = src.height
-        nx1 = src.x1 + offset
-        ny1 = src.y1 + offset
-        if self._doc.image_width > 0 and nx1 + bw > self._doc.image_width:
-            nx1 = max(0.0, src.x1 - offset)
-        if self._doc.image_height > 0 and ny1 + bh > self._doc.image_height:
-            ny1 = max(0.0, src.y1 - offset)
-        dup = RectAnnotation(
-            label=src.label,
-            x1=nx1,
-            y1=ny1,
-            x2=nx1 + bw,
-            y2=ny1 + bh,
-        )
-        self._doc.boxes.append(dup)
-        self._apply_boxes_change(selected_idx=len(self._doc.boxes) - 1)
+        new_indices: list[int] = []
+        for idx in sel_indices:
+            src = self._doc.boxes[idx]
+            bw = src.width
+            bh = src.height
+            nx1 = src.x1 + offset
+            ny1 = src.y1 + offset
+            if self._doc.image_width > 0 and nx1 + bw > self._doc.image_width:
+                nx1 = max(0.0, src.x1 - offset)
+            if self._doc.image_height > 0 and ny1 + bh > self._doc.image_height:
+                ny1 = max(0.0, src.y1 - offset)
+            dup = RectAnnotation(
+                label=src.label,
+                x1=nx1,
+                y1=ny1,
+                x2=nx1 + bw,
+                y2=ny1 + bh,
+            )
+            self._doc.boxes.append(dup)
+            new_indices.append(len(self._doc.boxes) - 1)
+        self._apply_boxes_change(selected_idx=new_indices[-1], selected_indices=new_indices)
 
     def _delete_selected_box(self) -> None:
-        idx = self.canvas.selected_index()
-        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+        sel_indices = self.canvas.selected_indices()
+        if self._doc is None or not sel_indices:
             return
-        if self._is_box_locked(idx):
-            self._warn_locked_box(idx)
+        to_delete = sorted(i for i in sel_indices if not self._is_box_locked(i))
+        skipped_locked = len(sel_indices) - len(to_delete)
+        if not to_delete:
+            self._warn_locked_box(sel_indices[0])
             return
         self._push_undo_snapshot()
-        self._doc.boxes.pop(idx)
-        # 删除后重排单框隐藏与锁定索引，防止错位指向相邻框
-        self._hidden_box_indices = {
-            (i - 1 if i > idx else i) for i in self._hidden_box_indices if i != idx
-        }
-        self._locked_box_indices = {
-            (i - 1 if i > idx else i) for i in self._locked_box_indices if i != idx
-        }
-        next_sel = min(idx, len(self._doc.boxes) - 1)
+        del_set = set(to_delete)
+        kept_boxes: list[RectAnnotation] = []
+        new_hidden: set[int] = set()
+        new_locked: set[int] = set()
+        for old_i, box in enumerate(self._doc.boxes):
+            if old_i in del_set:
+                continue
+            new_i = len(kept_boxes)
+            kept_boxes.append(box)
+            if old_i in self._hidden_box_indices:
+                new_hidden.add(new_i)
+            if old_i in self._locked_box_indices:
+                new_locked.add(new_i)
+        self._doc.boxes = kept_boxes
+        self._hidden_box_indices = new_hidden
+        self._locked_box_indices = new_locked
+        next_sel = min(to_delete[0], len(self._doc.boxes) - 1) if len(to_delete) == 1 else -1
         self._apply_boxes_change(selected_idx=next_sel)
+        if len(to_delete) > 1 or skipped_locked:
+            extra = f"（已跳过 {skipped_locked} 个锁定框）" if skipped_locked else ""
+            msg = f"已批量删除 {len(to_delete)} 个目标框{extra}（Ctrl+Z 可撤回）"
+            self.save_state_label.setText(msg)
+            if self.isVisible():
+                self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1500)
 
     def _clear_all_boxes(self) -> None:
         if self._doc is None or not self._doc.boxes:
@@ -3930,12 +4103,16 @@ class LabelingStudioTab(QWidget):
             self.sam_point_worker is not None and self.sam_point_worker.isRunning()
         ):
             return
-        sel = self.canvas.selected_index()
-        if 0 <= sel < len(self._doc.boxes):
-            if self._is_box_locked(sel):
-                self._warn_locked_box(sel)
+        sel_indices = self.canvas.selected_indices()
+        if sel_indices:
+            targets = [
+                (i, self._doc.boxes[i])
+                for i in sel_indices
+                if 0 <= i < len(self._doc.boxes) and not self._is_box_locked(i)
+            ]
+            if not targets:
+                self._warn_locked_box(sel_indices[0])
                 return
-            targets = [(sel, self._doc.boxes[sel])]
         else:
             targets = [
                 (i, b)
@@ -4448,11 +4625,17 @@ class LabelingStudioTab(QWidget):
     # ------------------------------------------------------------------
     # 右侧目标框列表与画布双向同步
     # ------------------------------------------------------------------
-    def _refresh_shape_list(self, selected_idx: int = -1) -> None:
+    def _refresh_shape_list(
+        self,
+        selected_idx: int = -1,
+        *,
+        selected_indices: list[int] | set[int] | None = None,
+    ) -> None:
         self._syncing_lists = True
         try:
             self.shape_list.clear()
             boxes = self._doc.boxes if self._doc is not None else []
+            min_conf = self.canvas.min_confidence()
             hidden_cnt = sum(1 for i in range(len(boxes)) if not self.canvas.is_box_visible(i))
             locked_cnt = sum(1 for i in range(len(boxes)) if self._is_box_locked(i))
             suffix_parts: list[str] = []
@@ -4462,15 +4645,22 @@ class LabelingStudioTab(QWidget):
                 suffix_parts.append(f"锁{locked_cnt}")
             extra_title = f" · {'/'.join(suffix_parts)}" if suffix_parts else ""
             self.obj_title_label.setText(f"当前图目标框 ({len(boxes)}{extra_title})")
-            self.show_all_boxes_btn.setVisible(hidden_cnt > 0 or bool(self._hidden_classes))
+            self.show_all_boxes_btn.setVisible(
+                bool(self._hidden_box_indices) or bool(self._hidden_classes)
+            )
             for idx, b in enumerate(boxes):
                 score_part = f" · {b.score:.2f}" if b.score is not None else ""
                 size_part = f" [{int(round(b.width))}×{int(round(b.height))}]"
+                is_low_conf = (
+                    min_conf > 0.0 and b.score is not None and b.score < min_conf
+                )
                 is_hidden = not self.canvas.is_box_visible(idx)
                 is_locked = self._is_box_locked(idx)
                 state_tags: list[str] = []
-                if is_hidden:
+                if idx in self._hidden_box_indices or b.label in self._hidden_classes:
                     state_tags.append("[隐]")
+                elif is_low_conf:
+                    state_tags.append("[低分]")
                 if is_locked:
                     state_tags.append("[锁]")
                 prefix_state = (" ".join(state_tags) + " ") if state_tags else ""
@@ -4484,21 +4674,71 @@ class LabelingStudioTab(QWidget):
                 if b.description:
                     item.setToolTip(b.description)
                 self.shape_list.addItem(item)
-            if 0 <= selected_idx < len(boxes):
-                self.shape_list.setCurrentRow(selected_idx)
+
+            target_sel = (
+                sorted(i for i in selected_indices if 0 <= i < len(boxes))
+                if selected_indices is not None
+                else ([selected_idx] if 0 <= selected_idx < len(boxes) else [])
+            )
+            if target_sel:
+                primary = selected_idx if selected_idx in target_sel else target_sel[-1]
+                self.shape_list.setCurrentRow(primary)
+                for row_i in target_sel:
+                    it = self.shape_list.item(row_i)
+                    if it is not None:
+                        it.setSelected(True)
         finally:
             self._syncing_lists = False
         self._refresh_box_detail(selected_idx)
 
     def _refresh_box_detail(self, idx: int) -> None:
-        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+        sel_indices = self.canvas.selected_indices()
+        if self._doc is None or not sel_indices:
             self.box_detail_label.setText("")
             self.box_detail_panel.setVisible(False)
             return
-        b = self._doc.boxes[idx]
-        is_hidden = idx in self._hidden_box_indices
+
+        if len(sel_indices) > 1:
+            locked_cnt = sum(1 for i in sel_indices if self._is_box_locked(i))
+            hidden_cnt = sum(1 for i in sel_indices if not self.canvas.is_box_visible(i))
+            labels_used = sorted({self._doc.boxes[i].label for i in sel_indices})
+            lbl_preview = "、".join(labels_used[:4]) + ("…" if len(labels_used) > 4 else "")
+            status_bits = [f"涉及类别：{lbl_preview}"]
+            if locked_cnt:
+                status_bits.append(f"含 {locked_cnt} 个已锁定")
+            if hidden_cnt:
+                status_bits.append(f"含 {hidden_cnt} 个已隐藏")
+            self.box_detail_label.setText(
+                f"已多选 {len(sel_indices)} 个目标框（{' · '.join(status_bits)}）\n"
+                "拖动或按方向键可整组平移，按 1~9 / C 批量改类，Del 批量删除"
+            )
+            self.change_cls_btn.setText("批量改类")
+            self.box_del_inline_btn.setText("批量删除")
+            all_hidden = all(i in self._hidden_box_indices for i in sel_indices)
+            all_locked = all(self._is_box_locked(i) for i in sel_indices)
+            self.toggle_hide_box_btn.blockSignals(True)
+            self.toggle_lock_box_btn.blockSignals(True)
+            try:
+                self.toggle_hide_box_btn.setChecked(all_hidden)
+                self.toggle_hide_box_btn.setText("取消隐藏(V)" if all_hidden else "批量隐藏(V)")
+                self.toggle_lock_box_btn.setChecked(all_locked)
+                self.toggle_lock_box_btn.setText("批量解锁(K)" if all_locked else "批量锁定(K)")
+            finally:
+                self.toggle_hide_box_btn.blockSignals(False)
+                self.toggle_lock_box_btn.blockSignals(False)
+            self.box_detail_panel.setVisible(True)
+            return
+
+        single_idx = idx if 0 <= idx < len(self._doc.boxes) else sel_indices[0]
+        b = self._doc.boxes[single_idx]
+        is_hidden = single_idx in self._hidden_box_indices
         cls_hidden = b.label in self._hidden_classes
-        is_locked = self._is_box_locked(idx)
+        is_low_conf = (
+            self.canvas.min_confidence() > 0.0
+            and b.score is not None
+            and b.score < self.canvas.min_confidence()
+        )
+        is_locked = self._is_box_locked(single_idx)
         lines = [
             f"类别：{b.label}   尺寸：{int(round(b.width))} × {int(round(b.height))} px",
             f"坐标：({b.x1:.1f}, {b.y1:.1f}) → ({b.x2:.1f}, {b.y2:.1f})",
@@ -4510,6 +4750,8 @@ class LabelingStudioTab(QWidget):
             meta_tags.append("单框已隐藏")
         elif cls_hidden:
             meta_tags.append("所属类别已隐藏")
+        elif is_low_conf:
+            meta_tags.append("低于置信度阈值")
         if b.score is not None:
             meta_tags.append(f"置信度 {b.score:.3f}")
         if isinstance(b.flags, dict) and b.flags.get("llm_added"):
@@ -4523,6 +4765,8 @@ class LabelingStudioTab(QWidget):
         if b.description:
             lines.append(f"审核说明：{b.description}")
         self.box_detail_label.setText("\n".join(lines))
+        self.change_cls_btn.setText("改类别")
+        self.box_del_inline_btn.setText("删除")
         self.toggle_hide_box_btn.blockSignals(True)
         self.toggle_lock_box_btn.blockSignals(True)
         try:
@@ -4543,10 +4787,27 @@ class LabelingStudioTab(QWidget):
     def _on_shape_row_changed(self, row: int) -> None:
         if self._syncing_lists:
             return
-        self.canvas.select_box(row, emit_signal=False)
-        if row >= 0:
-            self.canvas.ensure_box_visible(row)
+        selected_rows = sorted({self.shape_list.row(it) for it in self.shape_list.selectedItems()})
+        if len(selected_rows) > 1:
+            self.canvas.select_boxes(selected_rows, primary=row, emit_signal=False)
+        else:
+            self.canvas.select_box(row, emit_signal=False)
+            if row >= 0:
+                self.canvas.ensure_box_visible(row)
         self._refresh_box_detail(row)
+        self._refresh_action_states()
+
+    def _on_shape_selection_changed(self) -> None:
+        if self._syncing_lists:
+            return
+        selected_rows = sorted({self.shape_list.row(it) for it in self.shape_list.selectedItems()})
+        cur_row = self.shape_list.currentRow()
+        if selected_rows:
+            primary = cur_row if cur_row in selected_rows else selected_rows[-1]
+            self.canvas.select_boxes(selected_rows, primary=primary, emit_signal=False)
+        else:
+            self.canvas.select_box(-1, emit_signal=False)
+        self._refresh_box_detail(self.canvas.selected_index())
         self._refresh_action_states()
 
     def _on_shape_double_clicked(self, _item: QListWidgetItem) -> None:
@@ -4562,12 +4823,18 @@ class LabelingStudioTab(QWidget):
         row = self.shape_list.row(item)
         if not (0 <= row < len(self._doc.boxes)):
             return
-        self.shape_list.setCurrentRow(row)
-        is_hidden = not self.canvas.is_box_visible(row)
-        is_locked = self._is_box_locked(row)
+        if row not in self.canvas.selected_indices():
+            self.shape_list.setCurrentRow(row)
+        sel_indices = self.canvas.selected_indices() or [row]
+        is_multi = len(sel_indices) > 1
+        is_hidden = all(not self.canvas.is_box_visible(i) for i in sel_indices)
+        is_locked = all(self._is_box_locked(i) for i in sel_indices)
         menu = QMenu(self)
         focus_act = menu.addAction("聚焦居中查看")
-        relabel_act = menu.addAction("修改类别... (C)")
+        focus_act.setEnabled(not is_multi)
+        relabel_act = menu.addAction(
+            f"批量修改 {len(sel_indices)} 个框类别... (C)" if is_multi else "修改类别... (C)"
+        )
         relabel_act.setEnabled(not is_locked)
         hide_act = menu.addAction("显示此框 (V)" if is_hidden else "隐藏此框 (V)")
         lock_act = menu.addAction("解锁此框 (K)" if is_locked else "锁定此框 (K)")
@@ -4622,9 +4889,14 @@ class LabelingStudioTab(QWidget):
             return
         menu = QMenu(self)
         if 0 <= hit_idx < len(self._doc.boxes):
-            self.canvas.select_box(hit_idx, emit_signal=True)
-            is_locked = self._is_box_locked(hit_idx)
-            relabel_act = menu.addAction("修改类别... (C)")
+            if hit_idx not in self.canvas.selected_indices():
+                self.canvas.select_box(hit_idx, emit_signal=True)
+            sel_indices = self.canvas.selected_indices() or [hit_idx]
+            is_multi = len(sel_indices) > 1
+            is_locked = all(self._is_box_locked(i) for i in sel_indices)
+            relabel_act = menu.addAction(
+                f"批量修改 {len(sel_indices)} 个框类别... (C)" if is_multi else "修改类别... (C)"
+            )
             relabel_act.setEnabled(not is_locked)
             focus_act = menu.addAction("聚焦居中查看")
             hide_act = menu.addAction("隐藏此框 (V)")
@@ -4699,6 +4971,11 @@ class LabelingStudioTab(QWidget):
         toggle_enhance_act = menu.addAction("暗部/对比度视图增强 (B)")
         toggle_enhance_act.setCheckable(True)
         toggle_enhance_act.setChecked(self.view_enhance_btn.isChecked())
+        toggle_onion_act = menu.addAction("上一帧框淡色参考 (O)")
+        toggle_onion_act.setCheckable(True)
+        toggle_onion_act.setChecked(self.onion_skin_btn.isChecked())
+        select_all_act = menu.addAction("全选可见目标框 (Ctrl+A)")
+        select_all_act.setEnabled(bool(self._doc.boxes))
         show_all_vis_act = None
         if self._hidden_box_indices or self._hidden_classes:
             show_all_vis_act = menu.addAction("显示全部隐藏框与类别")
@@ -4732,6 +5009,10 @@ class LabelingStudioTab(QWidget):
             self.crosshair_btn.toggle()
         elif chosen is toggle_enhance_act:
             self.view_enhance_btn.toggle()
+        elif chosen is toggle_onion_act:
+            self.onion_skin_btn.toggle()
+        elif chosen is select_all_act:
+            self._select_all_visible_boxes()
         elif show_all_vis_act is not None and chosen is show_all_vis_act:
             self._show_all_boxes_and_classes()
         elif unlock_all_act is not None and chosen is unlock_all_act:
@@ -4972,9 +5253,28 @@ class LabelingStudioTab(QWidget):
             self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1400)
 
     def _toggle_selected_box_hidden(self) -> None:
-        idx = self.canvas.selected_index()
-        if idx >= 0:
-            self._toggle_box_hidden(idx)
+        sel_indices = self.canvas.selected_indices()
+        if not sel_indices or self._doc is None:
+            return
+        if len(sel_indices) == 1:
+            self._toggle_box_hidden(sel_indices[0])
+            return
+        all_hidden = all(i in self._hidden_box_indices for i in sel_indices)
+        if all_hidden:
+            for i in sel_indices:
+                self._hidden_box_indices.discard(i)
+            msg = f"已恢复显示选中的 {len(sel_indices)} 个目标框"
+        else:
+            for i in sel_indices:
+                self._hidden_box_indices.add(i)
+            msg = f"已批量隐藏选中的 {len(sel_indices)} 个目标框"
+        self.canvas.set_hidden_box_indices(self._hidden_box_indices)
+        self._refresh_shape_list(
+            selected_idx=self.canvas.selected_index(), selected_indices=sel_indices
+        )
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1400)
 
     def _toggle_box_locked(self, idx: int) -> None:
         """切换当前图单个目标框的锁定状态（锁定后禁止拖拽、缩放、改类、删除与 AI/SAM 覆盖）。"""
@@ -4990,16 +5290,41 @@ class LabelingStudioTab(QWidget):
             msg = f"已锁定目标框 #{idx + 1}「{box.label}」（防误拖/防误删 · 再按 K 解锁）"
             color = "#bf8700"
         self.canvas.set_locked_box_indices(self._locked_box_indices)
-        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        self._refresh_shape_list(
+            selected_idx=self.canvas.selected_index(),
+            selected_indices=self.canvas.selected_indices(),
+        )
         self._refresh_action_states()
         self.save_state_label.setText(msg)
         if self.isVisible():
             self.canvas.show_hud_message(msg, color=color, duration_ms=1500)
 
     def _toggle_selected_box_locked(self) -> None:
-        idx = self.canvas.selected_index()
-        if idx >= 0:
-            self._toggle_box_locked(idx)
+        sel_indices = self.canvas.selected_indices()
+        if not sel_indices or self._doc is None:
+            return
+        if len(sel_indices) == 1:
+            self._toggle_box_locked(sel_indices[0])
+            return
+        all_locked = all(self._is_box_locked(i) for i in sel_indices)
+        if all_locked:
+            for i in sel_indices:
+                self._locked_box_indices.discard(i)
+            msg = f"已批量解锁选中的 {len(sel_indices)} 个目标框"
+            color = "#0969da"
+        else:
+            for i in sel_indices:
+                self._locked_box_indices.add(i)
+            msg = f"已批量锁定选中的 {len(sel_indices)} 个目标框"
+            color = "#bf8700"
+        self.canvas.set_locked_box_indices(self._locked_box_indices)
+        self._refresh_shape_list(
+            selected_idx=self.canvas.selected_index(), selected_indices=sel_indices
+        )
+        self._refresh_action_states()
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(msg, color=color, duration_ms=1500)
 
     def _show_all_boxes_and_classes(self) -> None:
         """一键恢复显示当前图所有被隐藏的单框与类别。"""
@@ -5040,18 +5365,26 @@ class LabelingStudioTab(QWidget):
             self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1500)
 
     def _open_quick_class_picker(self) -> None:
-        """按 C 或点「搜类(C)」唤出可搜索类别选择器：有未锁定选中框时改该框类别，否则切换当前绘制类别。"""
-        sel = self.canvas.selected_index()
-        relabeling = (
-            self._doc is not None
-            and 0 <= sel < len(self._doc.boxes)
-            and self.canvas.editing()
-        )
-        if relabeling and self._is_box_locked(sel):
-            self._warn_locked_box(sel)
+        """按 C 或点「搜类(C)」唤出可搜索类别选择器：有未锁定选中框（含多选）时改类，否则切换绘制类别。"""
+        sel_indices = self.canvas.selected_indices()
+        relabeling = self._doc is not None and bool(sel_indices) and self.canvas.editing()
+        unlocked = [i for i in sel_indices if not self._is_box_locked(i)] if relabeling else []
+        if relabeling and not unlocked:
+            self._warn_locked_box(sel_indices[0])
             return
-        cur_label = self._doc.boxes[sel].label if (relabeling and self._doc is not None) else self._active_label
-        title = "搜索并修改选中框类别" if relabeling else "搜索并切换当前绘制类别"
+        cur_label = (
+            self._doc.boxes[unlocked[0]].label
+            if (relabeling and self._doc is not None and unlocked)
+            else self._active_label
+        )
+        if relabeling:
+            title = (
+                f"搜索并批量修改 {len(unlocked)} 个选中框类别"
+                if len(sel_indices) > 1
+                else "搜索并修改选中框类别"
+            )
+        else:
+            title = "搜索并切换当前绘制类别"
         dlg = ClassPickerDialog(
             self._classes,
             current_label=cur_label,
@@ -5065,13 +5398,162 @@ class LabelingStudioTab(QWidget):
         chosen = dlg.selected_label()
         self._set_active_class(chosen)
         if relabeling:
-            self._relabel_box(sel, chosen)
+            self._relabel_boxes(sel_indices, chosen)
         else:
             msg = f"当前绘制类别已切换为「{chosen}」"
             self.save_state_label.setText(msg)
             if self.isVisible() and self._doc is not None:
                 self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1300)
         self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _select_all_visible_boxes(self) -> None:
+        """全选当前图中所有可见目标框（快捷键 Ctrl+A）。"""
+        if self._doc is None or not self._doc.boxes:
+            return
+        visible = [i for i in range(len(self._doc.boxes)) if self.canvas.is_box_visible(i)]
+        if not visible:
+            return
+        self.canvas.select_boxes(visible, primary=visible[-1], emit_signal=True)
+        msg = f"已选中全部 {len(visible)} 个可见目标框"
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1200)
+
+    def _load_mapped_previous_frame_boxes(self) -> list[RectAnnotation]:
+        """读取上一张图片的标注框并按当前图分辨率等比缩放与裁剪，用于洋葱皮参考。"""
+        if self._doc is None:
+            return []
+        prev_path = self._resolve_previous_image_path()
+        if prev_path is None:
+            return []
+        prev_doc = load_image_annotation(prev_path)
+        if not prev_doc.boxes:
+            return []
+        cur_w = self._doc.image_width
+        cur_h = self._doc.image_height
+        prev_w = prev_doc.image_width
+        prev_h = prev_doc.image_height
+        scale_x = (
+            float(cur_w) / float(prev_w)
+            if (cur_w > 0 and prev_w > 0 and cur_w != prev_w)
+            else 1.0
+        )
+        scale_y = (
+            float(cur_h) / float(prev_h)
+            if (cur_h > 0 and prev_h > 0 and cur_h != prev_h)
+            else 1.0
+        )
+        mapped: list[RectAnnotation] = []
+        for src in prev_doc.boxes:
+            cand = RectAnnotation(
+                label=src.label,
+                x1=src.x1 * scale_x,
+                y1=src.y1 * scale_y,
+                x2=src.x2 * scale_x,
+                y2=src.y2 * scale_y,
+            )
+            if cur_w > 0 and cur_h > 0:
+                cand = cand.clamped(cur_w, cur_h)
+            if (
+                cand.width >= AnnotationCanvasView.MIN_BOX_SIZE_PX
+                and cand.height >= AnnotationCanvasView.MIN_BOX_SIZE_PX
+            ):
+                mapped.append(cand)
+        return mapped
+
+    def _refresh_onion_skin_overlay(self) -> None:
+        """同步上一帧洋葱皮参考框到画布；关闭时清空参考层。"""
+        if not self.onion_skin_btn.isChecked() or self._doc is None:
+            self.canvas.set_onion_skin_visible(False)
+            self.canvas.set_onion_skin_boxes([])
+            return
+        mapped = self._load_mapped_previous_frame_boxes()
+        self.canvas.set_onion_skin_boxes(mapped)
+        self.canvas.set_onion_skin_visible(True)
+
+    def _on_onion_skin_toggled(self, checked: bool) -> None:
+        self._refresh_onion_skin_overlay()
+        if not (self.isVisible() and self._doc is not None):
+            return
+        if checked:
+            cnt = len(self.canvas._onion_skin_boxes)
+            msg = (
+                f"已开启上一帧洋葱皮参考（叠显 {cnt} 个上帧框 · 再按 O 关闭）"
+                if cnt > 0
+                else "已开启上一帧洋葱皮参考（上一张暂无标注框）"
+            )
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1500)
+        else:
+            self.canvas.show_hud_message("已关闭上一帧洋葱皮参考", color="#57606a", duration_ms=1200)
+
+    def _refresh_confidence_filter_bar(self) -> None:
+        """按需显隐置信度过滤条并刷新隐藏低分框计数与一键清理按钮状态。"""
+        boxes = self._doc.boxes if self._doc is not None else []
+        scored = [b for b in boxes if b.score is not None]
+        threshold = self.conf_threshold_slider.value() / 100.0
+        show_bar = bool(scored) or threshold > 0.0
+        self.conf_filter_bar.setVisible(show_bar)
+        low_cnt = sum(1 for b in scored if b.score is not None and b.score < threshold) if threshold > 0.0 else 0
+        self.conf_threshold_label.setText(f"置信≥{threshold:.2f}")
+        self.prune_low_conf_btn.setText(f"删低分({low_cnt})" if low_cnt > 0 else "删低分")
+        self.prune_low_conf_btn.setEnabled(low_cnt > 0)
+        self.conf_reset_btn.setEnabled(threshold > 0.0)
+
+    def _on_conf_threshold_changed(self, value: int) -> None:
+        threshold = max(0, min(95, int(value))) / 100.0
+        self.canvas.set_min_confidence(threshold)
+        self._refresh_confidence_filter_bar()
+        self._refresh_shape_list(
+            selected_idx=self.canvas.selected_index(),
+            selected_indices=self.canvas.selected_indices(),
+        )
+
+    def _prune_low_confidence_boxes(self) -> int:
+        """一键删除当前图中低于置信度阈值的未锁定 AI 预标注框（保留人工框与锁定框，Ctrl+Z 可撤回）。"""
+        if self._doc is None:
+            return 0
+        threshold = self.conf_threshold_slider.value() / 100.0
+        if threshold <= 0.0:
+            return 0
+        to_remove: set[int] = set()
+        skipped_locked = 0
+        for idx, b in enumerate(self._doc.boxes):
+            if b.score is not None and b.score < threshold:
+                if self._is_box_locked(idx):
+                    skipped_locked += 1
+                else:
+                    to_remove.add(idx)
+        if not to_remove:
+            if skipped_locked:
+                msg = f"有 {skipped_locked} 个低分框已锁定，请先解锁后再清理"
+                self.save_state_label.setText(msg)
+                if self.isVisible():
+                    self.canvas.show_hud_message(msg, color="#bf8700", duration_ms=1500)
+            return 0
+
+        self._push_undo_snapshot()
+        kept_boxes: list[RectAnnotation] = []
+        new_hidden: set[int] = set()
+        new_locked: set[int] = set()
+        for old_i, b in enumerate(self._doc.boxes):
+            if old_i in to_remove:
+                continue
+            new_i = len(kept_boxes)
+            kept_boxes.append(b)
+            if old_i in self._hidden_box_indices:
+                new_hidden.add(new_i)
+            if old_i in self._locked_box_indices:
+                new_locked.add(new_i)
+        self._doc.boxes = kept_boxes
+        self._hidden_box_indices = new_hidden
+        self._locked_box_indices = new_locked
+        self._apply_boxes_change(selected_idx=-1)
+        extra = f"（保留 {skipped_locked} 个锁定框）" if skipped_locked else ""
+        msg = f"已清理 {len(to_remove)} 个置信度 < {threshold:.2f} 的 AI 框{extra}（Ctrl+Z 可撤回）"
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1700)
+        return len(to_remove)
 
     def _refresh_box_opacity_button(self) -> None:
         fill_pct, stroke_pct = self.canvas.box_opacity()
@@ -5203,16 +5685,28 @@ class LabelingStudioTab(QWidget):
                 return
 
     def _on_canvas_selection_changed(self, idx: int) -> None:
+        self._sync_shape_list_selection(idx, self.canvas.selected_indices())
+
+    def _on_canvas_multi_selection_changed(self, indices: list[int]) -> None:
+        self._sync_shape_list_selection(self.canvas.selected_index(), list(indices))
+
+    def _sync_shape_list_selection(self, primary_idx: int, indices: list[int]) -> None:
         self._syncing_lists = True
         try:
-            if 0 <= idx < self.shape_list.count():
-                self.shape_list.setCurrentRow(idx)
+            self.shape_list.clearSelection()
+            valid = [i for i in indices if 0 <= i < self.shape_list.count()]
+            if valid:
+                primary = primary_idx if primary_idx in valid else valid[-1]
+                self.shape_list.setCurrentRow(primary)
+                for row_i in valid:
+                    it = self.shape_list.item(row_i)
+                    if it is not None:
+                        it.setSelected(True)
             else:
-                self.shape_list.clearSelection()
                 self.shape_list.setCurrentRow(-1)
         finally:
             self._syncing_lists = False
-        self._refresh_box_detail(idx)
+        self._refresh_box_detail(primary_idx)
         self._refresh_action_states()
 
     def _on_keep_view_toggled(self, checked: bool) -> None:
