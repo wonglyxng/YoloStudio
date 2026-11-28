@@ -75,7 +75,8 @@ def test_mainwindow_mounts_native_workbench_and_scopes_shortcuts(
             box.title() for box in win.review_tab.findChildren(QGroupBox)
         ]
         assert "2. AI 大模型配置（全局共享）" in review_group_titles
-        assert win.settings_btn.text() == "⚙ 设置"
+        assert win.settings_btn.text() == "设置"
+        assert not win.settings_btn.icon().isNull()
         assert win.labeling_tab.settings_store is win.settings_store
         assert win.review_tab.settings_store is win.settings_store
         assert win.labeling_tab.ensure_mounted() is True

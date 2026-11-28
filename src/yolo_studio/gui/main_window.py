@@ -13,10 +13,21 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QThread, QTimer
-from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
+from PyQt6.QtCore import QPointF, QSettings, QSize, Qt, QThread, QTimer
+from PyQt6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QColor,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QMainWindow,
@@ -112,6 +123,23 @@ QPushButton#accentActionBtn:disabled {
     background-color: #f2f2f2;
     border-color: #c6cdd5;
 }
+QPushButton#settingsCornerBtn {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    color: #57606a;
+    padding: 0px 8px;
+    font-size: 12px;
+    font-weight: 500;
+}
+QPushButton#settingsCornerBtn:hover {
+    background-color: rgba(175, 184, 193, 0.24);
+    color: #24292f;
+}
+QPushButton#settingsCornerBtn:pressed {
+    background-color: rgba(175, 184, 193, 0.40);
+    color: #1f2328;
+}
 QProgressBar {
     border: 1px solid #d0d7de;
     border-radius: 6px;
@@ -139,6 +167,64 @@ QWidget#metricCard {
     background-color: #f8fafc;
 }
 """
+
+
+def _render_gear_pixmap(size: int, color_hex: str, dpr: float = 2.0) -> QPixmap:
+    """绘制高 DPI 抗锯齿的单色细线矢量齿轮位图，避免 Windows 彩色 Emoji 割裂界面风格。"""
+    phys = max(16, int(round(size * dpr)))
+    pm = QPixmap(phys, phys)
+    pm.fill(Qt.GlobalColor.transparent)
+    pm.setDevicePixelRatio(dpr)
+
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    cx = size / 2.0
+    cy = size / 2.0
+    r_outer = size * 0.435
+    r_inner = size * 0.325
+    r_hole = size * 0.155
+    teeth = 6
+    step = (2.0 * math.pi) / teeth
+
+    # 用 6 齿圆润细线轮廓绘制现代扁平齿轮（在小尺寸 14px 下仍清晰锐利、不糊成一团）
+    path = QPainterPath()
+    first = True
+    for i in range(teeth):
+        base = i * step - math.pi / 2.0
+        pts = (
+            (base - step * 0.30, r_inner),
+            (base - step * 0.16, r_outer),
+            (base + step * 0.16, r_outer),
+            (base + step * 0.30, r_inner),
+        )
+        for ang, rad in pts:
+            p = QPointF(cx + math.cos(ang) * rad, cy + math.sin(ang) * rad)
+            if first:
+                path.moveTo(p)
+                first = False
+            else:
+                path.lineTo(p)
+    path.closeSubpath()
+
+    pen = QPen(QColor(color_hex), 1.3)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(path)
+    painter.drawEllipse(QPointF(cx, cy), r_hole, r_hole)
+    painter.end()
+    return pm
+
+
+def _build_settings_gear_icon(size: int = 14) -> QIcon:
+    """构造带常规态与悬停态的单色矢量设置图标。"""
+    icon = QIcon()
+    icon.addPixmap(_render_gear_pixmap(size, "#57606a"), QIcon.Mode.Normal, QIcon.State.Off)
+    icon.addPixmap(_render_gear_pixmap(size, "#24292f"), QIcon.Mode.Active, QIcon.State.Off)
+    icon.addPixmap(_render_gear_pixmap(size, "#24292f"), QIcon.Mode.Selected, QIcon.State.Off)
+    return icon
 
 
 class MainWindow(QMainWindow):
@@ -220,17 +306,22 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.train_tab, "5. YOLO26 训练")
         self.tabs.addTab(self.eval_tab, "6. 验证、推理与导出")
 
-        # 右上角常驻全局设置入口（快捷键 Ctrl+,），集中管理 AI 大模型、本地 SAM 与通用偏好
+        # 右上角常驻全局设置入口（快捷键 Ctrl+,），采用单色矢量齿轮 + 无边框幽灵按钮融入标签栏
         corner = QWidget(self.tabs)
         corner_lay = QHBoxLayout(corner)
-        corner_lay.setContentsMargins(0, 0, 2, 2)
-        corner_lay.setSpacing(4)
-        self.settings_btn = QPushButton("⚙ 设置")
+        corner_lay.setContentsMargins(0, 0, 2, 3)
+        corner_lay.setSpacing(0)
+        self.settings_btn = QPushButton("设置")
         self.settings_btn.setObjectName("settingsCornerBtn")
+        self.settings_btn.setIcon(_build_settings_gear_icon(14))
+        self.settings_btn.setIconSize(QSize(14, 14))
+        self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tab_bar_h = self.tabs.tabBar().sizeHint().height()
+        self.settings_btn.setFixedHeight(max(22, min(26, tab_bar_h - 3 if tab_bar_h > 0 else 24)))
         self.settings_btn.setToolTip("打开全局设置：AI 大模型、本地 SAM 模型与通用偏好 (Ctrl+,)")
-        self.settings_btn.setStyleSheet("padding: 3px 10px; font-size: 12px;")
         self.settings_btn.clicked.connect(lambda: self.open_settings_dialog(PAGE_AI))
-        corner_lay.addWidget(self.settings_btn)
+        corner_lay.addWidget(self.settings_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
         self.settings_action = QAction("全局设置", self)
