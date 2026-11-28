@@ -3190,3 +3190,128 @@ def test_crosshair_style_geometry_color_settings_and_workbench_sync(
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_workbench_directory_class_rename_merge_and_shortcut_help(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证类别全目录重命名（含备份）、合并到已有类别、确认弹窗统计与范围，以及 ?/F1 快捷键速查面板。"""
+    from yolo_studio.gui.class_rename_dialog import ClassRenameDialog
+    from yolo_studio.gui.shortcut_help_dialog import WORKBENCH_SHORTCUT_GROUPS
+
+    frames_dir = tmp_path / "rename_frames"
+    imgs = [frames_dir / f"f{i}.jpg" for i in range(3)]
+    for p in imgs:
+        _write_sample_frame(p, (200, 150))
+
+    def _write_shapes(img: Path, labels: list[str]) -> None:
+        img.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "version": "2.5.4",
+                    "flags": {},
+                    "shapes": [
+                        {
+                            "label": lb,
+                            "points": [[10.0 + i * 30, 10.0], [30.0 + i * 30, 40.0]],
+                            "shape_type": "rectangle",
+                            "flags": {},
+                        }
+                        for i, lb in enumerate(labels)
+                    ],
+                    "imagePath": img.name,
+                    "imageHeight": 150,
+                    "imageWidth": 200,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    _write_shapes(imgs[0], ["hero", "monster"])
+    _write_shapes(imgs[1], ["hero", "hero"])
+    _write_shapes(imgs[2], ["monster"])
+
+    def _labels(img: Path) -> list[str]:
+        return [s["label"] for s in json.loads(img.with_suffix(".json").read_text(encoding="utf-8"))["shapes"]]
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    changed_dirs: list[str] = []
+    win.labeling_tab.annotations_changed.connect(changed_dirs.append)
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+        assert tab.current_image_path() == imgs[0].resolve()
+        assert {"hero", "monster"} <= set(tab._classes)
+
+        # 1) 确认弹窗：默认作用于整个目录，统计含当前图在内 2 张图 3 个框；合并时按钮文字变为「合并」
+        dlg = ClassRenameDialog(
+            "hero",
+            list(tab._classes),
+            dir_file_count=1,
+            dir_shape_count=2,
+            current_shape_count=1,
+            has_directory=True,
+            backup_hint="X",
+            parent=tab,
+        )
+        try:
+            assert dlg.apply_to_directory() is True
+            assert "2 张图片，共 3 个框" in dlg.dir_radio.text()
+            assert dlg.ok_btn.isEnabled() is False  # 未改名
+            dlg.name_edit.setText("monster")
+            assert dlg.is_merge() is True and dlg.ok_btn.text() == "合并"
+            dlg.name_edit.setText("player")
+            assert dlg.is_merge() is False and dlg.ok_btn.text() == "重命名"
+            assert "备份" in dlg.info_label.text()
+            dlg.cur_radio.setChecked(True)
+            assert "两个不同类别" in dlg.info_label.text()
+        finally:
+            dlg.close()
+
+        # 2) 全目录重命名 hero -> player：其它图先备份再改写，当前图同步保存
+        assert tab._rename_class("hero", "player", apply_to_directory=True) is True
+        qt_app.processEvents()
+        assert _labels(imgs[0]) == ["player", "monster"]
+        assert _labels(imgs[1]) == ["player", "player"]
+        assert "player" in tab._classes and "hero" not in tab._classes
+        assert tab._dirty is False
+        backups = sorted((tmp_path / "data" / "backups").glob("label_rename_*"))
+        assert len(backups) == 1
+        assert json.loads((backups[0] / "f1.json").read_text(encoding="utf-8"))["shapes"][0]["label"] == "hero"
+        assert (backups[0] / "manifest.json").is_file()
+        assert changed_dirs
+        assert "2 张图片 / 3 个框" in tab.save_state_label.text()
+
+        # 3) 全目录合并 monster -> player：旧类别从清单移除
+        assert tab._rename_class("monster", "player", apply_to_directory=True) is True
+        qt_app.processEvents()
+        assert _labels(imgs[0]) == ["player", "player"]
+        assert _labels(imgs[2]) == ["player"]
+        assert "monster" not in tab._classes
+        assert tab._classes.count("player") == 1
+
+        # 4) 快捷键速查：? 打开、再按关闭；分组覆盖关键快捷键；底栏按钮同样可打开
+        all_keys = " ".join(k for _g, items in WORKBENCH_SHORTCUT_GROUPS for k, _d in items)
+        for must in ("A / D", "Shift+V", "Ctrl+D", "? / F1", "Tab / Shift+Tab"):
+            assert must in all_keys
+        tab.canvas.setFocus()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_Question, Qt.KeyboardModifier.ShiftModifier)
+        qt_app.processEvents()
+        assert tab._shortcut_help_dlg is not None and tab._shortcut_help_dlg.isVisible()
+        assert "复用上一张图的全部框" in tab._shortcut_help_dlg.browser.toPlainText()
+        tab.show_shortcut_help()
+        qt_app.processEvents()
+        assert tab._shortcut_help_dlg.isVisible() is False
+        tab.shortcut_help_btn.click()
+        qt_app.processEvents()
+        assert tab._shortcut_help_dlg.isVisible() is True
+        tab._shortcut_help_dlg.close()
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()

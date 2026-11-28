@@ -42,7 +42,6 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -69,9 +68,15 @@ from yolo_studio.core.annotation_io import (
     label_color_rgb,
     load_classes_txt,
     load_image_annotation,
+    resolve_annotation_json_path,
     save_classes_txt,
     save_image_annotation,
     scan_labeling_directory,
+)
+from yolo_studio.core.label_batch_ops import (
+    make_label_backup_dir,
+    rename_label_in_json_files,
+    scan_label_usage,
 )
 from yolo_studio.core.label_auditor import (
     AuditIssueKind,
@@ -89,8 +94,10 @@ from yolo_studio.gui.app_settings import (
     validate_llm_credentials,
 )
 from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
+from yolo_studio.gui.class_rename_dialog import ClassRenameDialog
 from yolo_studio.gui.label_audit_dialog import LabelAuditDialog
 from yolo_studio.gui.sam_track_dialog import SamTrackDialog
+from yolo_studio.gui.shortcut_help_dialog import ShortcutHelpDialog
 
 _ADDED_DLL_HANDLES: list[object] = []
 _MAX_UNDO_STEPS = 80
@@ -879,6 +886,8 @@ class LabelingStudioTab(QWidget):
         self._audit_report_map: dict[Path, ImageAuditReport] = {}
         self._audit_predictor_override: Any | None = None
         self._sam_tracker_override: Any | None = None
+        # 快捷键速查面板（首次按 ? / F1 时创建并复用）
+        self._shortcut_help_dlg: ShortcutHelpDialog | None = None
         self._scoped_actions: list[QAction] = []
         self._clipboard_boxes: list[RectAnnotation] = []
         self._clipboard_source_image: Path | None = None
@@ -1153,7 +1162,7 @@ class LabelingStudioTab(QWidget):
         self.img_info_label = _CompactFooterLabel("分辨率: -", min_width=64)
         self.cursor_info_label = _CompactFooterLabel("坐标: -", min_width=52)
         self.hint_info_label = _ElidedStatusLabel(
-            "滚轮缩放 · 拖空白/右键/空格平移 · X准星 · B增亮 · Shift+V复用上帧",
+            "滚轮缩放 · 拖空白/右键/空格平移 · X准星 · B增亮 · Shift+V复用上帧 · ?快捷键",
             min_width=0,
         )
         self.hint_info_label.setStyleSheet("border: none; color: #8c959f; font-size: 11px;")
@@ -1175,7 +1184,10 @@ class LabelingStudioTab(QWidget):
         self.crosshair_btn = QPushButton("准星(X)")
         self.crosshair_btn.setObjectName("footerToggleBtn")
         self.crosshair_btn.setCheckable(True)
-        self.crosshair_btn.setToolTip("全模式常显双色高对比度十字准星，方便编辑对齐边缘 (快捷键 X)")
+        self.crosshair_btn.setToolTip("全模式常显中心留空的细十字准星，方便编辑对齐边缘；样式可在「⚙ 设置 → 通用设置」中调整 (快捷键 X)")
+
+        self.shortcut_help_btn = QPushButton("快捷键(?)")
+        self.shortcut_help_btn.setToolTip("打开工作台快捷键速查面板 (? / F1)")
 
         enhance_grp = QWidget()
         enhance_lay = QHBoxLayout(enhance_grp)
@@ -1211,6 +1223,7 @@ class LabelingStudioTab(QWidget):
         self.zoom_100_btn.setToolTip("切换至 100% 原始像素比例 (Ctrl+1)")
         for zb in (
             self.crosshair_btn,
+            self.shortcut_help_btn,
             self.view_enhance_btn,
             self.view_enhance_menu_btn,
             self.zoom_out_btn,
@@ -1236,6 +1249,8 @@ class LabelingStudioTab(QWidget):
         f_lay.addWidget(self.zoom_in_btn)
         f_lay.addWidget(self.fit_btn)
         f_lay.addWidget(self.zoom_100_btn)
+        f_lay.addWidget(self._make_vsep())
+        f_lay.addWidget(self.shortcut_help_btn)
         center_lay.addWidget(footer)
         self.main_splitter.addWidget(center_panel)
 
@@ -1541,6 +1556,7 @@ class LabelingStudioTab(QWidget):
         self.llm_fix_btn.clicked.connect(self._on_llm_fix_box_clicked)
         self.keep_view_chk.toggled.connect(self._on_keep_view_toggled)
         self.crosshair_btn.toggled.connect(self._on_crosshair_toggled)
+        self.shortcut_help_btn.clicked.connect(self.show_shortcut_help)
         self.view_enhance_btn.toggled.connect(self._on_view_enhance_toggled)
         self.view_enhance_menu_btn.clicked.connect(self._on_view_enhance_menu_clicked)
         self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_by(1.0 / 1.25))
@@ -1721,6 +1737,11 @@ class LabelingStudioTab(QWidget):
         ):
             return False
         key = event.key()
+        if key in (Qt.Key.Key_Question, Qt.Key.Key_F1) or (
+            key == Qt.Key.Key_Slash and bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        ):
+            self.show_shortcut_help()
+            return True
         if key in (Qt.Key.Key_R, Qt.Key.Key_W):
             self.canvas.set_mode(AnnotationCanvasView.MODE_DRAW)
             return True
@@ -2933,7 +2954,7 @@ class LabelingStudioTab(QWidget):
             return
         menu = QMenu(self)
         use_act = menu.addAction(f"设为当前绘制类别「{cls_name}」")
-        rename_act = menu.addAction("重命名类别...")
+        rename_act = menu.addAction("重命名 / 合并类别...")
         menu.addSeparator()
         remove_act = menu.addAction("从清单移除")
         chosen = menu.exec(self.unique_label_list.mapToGlobal(pos))
@@ -2945,36 +2966,126 @@ class LabelingStudioTab(QWidget):
             self._remove_class_from_list(cls_name)
 
     def _prompt_rename_class(self, old_name: str) -> None:
-        new_name, ok = QInputDialog.getText(
-            self, "重命名类别", f"将类别「{old_name}」重命名为：", text=old_name
+        """弹出重命名/合并确认窗：先只读统计目录内使用情况，再按用户选择的范围执行。"""
+        other_jsons = self._directory_json_paths(exclude_current=True)
+        usage = scan_label_usage(other_jsons, old_name)
+        cur_cnt = (
+            sum(1 for b in self._doc.boxes if b.label == old_name) if self._doc is not None else 0
         )
-        if ok:
-            self._rename_class(old_name, new_name)
+        backup_hint = str(make_label_backup_dir(self.workspace_root).parent / "label_rename_<时间>")
+        dlg = ClassRenameDialog(
+            old_name,
+            list(self._classes),
+            dir_file_count=len(usage.files),
+            dir_shape_count=usage.shape_count,
+            current_shape_count=cur_cnt,
+            has_directory=self._current_dir is not None,
+            backup_hint=backup_hint,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._rename_class(old_name, dlg.new_name(), apply_to_directory=dlg.apply_to_directory())
 
-    def _rename_class(self, old_name: str, new_name: str) -> bool:
-        """重命名右侧类别并同步更新当前图片同名框（支持 Ctrl+Z 撤回）。"""
+    def _directory_json_paths(self, *, exclude_current: bool) -> list[Path]:
+        """返回当前目录全部图片对应且已存在的 `.json` 路径（不受列表筛选影响）。"""
+        current = self._doc.image_path if self._doc is not None else None
+        paths: list[Path] = []
+        for img in self._all_images:
+            if exclude_current and current is not None and img.resolve() == current:
+                continue
+            jp = resolve_annotation_json_path(img.resolve())
+            if jp.is_file():
+                paths.append(jp)
+        return paths
+
+    def _rename_class(
+        self, old_name: str, new_name: str, *, apply_to_directory: bool = False
+    ) -> bool:
+        """重命名或合并类别。
+
+        - 新名已在类别清单中时视为“合并”：旧类别的框并入新类别，旧类别从清单移除；
+        - 当前图片的框始终在内存中改名并入撤销栈（`Ctrl+Z` 可撤回）；
+        - `apply_to_directory=True` 时，目录内其它图片的 `.json` 先备份到
+          `<workspace>/data/backups/label_rename_<时间>` 再原子改写，磁盘改写不进撤销栈，靠备份恢复；
+          若当前图片原本没有未保存改动，会同步立即保存，保证磁盘与内存一致。
+        返回是否执行了改名。
+        """
         clean = new_name.strip()
         if not clean or clean == old_name or old_name not in self._classes:
             return False
-        if clean in self._classes:
-            QMessageBox.warning(self, "重命名冲突", f"类别「{clean}」已存在。")
-            return False
+        is_merge = clean in self._classes
 
-        idx = self._classes.index(old_name)
-        self._classes[idx] = clean
+        disk_result = None
+        if apply_to_directory and self._current_dir is not None:
+            other_jsons = self._directory_json_paths(exclude_current=True)
+            self._suppress_watch_until = time.monotonic() + 2.0
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                disk_result = rename_label_in_json_files(
+                    other_jsons,
+                    old_name,
+                    clean,
+                    backup_dir=make_label_backup_dir(self.workspace_root),
+                    base_dir=self._current_dir,
+                )
+            finally:
+                QApplication.restoreOverrideCursor()
+
+        if is_merge:
+            self._classes.remove(old_name)
+        else:
+            self._classes[self._classes.index(old_name)] = clean
         if self._active_label == old_name:
             self._active_label = clean
             self.canvas.set_active_label(clean)
 
-        if self._doc is not None and any(b.label == old_name for b in self._doc.boxes):
+        was_dirty = self._dirty
+        cur_changed = False
+        if self._doc is not None and (
+            any(b.label == old_name for b in self._doc.boxes)
+            or any(str(s.get("label") or "").strip() == old_name for s in self._doc.preserved_shapes)
+        ):
             self._push_undo_snapshot()
             for box in self._doc.boxes:
                 if box.label == old_name:
                     box.label = clean
+            for shape in self._doc.preserved_shapes:
+                if str(shape.get("label") or "").strip() == old_name:
+                    shape["label"] = clean
             self._apply_boxes_change(selected_idx=self.canvas.selected_index())
+            cur_changed = True
         else:
             self._refresh_class_counts()
-        self.save_state_label.setText(f"已重命名类别为「{clean}」")
+
+        if apply_to_directory and cur_changed and not was_dirty:
+            self.save_current_annotation(force=True)
+
+        verb = "合并到" if is_merge else "重命名为"
+        if disk_result is not None:
+            n_files = len(disk_result.changed_files) + (1 if cur_changed else 0)
+            n_shapes = disk_result.changed_shapes + (
+                sum(1 for b in self._doc.boxes if b.label == clean) if (cur_changed and self._doc) else 0
+            )
+            msg = f"已将「{old_name}」{verb}「{clean}」：{n_files} 张图片 / {n_shapes} 个框"
+            if disk_result.backup_dir is not None:
+                msg += f"（原文件已备份至 {disk_result.backup_dir.name}）"
+            self.save_state_label.setText(msg)
+            self.save_state_label.setToolTip(
+                str(disk_result.backup_dir) if disk_result.backup_dir is not None else ""
+            )
+            if disk_result.changed_files and self._current_dir is not None:
+                self.annotations_changed.emit(str(self._current_dir))
+            if disk_result.failed:
+                detail = "\n".join(f"{p.name}：{why}" for p, why in disk_result.failed[:10])
+                more = f"\n…另有 {len(disk_result.failed) - 10} 个" if len(disk_result.failed) > 10 else ""
+                QMessageBox.warning(
+                    self,
+                    "部分文件未能改写",
+                    f"{len(disk_result.failed)} 个标注文件处理失败（已成功的文件不受影响）：\n{detail}{more}",
+                )
+        else:
+            self.save_state_label.setText(f"已将类别「{old_name}」{verb}「{clean}」（仅当前图片）")
         return True
 
     def _remove_class_from_list(self, cls_name: str) -> bool:
@@ -3245,6 +3356,25 @@ class LabelingStudioTab(QWidget):
         )
         self.save_state_label.setText(msg)
         self.canvas.show_hud_message(msg, color="#0d9488", duration_ms=2600)
+
+    def show_shortcut_help(self) -> ShortcutHelpDialog:
+        """打开（或在已打开时关闭）非模态快捷键速查面板，返回面板实例。
+
+        面板实例复用并由工作台持有；关闭后焦点交还画布，保证单键快捷键继续可用。
+        """
+        dlg = self._shortcut_help_dlg
+        if dlg is not None and dlg.isVisible():
+            dlg.close()
+            self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+            return dlg
+        if dlg is None:
+            dlg = ShortcutHelpDialog(self)
+            dlg.finished.connect(lambda *_a: self.canvas.setFocus(Qt.FocusReason.OtherFocusReason))
+            self._shortcut_help_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        return dlg
 
     def _copy_boxes_from_previous_image(self) -> bool:
         """一键复用上一张图片的全部标注框到当前图（跨分辨率自动缩放、同类高重合自动去重、支持 Ctrl+Z 撤回）。"""
