@@ -510,6 +510,9 @@ class SettingsDialog(QDialog):
         return "未检测到可用 NVIDIA CUDA 显卡，当前将使用 CPU 模式运行本地模型"
 
     def _load_from_preferences(self, prefs: AppPreferences) -> None:
+        self._wb_box_fill_opacity = prefs.workbench_box_fill_opacity
+        self._wb_box_stroke_opacity = prefs.workbench_box_stroke_opacity
+        self._wb_prompt_label_after_draw = prefs.workbench_prompt_label_after_draw
         self._loading_from_store = True
         try:
             idx = self.provider_combo.findData(prefs.provider)
@@ -595,6 +598,9 @@ class SettingsDialog(QDialog):
             workbench_crosshair_dashed=bool(self.wb_crosshair_dashed_combo.currentData()),
             workbench_crosshair_halo=self.wb_crosshair_halo_chk.isChecked(),
             workbench_crosshair_dash=normalize_crosshair_dash_key(self.wb_crosshair_dash_combo.currentData()),
+            workbench_box_fill_opacity=self._wb_box_fill_opacity,
+            workbench_box_stroke_opacity=self._wb_box_stroke_opacity,
+            workbench_prompt_label_after_draw=self._wb_prompt_label_after_draw,
             remember_last_dir=self.remember_last_dir_chk.isChecked(),
             default_prefer_gpu=self.default_prefer_gpu_chk.isChecked(),
         )

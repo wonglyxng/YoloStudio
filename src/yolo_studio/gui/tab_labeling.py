@@ -85,7 +85,12 @@ from yolo_studio.core.label_auditor import (
 )
 from yolo_studio.core.sam_tracker import SamTrackResult
 from yolo_studio.core.trainer import DeviceInfo, detect_compute_device
-from yolo_studio.gui.annotation_canvas import AnnotationCanvasView, load_image_pixmap
+from yolo_studio.gui.annotation_canvas import (
+    DEFAULT_BOX_FILL_OPACITY,
+    DEFAULT_BOX_STROKE_OPACITY,
+    AnnotationCanvasView,
+    load_image_pixmap,
+)
 from yolo_studio.gui.app_settings import (
     AppPreferences,
     AppSettingsStore,
@@ -93,6 +98,7 @@ from yolo_studio.gui.app_settings import (
     format_llm_summary,
     validate_llm_credentials,
 )
+from yolo_studio.gui.class_picker_dialog import ClassPickerDialog
 from yolo_studio.gui.common import GpuTaskGuard, install_combobox_wheel_guard
 from yolo_studio.gui.class_rename_dialog import ClassRenameDialog
 from yolo_studio.gui.label_audit_dialog import LabelAuditDialog
@@ -276,61 +282,8 @@ class _EmptyHintListWidget(QListWidget):
         painter.end()
 
 
-class _LabelPickerDialog(QDialog):
-    """简洁的类别选择与新建弹窗（用于未选类别时落框或双击改类）。"""
-
-    def __init__(
-        self,
-        classes: list[str],
-        *,
-        current_label: str = "",
-        title: str = "选择或输入目标类别",
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setMinimumWidth(320)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-        layout.addWidget(QLabel("选择已有类别，或直接输入新类别名称后回车确认："))
-
-        self.combo = QComboBox()
-        self.combo.setEditable(True)
-        self.combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        for cls_name in classes:
-            self.combo.addItem(_make_color_icon(label_color_rgb(cls_name)), cls_name)
-        if current_label:
-            idx = self.combo.findText(current_label)
-            if idx >= 0:
-                self.combo.setCurrentIndex(idx)
-            else:
-                self.combo.setEditText(current_label)
-        elif classes:
-            self.combo.setCurrentIndex(0)
-        layout.addWidget(self.combo)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
-        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        btns.accepted.connect(self._on_accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-        if self.combo.lineEdit() is not None:
-            self.combo.lineEdit().selectAll()
-            self.combo.lineEdit().setFocus()
-
-    def _on_accept(self) -> None:
-        if not self.selected_label():
-            QMessageBox.warning(self, "提示", "类别名称不能为空。")
-            return
-        self.accept()
-
-    def selected_label(self) -> str:
-        return self.combo.currentText().strip()
+# 兼容旧名称：统一复用独立的可搜索类别快速选择弹窗
+_LabelPickerDialog = ClassPickerDialog
 
 
 def _rect_iou(a: RectAnnotation, b: RectAnnotation) -> float:
@@ -861,6 +814,10 @@ class LabelingStudioTab(QWidget):
 
         self._classes: list[str] = []
         self._active_label: str = ""
+        # 视图态按类别隐藏（跨图保持，切换目录或点「全显」清空）与当前图单框隐藏/锁定索引（切图重置）
+        self._hidden_classes: set[str] = set()
+        self._hidden_box_indices: set[int] = set()
+        self._locked_box_indices: set[int] = set()
         self._syncing_lists: bool = False
         self._suppress_watch_until: float = 0.0
 
@@ -921,6 +878,7 @@ class LabelingStudioTab(QWidget):
         self.settings_store.sam_changed.connect(self._on_sam_settings_changed)
         self.settings_store.general_changed.connect(self._on_general_settings_changed)
         self._refresh_ai_tooltips()
+        self._refresh_box_opacity_button()
         self._refresh_action_states()
 
     # ------------------------------------------------------------------
@@ -1144,6 +1102,10 @@ class LabelingStudioTab(QWidget):
             dashed=_init_prefs.workbench_crosshair_dashed, halo=_init_prefs.workbench_crosshair_halo
         )
         self.canvas.set_crosshair_dash(_init_prefs.workbench_crosshair_dash)
+        self.canvas.set_box_opacity(
+            fill=_init_prefs.workbench_box_fill_opacity,
+            stroke=_init_prefs.workbench_box_stroke_opacity,
+        )
         center_lay.addWidget(self.canvas, 1)
 
         footer = QFrame()
@@ -1209,6 +1171,13 @@ class LabelingStudioTab(QWidget):
         enhance_lay.addWidget(self.view_enhance_btn)
         enhance_lay.addWidget(self.view_enhance_menu_btn)
 
+        self.box_opacity_btn = QPushButton("框透明 ▾")
+        self.box_opacity_btn.setObjectName("footerToggleBtn")
+        self.box_opacity_btn.setCheckable(True)
+        self.box_opacity_btn.setToolTip(
+            "调节目标框填充与描边不透明度，或一键切换「仅描边」以看清密集细节"
+        )
+
         self.zoom_out_btn = QPushButton("−")
         self.zoom_out_btn.setFixedWidth(26)
         self.zoom_out_btn.setToolTip("缩小画布 (- / Ctrl+-)")
@@ -1223,6 +1192,7 @@ class LabelingStudioTab(QWidget):
         self.zoom_100_btn.setToolTip("切换至 100% 原始像素比例 (Ctrl+1)")
         for zb in (
             self.crosshair_btn,
+            self.box_opacity_btn,
             self.shortcut_help_btn,
             self.view_enhance_btn,
             self.view_enhance_menu_btn,
@@ -1243,6 +1213,7 @@ class LabelingStudioTab(QWidget):
         f_lay.addWidget(self.sam_hover_preview_chk)
         f_lay.addWidget(self.crosshair_btn)
         f_lay.addWidget(enhance_grp)
+        f_lay.addWidget(self.box_opacity_btn)
         f_lay.addWidget(self._make_vsep())
         f_lay.addWidget(self.zoom_out_btn)
         f_lay.addWidget(self.zoom_menu_btn)
@@ -1279,6 +1250,13 @@ class LabelingStudioTab(QWidget):
         cls_hdr.setSpacing(4)
         cls_title = QLabel("类别清单 (1-9)")
         cls_title.setStyleSheet("font-weight: 600; color: #24292f;")
+        self.show_all_classes_btn = QPushButton("全显")
+        self.show_all_classes_btn.setToolTip("显示所有已隐藏的类别")
+        self.show_all_classes_btn.setStyleSheet(
+            "padding: 2px 6px; font-size: 11px; color: #0969da; border-color: #54aeff; background: #ddf4ff;"
+        )
+        self.show_all_classes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.show_all_classes_btn.setVisible(False)
         self.load_classes_btn = QPushButton("导入")
         self.load_classes_btn.setToolTip("导入外部 classes.txt 类别清单...")
         self.save_classes_btn = QPushButton("保存")
@@ -1288,6 +1266,7 @@ class LabelingStudioTab(QWidget):
             btn.setStyleSheet("padding: 2px 7px; font-size: 11px;")
         cls_hdr.addWidget(cls_title)
         cls_hdr.addStretch(1)
+        cls_hdr.addWidget(self.show_all_classes_btn)
         cls_hdr.addWidget(self.load_classes_btn)
         cls_hdr.addWidget(self.save_classes_btn)
         cls_lay.addLayout(cls_hdr)
@@ -1302,6 +1281,27 @@ class LabelingStudioTab(QWidget):
         add_cls_row.addWidget(self.new_class_edit, 1)
         add_cls_row.addWidget(self.add_class_btn)
         cls_lay.addLayout(add_cls_row)
+
+        cls_opt_row = QHBoxLayout()
+        cls_opt_row.setContentsMargins(0, 0, 0, 0)
+        cls_opt_row.setSpacing(4)
+        self.prompt_label_after_draw_chk = QCheckBox("画完自动搜类")
+        self.prompt_label_after_draw_chk.setChecked(bool(_init_prefs.workbench_prompt_label_after_draw))
+        self.prompt_label_after_draw_chk.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.prompt_label_after_draw_chk.setStyleSheet("font-size: 11px; color: #57606a;")
+        self.prompt_label_after_draw_chk.setToolTip(
+            "勾选后，每次画框或 SAM 确认落框时自动弹出可搜索类别选择器；平时也可按 C 随时快速搜类/改类"
+        )
+        self.quick_pick_class_btn = QPushButton("搜类(C)")
+        self.quick_pick_class_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.quick_pick_class_btn.setStyleSheet("padding: 1px 6px; font-size: 11px;")
+        self.quick_pick_class_btn.setToolTip(
+            "打开可搜索类别选择器：未选框时切换当前绘制类别，选中框时修改该框类别 (快捷键 C)"
+        )
+        cls_opt_row.addWidget(self.prompt_label_after_draw_chk)
+        cls_opt_row.addStretch(1)
+        cls_opt_row.addWidget(self.quick_pick_class_btn)
+        cls_lay.addLayout(cls_opt_row)
 
         self.unique_label_list = _EmptyHintListWidget(
             "暂无类别\n在上方输入名称回车添加，或点击「导入」"
@@ -1325,6 +1325,13 @@ class LabelingStudioTab(QWidget):
         obj_hdr.setSpacing(4)
         self.obj_title_label = QLabel("当前图目标框 (0)")
         self.obj_title_label.setStyleSheet("font-weight: 600; color: #24292f;")
+        self.show_all_boxes_btn = QPushButton("全显")
+        self.show_all_boxes_btn.setToolTip("恢复显示当前图所有被隐藏的单框与类别")
+        self.show_all_boxes_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.show_all_boxes_btn.setStyleSheet(
+            "padding: 2px 6px; font-size: 11px; color: #0969da; border-color: #54aeff; background: #ddf4ff;"
+        )
+        self.show_all_boxes_btn.setVisible(False)
         self.copy_prev_boxes_btn = QPushButton("←上帧")
         self.copy_prev_boxes_btn.setToolTip(
             "一键复制上一张图片中的全部目标框到当前图（自动跳过已重合框，Ctrl+Z 可撤回；快捷键 Shift+V）"
@@ -1343,6 +1350,7 @@ class LabelingStudioTab(QWidget):
         self.clear_boxes_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
         obj_hdr.addWidget(self.obj_title_label)
         obj_hdr.addStretch(1)
+        obj_hdr.addWidget(self.show_all_boxes_btn)
         obj_hdr.addWidget(self.copy_prev_boxes_btn)
         obj_hdr.addWidget(self.track_forward_btn)
         obj_hdr.addWidget(self.clear_boxes_btn)
@@ -1383,6 +1391,23 @@ class LabelingStudioTab(QWidget):
             btn.setStyleSheet("padding: 3px 6px; font-size: 11px;")
             box_ops.addWidget(btn, 1)
         detail_lay.addLayout(box_ops)
+
+        box_vis_ops = QHBoxLayout()
+        box_vis_ops.setSpacing(4)
+        self.toggle_hide_box_btn = QPushButton("隐藏(V)")
+        self.toggle_hide_box_btn.setCheckable(True)
+        self.toggle_hide_box_btn.setToolTip("临时隐藏/显示当前选中框（仅影响视图，不影响标注保存；快捷键 V）")
+        self.toggle_lock_box_btn = QPushButton("锁定(K)")
+        self.toggle_lock_box_btn.setCheckable(True)
+        self.toggle_lock_box_btn.setToolTip("锁定/解锁当前选中框（锁定后禁止误拖、改类或误删；快捷键 K）")
+        for btn in (self.toggle_hide_box_btn, self.toggle_lock_box_btn):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setStyleSheet(
+                "QPushButton { padding: 3px 6px; font-size: 11px; }"
+                "QPushButton:checked { background-color: #fff8c5; border-color: #bf8700; color: #7d4e00; font-weight: 600; }"
+            )
+            box_vis_ops.addWidget(btn, 1)
+        detail_lay.addLayout(box_vis_ops)
 
         box_ai_ops = QHBoxLayout()
         box_ai_ops.setSpacing(4)
@@ -1540,6 +1565,9 @@ class LabelingStudioTab(QWidget):
         self.box_del_inline_btn.clicked.connect(self._delete_selected_box)
         self.change_cls_btn.clicked.connect(self._prompt_relabel_selected_box)
         self.focus_box_btn.clicked.connect(self._focus_selected_box)
+        self.toggle_hide_box_btn.clicked.connect(self._toggle_selected_box_hidden)
+        self.toggle_lock_box_btn.clicked.connect(self._toggle_selected_box_locked)
+        self.show_all_boxes_btn.clicked.connect(self._show_all_boxes_and_classes)
         self.box_sam_inline_btn.clicked.connect(self._on_sam_refine_clicked)
         self.box_llm_fix_inline_btn.clicked.connect(self._on_llm_fix_box_clicked)
         self.copy_prev_boxes_btn.clicked.connect(self._copy_boxes_from_previous_image)
@@ -1559,6 +1587,7 @@ class LabelingStudioTab(QWidget):
         self.shortcut_help_btn.clicked.connect(self.show_shortcut_help)
         self.view_enhance_btn.toggled.connect(self._on_view_enhance_toggled)
         self.view_enhance_menu_btn.clicked.connect(self._on_view_enhance_menu_clicked)
+        self.box_opacity_btn.clicked.connect(self._on_box_opacity_menu_clicked)
         self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom_by(1.0 / 1.25))
         self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom_by(1.25))
         self.zoom_menu_btn.clicked.connect(self._on_zoom_menu_clicked)
@@ -1576,6 +1605,9 @@ class LabelingStudioTab(QWidget):
         self.add_class_btn.clicked.connect(self._on_add_class_from_input)
         self.new_class_edit.returnPressed.connect(self._on_add_class_from_input)
         self.save_classes_btn.clicked.connect(self._on_save_classes_txt)
+        self.show_all_classes_btn.clicked.connect(self._show_all_classes)
+        self.prompt_label_after_draw_chk.toggled.connect(self._on_prompt_label_after_draw_toggled)
+        self.quick_pick_class_btn.clicked.connect(self._open_quick_class_picker)
         self.unique_label_list.currentRowChanged.connect(self._on_class_row_changed)
         self.unique_label_list.itemDoubleClicked.connect(self._on_class_double_clicked)
         self.unique_label_list.customContextMenuRequested.connect(self._on_class_list_context_menu)
@@ -1778,6 +1810,19 @@ class LabelingStudioTab(QWidget):
         if key == Qt.Key.Key_V and bool(mods & Qt.KeyboardModifier.ShiftModifier):
             self._copy_boxes_from_previous_image()
             return True
+        if key == Qt.Key.Key_V and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            if self._doc is not None and self.canvas.selected_index() >= 0:
+                self._toggle_selected_box_hidden()
+                return True
+            return False
+        if key == Qt.Key.Key_K and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            if self._doc is not None and self.canvas.selected_index() >= 0:
+                self._toggle_selected_box_locked()
+                return True
+            return False
+        if key == Qt.Key.Key_C and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            self._open_quick_class_picker()
+            return True
         if key == Qt.Key.Key_A:
             self.open_prev_image()
             return True
@@ -1887,7 +1932,7 @@ class LabelingStudioTab(QWidget):
         self._review_guidance_provider = provider
 
     def apply_general_preferences(self, prefs: AppPreferences) -> None:
-        """将全局通用设置中的工作台默认偏好应用到工具栏复选框与画布十字准星颜色。"""
+        """将全局通用设置中的工作台默认偏好应用到工具栏复选框、准星样式、透明度与画后搜类开关。"""
         self.auto_save_chk.setChecked(bool(prefs.workbench_auto_save))
         self.show_labels_chk.setChecked(bool(prefs.workbench_show_labels))
         self.keep_view_chk.setChecked(bool(prefs.workbench_keep_view))
@@ -1896,6 +1941,16 @@ class LabelingStudioTab(QWidget):
             dashed=prefs.workbench_crosshair_dashed, halo=prefs.workbench_crosshair_halo
         )
         self.canvas.set_crosshair_dash(prefs.workbench_crosshair_dash)
+        self.canvas.set_box_opacity(
+            fill=prefs.workbench_box_fill_opacity,
+            stroke=prefs.workbench_box_stroke_opacity,
+        )
+        self._refresh_box_opacity_button()
+        self.prompt_label_after_draw_chk.blockSignals(True)
+        try:
+            self.prompt_label_after_draw_chk.setChecked(bool(prefs.workbench_prompt_label_after_draw))
+        finally:
+            self.prompt_label_after_draw_chk.blockSignals(False)
 
     def _on_general_settings_changed(self) -> None:
         self.apply_general_preferences(self.settings_store.preferences)
@@ -2004,7 +2059,11 @@ class LabelingStudioTab(QWidget):
         # 已通过未保存保护校验，清空旧文档引用，确保刷新同目录同单图时强制重读磁盘最新 .json
         if self._current_dir != target_dir:
             self._pixmap_cache.clear()
+            self._hidden_classes.clear()
+            self.canvas.set_hidden_classes(set())
             self.clear_audit_result(refresh_list=False)
+        self._hidden_box_indices.clear()
+        self._locked_box_indices.clear()
         self._doc = None
         self._dirty = False
         self._last_nudge_key = None
@@ -2017,6 +2076,8 @@ class LabelingStudioTab(QWidget):
         self._pending_sam_refine_request = None
         self._undo_stack.clear()
         self._redo_stack.clear()
+        self._hidden_box_indices.clear()
+        self._locked_box_indices.clear()
 
         images = scan_labeling_directory(target_dir, recursive=True)
         self._current_dir = target_dir
@@ -2445,6 +2506,8 @@ class LabelingStudioTab(QWidget):
         self._pending_sam_refine_request = None
         self._undo_stack.clear()
         self._redo_stack.clear()
+        self._hidden_box_indices.clear()
+        self._locked_box_indices.clear()
 
         # 把当前图片新出现的类别纳入右侧清单
         new_labels = [b.label for b in doc.boxes if b.label and b.label not in self._classes]
@@ -2476,6 +2539,9 @@ class LabelingStudioTab(QWidget):
                 self.canvas.restore_view_state(prev_scale, target_center, fit_mode=False)
 
         self.canvas.set_boxes(doc.boxes, selected_index=-1)
+        self.canvas.set_hidden_classes(self._hidden_classes)
+        self.canvas.set_hidden_box_indices(self._hidden_box_indices)
+        self.canvas.set_locked_box_indices(self._locked_box_indices)
         self._refresh_class_counts()
         self._refresh_shape_list()
         self._refresh_review_banner()
@@ -2800,22 +2866,31 @@ class LabelingStudioTab(QWidget):
 
     def _refresh_action_states(self) -> None:
         has_img = self._doc is not None
-        has_sel = has_img and self.canvas.selected_index() >= 0
+        sel_idx = self.canvas.selected_index() if has_img else -1
+        has_sel = has_img and sel_idx >= 0
+        sel_locked = has_sel and self._is_box_locked(sel_idx)
         has_boxes = has_img and self._doc is not None and len(self._doc.boxes) > 0
+        has_unlocked_boxes = (
+            has_boxes
+            and self._doc is not None
+            and any(not self._is_box_locked(i) for i in range(len(self._doc.boxes)))
+        )
         sam_busy = self.sam_worker is not None and self.sam_worker.isRunning()
         sam_point_busy = self.sam_point_worker is not None and self.sam_point_worker.isRunning()
         llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
 
         self.dup_box_btn.setEnabled(has_sel)
-        self.del_box_btn.setEnabled(has_sel)
-        self.box_del_inline_btn.setEnabled(has_sel)
-        self.change_cls_btn.setEnabled(has_sel)
+        self.del_box_btn.setEnabled(has_sel and not sel_locked)
+        self.box_del_inline_btn.setEnabled(has_sel and not sel_locked)
+        self.change_cls_btn.setEnabled(has_sel and not sel_locked)
         self.focus_box_btn.setEnabled(has_sel)
+        self.toggle_hide_box_btn.setEnabled(has_sel)
+        self.toggle_lock_box_btn.setEnabled(has_sel)
         self.copy_prev_boxes_btn.setEnabled(self._resolve_previous_image_path() is not None)
         self.track_forward_btn.setEnabled(
             has_boxes and bool(self._resolve_following_image_paths()) and not sam_busy and not sam_point_busy
         )
-        self.clear_boxes_btn.setEnabled(has_boxes)
+        self.clear_boxes_btn.setEnabled(has_unlocked_boxes)
         self.undo_btn.setEnabled(len(self._undo_stack) > 0)
         self.redo_btn.setEnabled(len(self._redo_stack) > 0)
         self.save_btn.setEnabled(has_img)
@@ -2826,13 +2901,15 @@ class LabelingStudioTab(QWidget):
         self.next_unlabeled_btn.setEnabled(len(self._filtered_images) > 0)
         self.audit_btn.setEnabled(len(self._all_images) > 0)
         self.sam_point_mode_btn.setEnabled(has_img)
-        self.sam_refine_btn.setEnabled(has_boxes and not sam_busy and not sam_point_busy)
+        self.sam_refine_btn.setEnabled(
+            has_unlocked_boxes and not sel_locked and not sam_busy and not sam_point_busy
+        )
         self.sam_refine_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
-        self.box_sam_inline_btn.setEnabled(has_sel and not sam_busy and not sam_point_busy)
+        self.box_sam_inline_btn.setEnabled(has_sel and not sel_locked and not sam_busy and not sam_point_busy)
         self.box_sam_inline_btn.setText("SAM收紧中" if sam_busy else "SAM收框")
-        self.llm_fix_btn.setEnabled(has_sel and not llm_busy)
+        self.llm_fix_btn.setEnabled(has_sel and not sel_locked and not llm_busy)
         self.llm_fix_btn.setText("AI精修中" if llm_busy else "AI修框(G)")
-        self.box_llm_fix_inline_btn.setEnabled(has_sel and not llm_busy)
+        self.box_llm_fix_inline_btn.setEnabled(has_sel and not sel_locked and not llm_busy)
         self.box_llm_fix_inline_btn.setText("AI精修中" if llm_busy else "AI精修(G)")
 
     # ------------------------------------------------------------------
@@ -2859,11 +2936,21 @@ class LabelingStudioTab(QWidget):
         self.canvas.set_active_label(self._active_label)
         self._refresh_class_counts()
 
-    def _refresh_class_counts(self) -> None:
+    def _current_class_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         if self._doc is not None:
             for b in self._doc.boxes:
                 counts[b.label] = counts.get(b.label, 0) + 1
+        return counts
+
+    def _refresh_class_counts(self) -> None:
+        counts = self._current_class_counts()
+        hidden_in_list = [c for c in self._classes if c in self._hidden_classes]
+        if hidden_in_list:
+            self.show_all_classes_btn.setText(f"全显({len(hidden_in_list)})")
+            self.show_all_classes_btn.setVisible(True)
+        else:
+            self.show_all_classes_btn.setVisible(False)
 
         self._syncing_lists = True
         try:
@@ -2872,8 +2959,21 @@ class LabelingStudioTab(QWidget):
             for idx, cls_name in enumerate(self._classes):
                 shortcut_tag = f"[{idx + 1}] " if idx < 9 else "    "
                 cnt = counts.get(cls_name, 0)
-                text = f"{shortcut_tag}{cls_name}  ({cnt})" if cnt > 0 else f"{shortcut_tag}{cls_name}"
-                item = QListWidgetItem(_make_color_icon(label_color_rgb(cls_name)), text)
+                is_hidden = cls_name in self._hidden_classes
+                hide_tag = "[隐] " if is_hidden else ""
+                text = (
+                    f"{shortcut_tag}{hide_tag}{cls_name}  ({cnt})"
+                    if cnt > 0
+                    else f"{shortcut_tag}{hide_tag}{cls_name}"
+                )
+                rgb = (175, 184, 193) if is_hidden else label_color_rgb(cls_name)
+                item = QListWidgetItem(_make_color_icon(rgb), text)
+                if is_hidden:
+                    item.setForeground(QColor("#8c959f"))
+                    fnt = item.font()
+                    fnt.setStrikeOut(True)
+                    item.setFont(fnt)
+                    item.setToolTip(f"类别「{cls_name}」已隐藏，右键可恢复显示")
                 item.setData(Qt.ItemDataRole.UserRole, cls_name)
                 self.unique_label_list.addItem(item)
                 if cls_name == self._active_label:
@@ -2954,12 +3054,26 @@ class LabelingStudioTab(QWidget):
             return
         menu = QMenu(self)
         use_act = menu.addAction(f"设为当前绘制类别「{cls_name}」")
+        menu.addSeparator()
+        is_hidden = cls_name in self._hidden_classes
+        toggle_hide_act = menu.addAction(f"显示此类别「{cls_name}」" if is_hidden else f"隐藏此类别「{cls_name}」")
+        solo_act = menu.addAction(f"仅显示此类别「{cls_name}」(Solo)")
+        solo_act.setEnabled(len(self._classes) > 1)
+        show_all_act = menu.addAction("显示全部类别")
+        show_all_act.setEnabled(bool(self._hidden_classes))
+        menu.addSeparator()
         rename_act = menu.addAction("重命名 / 合并类别...")
         menu.addSeparator()
         remove_act = menu.addAction("从清单移除")
         chosen = menu.exec(self.unique_label_list.mapToGlobal(pos))
         if chosen is use_act:
             self._set_active_class(cls_name)
+        elif chosen is toggle_hide_act:
+            self._toggle_class_hidden(cls_name)
+        elif chosen is solo_act:
+            self._solo_class(cls_name)
+        elif chosen is show_all_act:
+            self._show_all_classes()
         elif chosen is rename_act:
             self._prompt_rename_class(cls_name)
         elif chosen is remove_act:
@@ -3034,8 +3148,13 @@ class LabelingStudioTab(QWidget):
 
         if is_merge:
             self._classes.remove(old_name)
+            self._hidden_classes.discard(old_name)
         else:
             self._classes[self._classes.index(old_name)] = clean
+            if old_name in self._hidden_classes:
+                self._hidden_classes.discard(old_name)
+                self._hidden_classes.add(clean)
+        self.canvas.set_hidden_classes(self._hidden_classes)
         if self._active_label == old_name:
             self._active_label = clean
             self.canvas.set_active_label(clean)
@@ -3129,7 +3248,13 @@ class LabelingStudioTab(QWidget):
         if self._doc is None:
             return
         self._dirty = True
+        box_count = len(self._doc.boxes)
+        self._hidden_box_indices = {i for i in self._hidden_box_indices if 0 <= i < box_count}
+        self._locked_box_indices = {i for i in self._locked_box_indices if 0 <= i < box_count}
         self.canvas.set_boxes(self._doc.boxes, selected_index=selected_idx)
+        self.canvas.set_hidden_classes(self._hidden_classes)
+        self.canvas.set_hidden_box_indices(self._hidden_box_indices)
+        self.canvas.set_locked_box_indices(self._locked_box_indices)
         self._refresh_class_counts()
         self._refresh_shape_list(selected_idx=selected_idx)
         self._refresh_review_banner()
@@ -3160,15 +3285,21 @@ class LabelingStudioTab(QWidget):
         self._apply_boxes_change(selected_idx=-1)
 
     def _cycle_selected_box(self, *, reverse: bool = False) -> None:
-        """按 Tab / Shift+Tab 在当前图目标框间循环切换选中并确保新选中框处于可视区。"""
+        """按 Tab / Shift+Tab 在当前图可见目标框间循环切换选中并确保新选中框处于可视区。"""
         if self._doc is None or not self._doc.boxes:
             return
-        total = len(self._doc.boxes)
+        visible_indices = [
+            i for i in range(len(self._doc.boxes)) if self.canvas.is_box_visible(i)
+        ]
+        if not visible_indices:
+            self.canvas.show_hud_message("当前图目标框均已隐藏，点击「全显」可恢复", color="#57606a", duration_ms=1400)
+            return
         cur = self.canvas.selected_index()
-        if not (0 <= cur < total):
-            next_idx = total - 1 if reverse else 0
+        if cur in visible_indices:
+            pos = visible_indices.index(cur)
+            next_idx = visible_indices[(pos - 1) % len(visible_indices)] if reverse else visible_indices[(pos + 1) % len(visible_indices)]
         else:
-            next_idx = (cur - 1) % total if reverse else (cur + 1) % total
+            next_idx = visible_indices[-1] if reverse else visible_indices[0]
         self.canvas.select_box(next_idx, emit_signal=True)
         self.canvas.ensure_box_visible(next_idx)
 
@@ -3176,6 +3307,9 @@ class LabelingStudioTab(QWidget):
         """使用方向键对选中框执行像素级平移（600 ms 内连续微调同一框合并为单次撤销记录）。"""
         idx = self.canvas.selected_index()
         if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        if self._is_box_locked(idx):
+            self._warn_locked_box(idx)
             return
         old = self._doc.boxes[idx]
         bw = old.width
@@ -3463,8 +3597,14 @@ class LabelingStudioTab(QWidget):
         if self._doc is None:
             return
         label = self._active_label
-        if not label:
-            dlg = _LabelPickerDialog(self._classes, title="为新标注框指定类别", parent=self)
+        if not label or self.prompt_label_after_draw_chk.isChecked():
+            dlg = ClassPickerDialog(
+                self._classes,
+                current_label=label,
+                counts=self._current_class_counts(),
+                title="为新标注框选择或搜索类别",
+                parent=self,
+            )
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             label = dlg.selected_label()
@@ -3481,6 +3621,10 @@ class LabelingStudioTab(QWidget):
         self, idx: int, x1: float, y1: float, x2: float, y2: float
     ) -> None:
         if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        if self._is_box_locked(idx):
+            self._warn_locked_box(idx)
+            self.canvas.set_boxes(self._doc.boxes, selected_index=idx)
             return
         self._push_undo_snapshot()
         old = self._doc.boxes[idx]
@@ -3504,6 +3648,9 @@ class LabelingStudioTab(QWidget):
     def _relabel_box(self, idx: int, new_label: str) -> None:
         if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
             return
+        if self._is_box_locked(idx):
+            self._warn_locked_box(idx)
+            return
         clean = new_label.strip()
         if not clean or self._doc.boxes[idx].label == clean:
             return
@@ -3517,9 +3664,16 @@ class LabelingStudioTab(QWidget):
         idx = self.canvas.selected_index()
         if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
             return
+        if self._is_box_locked(idx):
+            self._warn_locked_box(idx)
+            return
         cur_label = self._doc.boxes[idx].label
-        dlg = _LabelPickerDialog(
-            self._classes, current_label=cur_label, title="修改选中框类别", parent=self
+        dlg = ClassPickerDialog(
+            self._classes,
+            current_label=cur_label,
+            counts=self._current_class_counts(),
+            title="修改选中框类别",
+            parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             chosen = dlg.selected_label()
@@ -3555,17 +3709,48 @@ class LabelingStudioTab(QWidget):
         idx = self.canvas.selected_index()
         if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
             return
+        if self._is_box_locked(idx):
+            self._warn_locked_box(idx)
+            return
         self._push_undo_snapshot()
         self._doc.boxes.pop(idx)
+        # 删除后重排单框隐藏与锁定索引，防止错位指向相邻框
+        self._hidden_box_indices = {
+            (i - 1 if i > idx else i) for i in self._hidden_box_indices if i != idx
+        }
+        self._locked_box_indices = {
+            (i - 1 if i > idx else i) for i in self._locked_box_indices if i != idx
+        }
         next_sel = min(idx, len(self._doc.boxes) - 1)
         self._apply_boxes_change(selected_idx=next_sel)
 
     def _clear_all_boxes(self) -> None:
         if self._doc is None or not self._doc.boxes:
             return
+        locked_indices = sorted(i for i in self._locked_box_indices if 0 <= i < len(self._doc.boxes))
+        if len(locked_indices) >= len(self._doc.boxes):
+            msg = "当前全部目标框均已锁定，请先解锁后再清空"
+            self.save_state_label.setText(msg)
+            self.canvas.show_hud_message(msg, color="#bf8700", duration_ms=1600)
+            return
         self._push_undo_snapshot()
-        self._doc.boxes.clear()
-        self._apply_boxes_change(selected_idx=-1)
+        if locked_indices:
+            kept_boxes = [self._doc.boxes[i] for i in locked_indices]
+            kept_hidden = {
+                new_i for new_i, old_i in enumerate(locked_indices) if old_i in self._hidden_box_indices
+            }
+            self._doc.boxes = kept_boxes
+            self._locked_box_indices = set(range(len(kept_boxes)))
+            self._hidden_box_indices = kept_hidden
+            self._apply_boxes_change(selected_idx=-1)
+            msg = f"已清空未锁定框，保留 {len(kept_boxes)} 个已锁定框（Ctrl+Z 可撤回）"
+            self.save_state_label.setText(msg)
+            self.canvas.show_hud_message(msg, color="#bf8700", duration_ms=1700)
+        else:
+            self._doc.boxes.clear()
+            self._hidden_box_indices.clear()
+            self._locked_box_indices.clear()
+            self._apply_boxes_change(selected_idx=-1)
 
     def _clear_missing_hint(self) -> None:
         if self._doc is None:
@@ -3747,9 +3932,21 @@ class LabelingStudioTab(QWidget):
             return
         sel = self.canvas.selected_index()
         if 0 <= sel < len(self._doc.boxes):
+            if self._is_box_locked(sel):
+                self._warn_locked_box(sel)
+                return
             targets = [(sel, self._doc.boxes[sel])]
         else:
-            targets = list(enumerate(self._doc.boxes))
+            targets = [
+                (i, b)
+                for i, b in enumerate(self._doc.boxes)
+                if not self._is_box_locked(i) and self.canvas.is_box_visible(i)
+            ]
+            if not targets:
+                msg = "当前没有可收紧的可见未锁定目标框"
+                self.save_state_label.setText(msg)
+                self.canvas.show_hud_message(msg, color="#bf8700", duration_ms=1500)
+                return
 
         self._sam_precompute_timer.stop()
         if self.sam_precompute_worker is not None and self.sam_precompute_worker.isRunning():
@@ -4061,8 +4258,14 @@ class LabelingStudioTab(QWidget):
             return
 
         label = self._active_label
-        if not label:
-            dlg = _LabelPickerDialog(self._classes, title="为 SAM 点选框指定类别", parent=self)
+        if not label or self.prompt_label_after_draw_chk.isChecked():
+            dlg = ClassPickerDialog(
+                self._classes,
+                current_label=label,
+                counts=self._current_class_counts(),
+                title="为 SAM 点选框选择或搜索类别",
+                parent=self,
+            )
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             label = dlg.selected_label()
@@ -4100,6 +4303,9 @@ class LabelingStudioTab(QWidget):
         sel = self.canvas.selected_index()
         if not (0 <= sel < len(self._doc.boxes)):
             QMessageBox.information(self, "提示", "请先在画布或右侧列表中选中需要精修的单个目标框。")
+            return
+        if self._is_box_locked(sel):
+            self._warn_locked_box(sel)
             return
         if self.llm_fix_worker is not None and self.llm_fix_worker.isRunning():
             return
@@ -4247,12 +4453,34 @@ class LabelingStudioTab(QWidget):
         try:
             self.shape_list.clear()
             boxes = self._doc.boxes if self._doc is not None else []
-            self.obj_title_label.setText(f"当前图目标框 ({len(boxes)})")
+            hidden_cnt = sum(1 for i in range(len(boxes)) if not self.canvas.is_box_visible(i))
+            locked_cnt = sum(1 for i in range(len(boxes)) if self._is_box_locked(i))
+            suffix_parts: list[str] = []
+            if hidden_cnt > 0:
+                suffix_parts.append(f"隐{hidden_cnt}")
+            if locked_cnt > 0:
+                suffix_parts.append(f"锁{locked_cnt}")
+            extra_title = f" · {'/'.join(suffix_parts)}" if suffix_parts else ""
+            self.obj_title_label.setText(f"当前图目标框 ({len(boxes)}{extra_title})")
+            self.show_all_boxes_btn.setVisible(hidden_cnt > 0 or bool(self._hidden_classes))
             for idx, b in enumerate(boxes):
                 score_part = f" · {b.score:.2f}" if b.score is not None else ""
                 size_part = f" [{int(round(b.width))}×{int(round(b.height))}]"
-                tag = f"#{idx + 1} {b.label}{score_part}{size_part}"
-                item = QListWidgetItem(_make_color_icon(label_color_rgb(b.label)), tag)
+                is_hidden = not self.canvas.is_box_visible(idx)
+                is_locked = self._is_box_locked(idx)
+                state_tags: list[str] = []
+                if is_hidden:
+                    state_tags.append("[隐]")
+                if is_locked:
+                    state_tags.append("[锁]")
+                prefix_state = (" ".join(state_tags) + " ") if state_tags else ""
+                tag = f"{prefix_state}#{idx + 1} {b.label}{score_part}{size_part}"
+                rgb = (175, 184, 193) if is_hidden else label_color_rgb(b.label)
+                item = QListWidgetItem(_make_color_icon(rgb), tag)
+                if is_hidden:
+                    item.setForeground(QColor("#8c959f"))
+                elif is_locked:
+                    item.setForeground(QColor("#7d4e00"))
                 if b.description:
                     item.setToolTip(b.description)
                 self.shape_list.addItem(item)
@@ -4268,11 +4496,20 @@ class LabelingStudioTab(QWidget):
             self.box_detail_panel.setVisible(False)
             return
         b = self._doc.boxes[idx]
+        is_hidden = idx in self._hidden_box_indices
+        cls_hidden = b.label in self._hidden_classes
+        is_locked = self._is_box_locked(idx)
         lines = [
             f"类别：{b.label}   尺寸：{int(round(b.width))} × {int(round(b.height))} px",
             f"坐标：({b.x1:.1f}, {b.y1:.1f}) → ({b.x2:.1f}, {b.y2:.1f})",
         ]
         meta_tags: list[str] = []
+        if is_locked:
+            meta_tags.append("已锁定")
+        if is_hidden:
+            meta_tags.append("单框已隐藏")
+        elif cls_hidden:
+            meta_tags.append("所属类别已隐藏")
         if b.score is not None:
             meta_tags.append(f"置信度 {b.score:.3f}")
         if isinstance(b.flags, dict) and b.flags.get("llm_added"):
@@ -4286,6 +4523,16 @@ class LabelingStudioTab(QWidget):
         if b.description:
             lines.append(f"审核说明：{b.description}")
         self.box_detail_label.setText("\n".join(lines))
+        self.toggle_hide_box_btn.blockSignals(True)
+        self.toggle_lock_box_btn.blockSignals(True)
+        try:
+            self.toggle_hide_box_btn.setChecked(is_hidden or cls_hidden)
+            self.toggle_hide_box_btn.setText("取消隐藏(V)" if (is_hidden or cls_hidden) else "隐藏(V)")
+            self.toggle_lock_box_btn.setChecked(is_locked)
+            self.toggle_lock_box_btn.setText("解锁(K)" if is_locked else "锁定(K)")
+        finally:
+            self.toggle_hide_box_btn.blockSignals(False)
+            self.toggle_lock_box_btn.blockSignals(False)
         self.box_detail_panel.setVisible(True)
 
     def _focus_selected_box(self) -> None:
@@ -4316,9 +4563,18 @@ class LabelingStudioTab(QWidget):
         if not (0 <= row < len(self._doc.boxes)):
             return
         self.shape_list.setCurrentRow(row)
+        is_hidden = not self.canvas.is_box_visible(row)
+        is_locked = self._is_box_locked(row)
         menu = QMenu(self)
         focus_act = menu.addAction("聚焦居中查看")
-        relabel_act = menu.addAction("修改类别...")
+        relabel_act = menu.addAction("修改类别... (C)")
+        relabel_act.setEnabled(not is_locked)
+        hide_act = menu.addAction("显示此框 (V)" if is_hidden else "隐藏此框 (V)")
+        lock_act = menu.addAction("解锁此框 (K)" if is_locked else "锁定此框 (K)")
+        show_all_act = menu.addAction("显示全部框与类别")
+        show_all_act.setEnabled(bool(self._hidden_box_indices or self._hidden_classes))
+        unlock_all_act = menu.addAction("解锁全部框")
+        unlock_all_act.setEnabled(bool(self._locked_box_indices))
         menu.addSeparator()
         dup_act = menu.addAction("复制框 (Ctrl+D)")
         copy_act = menu.addAction("复制到剪贴板 (Ctrl+C)")
@@ -4326,19 +4582,28 @@ class LabelingStudioTab(QWidget):
         sam_busy = (self.sam_worker is not None and self.sam_worker.isRunning()) or (
             self.sam_point_worker is not None and self.sam_point_worker.isRunning()
         )
-        sam_act.setEnabled(not sam_busy)
+        sam_act.setEnabled(not sam_busy and not is_locked)
         track_act = menu.addAction("向后连续帧追踪此框...")
         track_act.setEnabled(not sam_busy and bool(self._resolve_following_image_paths()))
         llm_act = menu.addAction("AI 精修此框 (G)")
         llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
-        llm_act.setEnabled(not llm_busy)
+        llm_act.setEnabled(not llm_busy and not is_locked)
         menu.addSeparator()
         del_act = menu.addAction("删除框 (Del)")
+        del_act.setEnabled(not is_locked)
         chosen = menu.exec(self.shape_list.mapToGlobal(pos))
         if chosen is focus_act:
             self.canvas.focus_box(row)
         elif chosen is relabel_act:
             self._prompt_relabel_selected_box()
+        elif chosen is hide_act:
+            self._toggle_box_hidden(row)
+        elif chosen is lock_act:
+            self._toggle_box_locked(row)
+        elif chosen is show_all_act:
+            self._show_all_boxes_and_classes()
+        elif chosen is unlock_all_act:
+            self._unlock_all_boxes()
         elif chosen is dup_act:
             self._duplicate_selected_box()
         elif chosen is copy_act:
@@ -4358,8 +4623,12 @@ class LabelingStudioTab(QWidget):
         menu = QMenu(self)
         if 0 <= hit_idx < len(self._doc.boxes):
             self.canvas.select_box(hit_idx, emit_signal=True)
-            relabel_act = menu.addAction("修改类别...")
+            is_locked = self._is_box_locked(hit_idx)
+            relabel_act = menu.addAction("修改类别... (C)")
+            relabel_act.setEnabled(not is_locked)
             focus_act = menu.addAction("聚焦居中查看")
+            hide_act = menu.addAction("隐藏此框 (V)")
+            lock_act = menu.addAction("解锁此框 (K)" if is_locked else "锁定此框 (K)")
             menu.addSeparator()
             dup_act = menu.addAction("复制框 (Ctrl+D)")
             copy_act = menu.addAction("复制到剪贴板 (Ctrl+C)")
@@ -4367,19 +4636,24 @@ class LabelingStudioTab(QWidget):
             sam_busy = (self.sam_worker is not None and self.sam_worker.isRunning()) or (
                 self.sam_point_worker is not None and self.sam_point_worker.isRunning()
             )
-            sam_act.setEnabled(not sam_busy)
+            sam_act.setEnabled(not sam_busy and not is_locked)
             track_act = menu.addAction("向后连续帧追踪此框...")
             track_act.setEnabled(not sam_busy and bool(self._resolve_following_image_paths()))
             llm_act = menu.addAction("AI 精修此框 (G)")
             llm_busy = self.llm_fix_worker is not None and self.llm_fix_worker.isRunning()
-            llm_act.setEnabled(not llm_busy)
+            llm_act.setEnabled(not llm_busy and not is_locked)
             menu.addSeparator()
             del_act = menu.addAction("删除框 (Del)")
+            del_act.setEnabled(not is_locked)
             chosen = menu.exec(global_pos)
             if chosen is relabel_act:
                 self._prompt_relabel_selected_box()
             elif chosen is focus_act:
                 self.canvas.focus_box(hit_idx)
+            elif chosen is hide_act:
+                self._toggle_box_hidden(hit_idx)
+            elif chosen is lock_act:
+                self._toggle_box_locked(hit_idx)
             elif chosen is dup_act:
                 self._duplicate_selected_box()
             elif chosen is copy_act:
@@ -4425,6 +4699,12 @@ class LabelingStudioTab(QWidget):
         toggle_enhance_act = menu.addAction("暗部/对比度视图增强 (B)")
         toggle_enhance_act.setCheckable(True)
         toggle_enhance_act.setChecked(self.view_enhance_btn.isChecked())
+        show_all_vis_act = None
+        if self._hidden_box_indices or self._hidden_classes:
+            show_all_vis_act = menu.addAction("显示全部隐藏框与类别")
+        unlock_all_act = None
+        if self._locked_box_indices:
+            unlock_all_act = menu.addAction("解锁当前图全部框")
 
         chosen = menu.exec(global_pos)
         if chosen is edit_act:
@@ -4452,6 +4732,10 @@ class LabelingStudioTab(QWidget):
             self.crosshair_btn.toggle()
         elif chosen is toggle_enhance_act:
             self.view_enhance_btn.toggle()
+        elif show_all_vis_act is not None and chosen is show_all_vis_act:
+            self._show_all_boxes_and_classes()
+        elif unlock_all_act is not None and chosen is unlock_all_act:
+            self._unlock_all_boxes()
 
     def _on_crosshair_toggled(self, checked: bool) -> None:
         self.canvas.set_always_show_crosshair(checked)
@@ -4607,6 +4891,297 @@ class LabelingStudioTab(QWidget):
     def _on_view_enhance_menu_clicked(self) -> None:
         menu = self._build_view_enhance_menu()
         menu.exec(self.view_enhance_menu_btn.mapToGlobal(QPoint(0, -menu.sizeHint().height())))
+
+    # ------------------------------------------------------------------
+    # 单框隐藏/锁定、按类别显隐 (Solo)、透明度面板与可搜索快速选类
+    # ------------------------------------------------------------------
+    def _is_box_locked(self, idx: int) -> bool:
+        return self._doc is not None and 0 <= idx < len(self._doc.boxes) and idx in self._locked_box_indices
+
+    def _warn_locked_box(self, idx: int) -> None:
+        label = (
+            self._doc.boxes[idx].label
+            if self._doc is not None and 0 <= idx < len(self._doc.boxes)
+            else ""
+        )
+        msg = f"目标框 #{idx + 1}「{label}」已锁定，请先按 K 或点击解锁后再修改"
+        self.save_state_label.setText(msg)
+        self.canvas.show_hud_message(msg, color="#bf8700", duration_ms=1600)
+
+    def _toggle_class_hidden(self, cls_name: str) -> None:
+        """切换指定类别在画布上的临时可见性（跨图保持，绝不改动标注文件）。"""
+        if cls_name in self._hidden_classes:
+            self._hidden_classes.discard(cls_name)
+            msg = f"已恢复显示类别「{cls_name}」"
+        else:
+            self._hidden_classes.add(cls_name)
+            msg = f"已临时隐藏类别「{cls_name}」（不影响保存与训练）"
+        self.canvas.set_hidden_classes(self._hidden_classes)
+        self._refresh_class_counts()
+        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        self.save_state_label.setText(msg)
+        if self.isVisible() and self._doc is not None:
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1500)
+
+    def _solo_class(self, cls_name: str) -> None:
+        """仅显示指定类别，临时隐藏类别清单中的其它所有类别（Solo 检查模式）。"""
+        others = {c for c in self._classes if c != cls_name}
+        self._hidden_classes = others
+        self.canvas.set_hidden_classes(self._hidden_classes)
+        self._refresh_class_counts()
+        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        msg = f"仅显示类别「{cls_name}」（隐藏其余 {len(others)} 类，点「全显」恢复）"
+        self.save_state_label.setText(msg)
+        if self.isVisible() and self._doc is not None:
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1800)
+
+    def _show_all_classes(self) -> None:
+        """恢复显示所有被隐藏的类别。"""
+        if not self._hidden_classes:
+            return
+        self._hidden_classes.clear()
+        self.canvas.set_hidden_classes(set())
+        self._refresh_class_counts()
+        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        msg = "已恢复显示全部类别"
+        self.save_state_label.setText(msg)
+        if self.isVisible() and self._doc is not None:
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1300)
+
+    def _toggle_box_hidden(self, idx: int) -> None:
+        """切换当前图单个目标框的临时可见性（若所属类别正被隐藏，则先恢复该类别显示）。"""
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        box = self._doc.boxes[idx]
+        if idx in self._hidden_box_indices:
+            self._hidden_box_indices.discard(idx)
+            self._hidden_classes.discard(box.label)
+            msg = f"已恢复显示目标框 #{idx + 1}「{box.label}」"
+        elif box.label in self._hidden_classes:
+            self._hidden_classes.discard(box.label)
+            msg = f"已恢复显示所属类别「{box.label}」"
+        else:
+            self._hidden_box_indices.add(idx)
+            msg = f"已临时隐藏目标框 #{idx + 1}「{box.label}」（按 V 或点「全显」恢复）"
+        self.canvas.set_hidden_classes(self._hidden_classes)
+        self.canvas.set_hidden_box_indices(self._hidden_box_indices)
+        self._refresh_class_counts()
+        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1400)
+
+    def _toggle_selected_box_hidden(self) -> None:
+        idx = self.canvas.selected_index()
+        if idx >= 0:
+            self._toggle_box_hidden(idx)
+
+    def _toggle_box_locked(self, idx: int) -> None:
+        """切换当前图单个目标框的锁定状态（锁定后禁止拖拽、缩放、改类、删除与 AI/SAM 覆盖）。"""
+        if self._doc is None or not (0 <= idx < len(self._doc.boxes)):
+            return
+        box = self._doc.boxes[idx]
+        if idx in self._locked_box_indices:
+            self._locked_box_indices.discard(idx)
+            msg = f"已解锁目标框 #{idx + 1}「{box.label}」"
+            color = "#0969da"
+        else:
+            self._locked_box_indices.add(idx)
+            msg = f"已锁定目标框 #{idx + 1}「{box.label}」（防误拖/防误删 · 再按 K 解锁）"
+            color = "#bf8700"
+        self.canvas.set_locked_box_indices(self._locked_box_indices)
+        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        self._refresh_action_states()
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(msg, color=color, duration_ms=1500)
+
+    def _toggle_selected_box_locked(self) -> None:
+        idx = self.canvas.selected_index()
+        if idx >= 0:
+            self._toggle_box_locked(idx)
+
+    def _show_all_boxes_and_classes(self) -> None:
+        """一键恢复显示当前图所有被隐藏的单框与类别。"""
+        if not self._hidden_box_indices and not self._hidden_classes:
+            return
+        self._hidden_box_indices.clear()
+        self._hidden_classes.clear()
+        self.canvas.set_hidden_box_indices(set())
+        self.canvas.set_hidden_classes(set())
+        self._refresh_class_counts()
+        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        msg = "已恢复显示全部目标框与类别"
+        self.save_state_label.setText(msg)
+        if self.isVisible() and self._doc is not None:
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1300)
+
+    def _unlock_all_boxes(self) -> None:
+        """一键解锁当前图所有已锁定的目标框。"""
+        if not self._locked_box_indices:
+            return
+        self._locked_box_indices.clear()
+        self.canvas.set_locked_box_indices(set())
+        self._refresh_shape_list(selected_idx=self.canvas.selected_index())
+        self._refresh_action_states()
+        msg = "已解锁当前图全部目标框"
+        self.save_state_label.setText(msg)
+        if self.isVisible():
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1300)
+
+    def _on_prompt_label_after_draw_toggled(self, checked: bool) -> None:
+        self.settings_store.update(workbench_prompt_label_after_draw=bool(checked), mark_dirty=True)
+        if self.isVisible() and self._doc is not None:
+            msg = (
+                "已开启「画完自动搜类」：每次落框后弹出可搜索类别选择器"
+                if checked
+                else "已关闭「画完自动搜类」：落框直接使用当前激活类别"
+            )
+            self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1500)
+
+    def _open_quick_class_picker(self) -> None:
+        """按 C 或点「搜类(C)」唤出可搜索类别选择器：有未锁定选中框时改该框类别，否则切换当前绘制类别。"""
+        sel = self.canvas.selected_index()
+        relabeling = (
+            self._doc is not None
+            and 0 <= sel < len(self._doc.boxes)
+            and self.canvas.editing()
+        )
+        if relabeling and self._is_box_locked(sel):
+            self._warn_locked_box(sel)
+            return
+        cur_label = self._doc.boxes[sel].label if (relabeling and self._doc is not None) else self._active_label
+        title = "搜索并修改选中框类别" if relabeling else "搜索并切换当前绘制类别"
+        dlg = ClassPickerDialog(
+            self._classes,
+            current_label=cur_label,
+            counts=self._current_class_counts(),
+            title=title,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        chosen = dlg.selected_label()
+        self._set_active_class(chosen)
+        if relabeling:
+            self._relabel_box(sel, chosen)
+        else:
+            msg = f"当前绘制类别已切换为「{chosen}」"
+            self.save_state_label.setText(msg)
+            if self.isVisible() and self._doc is not None:
+                self.canvas.show_hud_message(msg, color="#0969da", duration_ms=1300)
+        self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _refresh_box_opacity_button(self) -> None:
+        fill_pct, stroke_pct = self.canvas.box_opacity()
+        is_custom = (fill_pct, stroke_pct) != (DEFAULT_BOX_FILL_OPACITY, DEFAULT_BOX_STROKE_OPACITY)
+        self.box_opacity_btn.blockSignals(True)
+        try:
+            self.box_opacity_btn.setChecked(is_custom)
+            if fill_pct == 0:
+                self.box_opacity_btn.setText("仅描边 ▾")
+            elif is_custom:
+                self.box_opacity_btn.setText(f"透明 {fill_pct}% ▾")
+            else:
+                self.box_opacity_btn.setText("框透明 ▾")
+        finally:
+            self.box_opacity_btn.blockSignals(False)
+
+    def _apply_box_opacity(self, fill_pct: int, stroke_pct: int) -> None:
+        self.canvas.set_box_opacity(fill=fill_pct, stroke=stroke_pct)
+        self._refresh_box_opacity_button()
+        self.settings_store.update(
+            workbench_box_fill_opacity=int(fill_pct),
+            workbench_box_stroke_opacity=int(stroke_pct),
+            mark_dirty=True,
+        )
+
+    def _build_box_opacity_menu(self) -> QMenu:
+        """构建画布底栏「框透明 ▾」弹出调节面板（填充/描边实时滑块 + 仅描边/轻显/默认/高亮预设）。"""
+        menu = QMenu(self)
+        panel = QWidget(menu)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+
+        title = QLabel("目标框透明度（纯显示效果，不修改标注）")
+        title.setStyleSheet("font-weight: 600; color: #24292f; font-size: 12px;")
+        lay.addWidget(title)
+
+        cur_fill, cur_stroke = self.canvas.box_opacity()
+        fill_val_lbl = QLabel(f"{cur_fill}%")
+        stroke_val_lbl = QLabel(f"{cur_stroke}%")
+        for vl in (fill_val_lbl, stroke_val_lbl):
+            vl.setFixedWidth(36)
+            vl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            vl.setStyleSheet("color: #57606a; font-size: 11px;")
+
+        fill_slider = QSlider(Qt.Orientation.Horizontal)
+        fill_slider.setRange(0, 80)
+        fill_slider.setValue(cur_fill)
+        stroke_slider = QSlider(Qt.Orientation.Horizontal)
+        stroke_slider.setRange(20, 100)
+        stroke_slider.setValue(cur_stroke)
+        for sl in (fill_slider, stroke_slider):
+            sl.setFixedWidth(150)
+
+        for name, slider, val_lbl in (
+            ("填充透明", fill_slider, fill_val_lbl),
+            ("描边透明", stroke_slider, stroke_val_lbl),
+        ):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            lbl = QLabel(name)
+            lbl.setFixedWidth(52)
+            lbl.setStyleSheet("color: #24292f; font-size: 11px;")
+            row.addWidget(lbl)
+            row.addWidget(slider, 1)
+            row.addWidget(val_lbl)
+            lay.addLayout(row)
+
+        def _sync_sliders() -> None:
+            f_val = fill_slider.value()
+            s_val = stroke_slider.value()
+            fill_val_lbl.setText(f"{f_val}%")
+            stroke_val_lbl.setText(f"{s_val}%")
+            self._apply_box_opacity(f_val, s_val)
+
+        fill_slider.valueChanged.connect(lambda _v: _sync_sliders())
+        stroke_slider.valueChanged.connect(lambda _v: _sync_sliders())
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        presets: tuple[tuple[str, int, int], ...] = (
+            ("仅描边", 0, 95),
+            ("轻显", 5, 65),
+            ("默认", DEFAULT_BOX_FILL_OPACITY, DEFAULT_BOX_STROKE_OPACITY),
+            ("高亮", 28, 100),
+        )
+        for p_label, pf, ps in presets:
+            p_btn = QPushButton(p_label)
+            p_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+
+            def _pick_preset(_checked: bool = False, _f: int = pf, _s: int = ps) -> None:
+                for sl, val in ((fill_slider, _f), (stroke_slider, _s)):
+                    sl.blockSignals(True)
+                    sl.setValue(val)
+                    sl.blockSignals(False)
+                _sync_sliders()
+
+            p_btn.clicked.connect(_pick_preset)
+            preset_row.addWidget(p_btn)
+        lay.addLayout(preset_row)
+
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(panel)
+        menu.addAction(act)
+        return menu
+
+    def _on_box_opacity_menu_clicked(self) -> None:
+        self._refresh_box_opacity_button()
+        menu = self._build_box_opacity_menu()
+        menu.exec(self.box_opacity_btn.mapToGlobal(QPoint(0, -menu.sizeHint().height())))
 
     def _on_zoom_menu_clicked(self) -> None:
         menu = QMenu(self)

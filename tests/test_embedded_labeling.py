@@ -3315,3 +3315,279 @@ def test_workbench_directory_class_rename_merge_and_shortcut_help(
     finally:
         assert win.labeling_tab.prepare_for_close() is True
         win.close()
+
+
+def test_workbench_box_hide_lock_class_visibility_and_solo(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """验证单框隐藏/锁定（V/K 与保护逻辑）、按类别显隐/Solo 跨图保持以及索引重排安全性。"""
+    from PyQt6.QtCore import QPointF
+
+    frames_dir = tmp_path / "vis_lock_frames"
+    f0 = frames_dir / "f0.jpg"
+    f1 = frames_dir / "f1.jpg"
+    for p in (f0, f1):
+        _write_sample_frame(p, (400, 300))
+
+    def _write_doc(img: Path, specs: list[tuple[str, float, float, float, float]]) -> None:
+        img.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "version": "2.5.4",
+                    "flags": {},
+                    "shapes": [
+                        {
+                            "label": lb,
+                            "points": [[x1, y1], [x2, y2]],
+                            "shape_type": "rectangle",
+                            "flags": {},
+                        }
+                        for lb, x1, y1, x2, y2 in specs
+                    ],
+                    "imagePath": img.name,
+                    "imageHeight": 300,
+                    "imageWidth": 400,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    _write_doc(
+        f0,
+        [
+            ("hero", 40.0, 40.0, 140.0, 140.0),
+            ("monster", 50.0, 50.0, 120.0, 120.0),  # 嵌套在 hero 内部，正常优先命中
+            ("item", 240.0, 80.0, 320.0, 160.0),
+        ],
+    )
+    _write_doc(
+        f1,
+        [
+            ("hero", 60.0, 60.0, 160.0, 160.0),
+            ("monster", 200.0, 60.0, 280.0, 140.0),
+        ],
+    )
+
+    win = _make_window(tmp_path)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        qt_app.processEvents()
+        assert tab._doc is not None and len(tab._doc.boxes) == 3
+
+        # 1) 单框隐藏（V）：命中穿透到下层框、Tab 跳过隐藏框、且绝不置脏未保存标记
+        assert tab.canvas._hit_test_box(QPointF(80.0, 80.0)) == 1  # monster 面积更小
+        tab.canvas.select_box(1, emit_signal=True)
+        qt_app.processEvents()
+        QTest.keyClick(tab.canvas, Qt.Key.Key_V)
+        qt_app.processEvents()
+        assert tab._dirty is False
+        assert tab.canvas.is_box_visible(1) is False
+        assert tab.canvas._hit_test_box(QPointF(80.0, 80.0)) == 0  # 穿透命中 hero
+        assert "[隐]" in tab.shape_list.item(1).text()
+        assert tab.show_all_boxes_btn.isVisible() is True
+
+        # Tab 轮选自动跳过隐藏的索引 1（0 -> 2 -> 0）
+        tab.canvas.select_box(0, emit_signal=True)
+        tab._cycle_selected_box(reverse=False)
+        assert tab.canvas.selected_index() == 2
+        tab._cycle_selected_box(reverse=False)
+        assert tab.canvas.selected_index() == 0
+
+        # 2) 单框锁定（K）：禁止手柄命中、禁止微调/改类/删除、清空仅删未锁定框
+        QTest.keyClick(tab.canvas, Qt.Key.Key_K)
+        qt_app.processEvents()
+        assert tab._dirty is False
+        assert tab.canvas.is_box_locked(0) is True
+        assert tab.canvas._hit_test_handle(QPointF(40.0, 40.0)) is None
+        assert tab.del_box_btn.isEnabled() is False
+        assert tab.change_cls_btn.isEnabled() is False
+        assert "[锁]" in tab.shape_list.item(0).text()
+
+        orig_x1 = tab._doc.boxes[0].x1
+        tab._nudge_selected_box(10, 0)
+        assert tab._doc.boxes[0].x1 == orig_x1
+        tab._relabel_box(0, "item")
+        assert tab._doc.boxes[0].label == "hero"
+        tab._delete_selected_box()
+        assert len(tab._doc.boxes) == 3
+
+        # 清空全部框时自动保留已锁定框，并把锁定索引重映射到 0
+        tab._clear_all_boxes()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 1
+        assert tab._doc.boxes[0].label == "hero"
+        assert tab.canvas.is_box_locked(0) is True
+        # 撤销恢复 3 框后先解锁再测试删除重排
+        tab._undo()
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 3
+        tab._toggle_box_locked(2)  # 锁定 item (#2)
+        tab._toggle_box_locked(0)  # 解锁 hero (#0)
+        tab.canvas.select_box(0, emit_signal=True)
+        tab._delete_selected_box()  # 删除 #0 后原 #2 移位到 #1，锁定状态跟着同步到 #1
+        qt_app.processEvents()
+        assert len(tab._doc.boxes) == 2
+        assert tab._doc.boxes[1].label == "item"
+        assert tab.canvas.is_box_locked(1) is True
+        assert tab.canvas.is_box_locked(0) is False
+        tab._undo()
+        tab._unlock_all_boxes()
+        tab._show_all_boxes_and_classes()
+        tab._dirty = False
+
+        # 3) 按类别隐藏与 Solo：跨图保持，重命名类别时同步隐藏集合，全显一键恢复
+        tab._solo_class("hero")
+        qt_app.processEvents()
+        assert tab.canvas.is_box_visible(0) is True
+        assert tab.canvas.is_box_visible(1) is False
+        assert tab.canvas.is_box_visible(2) is False
+        assert tab.show_all_classes_btn.isVisible() is True
+
+        tab.open_next_image()
+        qt_app.processEvents()
+        assert tab._doc is not None and tab._doc.image_path == f1.resolve()
+        assert tab.canvas.is_box_visible(0) is True  # f1 的 hero 仍可见
+        assert tab.canvas.is_box_visible(1) is False  # f1 的 monster 保持隐藏
+
+        tab.show_all_classes_btn.click()
+        qt_app.processEvents()
+        assert tab.canvas.is_box_visible(1) is True
+        assert tab.show_all_classes_btn.isVisible() is False
+    finally:
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+
+def test_workbench_box_opacity_panel_and_searchable_class_picker(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证目标框填充/描边透明度滑块（含仅描边与设置持久化）与可搜索类别选择器（过滤/键盘/C/画后搜类）。"""
+    from yolo_studio.gui.annotation_canvas import (
+        DEFAULT_BOX_FILL_OPACITY,
+        DEFAULT_BOX_STROKE_OPACITY,
+        clamp_box_opacity,
+    )
+    from yolo_studio.gui.class_picker_dialog import ClassPickerDialog, filter_classes_by_query
+    from yolo_studio.gui.settings_dialog import PAGE_GENERAL, SettingsDialog
+
+    # 1) 纯函数：透明度夹紧与多关键词类别过滤排序
+    assert clamp_box_opacity(-10, 150) == (0, 100)
+    assert clamp_box_opacity("bad", None) == (DEFAULT_BOX_FILL_OPACITY, DEFAULT_BOX_STROKE_OPACITY)
+    sample_classes = [
+        "npc_shop",
+        "boss_dragon",
+        "boss",
+        "mini_boss_fire",
+        "player_mage",
+    ]
+    assert filter_classes_by_query(sample_classes, "boss") == ["boss", "boss_dragon", "mini_boss_fire"]
+    assert filter_classes_by_query(sample_classes, "boss fire") == ["mini_boss_fire"]
+
+    # 2) ClassPickerDialog 键盘 ↑↓ + Enter 与新建类别行为
+    picker = ClassPickerDialog(sample_classes, current_label="player_mage", counts={"boss": 3})
+    try:
+        picker.show()
+        qt_app.processEvents()
+        assert picker.selected_label() == "player_mage"
+        picker.search_edit.setText("boss")
+        qt_app.processEvents()
+        assert picker.selected_label() == "boss"
+        # 下方向键切到第二匹配项 boss_dragon
+        QTest.keyClick(picker.search_edit, Qt.Key.Key_Down)
+        qt_app.processEvents()
+        assert picker.selected_label() == "boss_dragon"
+        # 输入全新类别名并回车直接新建
+        picker.search_edit.setText("brand_new_cls")
+        qt_app.processEvents()
+        assert picker.selected_label() == "brand_new_cls"
+        QTest.keyClick(picker.search_edit, Qt.Key.Key_Return)
+        qt_app.processEvents()
+        assert picker.result() == ClassPickerDialog.DialogCode.Accepted
+        assert picker.selected_label() == "brand_new_cls"
+    finally:
+        picker.close()
+
+    # 3) 工作台透明度滑块/仅描边、SettingsDialog 不覆盖透明度、持久化往返与画后搜类
+    settings_file = tmp_path / "opacity_picker.ini"
+    frames_dir = tmp_path / "op_frames"
+    f0 = frames_dir / "frame0.jpg"
+    _write_sample_frame(f0, (320, 240))
+
+    s1 = QSettings(str(settings_file), QSettings.Format.IniFormat)
+    win = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=s1)
+    win.show()
+    QTest.qWaitForWindowExposed(win)
+    qt_app.processEvents()
+    try:
+        tab = win.labeling_tab
+        win.tabs.setCurrentWidget(tab)
+        assert tab.open_directory(frames_dir) is True
+        tab._merge_classes(sample_classes, replace_order=True)
+        qt_app.processEvents()
+
+        # 通过透明度弹出菜单切换为“仅描边” (0%, 95%) 并检验按钮状态
+        assert tab.canvas.box_opacity() == (DEFAULT_BOX_FILL_OPACITY, DEFAULT_BOX_STROKE_OPACITY)
+        tab._apply_box_opacity(0, 75)
+        qt_app.processEvents()
+        assert tab.canvas.box_opacity() == (0, 75)
+        assert "仅描边" in tab.box_opacity_btn.text()
+        assert tab.box_opacity_btn.isChecked() is True
+
+        # 打开全局设置弹窗改动别项并保存，不应把工作台透明度覆盖回默认值
+        dlg = SettingsDialog(win.settings_store, workspace_root=tmp_path, initial_page=PAGE_GENERAL, parent=win)
+        try:
+            dlg.apply_changes()
+        finally:
+            dlg.close()
+        qt_app.processEvents()
+        assert win.settings_store.preferences.workbench_box_fill_opacity == 0
+        assert win.settings_store.preferences.workbench_box_stroke_opacity == 75
+        assert tab.canvas.box_opacity() == (0, 75)
+
+        # 画完自动搜类：开启后画框自动弹出 ClassPickerDialog，选类即落框
+        tab.prompt_label_after_draw_chk.setChecked(True)
+        qt_app.processEvents()
+
+        picked_titles: list[str] = []
+
+        class _FakePicker:
+            def __init__(self, classes, *, current_label="", counts=None, title="", parent=None):
+                picked_titles.append(title)
+
+            def exec(self) -> int:
+                return int(ClassPickerDialog.DialogCode.Accepted)
+
+            def selected_label(self) -> str:
+                return "mini_boss_fire"
+
+        monkeypatch.setattr("yolo_studio.gui.tab_labeling.ClassPickerDialog", _FakePicker)
+        tab._on_canvas_box_drawn(20.0, 20.0, 120.0, 100.0)
+        qt_app.processEvents()
+        assert tab._doc is not None and len(tab._doc.boxes) == 1
+        assert tab._doc.boxes[0].label == "mini_boss_fire"
+        assert picked_titles and "选择或搜索类别" in picked_titles[-1]
+
+        # 保存设置并在新窗口恢复验证透明度与画后搜类开关持久化
+        win.settings_store.save(s1, force=True)
+        s1.sync()
+    finally:
+        win.labeling_tab._dirty = False
+        assert win.labeling_tab.prepare_for_close() is True
+        win.close()
+
+    s2 = QSettings(str(settings_file), QSettings.Format.IniFormat)
+    win2 = MainWindow(workspace_root=tmp_path, lazy_init=True, settings=s2)
+    try:
+        assert win2.settings_store.preferences.workbench_box_fill_opacity == 0
+        assert win2.settings_store.preferences.workbench_box_stroke_opacity == 75
+        assert win2.settings_store.preferences.workbench_prompt_label_after_draw is True
+        assert win2.labeling_tab.canvas.box_opacity() == (0, 75)
+        assert win2.labeling_tab.prompt_label_after_draw_chk.isChecked() is True
+    finally:
+        win2.close()

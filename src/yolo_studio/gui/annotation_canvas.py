@@ -67,6 +67,29 @@ _CROSSHAIR_RGB_BY_KEY: dict[str, tuple[int, int, int]] = {k: rgb for k, _n, rgb 
 # 十字准星中心留空半径（屏幕像素），保证瞄准点像素不被线条遮挡
 CROSSHAIR_CENTER_GAP_PX = 6.0
 
+# 目标框填充与描边不透明度（百分比）默认值与合法范围；填充为 0 时即“仅描边零遮挡”
+DEFAULT_BOX_FILL_OPACITY = 10
+DEFAULT_BOX_STROKE_OPACITY = 95
+MIN_BOX_FILL_OPACITY = 0
+MAX_BOX_FILL_OPACITY = 80
+MIN_BOX_STROKE_OPACITY = 20
+MAX_BOX_STROKE_OPACITY = 100
+
+
+def clamp_box_opacity(fill: object, stroke: object) -> tuple[int, int]:
+    """将目标框填充/描边不透明度规范化到合法百分比范围 `(fill ∈ [0,80], stroke ∈ [20,100])`。"""
+    try:
+        f_val = int(round(float(fill)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        f_val = DEFAULT_BOX_FILL_OPACITY
+    try:
+        s_val = int(round(float(stroke)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        s_val = DEFAULT_BOX_STROKE_OPACITY
+    f_val = max(MIN_BOX_FILL_OPACITY, min(MAX_BOX_FILL_OPACITY, f_val))
+    s_val = max(MIN_BOX_STROKE_OPACITY, min(MAX_BOX_STROKE_OPACITY, s_val))
+    return f_val, s_val
+
 # 十字准星虚线长度预设：(配置键, 中文显示名, (实线段像素, 空隙像素))，像素均为屏幕像素。
 # 配置键持久化在全局设置 `workbench_crosshair_dash` 中，不可随意改名；未知键回退 `DEFAULT_CROSSHAIR_DASH`。
 CROSSHAIR_DASH_PRESETS: tuple[tuple[str, str, tuple[float, float]], ...] = (
@@ -264,6 +287,13 @@ class AnnotationCanvasView(QGraphicsView):
         self._crosshair_halo: bool = False
         # 虚线长度配置键（见 `CROSSHAIR_DASH_PRESETS`），仅虚线线型下生效
         self._crosshair_dash_key: str = DEFAULT_CROSSHAIR_DASH
+        # 视图态显隐与单框锁定集合（均由工作台写入，绝不修改 `.json` 数据）
+        self._hidden_classes: set[str] = set()
+        self._hidden_box_indices: set[int] = set()
+        self._locked_box_indices: set[int] = set()
+        # 目标框填充与描边不透明度（百分比：`fill ∈ [0,80]`, `stroke ∈ [20,100]`）
+        self._box_fill_opacity: int = DEFAULT_BOX_FILL_OPACITY
+        self._box_stroke_opacity: int = DEFAULT_BOX_STROKE_OPACITY
         self._view_enhance_enabled: bool = False
         self._view_enhance_brightness: int = self.DEFAULT_ENHANCE_BRIGHTNESS
         self._view_enhance_contrast: float = self.DEFAULT_ENHANCE_CONTRAST
@@ -551,6 +581,85 @@ class AnnotationCanvasView(QGraphicsView):
         self._crosshair_dash_key = normalized
         self.viewport().update()
 
+    def hidden_classes(self) -> set[str]:
+        """返回当前按类别隐藏的类别名集合副本。"""
+        return set(self._hidden_classes)
+
+    def set_hidden_classes(self, labels: set[str] | list[str] | tuple[str, ...]) -> None:
+        """设置按类别隐藏的集合；若当前选中框因此不可见，保持选中索引但不再绘制句柄。"""
+        cleaned = {str(lbl).strip() for lbl in labels if str(lbl).strip()}
+        if cleaned == self._hidden_classes:
+            return
+        self._hidden_classes = cleaned
+        if self._hover_idx >= 0 and not self.is_box_visible(self._hover_idx):
+            self._hover_idx = -1
+            self._hover_handle = None
+        self.viewport().update()
+
+    def hidden_box_indices(self) -> set[int]:
+        """返回当前图按单框隐藏的索引集合副本。"""
+        return set(self._hidden_box_indices)
+
+    def set_hidden_box_indices(self, indices: set[int] | list[int] | tuple[int, ...]) -> None:
+        """设置当前图的单框隐藏索引集合（纯视图过滤，不改动底层框列表）。"""
+        cleaned = {int(i) for i in indices if 0 <= int(i) < len(self._boxes)}
+        if cleaned == self._hidden_box_indices:
+            return
+        self._hidden_box_indices = cleaned
+        if self._hover_idx >= 0 and not self.is_box_visible(self._hover_idx):
+            self._hover_idx = -1
+            self._hover_handle = None
+        self.viewport().update()
+
+    def locked_box_indices(self) -> set[int]:
+        """返回当前图已锁定（禁止拖拽与改尺寸）的框索引集合副本。"""
+        return set(self._locked_box_indices)
+
+    def set_locked_box_indices(self, indices: set[int] | list[int] | tuple[int, ...]) -> None:
+        """设置当前图的单框锁定索引集合；锁定框仍可点选查看但禁止拖拽移动或拖手柄缩放。"""
+        cleaned = {int(i) for i in indices if 0 <= int(i) < len(self._boxes)}
+        if cleaned == self._locked_box_indices:
+            return
+        self._locked_box_indices = cleaned
+        if self._dragging_box_idx in cleaned:
+            self._reset_edit_drag_state()
+        if self._hover_idx in cleaned:
+            self._hover_handle = None
+            self._update_cursor_for_hover()
+        self.viewport().update()
+
+    def is_box_visible(self, idx: int) -> bool:
+        """判断指定索引目标框当前在画布上是否可见（未被单框隐藏且所属类别未被隐藏）。"""
+        if not (0 <= idx < len(self._boxes)):
+            return False
+        if idx in self._hidden_box_indices:
+            return False
+        return self._boxes[idx].label not in self._hidden_classes
+
+    def is_box_locked(self, idx: int) -> bool:
+        """判断指定索引目标框是否已锁定。"""
+        return 0 <= idx < len(self._boxes) and idx in self._locked_box_indices
+
+    def box_opacity(self) -> tuple[int, int]:
+        """返回当前目标框 `(填充不透明度%, 描边不透明度%)`。"""
+        return self._box_fill_opacity, self._box_stroke_opacity
+
+    def set_box_opacity(self, *, fill: int | None = None, stroke: int | None = None) -> None:
+        """实时调整目标框填充与描边不透明度（`fill=0` 为纯描边模式）；无变化时不触发重绘。"""
+        next_fill, next_stroke = clamp_box_opacity(
+            self._box_fill_opacity if fill is None else fill,
+            self._box_stroke_opacity if stroke is None else stroke,
+        )
+        if (next_fill, next_stroke) == (self._box_fill_opacity, self._box_stroke_opacity):
+            return
+        self._box_fill_opacity = next_fill
+        self._box_stroke_opacity = next_stroke
+        self.viewport().update()
+
+    def reset_box_opacity(self) -> None:
+        """恢复目标框默认填充与描边不透明度。"""
+        self.set_box_opacity(fill=DEFAULT_BOX_FILL_OPACITY, stroke=DEFAULT_BOX_STROKE_OPACITY)
+
     def view_enhancement_enabled(self) -> bool:
         """返回当前是否开启暗部/对比度临时视图增强。"""
         return self._view_enhance_enabled
@@ -725,6 +834,8 @@ class AnnotationCanvasView(QGraphicsView):
         self._cancel_transient_interactions()
         self._zoom_anchor_cache = None
         self._boxes = []
+        self._hidden_box_indices.clear()
+        self._locked_box_indices.clear()
         self._selected_idx = -1
         self._hover_idx = -1
         self._hover_handle = None
@@ -760,6 +871,8 @@ class AnnotationCanvasView(QGraphicsView):
         self._image_width = 0
         self._image_height = 0
         self._boxes = []
+        self._hidden_box_indices.clear()
+        self._locked_box_indices.clear()
         self._selected_idx = -1
         self._hover_idx = -1
         self._hover_handle = None
@@ -777,7 +890,10 @@ class AnnotationCanvasView(QGraphicsView):
         """整体刷新画布显示的矩形框列表并同步选中索引（不触发 `selection_changed`）。"""
         self._cancel_transient_interactions()
         self._boxes = [b.clone() for b in boxes]
-        if 0 <= selected_index < len(self._boxes):
+        box_count = len(self._boxes)
+        self._hidden_box_indices = {i for i in self._hidden_box_indices if 0 <= i < box_count}
+        self._locked_box_indices = {i for i in self._locked_box_indices if 0 <= i < box_count}
+        if 0 <= selected_index < box_count:
             self._selected_idx = selected_index
         else:
             self._selected_idx = -1
@@ -1075,7 +1191,12 @@ class AnnotationCanvasView(QGraphicsView):
         return handles
 
     def _hit_test_handle(self, scene_pos: QPointF) -> str | None:
-        if self._mode != self.MODE_EDIT or not (0 <= self._selected_idx < len(self._boxes)):
+        if (
+            self._mode != self.MODE_EDIT
+            or not (0 <= self._selected_idx < len(self._boxes))
+            or not self.is_box_visible(self._selected_idx)
+            or self.is_box_locked(self._selected_idx)
+        ):
             return None
         b = self._boxes[self._selected_idx]
         scale = max(self._logical_scale(), 1e-4)
@@ -1099,6 +1220,8 @@ class AnnotationCanvasView(QGraphicsView):
         best_area = float("inf")
         px, py = scene_pos.x(), scene_pos.y()
         for idx, b in enumerate(self._boxes):
+            if not self.is_box_visible(idx):
+                continue
             if (b.x1 - pad) <= px <= (b.x2 + pad) and (b.y1 - pad) <= py <= (b.y2 + pad):
                 area = b.area
                 if area < best_area:
@@ -1251,7 +1374,10 @@ class AnnotationCanvasView(QGraphicsView):
             self.viewport().setCursor(QCursor(HANDLE_CURSORS[self._hover_handle]))
             return
         if self._hover_idx >= 0:
-            self.viewport().setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+            if self.is_box_locked(self._hover_idx):
+                self.viewport().setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            else:
+                self.viewport().setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
             return
         self.viewport().setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
@@ -1504,6 +1630,10 @@ class AnnotationCanvasView(QGraphicsView):
         hit_idx = self._hit_test_box(scene_pos)
         if hit_idx >= 0:
             self.select_box(hit_idx, emit_signal=True)
+            if self.is_box_locked(hit_idx):
+                self.viewport().update()
+                event.accept()
+                return
             b = self._boxes[hit_idx]
             self._edit_action = "pending_move"
             self._dragging_box_idx = hit_idx
@@ -1833,11 +1963,15 @@ class AnnotationCanvasView(QGraphicsView):
             order.append(self._selected_idx)
 
         for idx in order:
+            if not self.is_box_visible(idx):
+                continue
             box = self._boxes[idx]
             is_sel = idx == self._selected_idx
             is_hover = idx == self._hover_idx
+            is_locked = self.is_box_locked(idx)
             is_active_edit = (
                 is_sel
+                and not is_locked
                 and self._edit_action in ("dragging_handle", "moving_box")
                 and self._dragging_box_idx == idx
                 and self._drag_preview_rect is not None
@@ -1856,6 +1990,7 @@ class AnnotationCanvasView(QGraphicsView):
                 inv,
                 is_sel=is_sel,
                 is_hover=is_hover,
+                is_locked=is_locked,
                 show_live_size=is_active_edit,
             )
 
@@ -2061,7 +2196,7 @@ class AnnotationCanvasView(QGraphicsView):
                 self._paint_tag_pill(painter, ox1, oy1, tag_text, pill_bg, inv)
 
         for gt_idx, badge in self._audit_flagged_gt.items():
-            if not (0 <= gt_idx < len(self._boxes)) or not badge:
+            if not (0 <= gt_idx < len(self._boxes)) or not badge or not self.is_box_visible(gt_idx):
                 continue
             b = self._boxes[gt_idx]
             self._paint_corner_alert_pill(painter, b.x2, b.y1, badge, QColor(207, 34, 46, 232), inv)
@@ -2165,24 +2300,36 @@ class AnnotationCanvasView(QGraphicsView):
         *,
         is_sel: bool,
         is_hover: bool,
+        is_locked: bool = False,
         show_live_size: bool = False,
     ) -> None:
         r, g, b = label_color_rgb(box.label)
         rect_f = QRectF(x1, y1, x2 - x1, y2 - y1)
 
-        fill_alpha = 58 if is_sel else (42 if is_hover else 24)
-        painter.setBrush(QBrush(QColor(r, g, b, fill_alpha)))
+        if self._box_fill_opacity <= 0:
+            fill_alpha = 0
+        else:
+            eff_pct = min(85, self._box_fill_opacity + (12 if is_sel else (6 if is_hover else 0)))
+            fill_alpha = int(round(eff_pct * 2.55))
+        painter.setBrush(
+            Qt.BrushStyle.NoBrush if fill_alpha <= 0 else QBrush(QColor(r, g, b, fill_alpha))
+        )
 
+        stroke_ratio = self._box_stroke_opacity / 100.0
+        pen_style = Qt.PenStyle.DashDotLine if is_locked else Qt.PenStyle.SolidLine
         if is_sel:
             # 双层描边（白底 + 彩色主线），保证在任意明暗背景上都清晰锐利
-            painter.setPen(QPen(QColor(255, 255, 255, 225), 4.0 * inv))
+            halo_alpha = int(round(225 * max(0.35, stroke_ratio)))
+            main_alpha = int(round(255 * max(0.5, stroke_ratio)))
+            painter.setPen(QPen(QColor(255, 255, 255, halo_alpha), 4.0 * inv, Qt.PenStyle.SolidLine))
             painter.drawRect(rect_f)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(r, g, b, 255), 2.2 * inv))
+            painter.setPen(QPen(QColor(r, g, b, main_alpha), 2.2 * inv, pen_style))
             painter.drawRect(rect_f)
         else:
             line_w = 2.4 * inv if is_hover else 1.8 * inv
-            painter.setPen(QPen(QColor(r, g, b, 240), line_w))
+            line_alpha = int(round(255 * stroke_ratio))
+            painter.setPen(QPen(QColor(r, g, b, line_alpha), line_w, pen_style))
             painter.drawRect(rect_f)
 
         if show_live_size:
@@ -2196,10 +2343,15 @@ class AnnotationCanvasView(QGraphicsView):
                 tag += " ★"
             elif isinstance(box.flags, dict) and box.flags.get("box_refined"):
                 tag += " ⌖"
-            self._paint_tag_pill(painter, x1, y1, tag, QColor(r, g, b, 232), inv)
+            if is_locked:
+                tag += " [锁]"
+            tag_alpha = int(round(232 * max(0.45, stroke_ratio)))
+            self._paint_tag_pill(painter, x1, y1, tag, QColor(r, g, b, tag_alpha), inv)
+        elif is_sel and is_locked:
+            self._paint_tag_pill(painter, x1, y1, f"{box.label} [锁]", QColor(87, 96, 106, 220), inv)
 
-        # 仅在编辑模式下渲染选中框控制手柄，避免画框/抓手模式下误导拖动
-        if is_sel and self._mode == self.MODE_EDIT:
+        # 仅在编辑模式下为未锁定选中框渲染控制手柄，避免锁定框或画框/抓手模式下误导拖动
+        if is_sel and self._mode == self.MODE_EDIT and not is_locked:
             scale = max(self._logical_scale(), 1e-4)
             min_dim_px = min((x2 - x1) * scale, (y2 - y1) * scale)
             hs = (3.4 if min_dim_px < 22.0 else 4.6) * inv

@@ -34,8 +34,11 @@ from yolo_studio.core.mllm_reviewer import (
     resolve_effective_reasoning_effort,
 )
 from yolo_studio.gui.annotation_canvas import (
+    DEFAULT_BOX_FILL_OPACITY,
+    DEFAULT_BOX_STROKE_OPACITY,
     DEFAULT_CROSSHAIR_COLOR,
     DEFAULT_CROSSHAIR_DASH,
+    clamp_box_opacity,
     normalize_crosshair_color_key,
     normalize_crosshair_dash_key,
 )
@@ -107,6 +110,11 @@ class AppPreferences:
     workbench_crosshair_halo: bool = False
     # 十字准星虚线长度配置键（short / medium / long），仅虚线线型下生效，未知值回退 medium
     workbench_crosshair_dash: str = DEFAULT_CROSSHAIR_DASH
+    # 目标框填充与描边不透明度（百分比：`fill ∈ [0,80]`，0=仅描边；`stroke ∈ [20,100]`）
+    workbench_box_fill_opacity: int = DEFAULT_BOX_FILL_OPACITY
+    workbench_box_stroke_opacity: int = DEFAULT_BOX_STROKE_OPACITY
+    # 画完矩形框或 SAM 落框后是否自动弹出可搜索类别选择器（默认关闭，不打断连续画同类框）
+    workbench_prompt_label_after_draw: bool = False
     remember_last_dir: bool = True
     default_prefer_gpu: bool = True
 
@@ -288,6 +296,11 @@ class AppSettingsStore(QObject):
         updated.sam3_weights_path = updated.sam3_weights_path.strip()
         updated.workbench_crosshair_color = normalize_crosshair_color_key(updated.workbench_crosshair_color)
         updated.workbench_crosshair_dash = normalize_crosshair_dash_key(updated.workbench_crosshair_dash)
+        updated.workbench_box_fill_opacity, updated.workbench_box_stroke_opacity = clamp_box_opacity(
+            updated.workbench_box_fill_opacity,
+            updated.workbench_box_stroke_opacity,
+        )
+        updated.workbench_prompt_label_after_draw = bool(updated.workbench_prompt_label_after_draw)
 
         llm_diff = (
             old.provider != updated.provider
@@ -309,6 +322,9 @@ class AppSettingsStore(QObject):
             or old.workbench_crosshair_dashed != updated.workbench_crosshair_dashed
             or old.workbench_crosshair_halo != updated.workbench_crosshair_halo
             or old.workbench_crosshair_dash != updated.workbench_crosshair_dash
+            or old.workbench_box_fill_opacity != updated.workbench_box_fill_opacity
+            or old.workbench_box_stroke_opacity != updated.workbench_box_stroke_opacity
+            or old.workbench_prompt_label_after_draw != updated.workbench_prompt_label_after_draw
             or old.remember_last_dir != updated.remember_last_dir
             or old.default_prefer_gpu != updated.default_prefer_gpu
         )
@@ -370,6 +386,9 @@ class AppSettingsStore(QObject):
             "workbench_crosshair_dashed": bool(p.workbench_crosshair_dashed),
             "workbench_crosshair_halo": bool(p.workbench_crosshair_halo),
             "workbench_crosshair_dash": normalize_crosshair_dash_key(p.workbench_crosshair_dash),
+            "workbench_box_fill_opacity": int(p.workbench_box_fill_opacity),
+            "workbench_box_stroke_opacity": int(p.workbench_box_stroke_opacity),
+            "workbench_prompt_label_after_draw": bool(p.workbench_prompt_label_after_draw),
             "remember_last_dir": bool(p.remember_last_dir),
             "default_prefer_gpu": bool(p.default_prefer_gpu),
         }
@@ -443,6 +462,15 @@ class AppSettingsStore(QObject):
                 prefs.workbench_crosshair_halo = bool(state["workbench_crosshair_halo"])
             if "workbench_crosshair_dash" in state:
                 prefs.workbench_crosshair_dash = normalize_crosshair_dash_key(state["workbench_crosshair_dash"])
+            if "workbench_box_fill_opacity" in state or "workbench_box_stroke_opacity" in state:
+                f_op, s_op = clamp_box_opacity(
+                    state.get("workbench_box_fill_opacity", DEFAULT_BOX_FILL_OPACITY),
+                    state.get("workbench_box_stroke_opacity", DEFAULT_BOX_STROKE_OPACITY),
+                )
+                prefs.workbench_box_fill_opacity = f_op
+                prefs.workbench_box_stroke_opacity = s_op
+            if "workbench_prompt_label_after_draw" in state:
+                prefs.workbench_prompt_label_after_draw = bool(state["workbench_prompt_label_after_draw"])
             if "remember_last_dir" in state:
                 prefs.remember_last_dir = bool(state["remember_last_dir"])
             if "default_prefer_gpu" in state:
