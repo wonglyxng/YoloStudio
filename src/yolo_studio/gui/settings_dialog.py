@@ -421,8 +421,7 @@ class SettingsDialog(QDialog):
         crosshair_style_row.addWidget(self.wb_crosshair_halo_chk)
         crosshair_style_row.addStretch(1)
         crosshair_hint = QLabel(
-            "画框 (R)、SAM 点选 (Q) 与准星 (X) 共用此样式；线条在光标处留空，"
-            "模式由中心标记区分（方角=画框，圆圈=点选，圆点=编辑）。"
+            "画框 (R)、SAM 点选 (Q) 与准星 (X) 共用此样式；线条在光标处留空，交点由鼠标指针标示。"
         )
         crosshair_hint.setWordWrap(True)
         crosshair_hint.setStyleSheet("color: #57606a; font-size: 12px;")

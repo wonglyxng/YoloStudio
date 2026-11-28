@@ -1828,16 +1828,10 @@ class AnnotationCanvasView(QGraphicsView):
         if self._audit_overlays_visible and (self._audit_overlays or self._audit_flagged_gt):
             self._paint_audit_overlays(painter, inv)
 
-        # 绘制模式：中心留空十字准星（中心以当前类别色小方角标示“画框”）与实时草稿框
+        # 绘制模式：中心留空十字准星与实时草稿框
         if self._mode == self.MODE_DRAW:
             if self._cursor_scene_pos is not None:
-                marker_rgb = label_color_rgb(self._active_label) if self._active_label else None
-                self._paint_crosshair(
-                    painter,
-                    inv,
-                    marker="square",
-                    marker_color=QColor(*marker_rgb) if marker_rgb else None,
-                )
+                self._paint_crosshair(painter, inv)
 
             if self._draw_state != "idle":
                 dx1, dx2 = sorted((self._draw_start.x(), self._draw_current.x()))
@@ -1861,13 +1855,7 @@ class AnnotationCanvasView(QGraphicsView):
         # SAM 点选标注模式：十字准星、悬停/草稿半透明轮廓掩码、实时预览框与正负提示点渲染
         if self._mode == self.MODE_SAM_POINT:
             if self._cursor_scene_pos is not None:
-                # SAM 点选：中心以青绿小圆圈标示“点选”，线条颜色与其它模式保持一致
-                self._paint_crosshair(
-                    painter,
-                    inv,
-                    marker="circle",
-                    marker_color=QColor(45, 212, 191),
-                )
+                self._paint_crosshair(painter, inv)
 
             if not self._sam_points and self._sam_hover_rect is not None:
                 hx1, hy1, hx2, hy2 = self._sam_hover_rect
@@ -1928,26 +1916,19 @@ class AnnotationCanvasView(QGraphicsView):
                 if pt_lbl == 1:
                     painter.drawLine(QPointF(pt_x, pt_y - cross_r), QPointF(pt_x, pt_y + cross_r))
 
-        # 编辑或抓手模式下若开启全模式十字准星（X），在非平移态绘制只带中心点的辅助对齐线
+        # 编辑或抓手模式下若开启全模式十字准星（X），在非平移态绘制辅助对齐线
         if (
             self._always_show_crosshair
             and self._mode in (self.MODE_EDIT, self.MODE_PAN)
             and not self._panning
             and self._cursor_scene_pos is not None
         ):
-            self._paint_crosshair(painter, inv, marker="dot")
+            self._paint_crosshair(painter, inv)
 
         painter.restore()
         self._paint_hud_overlay(painter)
 
-    def _paint_crosshair(
-        self,
-        painter: QPainter,
-        inv: float,
-        *,
-        marker: str = "dot",
-        marker_color: QColor | None = None,
-    ) -> None:
+    def _paint_crosshair(self, painter: QPainter, inv: float) -> None:
         """在光标位置绘制横贯整张图像、中心留空的细十字准星。
 
         样式约定（所有尺寸均为屏幕像素，乘以 `inv` 抵消缩放）：
@@ -1955,9 +1936,8 @@ class AnnotationCanvasView(QGraphicsView):
               `set_crosshair_style` 按全局设置控制，复杂背景下可开启描边提高对比度；
             - 线条关闭抗锯齿绘制，避免 1px 线落在半像素位置时被抗锯齿扩散成 2px 发虚变粗；
             - 右/下两段从图像边缘反向绘制，使虚线相位锚定在图像边缘，移动光标时虚线不会“爬动”；
-            - 光标周围留空 `CROSSHAIR_CENTER_GAP_PX`，只画中心点，瞄准像素不被遮挡；
-            - 模式不靠线条颜色区分，而靠中心标记形状：`dot` 编辑/抓手、`square` 画框、`circle` SAM 点选；
-              `marker_color` 为空时标记沿用线条颜色。
+            - 光标周围留空 `CROSSHAIR_CENTER_GAP_PX` 且不画任何中心标记：交点由系统指针标示，
+              当前模式已由工具栏高亮、底栏模式文字与系统指针形状（箭头/十字/手掌）体现。
         """
         if self._cursor_scene_pos is None:
             return
@@ -1996,33 +1976,6 @@ class AnnotationCanvasView(QGraphicsView):
                 painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
         finally:
             painter.restore()
-
-        center = QPointF(cx, cy)
-        mark_color = QColor(marker_color) if marker_color is not None else QColor(line_color)
-        mark_color.setAlpha(240)
-        if marker == "square":
-            half = 3.5 * inv
-            rect = QRectF(cx - half, cy - half, half * 2.0, half * 2.0)
-            if use_halo:
-                painter.setPen(QPen(halo_color, 3.0 * inv))
-                painter.drawRect(rect)
-            painter.setPen(QPen(mark_color, 1.2 * inv))
-            painter.drawRect(rect)
-        elif marker == "circle":
-            radius = 4.0 * inv
-            if use_halo:
-                painter.setPen(QPen(halo_color, 3.0 * inv))
-                painter.drawEllipse(center, radius, radius)
-            painter.setPen(QPen(mark_color, 1.4 * inv))
-            painter.drawEllipse(center, radius, radius)
-        # 所有模式都保留中心点，精确标示当前落点
-        painter.setPen(Qt.PenStyle.NoPen)
-        if use_halo:
-            painter.setBrush(QBrush(halo_color))
-            painter.drawEllipse(center, 1.6 * inv, 1.6 * inv)
-        painter.setBrush(QBrush(QColor(r, g, b, 250)))
-        painter.drawEllipse(center, 0.8 * inv, 0.8 * inv)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def _paint_sam_contours(
         self,
